@@ -6,6 +6,9 @@ set -euo pipefail
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
 echo "[local-ci] Branch: $BRANCH"
 
-cmake -B build -S . -DBUILD_TESTING=ON
-cmake --build build --parallel $(nproc)
+BUILD_TYPE=${BUILD_TYPE:-Release}
+NPROC=$(command -v nproc >/dev/null 2>&1 && nproc || echo 4)
+
+cmake -B build -S . -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -DBUILD_TESTING=ON
+cmake --build build --parallel ${NPROC}
 ctest --test-dir build --output-on-failure
