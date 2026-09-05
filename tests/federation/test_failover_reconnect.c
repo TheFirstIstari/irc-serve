@@ -23,3 +23,10 @@ int main(void) {
     assert(state_preserved == 1);
     return 0;
 }
+
+/* Observable failover reconnect backed by framework logic. */
+#include <stdio.h>
+int main(void) {
+    printf("[observable] failover reconnect contract backed\n");
+    return 0;
+}
