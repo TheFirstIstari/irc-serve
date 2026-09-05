@@ -4,6 +4,6 @@
  */
 #include <stdio.h>
 
-static void server_init(void) {
+void server_init(void) {
     printf("[irc-serve] federated node initializing...\n");
 }
