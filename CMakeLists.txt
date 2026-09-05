@@ -10,7 +10,7 @@ option(BUILD_BENCHMARK "Build benchmarks" ON)
 
 # Compiler warnings (performance + correctness)
 add_compile_options(
-  $<$<C_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Werror -Wpedantic -O2>
+  $<$<C_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Werror -Wpedantic>
   $<$<C_COMPILER_ID:GNU>:-fstrict-aliasing -fno-omit-frame-pointer>
   $<$<C_COMPILER_ID:Clang>:-Weverything -Wno-padded -Wno-unused-macros>
 )
