@@ -11,4 +11,4 @@ NPROC=$(command -v nproc >/dev/null 2>&1 && nproc || echo 4)
 
 cmake -B build -S . -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -DBUILD_TESTING=ON
 cmake --build build --parallel ${NPROC}
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure --timeout 60

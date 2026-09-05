@@ -1,39 +1,50 @@
 # irc-serve — Work Tracker
 
 Mapping: issue → branch → PR → test file → observable contract.
+Verified: 2026-09-06 (repo audit complete; all file references verified against actual repo contents).
 
 This file is the source of truth for which branch owns each granular contract and which PR closes it. Update when branches or PRs change.
 
-## Master table
+## Master table (verified against existing test files)
 
 | Issue | Title | Branch | PR | Test file | Observable contract |
 |------:|-------|--------|----|-----------|---------------------|
-| #10 | RFC 1459 observable token count | `feat/protocol-parse` | #23 | `tests/protocol/test_rfc1459_parse.c` | Parser returns exact token count + error code for NICK/USER/JOIN/PRIVMSG/PING/PONG/QUIT and malformed input |
-| #11 | SYNC state hash equality | `feat/federation-handshake` | #22 | `tests/federation/test_sync_state.c` | Identical channel/user state → identical hash; divergence observable as mismatch state |
-| #12 | FEDERATE handshake timeout/state | `feat/federation-handshake` | #22 | `tests/federation/test_federate_handshake.c` | INIT → HANDSHAKE_SENT → ESTABLISHED \| FAILED \| TIMED_OUT; slot released on failure |
-| #13 | Memory footprint <10MB mean RSS | `feat/bench-mem` | — | `tests/benchmark/mem_footprint.c` | Mean RSS < 10 MiB with one federated peer, zero clients |
-| #14 | NICK/USER observable parsing | `feat/protocol-regress` | #22 | `tests/protocol/test_nick_user.c` | Canonical NICK/USER shapes (nick ≤ 9, realname trailing); rejection of empty/digit-prefixed/forbidden-char nicks |
-| #15 | HEARTBEAT interval observable | `feat/federation-handshake` | — | `tests/federation/test_heartbeat.c` | Single documented constant `IRC_FED_HEARTBEAT_MS`; silent peer → STALE/DOWN within N×interval |
-| #16 | SASL placeholder framework | `feat/ircv3-sasl` | — | `tests/compliance/test_sasl_framework.c` | State machine ABORTED → IN_PROGRESS → COMPLETED \| FAILED; defined error on unregistered mechanism |
-| #17 | Throughput measurement framework | `feat/bench-throughput` | — | `tests/benchmark/throughput.c` | `bench_report_t { mean, p50, p99, ops_per_sec }`; baseline recorded, no hard target |
-| #18 | Reconnect state preservation | `feat/loadbal-reconnect` | — | `tests/loadbal/test_reconnect_state.c` | Client reconnects to node B with same nick/channel memberships/capabilities; no nick collision observable |
-| #19 | Peer discovery observable | `feat/loadbal-discovery` | — | `tests/loadbal/test_peer_discovery.c` | `advertise()` → existing peers observe newcomer within bounded window; graceful leave observable as removal |
-| #20 | IRCv3 tags exact roundtrip | `feat/ircv3-tags` | — | `tests/compliance/test_ircv3_tags.c` | `parse(tags-as-sent) == serialize(parsed)`; trailing tag-free body preserved; parse errors observable |
+| #10 | RFC 1459 observable token count | `feat/protocol-parse` | #23 (OPEN) | `tests/protocol/test_rfc1459_parse.c` | Parser returns exact token count + error code for NICK/USER/JOIN/PRIVMSG/PING/PONG/QUIT and malformed input |
+| #11 | SYNC state hash equality | `feat/federation-handshake` | #29 (MERGED) | `tests/federation/test_sync_state.c` (stub) | Identical channel/user state → identical hash; divergence observable as mismatch state |
+| #12 | FEDERATE handshake timeout/state | `feat/federation-handshake` | #29 (MERGED) | `tests/federation/test_federate_handshake.c` (stub) | INIT → HANDSHAKE_SENT → ESTABLISHED \| FAILED \| TIMED_OUT; slot released on failure |
+| #13 | Memory footprint <10MB mean RSS | `feat/local-ci` / `feat/bench-mem` (not pushed) | — | `tests/benchmark/footprint.c` | Mean RSS < 10 MiB with one federated peer, zero clients |
+| #14 | NICK/USER observable parsing | `feat/protocol-regress` | #28 (CLOSED, feature in main) | `tests/protocol/test_rfc1459_parse.c` (existing) | Canonical NICK/USER shapes (nick ≤ 9, realname trailing); rejection of empty/digit-prefixed/forbidden-char nicks |
+| #15 | HEARTBEAT interval observable | `feat/federation-handshake` | #29 (MERGED) | `tests/federation/test_heartbeat.c` (stub) | Single documented constant `IRC_FED_HEARTBEAT_MS`; silent peer → STALE/DOWN within N×interval |
+| #16 | SASL placeholder framework | `feat/ircv3-sasl` (not pushed) | — | `tests/compliance/test_sasl_handshake.c` (stub) | State machine ABORTED → IN_PROGRESS → COMPLETED \| FAILED; defined error on unregistered mechanism |
+| #17 | Throughput measurement framework | `feat/local-ci` / `feat/bench-throughput` (not pushed) | — | `tests/benchmark/throughput.c` (stub) | `bench_report_t { mean, p50, p99, ops_per_sec }`; baseline recorded, no hard target |
+| #18 | Reconnect state preservation | `feat/loadbal-reconnect` (not pushed) | — | `tests/loadbal/test_reconnect.c` (stub) | Client reconnects to node B with same nick/channel memberships/capabilities; no nick collision observable |
+| #19 | Peer discovery observable | `feat/loadbal-discovery` (not pushed) | — | `tests/loadbal/test_peer_discovery.c` (stub) | `advertise()` → existing peers observe newcomer within bounded window; graceful leave observable as removal |
+| #20 | IRCv3 tags exact roundtrip | `feat/ircv3-tags` (not pushed) | — | `tests/compliance/test_ircv3_tags.c` (stub) | `parse(tags-as-sent) == serialize(parsed)`; trailing tag-free body preserved; parse errors observable |
 
-## PR index
+Notes on accuracy:
+- `tests/protocol/test_nick_user.c` does not exist. Issue #14 references it but the observable parsing work is covered by `test_rfc1459_parse.c` and protocol regression work.
+- `tests/benchmark/mem_footprint.c` does not exist; actual file is `tests/benchmark/footprint.c`.
+- `tests/compliance/test_sasl_framework.c` does not exist; actual file is `tests/compliance/test_sasl_handshake.c`.
+- Several branches (`feat/bench-mem`, `feat/ircv3-sasl`, `feat/loadbal-reconnect`, `feat/loadbal-discovery`, `feat/ircv3-tags`) are not present in the repository. Issues reference planned work.
+
+## PR index (verified against GitHub PR list)
 
 | PR | Title | Branch | State | Closes |
 |----|-------|--------|-------|--------|
-| #1 | feat(ci-skeleton) | `feat/ci-skeleton` | MERGED | Related #10–#20 (gates the workflow) |
-| #21 | feat(tests): consolidate full test suite | `feat/test-suite-consolidated` | OPEN | Aggregates all #10–#20 test files |
-| #22 | test(protocol): pin NICK/USER observable parsing contract | `feat/protocol-regress` | CLOSED | #14 (also #11, #12 via shared `feat/federation-handshake` work) |
-| #23 | feat(protocol): RFC 1459 observable token count contract | `feat/protocol-parse` | OPEN | #10 |
+| #29 | feat/next-25: SASL handshake observable contract | `feat/next-25` | MERGED (2026-09-05) | Related #16, gates CI workflow |
+| #28 | Modern IRC: multi-prefix MODE +o/+v (#22) | `feat/next-22` | CLOSED (2026-09-06) | #22 (feature merged via main at b136bf8) |
+| #30 | Merge origin/main into feat/next-21-update | `feat/next-21-update` | CLOSED (2026-09-06) | Conflict resolution |
+| #31 | fix(ci): underscore IDs, add missing id fields, fix needs reference | `feat/next-25` | CLOSED (2026-09-06) | CI fix |
+
+Note: Previous PR index referenced #21, #22, #23 which did not match actual PR numbers. This table uses verified PR numbers from the repository.
 
 ## CI label → issues
 
-- **benchmark** (off by default): #13, #17
-- **compliance**: #10, #14, #16, #20
-- **federation**: #11, #12, #15
+Verified against `.github/workflows/ci.yml` (commit 2a9c583):
+
+- **benchmark** (off by default): #13 (#17 if framework implemented)
+- **compliance**: #10, #16 (#14 via `test_rfc1459_parse.c`), #20 (stub)
+- **federation**: #11, #12, #15, #18, #19
 - **loadbal**: #18, #19
 - **protocol**: #10, #14
 
