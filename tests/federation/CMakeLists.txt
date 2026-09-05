@@ -1,0 +1,15 @@
+add_executable(test_federate_handshake test_federate_handshake.c)
+add_executable(test_sync_state test_sync_state.c)
+add_executable(test_heartbeat test_heartbeat.c)
+
+target_link_libraries(test_federate_handshake PRIVATE irc_core test_contracts)
+target_link_libraries(test_sync_state PRIVATE irc_core test_contracts)
+target_link_libraries(test_heartbeat PRIVATE irc_core test_contracts)
+
+add_test(NAME FederateHandshake COMMAND test_federate_handshake)
+add_test(NAME SyncState COMMAND test_sync_state)
+add_test(NAME Heartbeat COMMAND test_heartbeat)
+
+set_tests_properties(FederateHandshake PROPERTIES LABELS Federation)
+set_tests_properties(SyncState PROPERTIES LABELS Federation)
+set_tests_properties(Heartbeat PROPERTIES LABELS Federation)

@@ -9,11 +9,11 @@ Federated modern-spec IRC server in C. Performance-first, minimal memory footpri
 
 ## Development
 - `main` is protected. Work on `feat/*` branches.
-- PRs must pass `ci/test`, `ci/benchmark`, `ci/compliance`.
+- PRs must pass the GitHub Actions CI workflow.
 - See `docs/ARCHITECTURE.md` and `docs/SPEC_TRACKING.md`.
 
 ## CI / Benchmark
-Runs on GCC and Clang (Release + Debug). Memory footprint and spec compliance verified automatically.
+Runs on GCC and Clang (Release + Debug). Benchmark/spec-compliance automation is currently a placeholder.
 
 ## Tracking
 Issues and milestones track work. See GitHub Issues tab.
