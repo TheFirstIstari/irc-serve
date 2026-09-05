@@ -21,7 +21,7 @@ jobs:
       - name: Build
         run: cmake --build build --parallel $(nproc)
       - name: Unit Tests
-        id: ci/test
+        id: ci_test
         working-directory: build
         run: ctest --output-on-failure --timeout 60
       - name: Benchmark (minimal footprint)
