@@ -14,11 +14,11 @@ mise install
 make local-ci
 ```
 
-The script the Makefile invokes is `local-ci.sh` at the repo root. It calls
-`mise run cmake` / `mise run ctest` so the tool versions in `mise.toml`
-apply; running it without mise installed requires the Debian/Arch system
-packages listed in `mise.toml` (build-essential + cmake + make on Debian,
-base-devel + cmake on Arch).
+The script the Makefile invokes is `local-ci.sh` at the repo root. It calls plain
+`cmake` / `ctest`; if you have mise installed, the tool versions in `mise.toml`
+apply via mise shims on your `PATH`. Running it without mise installed requires
+the Debian/Arch packages listed in `mise.toml` (build-essential + cmake + make on
+Debian, base-devel + cmake on Arch).
 
 ## CI job mapping
 
