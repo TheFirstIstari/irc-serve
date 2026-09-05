@@ -1,0 +1,11 @@
+add_executable(test_ircv3_tags test_ircv3_tags.c)
+add_executable(test_tags_roundtrip test_tags_roundtrip.c)
+
+target_link_libraries(test_ircv3_tags PRIVATE irc_core test_contracts)
+target_link_libraries(test_tags_roundtrip PRIVATE irc_core test_contracts)
+
+add_test(NAME Ircv3Tags COMMAND test_ircv3_tags)
+add_test(NAME TagsRoundtrip COMMAND test_tags_roundtrip)
+
+set_tests_properties(Ircv3Tags PROPERTIES LABELS Compliance)
+set_tests_properties(TagsRoundtrip PROPERTIES LABELS Compliance)
