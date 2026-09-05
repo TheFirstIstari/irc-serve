@@ -1,0 +1,16 @@
+# Debian packaging stub
+# Target: debian package build
+
+Source: irc-serve
+Section: net
+Priority: optional
+Maintainer: TheFirstIstari <euphonium.ashe.f@gmail.com>
+Build-Depends: debhelper (>=12), cmake, gcc
+Standards-Version: 4.6.0
+
+Package: irc-serve
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Federated modern-spec IRC server in C
+ Performance-first, minimal memory footprint, federated nodes,
+ load-balanced, auto-scaling capable.
