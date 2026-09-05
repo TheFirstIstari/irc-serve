@@ -59,6 +59,7 @@ jobs:
           cmake -B build -S . -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DBUILD_TESTING=ON
           cmake --build build --parallel $(nproc)
       - name: Unit Tests (Arch target)
+
         working-directory: build
         run: ctest --output-on-failure --timeout 60
 
