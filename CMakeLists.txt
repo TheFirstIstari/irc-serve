@@ -18,11 +18,11 @@ add_compile_options(
 # Source layout
 add_subdirectory(src)
 
-if(BUILD_TESTING)
+if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
   enable_testing()
   add_subdirectory(tests)
 endif()
 
-if(BUILD_BENCHMARK)
+if(BUILD_BENCHMARK AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark/CMakeLists.txt")
   add_subdirectory(tests/benchmark)
 endif()
