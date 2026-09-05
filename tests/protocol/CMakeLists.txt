@@ -1,0 +1,15 @@
+add_executable(test_rfc1459_parse test_rfc1459_parse.c)
+add_executable(test_rfc1459_invalid test_rfc1459_invalid.c)
+add_executable(test_multi_prefix test_multi_prefix.c)
+
+target_link_libraries(test_rfc1459_parse PRIVATE irc_core test_contracts)
+target_link_libraries(test_rfc1459_invalid PRIVATE irc_core test_contracts)
+target_link_libraries(test_multi_prefix PRIVATE irc_core test_contracts)
+
+add_test(NAME Rfc1459Parse COMMAND test_rfc1459_parse)
+add_test(NAME Rfc1459Invalid COMMAND test_rfc1459_invalid)
+add_test(NAME MultiPrefix COMMAND test_multi_prefix)
+
+set_tests_properties(Rfc1459Parse PROPERTIES LABELS Protocol)
+set_tests_properties(Rfc1459Invalid PROPERTIES LABELS Protocol)
+set_tests_properties(MultiPrefix PROPERTIES LABELS Protocol)
