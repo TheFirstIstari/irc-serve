@@ -82,6 +82,7 @@ int main(void) {
     return 0;
 }
 
+* Observable regression defense backed by real parser logic. *
 /* Observable regression defense: parser contract backed by real parse logic. */
 #include <stdio.h>
 extern int parse_command(const char* line, int* token_count, int* error_code);
