@@ -27,7 +27,7 @@ jobs:
       - name: Benchmark (minimal footprint)
         id: ci/benchmark
         working-directory: build
-        run: ctest -L Benchmark --output-on-failure || echo "Benchmark target optional"
+        run: ctest -L Benchmark --output-on-failure
       - name: Memory-check build
         id: ci/compliance
         run: |
