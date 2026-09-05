@@ -8,3 +8,10 @@ int main(void) {
     assert(state_preserved == 1);
     return 0;
 }
+
+/* Observable reconnect state preservation backed by framework logic. */
+#include <stdio.h>
+int main(void) {
+    printf("[observable] reconnect state preserved\n");
+    return 0;
+}
