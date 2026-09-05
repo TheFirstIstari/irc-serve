@@ -8,6 +8,7 @@ on:
 
 jobs:
   ci_test:
+    id: ci_test
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -20,6 +21,7 @@ jobs:
         run: ctest --output-on-failure --timeout 60
 
   ci_benchmark:
+    id: ci_benchmark
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -32,6 +34,7 @@ jobs:
         run: ctest -L Benchmark --output-on-failure || echo "Benchmark optional"
 
   ci_compliance:
+    id: ci_compliance
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +43,8 @@ jobs:
           echo "Target platforms: Debian, Arch"
           echo "Memory footprint target: < 10MB base per federated node"
 
-  build-arch:
+  build_arch:
+    id: build_arch
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -58,9 +62,10 @@ jobs:
         working-directory: build
         run: ctest --output-on-failure --timeout 60
 
-  spec-compliance-check:
+  spec_compliance_check:
+    id: spec_compliance_check
     runs-on: ubuntu-latest
-    needs: [build-arch]
+    needs: [build_arch]
     steps:
       - uses: actions/checkout@v4
       - name: Check spec references
