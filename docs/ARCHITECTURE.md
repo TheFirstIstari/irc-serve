@@ -13,7 +13,7 @@
 - Federation handshake: `FEDERATE`, `SYNC`, `HEARTBEAT`
 
 ## CI / TDD
-- `tests/` — unit tests (CTest)
-- `tests/benchmark/` — memory footprint + throughput
-- CI runs on push/PR to `main` and `feat/*`
-- `main` protected; only merge via PR with passing CI (`ci/test`, `ci/benchmark`, `ci/compliance`)
+- `tests/` — unit tests (planned; will be wired up with CTest)
+- `tests/benchmark/` — memory footprint + throughput (planned)
+- CI runs on push/PR to `main` and feature branches
+- `main` protected; merge via PR with passing CI workflow
