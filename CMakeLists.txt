@@ -9,20 +9,23 @@ option(BUILD_TESTING "Build tests" ON)
 option(BUILD_BENCHMARK "Build benchmarks" ON)
 
 # Compiler warnings (performance + correctness)
-add_compile_options(
-  $<$<C_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Werror -Wpedantic>
-  $<$<C_COMPILER_ID:GNU>:-fstrict-aliasing -fno-omit-frame-pointer>
-  $<$<C_COMPILER_ID:Clang>:-Weverything -Wno-padded -Wno-unused-macros>
-)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  add_compile_options(-Wall -Wextra -Werror -Wpedantic -O2)
+  if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    add_compile_options(-fstrict-aliasing -fno-omit-frame-pointer)
+  elseif(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+    add_compile_options(-Weverything -Wno-padded -Wno-unused-macros)
+  endif()
+endif()
 
 # Source layout
 add_subdirectory(src)
 
-if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
+if(BUILD_TESTING)
   enable_testing()
   add_subdirectory(tests)
 endif()
 
-if(BUILD_BENCHMARK AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark/CMakeLists.txt")
+if(BUILD_BENCHMARK)
   add_subdirectory(tests/benchmark)
 endif()
