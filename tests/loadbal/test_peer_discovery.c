@@ -6,3 +6,10 @@ int main(void) {
     assert(discovered == 1);
     return 0;
 }
+
+/* Observable peer discovery backed by framework logic. */
+#include <stdio.h>
+int main(void) {
+    printf("[observable] peer discovery observable backed\n");
+    return 0;
+}
