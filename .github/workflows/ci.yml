@@ -7,8 +7,8 @@ on:
     branches: [main]
 
 jobs:
-  ci_test:
-    id: ci_test
+  ci_testExpected:
+    id: ci_testExpected
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -20,8 +20,8 @@ jobs:
         working-directory: build
         run: ctest --output-on-failure --timeout 60
 
-  ci_benchmark:
-    id: ci_benchmark
+  ci_benchmarkExpected:
+    id: ci_benchmarkExpected
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -33,8 +33,8 @@ jobs:
         working-directory: build
         run: ctest -L Benchmark --output-on-failure || echo "Benchmark optional"
 
-  ci_compliance:
-    id: ci_compliance
+  ci_complianceExpected:
+    id: ci_complianceExpected
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
