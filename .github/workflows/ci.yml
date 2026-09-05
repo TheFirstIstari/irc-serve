@@ -72,3 +72,18 @@ jobs:
         run: |
           echo "Verifying spec links in docs/"
           test -f docs/SPEC_TRACKING.md || exit 1
+
+# Enhanced spec compliance: verify docs content, not just file existence
+  spec_compliance_check_enhanced:
+    id: spec_compliance_check_enhanced
+    runs-on: ubuntu-latest
+    needs: [build_arch]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify docs references
+        run: |
+          echo "Verifying spec links in docs/"
+          test -f docs/SPEC_TRACKING.md || exit 1
+          grep -q "https://datatracker.ietf.org/doc/html/rfc1459" docs/SPEC_TRACKING.md || exit 1
+          grep -q "https://modern.ircdocs.horse/" docs/SPEC_TRACKING.md || exit 1
+          grep -q "https://ircv3.net/" docs/SPEC_TRACKING.md || exit 1
