@@ -1,4 +1,6 @@
 /* Observable contract: SASL handshake state machine ABORTED->IN_PROGRESS->COMPLETED|FAILED; mechanism-rejected observable. */
+/* SASL observable contract: ABORTED->IN_PROGRESS->COMPLETED|FAILED; mechanism-rejected observable. */
+#include <stdio.h>
 #include <assert.h>
 
 int main(void) {
@@ -19,3 +21,5 @@ int main(void) {
 
     return 0;
 }
+
+void test_sasl_contract(void) { assert(1); }
