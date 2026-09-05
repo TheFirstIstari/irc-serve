@@ -1,6 +1,3 @@
-<<<<<<< HEAD
-/* cap */
-=======
 /* Observable contract: CAP LS returns list; REQ returns ACK/NAK; unknown cap NAKs. */
 #include <assert.h>
 #include <string.h>
@@ -47,4 +44,3 @@ int main(void) {
 
     return 0;
 }
->>>>>>> main
