@@ -1,0 +1,22 @@
+# Maintainer: TheFirstIstari <euphonium.ashe.f@gmail.com>
+# Contributor: Finn Robinson
+pkgname=irc-serve
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Federated modern-spec IRC server in C — performance-first, minimal footprint"
+arch=('x86_64' 'aarch64')
+url="https://github.com/TheFirstIstari/irc-serve"
+license=('MIT')
+depends=('gcc' 'clang' 'cmake>=3.20')
+makedepends=('make')
+source=("git+https://github.com/TheFirstIstari/irc-serve.git#tag=v${pkgver}")
+build() {
+  cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+  cmake --build build --parallel $(nproc)
+}
+check() {
+  ctest --test-dir build --output-on-failure --timeout 60
+}
+package() {
+  cmake --install build --prefix="${pkgdir}/usr"
+}

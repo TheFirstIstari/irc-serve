@@ -45,4 +45,8 @@ local-ci:
 clean:
 	rm -rf $(BUILD_DIR) build-release
 
+docs-check:
+	@test -f docs/SPEC_TRACKING.md || (echo "docs/SPEC_TRACKING.md missing"; exit 1)
+	@echo "docs check passed"
+
 all: build
