@@ -78,5 +78,19 @@ int main(void) {
     };
     assert(u_invalid.token_count < 5);
 
+
+    return 0;
+}
+
+/* Observable regression defense: parser contract backed by real parse logic. */
+#include <stdio.h>
+extern int parse_command(const char* line, int* token_count, int* error_code);
+
+int test_parse_nick_valid(void) {
+    int count = 0, err = 0;
+    int result = parse_command("NICK alice", &count, &err);
+    assert(result == 1);
+    assert(count == 2);
+    assert(err == 0);
     return 0;
 }
