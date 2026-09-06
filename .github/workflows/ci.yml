@@ -7,7 +7,8 @@ on:
     branches: [main]
 
 jobs:
-  ci_test:
+  ci_testExpected:
+    id: ci_testExpected
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -19,7 +20,8 @@ jobs:
         working-directory: build
         run: ctest --output-on-failure --timeout 60
 
-  ci_benchmark:
+  ci_benchmarkExpected:
+    id: ci_benchmarkExpected
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +33,8 @@ jobs:
         working-directory: build
         run: ctest -L Benchmark --output-on-failure || echo "Benchmark optional"
 
-  ci_compliance:
+  ci_complianceExpected:
+    id: ci_complianceExpected
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +43,8 @@ jobs:
           echo "Target platforms: Debian, Arch"
           echo "Memory footprint target: < 10MB base per federated node"
 
-  build-arch:
+  build_arch:
+    id: build_arch
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -55,16 +59,31 @@ jobs:
           cmake -B build -S . -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DBUILD_TESTING=ON
           cmake --build build --parallel $(nproc)
       - name: Unit Tests (Arch target)
-
         working-directory: build
         run: ctest --output-on-failure --timeout 60
 
-  spec-compliance-check:
+  spec_compliance_check:
+    id: spec_compliance_check
     runs-on: ubuntu-latest
-    needs: [build-arch]
+    needs: [build_arch]
     steps:
       - uses: actions/checkout@v4
       - name: Check spec references
         run: |
           echo "Verifying spec links in docs/"
           test -f docs/SPEC_TRACKING.md || exit 1
+
+# Enhanced spec compliance: verify docs content, not just file existence
+  spec_compliance_check_enhanced:
+    id: spec_compliance_check_enhanced
+    runs-on: ubuntu-latest
+    needs: [build_arch]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify docs references
+        run: |
+          echo "Verifying spec links in docs/"
+          test -f docs/SPEC_TRACKING.md || exit 1
+          grep -q "https://datatracker.ietf.org/doc/html/rfc1459" docs/SPEC_TRACKING.md || exit 1
+          grep -q "https://modern.ircdocs.horse/" docs/SPEC_TRACKING.md || exit 1
+          grep -q "https://ircv3.net/" docs/SPEC_TRACKING.md || exit 1
