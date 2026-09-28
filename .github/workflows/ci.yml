@@ -123,8 +123,21 @@ jobs:
     # environment were removed. Belt and braces, because each fails differently:
     # `if:` stops the job existing for a pull request, and the environment stops
     # a bad or unreviewed commit on main from running unreviewed.
+    # The gate is conditional on WHO pushed. This is the mechanism behind
+    # "run my own work automatically, but nothing else":
+    #
+    #   github.actor is the authenticated identity that performed the push, and
+    #   for a push event that is trustworthy -- it comes from the credential,
+    #   not from anything a workflow or a commit message can set. (It would NOT
+    #   be trustworthy for pull_request, where the actor is the PR author, which
+    #   is one more reason the if: below restricts this job to pushes to main.)
+    #
+    #   your own push   -> self-hosted-auto   (no protection rules; starts at once)
+    #   anyone else's   -> self-hosted        (required reviewer: you; waits)
+    #
+    # Both are pinned to main, so neither can be used from another branch.
     environment:
-      name: self-hosted
+      name: ${{ github.actor == 'TheFirstIstari' && 'self-hosted-auto' || 'self-hosted' }}
     runs-on: [self-hosted, Linux, x64, cachyos-x8664]
     timeout-minutes: 30
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
