@@ -105,7 +105,15 @@ static void rig_open(rig_t *r)
          * reader that is deliberately not running yet. 32 KB per end is
          * comfortably more than a line and comfortably less than the 200 KB
          * flood in test_eof_and_pump(), so the same rig serves both: the line
-         * fits, and the flood still cannot. */
+         * fits, and the flood still cannot.
+         *
+         * This is a REQUEST and nothing asserts its value -- deliberately. The
+         * kernel may double it (Linux does) or floor it, and a test that pinned
+         * a socket buffer and then compared the number was macOS-only by
+         * construction. What the tests here rely on is only that the request is
+         * an order of magnitude below the 256 KB cap, so a single send() into a
+         * free socket cannot take a whole queue, and that holds whatever the
+         * kernel does with the number. */
         int bufsz = 32768;
 
         TF_CHECK(flags >= 0);
@@ -406,6 +414,67 @@ static void test_eof_and_pump(void)
     rig_close(&r);
 }
 
+/* Move bytes to the far end until exactly `n` of them have been read there.
+ *
+ * The far end is nonblocking (see put()), so a read that finds nothing has to
+ * give the conn a chance to write more rather than spin on it. The stall
+ * counter is the bound that keeps a broken rig from hanging: a test that hangs
+ * is worse than one that fails, so the possibility is removed rather than
+ * reasoned about. */
+static void pump_until_read(rig_t *r, char *dst, size_t n)
+{
+    size_t off = 0;
+    int stalls = 0;
+
+    while (off < n) {
+        size_t want = n - off;
+        ssize_t got;
+        int progress = 0;
+
+        if (want > 65536u) {
+            want = 65536u;
+        }
+        got = read(r->pair[1], dst + off, want);
+        if (got > 0) {
+            off += (size_t)got;
+            stalls = 0;
+            continue;
+        }
+        if (got == 0) {
+            break; /* the far end went away; the count check below reports it */
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            break;
+        }
+        if (conn_write_pending(r->c) > 0) {
+            size_t before = conn_write_pending(r->c);
+
+            TF_CHECK_MSG(conn_pump(r->c) == 0, "conn_pump failed");
+            if (conn_write_pending(r->c) < before) {
+                progress = 1;
+            }
+        }
+        if (progress) {
+            stalls = 0;
+            continue;
+        }
+        {
+            struct timeval tv = { 0, 2000 };
+            fd_set rfds;
+
+            /* Yield until the far end has something, or briefly. Not a fixed
+             * wait: select() returns the moment it does. */
+            FD_ZERO(&rfds);
+            FD_SET(r->pair[1], &rfds);
+            (void)select(r->pair[1] + 1, &rfds, NULL, NULL, &tv);
+        }
+        if (++stalls > 2000) {
+            break;
+        }
+    }
+    TF_CHECK_MSG(off == n, "only %zu of %zu bytes reached the far end", off, n);
+}
+
 /* The write queue's two bounds, and the compaction that keeps them consistent.
  *
  * The cap is on the UNSENT tail, and the allocation is a different thing that
@@ -415,26 +484,77 @@ static void test_eof_and_pump(void)
  * fit would have passed the cap, and the refusal the caller then saw was
  * indistinguishable from an over-cap one.
  *
- * Forced with a small send buffer so a single pump drains an amount below the
- * compaction threshold, which is the only way to reach the state where the sent
- * head is small and the allocation is still at the cap. */
+ * ---------------------------------------------------------------------------
+ * HOW THE STATE IS REACHED NOW
+ * ---------------------------------------------------------------------------
+ * This used to pin SO_SNDBUF to 1024 and then assert that one pump had left
+ * `0 < woff < CONN_WQ_COMPACT`. Both halves of that were macOS-only by
+ * construction, and the second half is not merely different on Linux -- it is
+ * UNREACHABLE. Linux floors SO_SNDBUF at SOCK_MIN_SNDBUF and then doubles the
+ * request, so the smallest value a socket can be given is already ~4 KB, which
+ * is CONN_WQ_COMPACT. No choice of buffer size can produce a sub-4 KB send()
+ * there, so a test that needs one is asking for something the kernel will not
+ * do.
+ *
+ * So the state is set up from the production API and nothing else:
+ *
+ *   1. conn_queue() the queue up to exactly the cap. The allocation grows to
+ *      the cap and the tail is the whole allocation: woff == 0.
+ *   2. conn_pump() once. The socket is EMPTY at this point -- nothing has been
+ *      sent yet -- so the pump takes some of the tail and the tail is now below
+ *      the cap while the allocation is still at it. How much it takes is the
+ *      kernel's business; the test only checks that it took SOME of it and not
+ *      all of it, which is what the rig's explicitly requested 32 KB socket
+ *      buffer makes certain with an eight-fold margin. The rig_open() comment
+ *      covers the same assumption for the 200 KB flood in test_eof_and_pump().
+ *      This is the one precondition that is not merely "no number is compared":
+ *      the state being set up is UNREACHABLE if a single send() can absorb the
+ *      whole 256 KB cap, because a send that short-writes is the only thing
+ *      that moves woff off zero, and a socket that can take the whole cap
+ *      never short-writes. Forced to a 256 KB-or-larger rig buffer this test
+ *      therefore fails, and that is arithmetic rather than a bug. What it does
+ *      NOT do is depend on the value: it passes unchanged with the rig buffer
+ *      set to 1 KB, 4 KB, 32 KB, 64 KB or left at the kernel default.
+ *   3. Assert the two preconditions of the interesting append directly, in
+ *      byte counts: there is a sent head (woff > 0) and the append does not
+ *      fit in the allocation (wlen + headroom > wcap). Those two together say
+ *      "this append cannot succeed unless the sent head is reclaimed", which is
+ *      exactly what the old woff band was a proxy for, without naming any
+ *      threshold a platform might not meet.
+ *   4. Append exactly the remaining headroom. It must SUCCEED, the tail must be
+ *      back at the cap, and the allocation must not have grown past it.
+ *   5. Check the data survived. The compaction is a memmove of the retained
+ *      tail down to offset zero followed by the append, so an off-by-anything
+ *      in it corrupts the stream. The whole thing is read back off the socket
+ *      and compared byte for byte against a position-dependent pattern: the
+ *      cap's worth of payload, then the headroom's worth starting again at
+ *      position zero. That is the observable consequence, and it is the reason
+ *      the queue's contents matter at all.
+ */
 static void test_queue_compaction(void)
 {
     rig_t r;
     char *bulk;
+    char *got;
     size_t chunk = 4096;
-    int sndbuf = 1024; /* below CONN_WQ_COMPACT, so one pump leaves woff < it */
     size_t at_cap;
+    size_t pending;
     size_t headroom;
+    size_t total;
+    size_t i;
 
     bulk = (char *)malloc(CONN_WQ_MAX);
     TF_CHECK(bulk != NULL);
-    memset(bulk, 'q', CONN_WQ_MAX);
+    got = (char *)malloc(CONN_WQ_MAX * 2u);
+    TF_CHECK(got != NULL);
+    /* Position-dependent, not a constant fill: the compaction memmove has to
+     * be caught if it is off by any amount at all, and 'q' repeated 256 KB
+     * times would hide a shift. */
+    for (i = 0; i < CONN_WQ_MAX; i++) {
+        bulk[i] = (char)('!' + (int)(i % 251u));
+    }
 
     rig_open(&r);
-    /* A send buffer this small is the only way to make the socket take exactly a
-     * few hundred bytes per pump, which is what leaves a small non-zero woff. */
-    (void)setsockopt(r.pair[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof sndbuf);
 
     /* Fill to exactly the cap. */
     at_cap = 0;
@@ -444,7 +564,12 @@ static void test_queue_compaction(void)
         if (n > chunk) {
             n = chunk;
         }
-        TF_CHECK_MSG(conn_queue(r.c, bulk, n) == 0,
+        /* bulk + at_cap, not bulk: the queue is being filled with the cap's
+         * worth of the payload in order, and passing the same head of the
+         * pattern every time would queue one 4 KB window 64 times over. That
+         * was invisible while the pattern was a constant fill, and the
+         * byte-for-byte check at the end of this test is what caught it. */
+        TF_CHECK_MSG(conn_queue(r.c, bulk + at_cap, n) == 0,
                      "filling the queue to the cap was refused at %zu of %zu",
                      at_cap, CONN_WQ_MAX);
         at_cap += n;
@@ -464,22 +589,37 @@ static void test_queue_compaction(void)
                  "a refused append buffered something: %zu bytes pending",
                  conn_write_pending(r.c));
 
-    /* Drain a little: the tail is now below the cap, the allocation is still
-     * at it. */
+    /* Drain some: the tail is now below the cap, the allocation is still at it.
+     * The socket is empty until this pump, so this is a single send() against
+     * a free socket rather than a guess about how full it already was. */
     TF_CHECK_MSG(conn_pump(r.c) == 0, "conn_pump failed");
-    TF_CHECK_MSG(conn_write_pending(r.c) < CONN_WQ_MAX,
-                 "the pump did not drain anything, so the state this test needs "
-                 "was not reached");
-    TF_CHECK_MSG(r.c->woff > 0 && r.c->woff < CONN_WQ_COMPACT,
-                 "woff is %zu after one pump: the state this test needs is a "
-                 "small non-zero sent head, and without it the growth path "
-                 "taken is the ordinary one", r.c->woff);
+    pending = conn_write_pending(r.c);
+    TF_CHECK_MSG(pending > 0 && pending < CONN_WQ_MAX,
+                 "the queue holds %zu bytes after one pump into an empty "
+                 "socket: the state this test needs is a tail below the cap "
+                 "with the allocation still at it, which needs a socket that "
+                 "cannot take the whole %zu byte cap in one send",
+                 pending, CONN_WQ_MAX);
+    TF_CHECK_MSG(r.c->wcap == CONN_WQ_MAX,
+                 "the allocation is %zu, expected it to still be at the cap %zu",
+                 r.c->wcap, CONN_WQ_MAX);
+
+    /* The two preconditions, stated as byte counts so no platform threshold is
+     * involved: there is a sent head, and the append does not fit without
+     * reclaiming it. */
+    headroom = CONN_WQ_MAX - pending;
+    TF_CHECK_MSG(headroom > 0, "no headroom left after the drain");
+    TF_CHECK_MSG(r.c->woff > 0,
+                 "woff is %zu: without a sent head there is nothing to reclaim "
+                 "and this append needs no compaction", r.c->woff);
+    TF_CHECK_MSG(r.c->wlen + headroom > r.c->wcap,
+                 "the append of %zu bytes would fit in the %zu byte allocation, "
+                 "so it would not exercise compaction at all", headroom,
+                 r.c->wcap);
 
     /* The cap is on the UNSENT tail, so exactly the remaining headroom is a
      * legal append -- and it is the one case where the allocation is at the cap
      * and cannot simply grow. It has to compact instead. */
-    headroom = CONN_WQ_MAX - conn_write_pending(r.c);
-    TF_CHECK_MSG(headroom > 0, "no headroom left after the drain");
     TF_CHECK_MSG(conn_queue(r.c, bulk, headroom) == 0,
                  "an append of exactly the %zu bytes of headroom the cap allows "
                  "was refused: the allocation is already at the cap, so this "
@@ -493,7 +633,23 @@ static void test_queue_compaction(void)
                  "the allocation grew to %zu, past the cap: compacting must "
                  "reclaim space, not raise the limit", r.c->wcap);
 
+    /* And the data is intact: the cap's worth of payload followed by the
+     * headroom's worth starting again at position zero, which is what the
+     * queue held after the compaction. */
+    total = CONN_WQ_MAX + headroom;
+    pump_until_read(&r, got, total);
+    for (i = 0; i < total; i++) {
+        char want = bulk[i < CONN_WQ_MAX ? i : i - CONN_WQ_MAX];
+
+        if (got[i] != want) {
+            TF_CHECK_MSG(0, "byte %zu is 0x%02x, expected 0x%02x -- the "
+                         "compaction reordered or corrupted the queue", i,
+                         (unsigned char)got[i], (unsigned char)want);
+        }
+    }
+
     rig_close(&r);
+    free(got);
     free(bulk);
 }
 

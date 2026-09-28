@@ -54,8 +54,16 @@ int tc_connect(test_client_t *c, int port);
  * CAVEAT, learned the hard way: this is a REQUEST, not a guarantee. macOS
  * re-autotunes the receive buffer after the handshake and reports a figure far
  * above what was asked for, so it cannot be used to force a peer's send() to
- * come up short. A test that needs a guaranteed small window must pin the
- * SENDING socket's SO_SNDBUF, which an explicit set does hold. */
+ * come up short. Nor can the value be read back and compared: Linux stores and
+ * reports roughly double the request and floors it, so a test that pinned a
+ * buffer and then asserted on the read-back number would be macOS-only by
+ * construction (that is exactly how test_partial_write failed on Linux).
+ *
+ * A test that needs a peer's send() to come up short has to make the condition
+ * unavoidable instead of predicting it -- see the dispatch in
+ * test_partial_write.c, which tops the write queue up to its cap and pumps
+ * until the socket refuses a single byte. Nothing here asserts on a
+ * kernel-reported number, and nothing should. */
 int tc_connect_rcvbuf(test_client_t *c, int port, int rcvbuf);
 
 /* Send `line` with the CRLF terminator RFC 1459 2.3 requires. Returns 0 on

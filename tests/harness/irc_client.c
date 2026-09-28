@@ -164,21 +164,19 @@ int tc_connect_rcvbuf(test_client_t *c, int port, int rcvbuf)
     }
     c->fd = fd;
 
-    /* Read SO_RCVBUF back so a test that depends on the window actually being
-     * small can assert it rather than hope. The kernel is allowed to round the
-     * request up (macOS and Linux both double it), so the check is "<= 4x the
-     * request", not "== the request". */
+    /* Read SO_RCVBUF back, and report nothing about the value. On macOS the
+     * kernel re-autotunes the receive buffer after the handshake and reports a
+     * figure far above what was requested, so the number is not a bound; on
+     * Linux a request of N reads back as roughly 2N, so it is not even the
+     * number that was asked for. Asserting on it either way makes a test
+     * platform-specific -- which is how test_partial_write failed on Linux
+     * before it stopped doing so. A test that needs a peer's send() to come up
+     * short must make that unavoidable rather than predict it; see the
+     * dispatch in test_partial_write.c. */
     if (rcvbuf > 0) {
         int got = 0;
         socklen_t len = sizeof got;
 
-        /* Read back, and report nothing about the value: on macOS the kernel
-         * re-autotunes the receive buffer after the handshake and reports a
-         * figure far above what was requested, so the number is not a bound and
-         * asserting on it would be asserting on the wrong thing. Callers that
-         * need a guaranteed small window must control the SENDING side's
-         * SO_SNDBUF instead -- that one is pinned by an explicit set, and it is
-         * the side that decides how much a send() may write. */
         (void)getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &got, &len);
     }
     return 0;
