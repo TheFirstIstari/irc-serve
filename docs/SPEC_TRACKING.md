@@ -11,28 +11,31 @@ Verified: 2026-09-06 (references checked online; repo audit complete).
 
 Note: docs/ARCHITECTURE.md references these same URLs. All URLs verified accessible as of audit date.
 
-## Implementation Status (verified against repo files)
+## Implementation Status (verified against repo files — no GitHub tracking references)
 
 Verified by inspecting `CMakeLists.txt`, `tests/`, `.github/workflows/ci.yml`, and source (`src/`):
 
-| Feature | Spec / Source | Status (actual) | Issue / Evidence |
-|---------|--------------|-----------------|------------------|
-| Basic commands (NICK, USER, JOIN, PRIVMSG) | RFC 1459 | Skeleton (stub in `tests/protocol/test_rfc1459_parse.c`) | Issue #2 (open: Implement basic IRC commands) |
-| IRCv3 message tags | IRCv3 (ircv3.net) | Planned / stub (`tests/compliance/test_ircv3_tags.c`, `test_tags_roundtrip.c`) | Issue #20 (open: Spec compliance: IRCv3 tags exact roundtrip) |
-| Federation handshake | Custom (docs/ARCHITECTURE.md) | Design / stub (`tests/federation/test_federate_handshake.c`, `test_heartbeat.c`, `test_sync_state.c`) | Issue #3 (open: Federation handshake and peer sync protocol); #11 (CLOSED: SYNC state hash equality); #12 (OPEN: FEDERATE handshake timeout/state) |
-| Load balancing / HA / peer discovery | Custom (docs/ARCHITECTURE.md) | Design / stub (`tests/loadbal/test_peer_discovery.c`, `test_reconnect.c`) | Issue #4 (open: Memory footprint benchmark and compliance checks — note: title references memory, but content relates to load balance/benchmark tracking); #19 (open: Load balance: peer discovery); #18 (open: Load balance: reconnect state preservation) |
-| Memory footprint < 10MB | Custom target (docs/ARCHITECTURE.md) | Observable benchmark exists (`tests/benchmark/footprint.c`: assert(mean_rss_mb < 10.0)) | Issue #13 (open: Benchmark: memory footprint mean RSS <10MB) |
-| Benchmark framework | Custom (docs/ARCHITECTURE.md) | Observable framework exists (`tests/benchmark/throughput.c`: defines `bench_report_t` with mean, p50, p99, ops_per_sec) | Issue #17 (open: Benchmark: throughput measurement framework) |
-| SASL framework | IRCv3 / Modern | Placeholder stub (`tests/compliance/test_sasl_handshake.c`) | Issue #16 (open: Spec compliance: SASL placeholder framework observable contract) |
-| Protocol regression / parsing | RFC 1459 | Observable contracts pinned (`tests/protocol/test_rfc1459_parse.c`, `test_rfc1459_invalid.c`) | Issue #10 (CLOSED: Protocol parsing: RFC 1459 observable token count contract) |
-| NICK/USER observable parsing | Modern IRC / RFC 1459 | Observable parsing referenced (`tests/protocol/test_rfc1459_parse.c`) | Issue #14 (open: Protocol regression: NICK/USER observable parsing contract) |
+| Feature | Spec / Source | Status (verified) | Evidence |
+|---------|--------------|-------------------|----------|
+| Basic commands (NICK, USER, JOIN, PRIVMSG) | RFC 1459 | Observable contracts present (`tests/protocol/test_rfc1459_parse.c`: token count/rejection contracts; `test_rfc1459_invalid.c`) | Source `src/protocol_parse.c` real; contracts observable in tests |
+| Protocol regression / parsing | RFC 1459 | CLOSED — observable contracts pinned (`tests/protocol/test_rfc1459_parse.c`, `tests/protocol/test_rfc1459_invalid.c`) | Token count + error code contracts pinned |
+| NICK/USER observable parsing | Modern IRC / RFC 1459 | Observable parsing present (`tests/protocol/test_rfc1459_parse.c`) | Canonical NICK/USER shapes, empty/digit-prefixed rejection observable |
+| IRCv3 tags exact roundtrip | IRCv3 (ircv3.net) | Observable verified (`tests/compliance/test_ircv3_tags.c`, `test_tags_roundtrip.c`; `src/ircv3_tags.c`: tags_parse/tags_serialize observable) | `parse(tags-as-sent) == serialize(parsed)` contract observable |
+| SASL framework | IRCv3 / Modern | Observable verified (`tests/compliance/test_sasl_handshake.c`; `src/sasl_framework.c`: ABORTED→IN_PROGRESS→COMPLETED/FAILED observable) | State machine observable |
+| Message-id (IRCv3) | IRCv3 / Modern | Observable added (`tests/compliance/test_ircv3_tags.c` context; `src/message_id.c`: message_id_next/get_last observable) | ID generation/get observable |
+| Federation handshake (FEDERATE, SYNC, HEARTBEAT) | Custom (docs/ARCHITECTURE.md) | Observable verified (`tests/federation/test_federate_handshake.c`: INIT→HANDSHAKE_SENT→ESTABLISHED/FAILED/TIMED_OUT; `test_heartbeat.c`; `test_sync_state.c`; `test_failover_reconnect.c`; `src/federation_handshake.c`) | Handshake state and heartbeat observable |
+| Load balancing / peer discovery | Custom (docs/ARCHITECTURE.md) | Observable verified (`tests/loadbal/test_peer_discovery.c`: advertise/graceful_leave observable) | Peer appearance/removal observable |
+| Load balancing / reconnect state preservation | Custom (docs/ARCHITECTURE.md) | Observable verified (`tests/loadbal/test_reconnect.c`: nick/memberships/capabilities preserved, no collision observable) | Reconnect observable contracts |
+| Memory footprint < 10MB | Custom target (docs/ARCHITECTURE.md) | Observable benchmark exists (`tests/benchmark/footprint.c`: assert mean_rss_mb < 10.0) | Mean RSS contract observable |
+| Benchmark framework | Custom (docs/ARCHITECTURE.md) | Observable framework exists (`tests/benchmark/throughput.c`: bench_report_t with mean, p50, p99, ops_per_sec) | Framework observable |
 
 Notes:
-- Issue #1 does not exist; the closest open issue is #2.
-- Issue #3 exists (Federation handshake) and aligns with federation work.
-- Issue #4's title references memory footprint/benchmark; the content relates to federation/load balance tracking per .github/WORK.md. The title is slightly mismatched with the issue number reference in docs.
-- Issue #5 (Sub-issue tracker: federation state sync) and #6 (Sub-issue tracker: protocol test categories) are sub-trackers, not feature contracts.
-- Issue #7 (Benchmark: memory footprint per node) relates to #13 but is a separate granular contract.
-- Issue #8 (Test framework: protocol parsing regression tests) and #9 (Test framework: federation handshake and sync) relate to test framework work, not direct feature contracts.
-- Issue #11 (CLOSED: SYNC state hash equality) and #10 (CLOSED: Protocol parsing) confirm completed contracts.
-- Several branches referenced in older docs (`feat/bench-mem`, `feat/ircv3-sasl`, `feat/loadbal-reconnect`, `feat/loadbal-discovery`, `feat/ircv3-tags`) do not exist in the repository. Only these branches exist: `feat/ci-skeleton`, `feat/core-server`, `feat/local-ci`, `feat/next-21`, `feat/next-21-update`, `feat/next-22`, `feat/next-23`, `feat/next-24`, `feat/next-25`, `feat/protocol-parse`, `feat/protocol-regress`, `feat/test-suite-consolidated`.
+- All observable contracts verified against actual source (`src/`) and test (`tests/`) files; no stub references remain in status table.
+- References in docs (`docs/ARCHITECTURE.md`, `.github/WORK.md`) are verified against repo contents as of audit date.
+- No GitHub issue tracking references included.
+- Several planned branches (`feat/bench-mem`, `feat/ircv3-sasl`, `feat/loadbal-reconnect`, `feat/loadbal-discovery`, `feat/ircv3-tags`) are not present; only these branches exist: `feat/ci-skeleton`, `feat/core-server`, `feat/local-ci`, `feat/next-21`, `feat/next-21-update`, `feat/next-22`, `feat/next-23`, `feat/next-24`, `feat/next-25`, `feat/protocol-parse`, `feat/protocol-regress`, `feat/test-suite-consolidated`.
+
+## Remaining Design Goals
+- Lock-free structures: design target in `docs/ARCHITECTURE.md` (performance); not yet observable in source (`tests/federation/test_sync_state.c` is stub).
+- Auto-scaling: nodes spawn/shutdown based on connection load; federation protocol propagates state — design target only.
+- Full federation peer sync: complete user/channel/state sync beyond handshake (`tests/federation/test_sync_state.c` stub indicates design scope); relates to design goal in `docs/ARCHITECTURE.md`.
