@@ -1,0 +1,20 @@
+[Unit]
+Description=GitHub Actions runner (irc-serve, self-hosted)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__RUNNER_USER__
+WorkingDirectory=__RUNNER_DIR__
+ExecStart=__RUNNER_DIR__/run.sh
+Restart=on-failure
+RestartSec=10
+# The runner is a network client; give it time to reconnect.
+KillSignal=SIGINT
+TimeoutStopSec=30
+Environment=RUNNER_TRACKING_ID=""
+NoNewPrivileges=false
+
+[Install]
+WantedBy=default.target
