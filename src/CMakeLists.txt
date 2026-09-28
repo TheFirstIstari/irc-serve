@@ -7,6 +7,8 @@ add_library(irc_core STATIC
   core/connection.c
   core/server.c
   core/poll_loop.c
+  core/reply.c
+  core/commands.c
 )
 
 target_link_libraries(irc_core PRIVATE pthread)

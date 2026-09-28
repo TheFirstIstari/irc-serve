@@ -264,6 +264,16 @@ int tc_expect(test_client_t *c, const char *needle, int timeout_ms)
                 }
                 break;
             }
+            /* read_once() returns 0 both for "nothing yet" and for "the deadline
+             * is already past", and those are not the same thing to a LOOP: the
+             * second one never makes progress, so without this check the wait
+             * spins at full CPU forever instead of timing out. A timeout that
+             * hangs is the worst possible failure mode for a test suite -- the
+             * test is not reported as failed, it is reported as a hung CI job
+             * with no output. */
+            if (now_ms() >= deadline) {
+                break;
+            }
         }
     }
     fprintf(stderr, "tc_expect: TIMEOUT after %d ms waiting for \"%s\"\n",
@@ -325,6 +335,14 @@ int tc_expect_eof(test_client_t *c, int timeout_ms)
         }
         if (eof) {
             return 0;
+        }
+        /* Past the deadline, read_once() returns 0 without blocking. Without
+         * this the loop never ends: a client whose close never arrives would
+         * hang the suite instead of failing it. -2 distinguishes "timed out,
+         * but the server had been talking" from "timed out in silence", which
+         * is a useful distinction when a node dies mid-test. */
+        if (now_ms() >= deadline) {
+            return (c->len > 0) ? -2 : -1;
         }
     }
 }

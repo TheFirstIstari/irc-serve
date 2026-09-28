@@ -3,7 +3,7 @@
 Status: **authoritative design**. Supersedes the status claims in
 `SPEC_TRACKING.md` and `ARCHITECTURE.md`, which overstate what is implemented.
 
-Date: 2026-09-28. Verified against source at commit `2910979`.
+Date: 2026-09-28. Source claims verified against the tree; see `docs/SPEC_TRACKING.md` for the per-phase audit.
 
 **Design principle: federation is not a feature bolted on at the end. It is a
 property of the core data model.** Every design decision below is chosen so
@@ -441,8 +441,14 @@ wire format, and a wire format cannot be invented later.
 
 Registration `001`–`005`; channel `331` `332` `333` `353` `366` `324` `329`;
 query `311`–`319` `321`–`323` `351`–`352` `315`; server info `251`–`266`
-`372`–`376`; errors `401` `403` `404` `405` `421` `422` `431` `433` `441` `442`
+`372`–`376`; errors `401` `403` `404` `405` `421` `422` `431` `432` `433` `441` `442`
 `443` `451` `461` `462` `464` `465` `482`.
+
+`432` `ERR_ERRONEUSNICKNAME` is for a nickname that is **malformed** — illegal
+under §2.1. It is distinct from `433` `ERR_NICKNAMEINUSE`, which is for a legal
+nickname already claimed. The two must not be conflated: answering an illegal
+nickname with `433` tells the client the name is taken, so it retries with a
+different name on a false premise, and the real cause is never surfaced.
 
 `005` with `PREFIX=(ov)@+`, `CHANTYPES=#&`, `NETWORK=` is effectively
 mandatory — many clients misbehave without it.
@@ -525,7 +531,8 @@ fixed sleep is the leading cause of CI flake.
 
 `KNOWN_SKIPS` in `tests/CMakeLists.txt` lists every legitimately-skipped test.
 CI fails if a test reports `Skipped` and is not listed, and `KNOWN_SKIPS` must
-reach empty by Phase 6. This closes the `return 77` blind spot that let 8 dead
+reach empty by Phase 7 (Phase 6 is the federation link; the gate lands with
+the command surface it protects). This closes the `return 77` blind spot that let 8 dead
 tests pass unnoticed.
 
 ---
