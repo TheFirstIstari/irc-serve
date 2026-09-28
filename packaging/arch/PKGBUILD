@@ -1,0 +1,36 @@
+# Maintainer: TheFirstIstari <euphonium.ashe.f@gmail.com>
+# Contributor: Finn Robinson
+pkgname=irc-serve
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Federated modern-spec IRC server in C — performance-first, minimal footprint"
+arch=('x86_64' 'aarch64')
+url="https://github.com/TheFirstIstari/irc-serve"
+# BLOCKER: no LICENSE file exists in the repo. Do not claim MIT (or any license)
+# until a LICENSE file is added upstream. The license() field is required by
+# makepkg but must match reality.
+license=('custom:Unlicensed')
+depends=('glibc')
+makedepends=('make' 'cmake>=3.20' 'gcc' 'clang')
+source=("git+https://github.com/TheFirstIstari/irc-serve.git#tag=v${pkgver}")
+sha256sums=('SKIP')  # TODO: generate real hashes once a stable release tarball is published
+
+CTEST_TIMEOUT=${CTEST_TIMEOUT:-120}
+
+build() {
+  cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_TESTING=ON
+  cmake --build build --parallel $(nproc)
+}
+
+check() {
+  ctest --test-dir build --output-on-failure --timeout "${CTEST_TIMEOUT}"
+}
+
+package() {
+  DESTDIR="${pkgdir}" cmake --install build
+  if [ -f LICENSE ]; then
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  else
+    echo "WARNING: LICENSE not found; license file omitted from package" >&2
+  fi
+}

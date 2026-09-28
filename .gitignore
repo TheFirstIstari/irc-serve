@@ -1,6 +1,8 @@
 # C build artifacts
-build/
-out/
+/build/
+/out/
+build-testing/
+build-benchmark/
 cmake-build-*/
 *.o
 *.a
@@ -8,19 +10,63 @@ cmake-build-*/
 *.dylib
 *.exe
 
+# CMake-generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+
+# Windows / MSVC
+*.obj
+*.ilk
+*.pdb
+*.exp
+*.lib
+*.idb
+*.pch
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
 # Editor
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
+*.bak
+*.orig
 
-# OS
-.DS_Store
-Thumbs.db
+# Secrets / environment (scoped — do not glob credentials* or *.xml)
+.env
+.env.*
+!.env.example
+*.secret
+*.pem
+*.key
 
 # CI / Test artifacts
 *.gcda
 *.gcno
 coverage/
+htmlcov/
+lcov.info
+*.coverage
+test-results/
+.pytest_cache/
+.tox/
 benchmark-results/
+
+# OS temp files
+.DS_Store
+Thumbs.db
+*.tmp
+*.pid
+
+# In-tree CMake build directories (any name, not just /build)
+build-*/
+# Stray compiled executables accidentally left in source dirs
+tests/benchmark/throughput
+tests/benchmark/footprint

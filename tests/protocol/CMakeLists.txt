@@ -1,15 +1,29 @@
 # Protocol tests
 add_executable(test_rfc1459_parse test_rfc1459_parse.c)
 add_executable(test_rfc1459_invalid test_rfc1459_invalid.c)
+add_executable(test_multi_prefix test_multi_prefix.c)
 add_executable(test_topic_persist test_topic_persist.c)
+add_executable(test_nick_user test_nick_user.c)
 
 target_link_libraries(test_rfc1459_parse PRIVATE irc_core test_contracts)
 target_link_libraries(test_rfc1459_invalid PRIVATE irc_core test_contracts)
+target_link_libraries(test_multi_prefix PRIVATE irc_core test_contracts)
+target_link_libraries(test_topic_persist PRIVATE irc_core test_contracts)
+target_link_libraries(test_nick_user PRIVATE irc_core test_contracts)
 
 add_test(NAME Rfc1459Parse COMMAND test_rfc1459_parse)
 add_test(NAME Rfc1459Invalid COMMAND test_rfc1459_invalid)
+add_test(NAME MultiPrefix COMMAND test_multi_prefix)
 add_test(NAME TopicPersistence COMMAND test_topic_persist)
+add_test(NAME NickUser COMMAND test_nick_user)
 
 set_tests_properties(Rfc1459Parse PROPERTIES LABELS Protocol)
 set_tests_properties(Rfc1459Invalid PROPERTIES LABELS Protocol)
+set_tests_properties(MultiPrefix PROPERTIES LABELS Protocol)
 set_tests_properties(TopicPersistence PROPERTIES LABELS Protocol)
+set_tests_properties(NickUser PROPERTIES LABELS Protocol)
+
+# Absent features register an honest skip (return 77) rather than fabricated
+# passing assertions.
+set_tests_properties(MultiPrefix PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(TopicPersistence PROPERTIES SKIP_RETURN_CODE 77)

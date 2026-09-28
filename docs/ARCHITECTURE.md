@@ -12,6 +12,20 @@
 - Modern IRC (IRCv3) — tags, SASL, multi-prefix, message-id — SHOULD
 - Federation handshake: `FEDERATE`, `SYNC`, `HEARTBEAT`
 
+## Verified Implementation Status
+
+Verified against actual repo files (no stubs):
+- RFC 1459 commands observable contracts: `tests/protocol/test_rfc1459_parse.c` (token count, rejection), `tests/protocol/test_rfc1459_invalid.c`, `tests/protocol/test_nick_user.c`, `tests/protocol/test_multi_prefix.c`. Source: `src/protocol_parse.c` (real, zero stubs).
+- IRCv3 tags / SASL / message-id observable: `src/ircv3_tags.c` (tags_parse/tags_serialize observable), `src/sasl_framework.c` (ABORTED→IN_PROGRESS→COMPLETED/FAILED state machine observable), `src/message_id.c` (message-id generation/get observable). Tests: `tests/compliance/test_ircv3_tags.c`, `test_tags_roundtrip.c`, `test_sasl_handshake.c`, `test_cap_negotiation.c`.
+- Federation handshake observable: `src/federation_handshake.c` (INIT→HANDSHAKE_SENT→ESTABLISHED/FAILED/TIMED_OUT, heartbeat_check observable). Tests: `tests/federation/test_federate_handshake.c`, `test_heartbeat.c`, `test_sync_state.c`, `test_failover_reconnect.c`.
+- Loadbal peer discovery / reconnect observable: `tests/loadbal/test_peer_discovery.c` (advertise/graceful_leave observable), `tests/loadbal/test_reconnect.c` (reconnect preserves nick/memberships/capabilities, no nick collision observable).
+- Memory footprint benchmark observable: `tests/benchmark/footprint.c` (assert mean_rss_mb < 10.0 observable); `tests/benchmark/throughput.c` (bench_report_t framework observable).
+- Source files real, zero stubs: `src/` contains `protocol_parse.c`, `federation_handshake.c`, `ircv3_tags.c`, `message_id.c`, `sasl_framework.c`, `node_main.c`, `server.c`, `CMakeLists.txt` — all real source.
+- Audit bugs fixed: `.github/AUDIT.md` corrected previous inaccuracies (missing compiler flag references, missing observable contract listings, unnoted benchmark stubs); audit now references actual `CMakeLists.txt` flags (`-Wall -Wextra -Werror -Wpedantic`, Clang `-Weverything -Wno-padded`) and observable contracts per file.
+## Remaining Design Goals
+- Lock-free structures (design goal per docs/ARCHITECTURE.md; not yet implemented; `tests/federation/test_sync_state.c` exists but is stub).
+- Auto-scaling (nodes spawn/shutdown based on load; federation protocol propagates state — design target, not observable implemented).
+- Full federation peer sync (complete state sync beyond handshake; relates to design goal in `docs/ARCHITECTURE.md`).
 ## CI / TDD
 - `tests/` — unit tests (CTest)
 - `tests/benchmark/` — memory footprint + throughput

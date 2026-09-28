@@ -1,82 +1,53 @@
-/* Observable parsing-contract regression test for NICK and USER commands
- * (RFC 1459 §4.1.2, §4.1.3).
- *
- * Pins observable parser output only:
- *   - token count for valid commands
- *   - command word + extracted fields for valid commands
- *   - rejection signal (token count below valid threshold, empty field)
- *     for invalid commands
- *
- * No plumbing, no struct-shape, no wire-format assertions.
- */
+/* Real NICK/USER invalid-input regression tests, exercising protocol_parse.c.
+ * Complements test_nick_user by centring on rejection paths: each returns -1
+ * and leaves a defined (cleared) output state. */
 #include <assert.h>
 #include <string.h>
+#include "protocol_parse.h"
 
-/* Simulated parser observable result for NICK. */
-struct parsed_nick {
-    char command[5];    /* literal "NICK\0" */
-    char nickname[32];  /* extracted nickname; "" if rejected */
-    int  token_count;   /* 2 for valid, 1 for invalid (command only) */
-};
-
-/* Simulated parser observable result for USER. */
-struct parsed_user {
-    char command[5];        /* literal "USER\0" */
-    char username[32];
-    char hostname[64];
-    char servername[64];
-    char realname[64];
-    int  token_count;       /* 5 for valid; < 5 if rejected */
-};
+#define BIG 128
 
 int main(void) {
-    /* NICK valid: command word preserved, nickname extracted, 2 tokens. */
-    struct parsed_nick n_valid = {
-        .command = "NICK",
-        .nickname = "alice",
-        .token_count = 2,
-    };
-    assert(strcmp(n_valid.command, "NICK") == 0);
-    assert(strcmp(n_valid.nickname, "alice") == 0);
-    assert(n_valid.token_count == 2);
+    int tc = -1;
+    char nick[BIG];
+    char user[BIG], host[BIG], serv[BIG], real[BIG];
 
-    /* NICK invalid (missing nickname): only the command word tokenizes,
-     * nickname field is empty, token count below valid threshold. */
-    struct parsed_nick n_invalid = {
-        .command = "NICK",
-        .nickname = "",
-        .token_count = 1,
-    };
-    assert(n_invalid.token_count < 2);
-    assert(strcmp(n_invalid.nickname, "") == 0);
+    /* wrong command for each parser */
+    assert(parse_nick("PRIVMSG #c hi", nick, sizeof nick, &tc) == -1);
+    assert(parse_nick("USER x y z :r", nick, sizeof nick, &tc) == -1);
+    assert(parse_user("NICK alice", user, sizeof user, host, sizeof host,
+                      serv, sizeof serv, real, sizeof real, &tc) == -1);
 
-    /* USER valid: all four positional fields preserved (realname trailing),
-     * exactly 5 tokens. */
-    struct parsed_user u_valid = {
-        .command = "USER",
-        .username = "alice",
-        .hostname = "host.example",
-        .servername = "server.example",
-        .realname = "Alice Q. User",
-        .token_count = 5,
-    };
-    assert(strcmp(u_valid.command, "USER") == 0);
-    assert(strcmp(u_valid.username, "alice") == 0);
-    assert(strcmp(u_valid.hostname, "host.example") == 0);
-    assert(strcmp(u_valid.servername, "server.example") == 0);
-    assert(strcmp(u_valid.realname, "Alice Q. User") == 0);
-    assert(u_valid.token_count == 5);
+    /* NULL buffer / capacity rejection */
+    assert(parse_nick("NICK a", nick, 0, &tc) == -1);
+    assert(parse_nick("NICK a", nick, -1, &tc) == -1);
+    assert(parse_user("USER u h s :r", user, sizeof user, host, sizeof host,
+                      serv, -1, real, sizeof real, &tc) == -1);
 
-    /* USER invalid (insufficient args): token count below valid 5. */
-    struct parsed_user u_invalid = {
-        .command = "USER",
-        .username = "alice",
-        .hostname = "",
-        .servername = "",
-        .realname = "",
-        .token_count = 2,
-    };
-    assert(u_invalid.token_count < 5);
+    /* embedded newline (multi-line / multiple commands) */
+    assert(parse_nick("NICK\nalice", nick, sizeof nick, &tc) == -1);
+    assert(parse_nick("NICK a\nNICK b", nick, sizeof nick, &tc) == -1);
+    assert(parse_user("USER u h s :a\nb", user, sizeof user, host, sizeof host,
+                      serv, sizeof serv, real, sizeof real, &tc) == -1);
+
+    /* extra whitespace-separated tokens after NICK = extra command */
+    assert(parse_nick("NICK a b c", nick, sizeof nick, &tc) == -1);
+
+    /* insufficient capacity rejects (no silent truncation) */
+    assert(parse_nick("NICK abcdef", nick, 3, &tc) == -1);
+    assert(parse_user("USER abcdef h s :r", user, 3, host, sizeof host,
+                      serv, sizeof serv, real, sizeof real, &tc) == -1);
+
+    /* on rejection the outputs are cleared */
+    nick[0] = 'Q';
+    assert(parse_nick("BOGUS x", nick, sizeof nick, &tc) == -1);
+    assert(nick[0] == '\0');
+    assert(tc == 0);
+
+    real[0] = 'Q';
+    assert(parse_user("USER u h s", user, sizeof user, host, sizeof host,
+                      serv, sizeof serv, real, sizeof real, &tc) == -1);
+    assert(real[0] == '\0');
 
     return 0;
 }

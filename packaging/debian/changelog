@@ -1,0 +1,8 @@
+irc-serve (0.1.0-1) unstable; urgency=medium
+
+  * Initial release: federated modern-spec IRC server in C.
+  * Performance-first, minimal memory footprint (<10MB base per node).
+  * TDD framework with observable contracts per protocol/regression/test.
+  * CI: ci_testExpected, ci_benchmarkExpected, ci_complianceExpected.
+
+ -- TheFirstIstari <euphonium.ashe.f@gmail.com>  Sat, 05 Sep 2026 22:00:00 +0100
