@@ -31,6 +31,10 @@
  *                          failure 3.4 forbids, and it looks correct in review
  *                          because the close is in the right file. The loop's
  *                          only permitted move is conn_mark_closing().
+ *   src/core/reply.c        NONE. It builds outbound lines and queues them; it
+ *                          has no business deciding that a descriptor dies.
+ *   src/core/commands.c     NONE, same reason: a handler states what it wants
+ *                          to say, never what happens to the socket.
  *   src/core/server.c       The registry close in server_close_conn() -- the one
  *                          place a conn_t's descriptor is closed. Plus: the
  *                          accept whose descriptor was >= FD_SETSIZE and so
@@ -45,137 +49,26 @@
  * about closing a descriptor is not mistaken for a call. A trailing comment
  * containing the literal text `close(` would be a false positive; that is the
  * cost of checking by inspection, and it is cheaper than the bug it prevents.
+ *
+ * The stripper and the call matcher live in the harness now (test_util.h,
+ * tf_read_code() and tf_calls()) rather than here, because the second
+ * source-inspection test -- test_reply_guard.c -- needs the same two and a
+ * second copy of a hand-written C lexer is a liability rather than a
+ * convenience. Every assertion below is unchanged.
  */
-#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "harness/test_util.h"
 
-#ifndef IRCSERVE_SRC_DIR
-#define IRCSERVE_SRC_DIR "."
-#endif
-
-/* Read a file with comments and string/character literals removed, so the
- * search sees code rather than prose. */
-static char *read_code(const char *path, size_t *len_out)
-{
-    FILE *f = fopen(path, "rb");
-    char *out;
-    size_t cap = 65536;
-    size_t len = 0;
-    int in_block = 0;
-    int in_line = 0;
-    int quote = 0;
-    int prev = 0;
-    int ch;
-
-    if (f == NULL) {
-        return NULL;
-    }
-    out = (char *)malloc(cap);
-    if (out == NULL) {
-        fclose(f);
-        return NULL;
-    }
-    while ((ch = fgetc(f)) != EOF) {
-        if (len + 2u >= cap) {
-            char *grown = (char *)realloc(out, cap * 2u);
-
-            if (grown == NULL) {
-                free(out);
-                fclose(f);
-                return NULL;
-            }
-            out = grown;
-            cap *= 2u;
-        }
-        /* A comment opener is two characters, so it is detected on its SECOND
-         * character and the previous one has to be remembered. Getting that
-         * backwards silently reduces the stripped output to almost nothing,
-         * which is what happened the first time. */
-        if (in_block) {
-            if (ch == '/' && prev == '*') {
-                in_block = 0;
-            }
-            prev = ch;
-            continue;
-        }
-        if (in_line) {
-            if (ch == '\n') {
-                in_line = 0;
-                out[len++] = (char)ch;
-            }
-            prev = 0;
-            continue;
-        }
-        if (quote != 0) {
-            if (ch == '\\') {
-                (void)fgetc(f); /* skip the escaped character */
-                prev = 0;
-                continue;
-            }
-            if (ch == quote) {
-                quote = 0;
-            }
-            prev = 0;
-            continue;
-        }
-        if (prev == '/' && ch == '/') {
-            in_line = 1;
-            prev = 0;
-            continue;
-        }
-        if (prev == '/' && ch == '*') {
-            in_block = 1;
-            prev = 0;
-            continue;
-        }
-        if (ch == '"' || ch == '\'') {
-            quote = ch;
-            prev = 0;
-            continue;
-        }
-        out[len++] = (char)ch;
-        prev = ch;
-    }
-    fclose(f);
-    out[len] = '\0';
-    *len_out = len;
-    return out;
-}
-
-/* Is `name` called in `code`? The character before it must not be an identifier
- * character, so a search for `close` does not match conn_close( or
- * server_close_conn(. */
-static int calls(const char *code, const char *name)
-{
-    size_t nlen = strlen(name);
-    const char *at = code;
-
-    while ((at = strstr(at, name)) != NULL) {
-        int before_ok = (at == code) ||
-                        !(isalnum((unsigned char)at[-1]) || at[-1] == '_');
-
-        if (before_ok && at[nlen] == '(') {
-            return 1;
-        }
-        at += nlen;
-    }
-    return 0;
-}
-
 static char *load(const char *rel)
 {
-    char path[1024];
-    char *code;
     size_t len = 0;
+    char *code = tf_read_code(rel, &len);
 
-    snprintf(path, sizeof path, "%s/%s", IRCSERVE_SRC_DIR, rel);
-    code = read_code(path, &len);
     TF_CHECK_MSG(code != NULL, "could not read %s (is IRCSERVE_SRC_DIR set?)",
-                 path);
+                 rel);
     return code;
 }
 
@@ -194,7 +87,7 @@ static int calls_between(const char *name, const char *from, const char *to)
     }
     memcpy(body, from, n);
     body[n] = '\0';
-    return calls(body, name);
+    return tf_calls(body, name);
 }
 
 int main(void)
@@ -205,6 +98,8 @@ int main(void)
         "src/core/connection.c",
         "src/core/poll_loop.c",
         "src/core/message.c",
+        "src/core/reply.c",
+        "src/core/commands.c",
         "src/node_main.c",
         "src/protocol_parse.c",
         "src/ircv3_tags.c",
@@ -225,7 +120,8 @@ int main(void)
      * server.c are absent from the second list because each is one of the two
      * places where destruction legitimately happens. */
     static const char *const no_destroy[] = {
-        "src/core/poll_loop.c", "src/core/message.c", "src/node_main.c",
+        "src/core/poll_loop.c", "src/core/message.c", "src/core/reply.c",
+        "src/core/commands.c", "src/node_main.c",
         "src/protocol_parse.c", "src/ircv3_tags.c",
         "src/federation_handshake.c", "src/sasl_framework.c",
         "src/message_id.c"
@@ -233,7 +129,7 @@ int main(void)
 
     for (i = 0; i < sizeof never / sizeof never[0]; i++) {
         code = load(never[i]);
-        TF_CHECK_MSG(!calls(code, "close"),
+        TF_CHECK_MSG(!tf_calls(code, "close"),
                      "%s calls close(). Only the reaper in server.c may close "
                      "a connection descriptor; everything else marks CLOSING "
                      "and lets the reaper do it.", never[i]);
@@ -242,12 +138,12 @@ int main(void)
 
     for (i = 0; i < sizeof no_destroy / sizeof no_destroy[0]; i++) {
         code = load(no_destroy[i]);
-        TF_CHECK_MSG(!calls(code, "conn_free"),
+        TF_CHECK_MSG(!tf_calls(code, "conn_free"),
                      "%s calls conn_free(): a registered conn_t is owned by "
                      "the registry and released by the reaper, so a free() "
                      "from anywhere else is a use-after-free waiting for the "
                      "next lookup on that descriptor", no_destroy[i]);
-        TF_CHECK_MSG(!calls(code, "server_close_conn"),
+        TF_CHECK_MSG(!tf_calls(code, "server_close_conn"),
                      "%s calls server_close_conn(): only the reaper destroys a "
                      "registered connection, so that every close happens at one "
                      "fixed point in the iteration", no_destroy[i]);
@@ -260,11 +156,11 @@ int main(void)
     {
         char *conn_code = load("src/core/connection.c");
 
-        TF_CHECK_MSG(!calls(conn_code, "server_close_conn"),
+        TF_CHECK_MSG(!tf_calls(conn_code, "server_close_conn"),
                      "connection.c calls server_close_conn(): a conn_t does not "
                      "know whether it is registered, so it must never decide "
                      "that a descriptor is closed");
-        TF_CHECK_MSG(calls(conn_code, "conn_free"),
+        TF_CHECK_MSG(tf_calls(conn_code, "conn_free"),
                      "connection.c no longer defines conn_free(): something "
                      "has to be able to release a conn_t's buffers");
         free(conn_code);
@@ -275,7 +171,7 @@ int main(void)
     /* The reaper's close must be there. Without this, "no stray close" could be
      * satisfied by deleting the legitimate one and leaving every connection
      * leaking, which the runtime test would then catch only as a hung test. */
-    TF_CHECK_MSG(calls(code, "close"),
+    TF_CHECK_MSG(tf_calls(code, "close"),
                  "server.c no longer calls close() at all: the reaper must be "
                  "the place a connection descriptor is closed");
 

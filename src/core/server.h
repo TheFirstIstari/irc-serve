@@ -68,6 +68,16 @@
 
 #include "core/connection.h"
 
+/* The version string this build reports in 002, 004 and PONG.
+ *
+ * It lives here, and not in the node's own banner, so that there is exactly
+ * ONE copy of it: a version number stated twice in one binary is a version
+ * number that will eventually be wrong in one of the two places, and 004 is
+ * the one clients show to report bugs against. This is not a server-identity
+ * system -- Phase 6 owns that, and it will want a real version/identity
+ * surface -- it is the single constant the Phase 3 numerics need. */
+#define IRC_SERVE_VERSION "irc-serve-0.1.0"
+
 typedef struct server server_t;
 typedef struct chan chan_t; /* opaque until Phase 4 (2.2) */
 /* message_t comes from core/message.h, which connection.h includes. It is an
@@ -169,6 +179,24 @@ struct server {
     uint64_t  n_ticks;           /* tick hook invocations */
     uint64_t  n_dial_connected;
     uint64_t  n_dial_failed;
+
+    /* ------------------------------------------------------------------------
+     * Phase 3 claims. Both are statements the node makes about itself that are
+     * real events rather than derived guesses, so a test can assert on them.
+     * ------------------------------------------------------------------------ */
+
+    /* PASS lines seen. The RECORD that PASS exists and does not authenticate:
+     * the node has no credential store in this phase, so a client that sends
+     * PASS with any value is treated exactly like one that sent none. The count
+     * is the whole record; the password itself is never logged. */
+    uint64_t  n_pass_seen;
+
+    /* Outbound messages reply() REFUSED to send: a numeric addressed to a
+     * CONN_SERVER conn, to nothing, or to a connection already on its way out.
+     * This one should be zero forever on a single node, so a non-zero value is
+     * a bug report rather than a metric -- which is why reply() prints it
+     * whether or not tracing is on. */
+    uint64_t  n_reply_refused;
 
     int       trace;             /* emit [observable] per-line output */
 };

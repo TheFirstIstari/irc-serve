@@ -1,10 +1,16 @@
 /* test_util.c -- see test_util.h. */
 #include "harness/test_util.h"
 
+#include <ctype.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
+
+#ifndef IRCSERVE_SRC_DIR
+#error "IRCSERVE_SRC_DIR must name the source tree for the source-inspection helpers"
+#endif
 
 /* A handful of nodes, which is more than any test here spawns at once. Fixed
  * size on purpose: this runs on a failing path, and an allocation there could
@@ -62,4 +68,138 @@ void tf_done(const char *name)
     }
     printf("ok: %s\n", name);
     fflush(stdout);
+}
+
+size_t tf_count(const char *hay, const char *needle)
+{
+    size_t n = 0;
+    size_t nlen;
+
+    if (hay == NULL || needle == NULL) {
+        return 0;
+    }
+    nlen = strlen(needle);
+    if (nlen == 0) {
+        return 0; /* an empty needle matches everywhere; refuse to pretend */
+    }
+    while (strstr(hay, needle) != NULL) {
+        hay = strstr(hay, needle) + nlen;
+        n++;
+    }
+    return n;
+}
+
+char *tf_read_code(const char *rel, size_t *len_out)
+{
+    char path[1024];
+    FILE *f;
+    char *out;
+    size_t cap = 65536;
+    size_t len = 0;
+    int in_block = 0;
+    int in_line = 0;
+    int quote = 0;
+    int prev = 0;
+    int ch;
+
+    (void)snprintf(path, sizeof path, "%s/%s", IRCSERVE_SRC_DIR, rel);
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        return NULL;
+    }
+    out = (char *)malloc(cap);
+    if (out == NULL) {
+        fclose(f);
+        return NULL;
+    }
+    while ((ch = fgetc(f)) != EOF) {
+        if (len + 2u >= cap) {
+            char *grown = (char *)realloc(out, cap * 2u);
+
+            if (grown == NULL) {
+                free(out);
+                fclose(f);
+                return NULL;
+            }
+            out = grown;
+            cap *= 2u;
+        }
+        /* A comment opener is two characters, so the CLOSING pair is detected
+         * on its second character and the previous one has to be remembered.
+         * Getting that backwards silently reduces the stripped output to almost
+         * nothing, and the symptom is an assertion about a function that
+         * "cannot be found" in a file that plainly contains it. */
+        if (in_block) {
+            if (ch == '/' && prev == '*') {
+                in_block = 0;
+            }
+            prev = ch;
+            continue;
+        }
+        if (in_line) {
+            if (ch == '\n') {
+                in_line = 0;
+                out[len++] = (char)ch;
+            }
+            prev = 0;
+            continue;
+        }
+        if (quote != 0) {
+            if (ch == '\\') {
+                (void)fgetc(f); /* skip the escaped character */
+                prev = 0;
+                continue;
+            }
+            if (ch == quote) {
+                quote = 0;
+            }
+            prev = 0;
+            continue;
+        }
+        if (prev == '/' && ch == '/') {
+            in_line = 1;
+            prev = 0;
+            continue;
+        }
+        if (prev == '/' && ch == '*') {
+            in_block = 1;
+            prev = 0;
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {
+            quote = ch;
+            prev = 0;
+            continue;
+        }
+        out[len++] = (char)ch;
+        prev = ch;
+    }
+    fclose(f);
+    out[len] = '\0';
+    if (len_out != NULL) {
+        *len_out = len;
+    }
+    return out;
+}
+
+int tf_calls(const char *code, const char *name)
+{
+    size_t nlen;
+    const char *at;
+
+    if (code == NULL || name == NULL) {
+        return 0;
+    }
+    nlen = strlen(name);
+    at = code;
+    while ((at = strstr(at, name)) != NULL) {
+        int before_ok = (at == code) ||
+                        !(isalnum((unsigned char)at[-1]) || at[-1] == '_');
+
+        if (before_ok && at[nlen] == '(') {
+            return 1;
+        }
+        at += nlen;
+    }
+    return 0;
 }
