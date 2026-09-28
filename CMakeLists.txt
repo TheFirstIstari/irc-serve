@@ -75,8 +75,16 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     #
     # -Wno-padded / -Wno-unused-macros: struct padding is deliberate and the
     # log/assertion macros are used across translation-unit boundaries.
+    #
+    # -Wno-disabled-macro-expansion: a GLIBC HEADER artifact, not a code defect.
+    # bits/sigaction.h defines sa_handler as __sigaction_handler.sa_handler --
+    # whose expansion still contains the token sa_handler, so Clang disables the
+    # recursive re-expansion and reports it. Any `sa.sa_handler = ...` therefore
+    # warns on glibc while building clean on macOS/BSD. There is no way to fix
+    # this from our side short of not using sigaction, so it is disabled.
     set(IRC_CLANG_WARNINGS -Weverything -Wno-padded -Wno-unused-macros
-                           -Wno-declaration-after-statement)
+                           -Wno-declaration-after-statement
+                           -Wno-disabled-macro-expansion)
 
     # -Wno-unsafe-buffer-usage is only RECOGNISED by Clang 16+ (the diagnostic
     # itself was added in 16). On Clang 15 or older the unknown option becomes
