@@ -7,7 +7,7 @@
 #include "federation_handshake.h"
 
 int main(void) {
-    handshake_ctx_t c = {0};
+    handshake_ctx_t c = {INIT};
     handshake_init(&c);
     assert(handshake_state(&c) == INIT);
 

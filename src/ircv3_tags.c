@@ -2,6 +2,8 @@
 #include <limits.h>
 #include <string.h>
 
+#include "ircv3_tags.h"
+
 /* IRCv3 message-tags structural roundtrip helper. See ircv3_tags.h for the
  * accepted grammar and return semantics. No logging is emitted from the
  * parse/serialize path.

@@ -53,7 +53,41 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
     add_compile_options(-fstrict-aliasing -fno-omit-frame-pointer)
   elseif(CMAKE_C_COMPILER_ID STREQUAL "Clang")
-    add_compile_options(-Weverything -Wno-padded -Wno-unused-macros)
+    # -Weverything is kept on purpose: it is what surfaced the real API-hygiene
+    # defects fixed alongside it (-Wmissing-prototypes on tags_parse /
+    # tags_serialize / sasl_* / assert_contract_exact_result). Narrowing it to
+    # a hand-picked list would hide the next one, so only the specific
+    # diagnostics below are opted out, each with its reason.
+    #
+    # -Wno-unsafe-buffer-usage: an experimental Clang diagnostic that fires on
+    # essentially ALL pointer arithmetic and indexing in C (`p++`, `line[i]`,
+    # `end - rn`, strncpy bounds). The sites it flags in protocol_parse.c and
+    # ircv3_tags.c are ordinary, already bounds-checked parsing code.
+    # Satisfying it would mean rewriting correct parsers into unnatural forms
+    # with no safety gain, so it is disabled rather than obeyed. Do NOT
+    # re-enable it and then "fix" the parsers to satisfy it.
+    #
+    # -Wno-declaration-after-statement: enforces C89 declaration placement.
+    # This project is explicitly C11 (CMAKE_C_STANDARD 11 above), where
+    # mid-block declarations are legal and idiomatic; -Wpedantic turns this on
+    # for C99+ and it contradicts the declared standard. Disabled so the
+    # dialect and the warning set agree.
+    #
+    # -Wno-padded / -Wno-unused-macros: struct padding is deliberate and the
+    # log/assertion macros are used across translation-unit boundaries.
+    set(IRC_CLANG_WARNINGS -Weverything -Wno-padded -Wno-unused-macros
+                           -Wno-declaration-after-statement)
+
+    # -Wno-unsafe-buffer-usage is only RECOGNISED by Clang 16+ (the diagnostic
+    # itself was added in 16). On Clang 15 or older the unknown option becomes
+    # -Wunknown-warning-option, which -Werror promotes to a hard build failure
+    # -- so a suppression intended to keep the build green would instead turn it
+    # red. Guard it on the compiler version rather than assuming a modern Clang.
+    if(CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 16)
+      list(APPEND IRC_CLANG_WARNINGS -Wno-unsafe-buffer-usage)
+    endif()
+
+    add_compile_options(${IRC_CLANG_WARNINGS})
   endif()
 endif()
 

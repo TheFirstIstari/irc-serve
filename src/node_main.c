@@ -21,12 +21,15 @@
 static volatile sig_atomic_t running = 1;
 static int listen_fd = -1;
 
-void handle_sigterm(int sig) {
+/* Both helpers below are private to this executable's main(); they are not
+ * part of any library interface, so they are static rather than exported with
+ * prototypes in a header. */
+static void handle_sigterm(int sig) {
     (void)sig;
     running = 0;
 }
 
-int bind_tcp_listener(int port) {
+static int bind_tcp_listener(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         perror("socket");

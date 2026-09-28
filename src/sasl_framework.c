@@ -3,23 +3,12 @@
 #include <stdio.h>
 #include <string.h>
 
-typedef enum {
-    SASL_ABORTED = 0,
-    SASL_IN_PROGRESS = 1,
-    SASL_COMPLETED = 2,
-    SASL_FAILED = 3
-} sasl_state_t;
+#include "sasl_framework.h"
 
-
-
-typedef struct {
-    sasl_state_t state;
-    char mechanism[32];
-    char authzid[64];
-    char authcid[64];
-    int step_count;
-    int last_error;
-} sasl_ctx_t;
+/* sasl_state_t has an unsigned underlying type, so default argument promotion
+ * makes it promote to unsigned int -- printf("%d", enum_value) is therefore a
+ * format mismatch, not just a style issue. The observable lines below keep
+ * printing the same digits they always printed, via an explicit (int) cast. */
 
 void sasl_init(sasl_ctx_t *ctx, const char *mechanism) {
     memset(ctx, 0, sizeof(*ctx));
@@ -103,35 +92,38 @@ int sasl_state_machine(void) {
 
     sasl_state_t s = sasl_start(&ctx);
     printf("[observable] sasl_state_machine: start returned=%d (IN_PROGRESS=%d COMPLETED=%d FAILED=%d)\n",
-           s, SASL_IN_PROGRESS, SASL_COMPLETED, SASL_FAILED);
+           (int)s, (int)SASL_IN_PROGRESS, (int)SASL_COMPLETED, (int)SASL_FAILED);
     assert(s == SASL_IN_PROGRESS);
 
     char buf[256];
     size_t out_len = sizeof(buf);
 
     sasl_step(&ctx, "", 0, buf, &out_len);
-    printf("[observable] sasl_state_machine: step1 state=%d\n", sasl_get_state(&ctx));
+    sasl_state_t step1_state = sasl_get_state(&ctx);
+    printf("[observable] sasl_state_machine: step1 state=%d\n", (int)step1_state);
 
     sasl_step(&ctx, "", 0, buf, &out_len);
-    printf("[observable] sasl_state_machine: step2 state=%d\n", sasl_get_state(&ctx));
+    sasl_state_t step2_state = sasl_get_state(&ctx);
+    printf("[observable] sasl_state_machine: step2 state=%d\n", (int)step2_state);
 
     sasl_state_t final = sasl_get_state(&ctx);
-    printf("[observable] sasl_state_machine: final_state=%d step_count=%d\n", final, ctx.step_count);
+    printf("[observable] sasl_state_machine: final_state=%d step_count=%d\n", (int)final, ctx.step_count);
     assert(final == SASL_COMPLETED);
 
     /* Observable mechanism-rejected error path */
     sasl_ctx_t rejected;
     sasl_init(&rejected, "REJECTED");
     sasl_state_t rejected_start = sasl_start(&rejected);
-    printf("[observable] sasl_state_machine: mechanism_rejected observable=%d\n", rejected_start);
+    printf("[observable] sasl_state_machine: mechanism_rejected observable=%d\n", (int)rejected_start);
 
     /* Observable abort and fail transitions */
     sasl_ctx_t fail_ctx;
     sasl_init(&fail_ctx, "TEST");
     sasl_start(&fail_ctx);
-    printf("[observable] sasl_state_machine: before_fail state=%d\n", sasl_get_state(&fail_ctx));
+    sasl_state_t before_fail = sasl_get_state(&fail_ctx);
+    printf("[observable] sasl_state_machine: before_fail state=%d\n", (int)before_fail);
     sasl_state_t fail_state = sasl_fail(&fail_ctx, -1);
-    printf("[observable] sasl_state_machine: fail_state=%d error=%d\n", fail_state, fail_ctx.last_error);
+    printf("[observable] sasl_state_machine: fail_state=%d error=%d\n", (int)fail_state, fail_ctx.last_error);
 
     printf("[observable] sasl_state_machine: completed=1 contract_verified=1\n");
     return (final == SASL_COMPLETED && fail_state == SASL_FAILED && rejected_start == SASL_IN_PROGRESS) ? 1 : 0;

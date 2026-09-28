@@ -34,8 +34,12 @@ void server_init(void) {
         printf("[observable] server_init: handshake_send failed (rc=%d)\n", handshake_rc);
         return;
     }
+    /* handshake_state() returns handshake_state_t, which is not int: cast the
+     * value once here rather than casting the function call itself, so the
+     * log line still carries the state. */
+    const handshake_state_t armed_state = handshake_state(&srv_handshake);
     printf("[observable] federation handshake armed: state=%d (local, awaiting peer ack)\n",
-           (int)handshake_state(&srv_handshake));
+           (int)armed_state);
 
     /* Prepare the protocol parser; do not claim readiness if it cannot parse. */
     parsed = parse_command("PING", &token_count, &error_code);
@@ -49,5 +53,5 @@ void server_init(void) {
 
     printf("[observable] server_init completed: initialized=1 "
            "handshake_state=%d (registered; federation pending peer ack)\n",
-           (int)handshake_state(&srv_handshake));
+           (int)armed_state);
 }
