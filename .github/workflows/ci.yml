@@ -61,6 +61,79 @@ jobs:
           grep -q "https://ircv3.net/" docs/SPEC_TRACKING.md || { echo "missing IRCv3 spec reference" >&2; exit 1; }
           echo "Spec references verified"
 
+  # macOS is a first-class target, not an afterthought: the parser uses POSIX
+  # APIs that behave differently under Darwin headers, and the _DARWIN_C_SOURCE
+  # fix in the root CMakeLists exists precisely because of it. Development has
+  # always been on macOS while CI ran Linux only, which is how the glibc POSIX
+  # break stayed hidden until CI caught it. The reverse direction needs covering
+  # too.
+  #
+  # Caveat, stated rather than implied: AppleClang does not match
+  # `STREQUAL "Clang"` in CMakeLists.txt, so `-Weverything` does NOT run on this
+  # job. That is issue #85. This job therefore covers the default macOS
+  # toolchain, not the full warning set.
+  ci_macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Release, Debug]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build --parallel $(sysctl -n hw.ncpu)
+      - name: Unit Tests
+        working-directory: build
+        run: ctest --output-on-failure --timeout 60
+      - name: Verify Spec References
+        shell: bash
+        run: |
+          test -f docs/SPEC_TRACKING.md || { echo "docs/SPEC_TRACKING.md missing" >&2; exit 1; }
+          grep -q "https://datatracker.ietf.org/doc/html/rfc1459" docs/SPEC_TRACKING.md || { echo "missing RFC1459 spec reference" >&2; exit 1; }
+          grep -q "https://modern.ircdocs.horse/" docs/SPEC_TRACKING.md || { echo "missing modern spec reference" >&2; exit 1; }
+          grep -q "https://ircv3.net/" docs/SPEC_TRACKING.md || { echo "missing IRCv3 spec reference" >&2; exit 1; }
+          echo "Spec references verified"
+
+  # Self-hosted CachyOS job. Deliberately scoped:
+  #
+  #   * `runs-on` targets a LABEL, so only this job can land on that machine
+  #   * this job is the only one gated on `if: github.event_name == 'push'`
+  #   * it therefore does NOT run for pull_request, so a PR from anyone --
+  #     including a public fork -- cannot execute code on it
+  #
+  # That restriction is the whole point. The repository is public; a self-hosted
+  # runner attached to any pull_request-triggered job would let arbitrary people
+  # run code on this machine. If you add this label to such a job, that
+  # protection is gone.
+  #
+  # This job is a smoke test that the distro builds, NOT a required status
+  # check. A machine you have switched off must not block the project.
+  build_cachyos:
+    runs-on: [self-hosted, Linux, x64, cachyos-x8664]
+    timeout-minutes: 30
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          uname -a
+          cat /etc/os-release 2>/dev/null | head -3 || true
+          cmake --version | head -1
+          gcc --version | head -1
+          clang --version | head -1
+      - name: Configure
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+      - name: Unit Tests
+        working-directory: build
+        run: ctest --output-on-failure --timeout 60
+
   build_arch:
     runs-on: ubuntu-latest
     timeout-minutes: 30
