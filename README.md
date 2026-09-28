@@ -9,7 +9,9 @@ Federated modern-spec IRC server in C. Performance-first, minimal memory footpri
 
 ## Development
 - `main` is protected. Work on `feat/*` branches.
-- PRs must pass `ci/test`, `ci/benchmark`, `ci/compliance`.
+- PRs must pass `ci_test`, `ci_benchmark` and `ci_compliance` — these are the
+  check names branch protection on `main` requires, and they must match the
+  job ids in `.github/workflows/ci.yml` exactly or the PR stays BLOCKED.
 - See `docs/ARCHITECTURE.md` and `docs/SPEC_TRACKING.md`.
 
 ## CI / Benchmark
