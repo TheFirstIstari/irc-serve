@@ -98,3 +98,12 @@ irc_add_integration_test(test_quit test_quit.c)
 # 3: numerics are never written to a peer link. Source inspection, and labelled
 # as such; Phase 6 adds the end-to-end version once a peer exists.
 irc_add_integration_test(test_reply_guard test_reply_guard.c)
+
+# 7/Phase 4: JOIN/PART/TOPIC/NAMES/LIST/KICK/MODE on the wire, the fixed 353
+# order, 332/333, non-op KICK -> 482, and the single-writer rule (437, with the
+# channel state asserted unchanged afterwards). The last group runs against an
+# INLINE child because 2.2's rule needs a channel whose origin is not this node,
+# and the only way to produce one without a peer socket is to re-key a channel
+# the node created -- which is 2.2's own creation-race path, driven from the
+# tick hook rather than simulated around.
+irc_add_integration_test(test_channels test_channels.c)
