@@ -152,7 +152,7 @@ int main(void)
             "NICK @",
             "NICK a:b",     /* a colon in a nick muddies the prefix grammar */
             "NICK a;b",     /* a tag separator in a nick */
-            "NICK 1abc",    /* a leading digit reads as a numeric reply */
+            "NICK 1abc",    /* a leading digit is neither letter nor "special" */
             "NICK 9",
             "NICK a b",     /* parse_nick rejects this one itself */
         };

@@ -404,15 +404,14 @@ int irc_serve_tags_valid(const irc_serve_tags_t *t);
  *   2. strlen(nick) <= IRC_MAX_NICK (63). The bound comes from
  *      conn_t::nick[64] in 2.1, not from an invented limit.
  *   3. The FIRST character is not an ASCII digit '0'-'9'. RFC 2812 2.3.1
- *      allows a letter or a "special" there, and a digit is neither; that
- *      is the reason. It is reinforced by federation rather than by
- *      parsing: a digit-leading nick accepted here is one a peer may
- *      refuse, and two nodes then disagree about who "123" is, which is
- *      the divergence this scheme exists to prevent. It is NOT a
- *      wire-parsing rule: ":123 PRIVMSG #c :hi" and ":server 123 target
- *      :text" are distinct, because message_parse() above reads the prefix
- *      and the command word into separate fields and "PRIVMSG" is not a
- *      three-digit numeric. Only the legibility cost survives.
+ *      allows a letter or a "special" there, and a digit is neither. A peer
+ *      may enforce the same rule, depending on its implementation, and a
+ *      nick this node holds that a peer will not accept is already
+ *      divergence -- federation stays cheap only while the nodes agree.
+ *      It is NOT a wire-parsing rule: message_parse() above puts the prefix
+ *      and the command word into separate fields, so ":123 PRIVMSG #c :hi"
+ *      and ":server 123 target :text" are distinct. Only the legibility
+ *      cost survives.
  *   4. NO character is any of: '@' '#' '&' '+' '!' ':' ';'
  *        '@'  breaks the nick@server split at the last '@' (2.1).
  *        '#' '&' '+' '!'  are channel and mode sigils, so they would make a

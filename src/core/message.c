@@ -972,22 +972,17 @@ static int nick_char_illegal(char c)
 }
 
 /* RFC 2812 2.3.1: the first character of a nickname is a letter or a
- * "special", and a digit is neither. That is the reason, and it stands on
- * its own.
- *
- * Second, and this is a federation concern rather than a parsing one: a
- * digit-leading nick accepted here is a nick a peer may refuse, and a nick
- * this node holds is one a peer will not. Two nodes that disagree about
- * who "123" is have diverged on identity, which is the class of divergence
- * the scoped-nick scheme exists to avoid -- so the rule is enforced at
- * registration, the only place a nick is ever chosen.
+ * "special", and a digit is neither. Independently, a peer may enforce the
+ * same rule -- that is its implementation's business -- and a nick this node
+ * holds that a peer will not accept is already divergence, since federation
+ * stays cheap only while the nodes agree. Enforced at registration, the
+ * only place a nick is ever chosen.
  *
  * What is NOT the reason is on-the-wire ambiguity. ":123 PRIVMSG #c :hi"
  * and ":server 123 target :text" are distinct, because message_parse()
  * above reads the prefix and the command word into separate fields and
  * "PRIVMSG" is not a three-digit numeric. Only the legibility cost
- * survives -- ":123" reads as a numeric prefix in a log -- and that is a
- * cost to a reader, not a correctness one. */
+ * survives: ":123" reads as a numeric prefix in a log. */
 static int nick_first_char_illegal(char c)
 {
     const unsigned char u = (unsigned char)c;

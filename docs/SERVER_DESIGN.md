@@ -69,15 +69,13 @@ char *qualify(const conn_t *c, char *out, size_t cap);
 be a digit, so `nick@server` is unambiguous and splits at the **last** `@`. A
 local `valid_nick()` predicate enforces this (§7 Phase 1) — `parse_nick` as it
 stands does not; see §5. The digit rule is **RFC 2812 §2.3.1**: the first
-character of a nickname is a letter or a "special", and a digit is neither.
-Enforcing it at registration also keeps identities comparable across nodes — a
-digit-leading nick accepted here is one a peer may refuse — which matters
-because federation stays cheap only while the nodes agree. It is *not* a
-wire-parsing rule: `:123 PRIVMSG #c :hi` and `:server 123 target :text` are
-distinguishable, because the parser puts the prefix and the command word in
-separate fields and `PRIVMSG` is not a three-digit numeric. `:` is the prefix
-and trailing-parameter marker in §3.2's grammar; `;` is the IRCv3 tag
-separator.
+character of a nickname is a letter or a "special", and a digit is neither. A
+peer may enforce the same rule, depending on its implementation; a nick this
+node holds that a peer will not accept is already divergence, and federation
+stays cheap only while the nodes agree. It is *not* a wire-parsing rule: the
+parser keeps prefix and command word in separate fields, so `:123 PRIVMSG #c :hi`
+and `:server 123 target :text` are distinct. `:` is the prefix and
+trailing-parameter marker in §3.2's grammar; `;` is the IRCv3 tag separator.
 
 Nick uniqueness is enforced **per server**, not globally, and needs no policy and
 no lock: `bob@a` and `bob@b` are distinct registry keys, so there is no
