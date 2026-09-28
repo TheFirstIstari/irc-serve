@@ -6,9 +6,11 @@ add_library(irc_core STATIC
   core/message.c
   core/connection.c
   core/server.c
+  core/channel.c
   core/poll_loop.c
   core/reply.c
   core/commands.c
+  core/chan_verbs.c
 )
 
 target_link_libraries(irc_core PRIVATE pthread)

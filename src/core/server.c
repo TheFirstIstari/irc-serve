@@ -14,6 +14,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "core/channel.h"
 #include "core/message.h"
 
 /* ---------------------------------------------------------------------------
@@ -193,6 +194,39 @@ static int strtab_del(struct strtab *t, const char *key)
     return 0;
 }
 
+/* Case-insensitive server-name comparison, ASCII-folded.
+ *
+ * The same fold is required in three places: 2.1's nick@server split, 2.4
+ * ("server names are case-insensitive in IRC, so a comparison against our OWN
+ * name MUST be case-insensitive") and channel.c's own server-name fold. It is
+ * written out here rather than exported because it is six lines and a public
+ * helper one of the two callers would never use again is a wider API than the
+ * duplication is worth. The two copies are asserted to agree by
+ * test_channels.c, which looks a peer up by a name differing only in case. */
+static int same_server_name(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+    while (*a != '\0' && *b != '\0') {
+        char ca = *a;
+        char cb = *b;
+
+        if (ca >= 'a' && ca <= 'z') {
+            ca = (char)(ca - ('a' - 'A'));
+        }
+        if (cb >= 'a' && cb <= 'z') {
+            cb = (char)(cb - ('a' - 'A'));
+        }
+        if (ca != cb) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
 /* Put a descriptor into nonblocking mode. Called on the listener, on every
  * accepted socket and on every dialled socket BEFORE the descriptor becomes
  * reachable from the loop, so the loop cannot inherit a blocking fd and stall
@@ -311,6 +345,20 @@ void server_shutdown(server_t *s)
     s->nicks = NULL;
     strtab_free(s->chans);
     s->chans = NULL;
+    /* Every conn is already closed by the loop above, so no chan_t can still be
+     * listed in a conn_t::chans that is about to be freed. What is left is the
+     * channels themselves: a channel can outlive all of its members while a
+     * peer still reports members for it, so this is a real list rather than
+     * something server_close_conn() has already emptied. Freeing them in
+     * creation order, and releasing the ordered index with them. */
+    for (i = 0; i < s->nchan_objs; i++) {
+        chan_free(s->chan_objs[i]);
+        s->chan_objs[i] = NULL;
+    }
+    free(s->chan_objs);
+    s->chan_objs = NULL;
+    s->nchan_objs = 0;
+    s->chan_objs_cap = 0;
     free(s->by_fd);
     s->by_fd = NULL;
     s->nconns = 0;
@@ -510,6 +558,23 @@ void server_close_conn(server_t *s, int fd)
         return; /* unregistered: a second close is a no-op, not a double close */
     }
 
+    /* Take the connection out of its channels BEFORE it is detached, and
+     * before conn_free() releases the array.
+     *
+     * The ordering is the whole point. A chan_t's member list holds conn_t
+     * pointers, so a conn that is freed while still a member leaves every
+     * remaining member of every channel it was in with a dangling pointer -- and
+     * the node has no way to notice, because nothing dereferences it until the
+     * next fan-out. This is the same class of hazard the fd detach below avoids
+     * for a reused descriptor, and it is why the reaper is the place both
+     * happen.
+     *
+     * chan_conn_gone() also emits the PART to whoever is left in each channel
+     * and disposes of any channel that has run out of reasons to exist. It must
+     * run while the conn is still a usable addressable object, which is exactly
+     * now. */
+    chan_conn_gone(s, c);
+
     /* Detach from the registry BEFORE closing, so a descriptor the OS reuses
      * between the close() and the next poll iteration cannot resolve to this
      * conn. */
@@ -600,10 +665,10 @@ int server_chan_add(server_t *s, const char *name)
     if (strtab_contains(s->chans, name)) {
         return -1; /* already known */
     }
-    /* The value is NULL in Phase 2: struct chan does not exist until Phase 4
-     * (2.2), and a placeholder value type here would be a shape Phase 4 would
-     * have to replace -- exactly the late landing 7/Phase 4 forbids. Presence
-     * is therefore tracked by the table's own occupancy, not by the value. */
+    /* The key is registered here with a NULL value; server_chan_attach() below
+     * installs the chan_t. Phase 2 stored NULL because struct chan did not exist,
+     * and the two-step shape is what lets the Phase 2 probe keep its exact
+     * contract -- see the comment on server_chan_lookup(). */
     return strtab_put(s->chans, name, NULL);
 }
 
@@ -619,9 +684,141 @@ const char *server_chan_lookup(const server_t *s, const char *name)
     if (s == NULL || !strtab_contains(s->chans, name)) {
         return NULL;
     }
-    /* A registered name is present; the chan_t it will point at arrives in
-     * Phase 4. Returning the name itself is the only honest value available. */
+    /* Phase 2's probe, unchanged: "is this EXACT key present". It is
+     * deliberately case-SENSITIVE, because a case-insensitive fold is Phase 4's
+     * business and belongs in the accessor that canonicalises rather than
+     * appearing here as a silent side effect. The channel VALUE is reached
+     * through server_chan_get() in core/channel.c. */
     return name;
+}
+
+/* ---------------------------------------------------------------------------
+ * The channel set: values, and an ordered index
+ * ---------------------------------------------------------------------------
+ * The Phase 2 probes above answer "is this key present" and carry no value.
+ * These are the value-carrying pair declared in core/channel.h, and they live
+ * here because the strtab is file-private: a second accessor in another file
+ * would mean either exporting the table type or duplicating the probe loop, and
+ * the probe loop is the one thing in this file that must not exist twice.
+ */
+int server_chan_attach(server_t *s, chan_t *ch)
+{
+    if (s == NULL || ch == NULL) {
+        return -1;
+    }
+    if (server_chan_get(s, ch->name) != NULL) {
+        return -1; /* the name is taken */
+    }
+    if (server_chan_add(s, ch->name) != 0) {
+        return -1;
+    }
+    /* Install the value now that the key is reserved. strtab_put on an
+     * existing key overwrites rather than refusing, which is exactly the
+     * re-claim case and is why attach can be written in this order. */
+    if (strtab_put(s->chans, ch->name, ch) != 0) {
+        server_chan_remove(s, ch->name);
+        return -1;
+    }
+    if (s->nchan_objs == s->chan_objs_cap) {
+        size_t want = (s->chan_objs_cap == 0) ? 8u : s->chan_objs_cap * 2u;
+        chan_t **grown = (chan_t **)realloc(s->chan_objs, want * sizeof *grown);
+
+        if (grown == NULL) {
+            /* Undo the registry entry, so a failure here cannot leave a channel
+             * that LIST can enumerate and JOIN cannot find. The two indexes
+             * agreeing is an invariant, not a nicety. */
+            server_chan_remove(s, ch->name);
+            return -1;
+        }
+        s->chan_objs = grown;
+        s->chan_objs_cap = want;
+    }
+    s->chan_objs[s->nchan_objs++] = ch;
+    return 0;
+}
+
+chan_t *server_chan_get(const server_t *s, const char *name)
+{
+    char canonical[CHAN_MAX_NAME + 1];
+
+    if (s == NULL || name == NULL) {
+        return NULL;
+    }
+    /* Canonicalise first. A channel's name is stored uppercase (2.2), so a
+     * lookup that did not fold would make "JOIN #T" and "JOIN #t" two
+     * channels -- which is the one behaviour the Phase 2 probe deliberately
+     * does not have. */
+    (void)chan_name_upper(canonical, sizeof canonical, name);
+    if (canonical[0] == '\0') {
+        return NULL;
+    }
+    if (!strtab_contains(s->chans, canonical)) {
+        return NULL;
+    }
+    return (chan_t *)strtab_get(s->chans, canonical);
+}
+
+void server_chan_detach(server_t *s, const char *name)
+{
+    char canonical[CHAN_MAX_NAME + 1];
+
+    if (s == NULL || name == NULL) {
+        return;
+    }
+    (void)chan_name_upper(canonical, sizeof canonical, name);
+    server_chan_remove(s, canonical);
+    for (size_t i = 0; i < s->nchan_objs; i++) {
+        if (s->chan_objs[i] != NULL &&
+            strcmp(s->chan_objs[i]->name, canonical) == 0) {
+            /* Order-preserving, like conn_t::chans and chan_t::members: LIST's
+             * row order is creation order, and one channel leaving must not
+             * reshuffle the rows behind it. */
+            (void)memmove(&s->chan_objs[i], &s->chan_objs[i + 1u],
+                          (s->nchan_objs - i - 1u) * sizeof s->chan_objs[0]);
+            s->nchan_objs--;
+            return;
+        }
+    }
+}
+
+size_t server_chan_count(const server_t *s)
+{
+    return (s == NULL) ? 0u : s->nchan_objs;
+}
+
+chan_t *server_chan_at(const server_t *s, size_t i)
+{
+    if (s == NULL || i >= s->nchan_objs) {
+        return NULL;
+    }
+    return s->chan_objs[i];
+}
+
+/* ---------------------------------------------------------------------------
+ * Peer lookup by server name (2.3)
+ * ---------------------------------------------------------------------------
+ * A CONN_SERVER conn's identity is conn_t::peer_name, which Phase 2's dial FSM
+ * already sets, so this is a real lookup over real state rather than a
+ * placeholder for state Phase 6 will create. O(FD_SETSIZE), which is the cost
+ * 3.4 already accepts for enumerating connections, and which no caller pays on
+ * the common path: chan_origin_state() short-circuits on origin == self before
+ * it ever gets here. */
+conn_t *server_find_peer(const server_t *s, const char *name)
+{
+    if (s == NULL || s->by_fd == NULL || name == NULL || name[0] == '\0') {
+        return NULL;
+    }
+    for (size_t i = 0; i < SERVER_FD_TABLE; i++) {
+        const conn_t *c = s->by_fd[i];
+
+        if (c == NULL || c->kind != CONN_SERVER || c->peer_name == NULL) {
+            continue;
+        }
+        if (same_server_name(c->peer_name, name)) {
+            return s->by_fd[i];
+        }
+    }
+    return NULL;
 }
 
 size_t server_dial_count(const server_t *s)

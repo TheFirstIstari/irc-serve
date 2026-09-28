@@ -2,14 +2,18 @@
  * built and queued.
  *
  * ---------------------------------------------------------------------------
- * ONE ENFORCEMENT POINT, TWO ENTRY POINTS
+ * ONE ENFORCEMENT POINT, THREE ENTRY POINTS
  * ---------------------------------------------------------------------------
- * reply() and send_pong() both end in emit_to_client(), and emit_to_client()
- * is the only thing in this file that calls server_queue(). The peer-link
- * refusal, the CLOSING refusal and the "no addressee" refusal all live there,
- * so there is no second copy of the invariant to keep in step and no way for a
- * new caller to reach the socket without passing it. A handler chooses a
+ * reply(), send_line() and send_pong() all end in emit_built(), and
+ * emit_to_client() is the only thing in this file that calls server_queue(). The
+ * peer-link refusal, the CLOSING refusal and the "no addressee" refusal all live
+ * there, so there is no second copy of the invariant to keep in step and no way
+ * for a new caller to reach the socket without passing it. A handler chooses a
  * numeric; it does not choose a destination.
+ *
+ * send_line() is Phase 4's addition and it is the same door, not a new one: a
+ * channel broadcast is not a numeric, but it is still an outbound message to a
+ * client and it must be refused for a peer target by exactly the same rule.
  */
 #include "core/reply.h"
 
@@ -70,8 +74,11 @@ static int emit_to_client(server_t *s, conn_t *c, const char *code,
 
 /* Render one message through the Phase 1 formatter and hand it to the client
  * the call named. `params` holds the FULL parameter list including the target
- * and the trailing text; `code` is the command word. */
+ * and the trailing text; `code` is the command word. `prefix` NULL means the
+ * node's own name, which is the rule for every numeric and for a PONG; a
+ * client-originated broadcast passes the acting user's hostmask. */
 static int emit_built(server_t *s, conn_t *c, const char *code,
+                      const char *prefix,
                       const char *const *params, int nparams)
 {
     message_t m;
@@ -81,7 +88,8 @@ static int emit_built(server_t *s, conn_t *c, const char *code,
     char line[IRC_MAX_LINE + 2];
     size_t len;
 
-    if (message_build(&m, NULL, s->name, code, params, nparams) != 0) {
+    if (message_build(&m, NULL, (prefix != NULL) ? prefix : s->name, code,
+                      params, nparams) != 0) {
         return refuse(s, c, code, "unbuildable");
     }
     len = message_format(&m, line, sizeof line - 2u);
@@ -156,7 +164,22 @@ int reply(server_t *s, conn_t *src, const char *code, const char *const *mid,
     }
     params[n++] = text;
 
-    return emit_built(s, src, code, params, want);
+    return emit_built(s, src, code, NULL, params, want);
+}
+
+int send_line(server_t *s, conn_t *dst, const char *prefix,
+              const char *command, const char *const *params, int nparams)
+{
+    if (s == NULL || command == NULL || command[0] == '\0') {
+        return refuse(s, dst, command, "bad_args");
+    }
+    if (params == NULL && nparams != 0) {
+        return refuse(s, dst, command, "bad_args");
+    }
+    if (nparams < 0 || nparams > IRC_MAX_PARAMS) {
+        return refuse(s, dst, command, "too_many_params");
+    }
+    return emit_built(s, dst, command, prefix, params, nparams);
 }
 
 /* ---------------------------------------------------------------------------
@@ -178,5 +201,5 @@ int send_pong(server_t *s, conn_t *src, const char *token)
     body = (token != NULL && token[0] != '\0') ? token : s->name;
     params[0] = s->name;
     params[1] = body;
-    return emit_built(s, src, "PONG", params, 2);
+    return emit_built(s, src, "PONG", NULL, params, 2);
 }
