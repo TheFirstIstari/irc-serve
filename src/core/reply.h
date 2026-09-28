@@ -139,6 +139,44 @@ int reply(server_t *s, conn_t *src, const char *code,
 #endif
     ;
 
+/*
+ * Emit ONE non-numeric message to one client, through exactly the same
+ * destination rules as reply().
+ *
+ *   prefix     the message prefix, WITHOUT the leading ':', or NULL for this
+ *              node's own name. A client-originated broadcast needs the acting
+ *              user's hostmask here (RFC 2812 3.3.1), which is why this is a
+ *              parameter rather than always s->name.
+ *   command    the command word, upper-cased by message_build() like every
+ *              other one.
+ *   params     the full parameter list, as message_build() wants it. For a
+ *              KICK the last parameter is the reason, which the formatter
+ *              colons automatically.
+ *
+ * Returns REPLY_OK, or REPLY_REFUSED for every reason reply() has: a peer
+ * target, a CLOSING target, a value the wire cannot represent in that
+ * position, or a line that does not fit IRC_MAX_LINE. The refusals are counted
+ * on s->n_reply_refused exactly as reply()'s are, because they are the same
+ * faults arriving by a different door.
+ *
+ * WHY THIS IS HERE RATHER THAN A FAN-OUT IN commands.c
+ * ---------------------------------------------------
+ * Phase 4's JOIN, PART, TOPIC, KICK and MODE all have to say something that is
+ * not a numeric -- ":nick!user@host JOIN #chan" -- and they all have to be able
+ * to say it to MORE THAN ONE client. Both of those are reply-path concerns, and
+ * section 3 is explicit that the reply path is the single enforcement point for
+ * "numerics are never written to a peer link". A broadcast helper that reached
+ * past reply() would be a second place that decides where an outbound message
+ * may be written, which is the exact duplication this module exists to prevent.
+ *
+ * A REFUSAL TO RENDER IS NOT THE SAME AS A REFUSAL TO SEND, and both count on
+ * the same counter on purpose: "this line is not representable" and "you may not
+ * send it here" are both bugs in a caller, and a caller that produces either
+ * should be noticed.
+ */
+int send_line(server_t *s, conn_t *dst, const char *prefix,
+              const char *command, const char *const *params, int nparams);
+
 /* As many middle parameters as the 15-parameter cap leaves room for once
  * <target> and the trailing text have taken two slots. */
 #define REPLY_MAX_MID (IRC_MAX_PARAMS - 2)
