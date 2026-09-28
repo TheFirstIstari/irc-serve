@@ -1,17 +1,10 @@
-/* Observable contract: reconnect succeeds and state preserved. */
-#include <assert.h>
-
-int main(void) {
-    int reconnect_ok = 1;
-    int state_preserved = 1;
-    assert(reconnect_ok == 1);
-    assert(state_preserved == 1);
-    return 0;
-}
-
-/* Observable reconnect state preservation backed by framework logic. */
+/* Client reconnect preserving session state is NOT implemented by this
+ * codebase. Honest CTest skip (return 77) rather than simulated reconnect
+ * state. See docs/SPEC_TRACKING.md for this absent feature. */
 #include <stdio.h>
+
 int main(void) {
-    printf("[observable] reconnect state preserved\n");
-    return 0;
+    printf("SKIP: client reconnect is not implemented; no real implementation "
+           "exists to test (returning 77).\n");
+    return 77;
 }
