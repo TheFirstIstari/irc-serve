@@ -4,6 +4,7 @@ add_library(irc_core STATIC
   protocol_parse.c
   ircv3_tags.c
   federation_handshake.c
+  core/message.c
 )
 
 target_link_libraries(irc_core PRIVATE pthread)
