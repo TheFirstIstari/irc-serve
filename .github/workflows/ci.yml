@@ -112,6 +112,19 @@ jobs:
   # This job is a smoke test that the distro builds, NOT a required status
   # check. A machine you have switched off must not block the project.
   build_cachyos:
+    # `environment` is the control that matters here. It points at an
+    # environment whose only required reviewer is the repository owner, and
+    # whose deployment branch policy allows only `main`. The job therefore
+    # STOPS and waits for a human to approve it before a single line runs on
+    # that machine.
+    #
+    # The `if:` below is a second, independent gate -- the environment would
+    # still gate it if this were removed, and this would still gate it if the
+    # environment were removed. Belt and braces, because each fails differently:
+    # `if:` stops the job existing for a pull request, and the environment stops
+    # a bad or unreviewed commit on main from running unreviewed.
+    environment:
+      name: self-hosted
     runs-on: [self-hosted, Linux, x64, cachyos-x8664]
     timeout-minutes: 30
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
