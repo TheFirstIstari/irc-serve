@@ -161,6 +161,7 @@ docs/         SERVER_DESIGN, SPEC_TRACKING, ARCHITECTURE, STATS (generated)
 | Document | What it is |
 |---|---|
 | [`docs/SERVER_DESIGN.md`](docs/SERVER_DESIGN.md) | Architecture and the 9-phase plan. Authoritative. |
+| [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) | Branching, what `main` enforces, and how to roll back. |
 | [`docs/SPEC_TRACKING.md`](docs/SPEC_TRACKING.md) | Per-feature status against RFC 1459 / RFC 2812 / IRCv3, with checkable evidence. |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Background and original design goals. |
 | [Project status](https://github.com/TheFirstIstari/irc-serve/blob/main/docs/STATS.md) | Generated test counts and phase progress. |
