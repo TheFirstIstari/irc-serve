@@ -27,9 +27,11 @@
 #ifndef TEST_HARNESS_TEST_UTIL_H
 #define TEST_HARNESS_TEST_UTIL_H
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "harness/irc_client.h"
 #include "harness/node_fixture.h"
 
 /* Nodes registered here are killed and their output dumped if a check fails.
@@ -66,5 +68,48 @@ void tf_report(const char *expr, const char *file, int line);
 /* A final "the test got to the end" line, so a passing CTest run is visibly
  * different from one that exited early by accident. */
 void tf_done(const char *name);
+
+/* ---------------------------------------------------------------------------
+ * Counting, for the "nothing else was said" assertions
+ * ---------------------------------------------------------------------------
+ * A protocol test has to be able to assert that a command produced NO output,
+ * and the obvious way to do that is to wait and see -- which is a sleep, and 6.3
+ * forbids it. This, plus tc_expect(), is how it is done without one.
+ *
+ * The technique: send the command under test followed by a command whose reply
+ * is known, wait for the known reply, and then count occurrences of the
+ * unknown one. If the node had answered the first command, the count would be
+ * higher; because the known reply arrived, the wait is not a guess about
+ * timing. So "PONG is accepted silently" becomes "exactly one PONG arrived,
+ * and it is the one for the token I sent afterwards" -- a fact about the bytes,
+ * with no sleeping anywhere in it.
+ */
+
+/* Non-overlapping occurrences of `needle` in `hay`, or 0 if either is NULL or
+ * `needle` is empty. */
+size_t tf_count(const char *hay, const char *needle);
+
+/* ---------------------------------------------------------------------------
+ * Source inspection
+ * ---------------------------------------------------------------------------
+ * A few properties here are properties of the code's SHAPE -- "nothing outside
+ * the reaper closes a descriptor", "the one function that emits numerics is the
+ * one that refuses to write to a peer" -- and no runtime test can check them,
+ * because the failure mode is a stray call that happens to leave every runtime
+ * invariant intact. Looking is the only way to check those, and these two are
+ * how. Both were in test_close_sites.c; they live here so the second source
+ * test does not carry a second copy of a C comment stripper.
+ */
+
+/* Read `rel` (a path under IRCSERVE_SRC_DIR) with comments and string/character
+ * literals REMOVED, so a search sees code rather than prose. Returns a
+ * NUL-terminated heap buffer and sets *len_out, or NULL if the file could not be
+ * read or allocated. The caller frees it. */
+char *tf_read_code(const char *rel, size_t *len_out);
+
+/* Is `name` called in `code`? The character before it must not be an identifier
+ * character, so a search for `close` does not match conn_close( or
+ * server_close_conn(. */
+int tf_calls(const char *code, const char *name);
 
 #endif /* TEST_HARNESS_TEST_UTIL_H */

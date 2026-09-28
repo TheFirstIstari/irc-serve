@@ -81,7 +81,15 @@ int tc_send_raw(test_client_t *c, const char *bytes, size_t n);
  * The search is over the ACCUMULATED buffer, not the latest chunk, so a needle
  * split across two TCP segments is found. On failure this prints the bytes
  * received (escaped, truncated) to stderr, because "timed out waiting for X"
- * without what did arrive is the least useful failure message there is. */
+ * without what did arrive is the least useful failure message there is.
+ *
+ * A TIMEOUT IS A TIMEOUT, NOT A HANG. Past the deadline this returns -1 rather
+ * than continuing to wait, so a needle that is never going to arrive fails the
+ * test promptly instead of spinning until the runner kills it. `needle` is a
+ * substring of the accumulated stream, not a line: a test asserting the exact
+ * bytes of a reply should include the terminating CRLF in `needle`, because
+ * that is what proves the line is terminated on the wire rather than being a
+ * prefix of a longer one. */
 int tc_expect(test_client_t *c, const char *needle, int timeout_ms);
 
 /* Wait for the server to close its half. Returns 0 when a clean EOF was

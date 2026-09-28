@@ -32,9 +32,15 @@
  *     6.2 requires the same handshake for the two-node fixture, where each
  *     child writes one line once its loop is armed; this is that line.
  *
- * There is NO command surface here yet. Registration, numerics, PING/PONG and
- * everything else are Phase 3, and a reply invented now would be a fabricated
- * behaviour wearing a protocol's clothes.
+ * ---------------------------------------------------------------------------
+ * WHAT THE NODE ANSWERS
+ * ---------------------------------------------------------------------------
+ * Phase 3: the client command surface, installed as srv.dispatch just below.
+ * PASS, NICK, USER, MOTD, PING, PONG and QUIT, the 001-005 welcome burst, and
+ * 451/421 for everything else. The numerics are built and queued in
+ * core/reply.c and nowhere else, which is what keeps them off a peer link
+ * (3). There is no channel, no messaging and no federation verb here, and the
+ * node answers 421 for those rather than pretending to support them.
  */
 #include <errno.h>
 #include <signal.h>
@@ -43,13 +49,15 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "core/commands.h"
 #include "core/poll_loop.h"
 #include "core/server.h"
 
 /* The node's own name. It must satisfy the 2.4 tag grammar, because it is
  * stamped on every outbound irc-serve-origin tag, and a name that cannot be
  * stamped would break the never-forward-own-origin rule at the first relay.
- * Phase 6 makes this configurable. */
+ * It is also the prefix on every numeric (002, 004, 005's context, PONG) and
+ * the <target>'s server half. Phase 6 makes this configurable. */
 #define NODE_NAME "irc.test"
 
 #define NODE_DEFAULT_PORT 6667
@@ -135,7 +143,7 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    printf("IRC-Serve Federated Node v0.1.0 initializing...\n");
+    printf("%s initializing...\n", IRC_SERVE_VERSION);
 
     if (install_handler(SIGTERM, on_stop_signal) != 0 ||
         install_handler(SIGINT, on_stop_signal) != 0 ||
@@ -159,6 +167,13 @@ int main(int argc, char **argv)
      * lines are the contract described at the top of this file, so the trace
      * flag is on for the shipped binary. */
     srv.trace = 1;
+
+    /* The command surface. Phase 2 installed nothing here, which was the
+     * honest state of a node with no vocabulary: the loop accepted, framed and
+     * parsed and then said nothing at all. This is the assignment rather than a
+     * commands_install() helper so that what the shipped binary answers with is
+     * visible at the point where it decides it. */
+    srv.dispatch = commands_dispatch;
 
     if (server_listen(&srv, port) != 0) {
         printf("[observable] server startup failed: port=%d reason=%s\n",
@@ -202,7 +217,7 @@ int main(int argc, char **argv)
     printf("[observable] loop_stats: ticks=%llu eintr=%llu accepted=%llu "
            "closed=%llu lines=%llu parse_reject=%llu frame_error=%llu "
            "writeq_overflow=%llu write_error=%llu partial_writes=%llu "
-           "rejected_fd=%llu\n",
+           "rejected_fd=%llu pass_seen=%llu reply_refused=%llu\n",
            (unsigned long long)srv.n_ticks, (unsigned long long)srv.n_eintr,
            (unsigned long long)srv.n_accepted, (unsigned long long)srv.n_closed,
            (unsigned long long)srv.n_lines,
@@ -211,7 +226,9 @@ int main(int argc, char **argv)
            (unsigned long long)srv.n_writeq_overflow,
            (unsigned long long)srv.n_write_error,
            (unsigned long long)srv.n_partial_writes,
-           (unsigned long long)srv.n_rejected_fd);
+           (unsigned long long)srv.n_rejected_fd,
+           (unsigned long long)srv.n_pass_seen,
+           (unsigned long long)srv.n_reply_refused);
 
     /* exit 0 even after a loop error: a clean shutdown is what a test asserts,
      * and a failed loop has already said so on stdout. */

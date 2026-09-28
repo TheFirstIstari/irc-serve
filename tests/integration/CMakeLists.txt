@@ -71,3 +71,30 @@ irc_add_integration_test(test_registries test_registries.c)
 
 # 3.4: the nonblocking dial state machine.
 irc_add_integration_test(test_dial_fsm test_dial_fsm.c)
+
+# 7/Phase 3: "integration test registers and receives 001 and 005; duplicate
+# nick -> 433". The first phase in which the node answers a client at all.
+irc_add_integration_test(test_registration test_registration.c)
+
+# 2.1 / 5: valid_nick() enforced at runtime. Phase 1 shipped the predicate with
+# no caller in src/, so this is the test that makes it load-bearing. Asserts the
+# RESPONSE, never that the function was called.
+irc_add_integration_test(test_nick_rule test_nick_rule.c)
+
+# 7/Phase 3: duplicate nick -> 433, and the incumbent keeps it.
+irc_add_integration_test(test_dup_nick test_dup_nick.c)
+
+# 4.4: 451 before registration, 421 for a verb this build does not have. Nothing
+# falls through in silence.
+irc_add_integration_test(test_pre_register test_pre_register.c)
+
+# 4.1: PING/PONG, including the trailing-colon cases a client's own liveness
+# check depends on.
+irc_add_integration_test(test_ping_pong test_ping_pong.c)
+
+# 3.4 + Phase 3: QUIT closes through the reaper, and the nickname is released.
+irc_add_integration_test(test_quit test_quit.c)
+
+# 3: numerics are never written to a peer link. Source inspection, and labelled
+# as such; Phase 6 adds the end-to-end version once a peer exists.
+irc_add_integration_test(test_reply_guard test_reply_guard.c)
