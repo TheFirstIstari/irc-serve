@@ -2,27 +2,34 @@
 
 # Project status
 
-This placeholder is replaced within one run of
-[stats.yml](../../blob/main/.github/workflows/stats.yml), which regenerates the
-whole file from a live `ctest` run and the milestone API. Until then, the
-authoritative counts are the CI run on `main`.
+Generated `2026-09-28T23:37:19Z` from commit `7d0fe4b` by
+[stats.yml](../../blob/main/.github/workflows/stats.yml).
 
 ## Test suite
 
 | | count |
 |---|---|
-| Total | 39 |
-| Passing | 31 |
+| Total | 40 |
+| Passing | 32 |
 | **Skipped** | **8** |
 | Failed | 0 |
 
-> **The skipped count is shown because it is the number that matters.** Each
-> skipped test is a CTest skip (`return 77`) naming a feature that is not
-> implemented. CI does not currently fail on skips, so "100% tests passed" can
-> coexist with unimplemented features. Closing that gap is Phase 7, issue #81.
+> **The skipped count is shown because it is the number that matters.**
+> Each skipped test is a CTest skip (`return 77`) naming a feature that
+> is not implemented. CI does not currently fail on skips, so
+> "100% tests passed" can coexist with unimplemented features.
+> Closing that gap is Phase 7, issue #81.
+
+## Code size
+
+| | lines |
+|---|---|
+| `src/` | 8142 |
+| `tests/` | 9891 |
 
 ## Build phases
 
-**3 of 9** complete. One issue per phase, tracked in the
-`Federated IRC Server v1.0` milestone; the plan is in `docs/SERVER_DESIGN.md`.
-Phase 5 is the "working server" line and Phase 6 is the federation line.
+**0 of 0** complete. One issue per phase, tracked in the
+`Federated IRC Server v1.0` milestone; the plan is in
+`docs/SERVER_DESIGN.md`. Phase 5 is the "working server" line and
+Phase 6 is the federation line.
