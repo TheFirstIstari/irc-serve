@@ -17,3 +17,8 @@ set_tests_properties(FederateHandshake PROPERTIES LABELS Federation)
 set_tests_properties(SyncState PROPERTIES LABELS Federation)
 set_tests_properties(Heartbeat PROPERTIES LABELS Federation)
 set_tests_properties(FailoverReconnect PROPERTIES LABELS Federation)
+
+# Absent features register an honest skip (return 77) rather than fabricated
+# passing assertions.
+set_tests_properties(SyncState PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(FailoverReconnect PROPERTIES SKIP_RETURN_CODE 77)

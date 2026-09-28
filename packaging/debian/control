@@ -5,8 +5,8 @@ Source: irc-serve
 Section: net
 Priority: optional
 Maintainer: TheFirstIstari <euphonium.ashe.f@gmail.com>
-Build-Depends: debhelper (>=12), cmake, gcc
-Standards-Version: 4.6.0
+Build-Depends: debhelper-compat (= 13), cmake
+Standards-Version: 4.6.2
 
 Package: irc-serve
 Architecture: any

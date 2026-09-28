@@ -6,9 +6,11 @@
 CMAKE ?= cmake
 CTEST ?= ctest
 NPROC := $(shell nproc 2>/dev/null || echo 4)
-BUILD_DIR := build
+BUILD_DIR := build-testing
+BENCH_BUILD_DIR := build-benchmark
+CTEST_TIMEOUT := 60
 
-.PHONY: all build test benchmark local-ci clean help
+.PHONY: all build test benchmark local-ci clean help docs-check
 .DEFAULT_GOAL := help
 
 help:
@@ -26,13 +28,13 @@ build:
 
 # `test` mirrors `local-ci.sh` line 3.
 test: build
-	cd $(BUILD_DIR) && $(CTEST) --output-on-failure --timeout 60
+	cd $(BUILD_DIR) && $(CTEST) --output-on-failure --timeout $(CTEST_TIMEOUT)
 
 # `benchmark` mirrors CI job `ci_benchmark`.
 benchmark:
-	$(CMAKE) -B $(BUILD_DIR) -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCHMARK=ON
-	$(CMAKE) --build $(BUILD_DIR) --parallel $(NPROC)
-	cd $(BUILD_DIR) && $(CTEST) -L Benchmark --output-on-failure
+	$(CMAKE) -B $(BENCH_BUILD_DIR) -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCHMARK=ON
+	$(CMAKE) --build $(BENCH_BUILD_DIR) --parallel $(NPROC)
+	cd $(BENCH_BUILD_DIR) && $(CTEST) -L Benchmark --output-on-failure --timeout $(CTEST_TIMEOUT)
 
 # `local-ci` invokes the script designed by the local_ci_design agent.
 local-ci:
@@ -43,6 +45,10 @@ local-ci:
 	./local-ci.sh
 
 clean:
-	rm -rf $(BUILD_DIR) build-release
+	rm -rf $(BUILD_DIR) $(BENCH_BUILD_DIR)
+
+docs-check:
+	@test -f docs/SPEC_TRACKING.md || (echo "docs/SPEC_TRACKING.md missing"; exit 1)
+	@echo "docs check passed"
 
 all: build

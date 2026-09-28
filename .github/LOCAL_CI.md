@@ -28,19 +28,14 @@ adds the cross-compiler matrix and compliance checks; see the table below.
 
 | GitHub Actions job                  | Workflow steps                                                                   | Covered by `make local-ci`? | Equivalent `make` target      |
 | ----------------------------------- | -------------------------------------------------------------------------------- | --------------------------- | ----------------------------- |
-| `ci_test`                           | Configure (Release, BUILD_TESTING=ON) → Build → `ctest --output-on-failure`       | **Yes**                     | `make test` (after `build`)   |
-| `ci_benchmark`                      | Configure with BUILD_BENCHMARK=ON → Build → `ctest -L Benchmark`                  | Optional (run on demand)    | `make benchmark`              |
-| `ci_compliance`                     | Echo target platforms + memory footprint statement                                 | Echo only — no script step   | n/a                           |
-| `build-arch` (matrix gcc/clang × Debug/Release) | Configure + Build + ctest on the `ubuntu-latest` runner                | Not run locally by default  | `make build` (host compiler)  |
-| `spec-compliance-check`             | Asserts `docs/SPEC_TRACKING.md` exists                                            | **Yes** (via `docs-check`)  | `make docs-check`             |
+| `ci_testExpected`                      | Configure (Release, BUILD_TESTING=ON) → Build → `ctest --output-on-failure`       | **Yes**                     | `make test` (after `build`)   |
+| `ci_benchmarkExpected`                  | Configure with BUILD_BENCHMARK=ON → Build → `ctest -L Benchmark`                  | Optional (run on demand)    | `make benchmark`              |
+| `ci_complianceExpected`                 | Echo target platforms + memory footprint statement                                 | Echo only — no script step   | n/a                           |
 
-### Why `ci_test` is the only locally-mirrored job
-
-`ci_test` is the *primary* path: every PR must pass it before merge
+`ci_testExpected` is the *primary* path: every PR must pass it before merge
 (`docs/ARCHITECTURE.md` → CI / TDD). The matrix and compliance jobs are
 intended to run in parallel across GitHub-hosted runners and are not
-worth reproducing on a developer laptop. Run them by pushing the branch
-and watching the Actions tab.
+reproduced locally by default.
 
 ## Feature-branch safety
 
