@@ -86,6 +86,13 @@ struct chan; /* opaque until Phase 4 (2.2) */
  * allocation pinned at its high-water mark forever. */
 #define CONN_WQ_COMPACT ((size_t)4096u)
 
+/* Size of the buffer conn_hostmask() renders into: nick + '!' + user + '@' +
+ * host + NUL, written as the three struct widths so raising any of them cannot
+ * leave a caller with a buffer that is one byte short. */
+#define CONN_HOSTMASK_MAX (sizeof(((conn_t *)0)->nick) + \
+                           sizeof(((conn_t *)0)->user) + \
+                           sizeof(((conn_t *)0)->host) + 3u)
+
 /* conn_fill() outcomes. EOF is a distinct value from a hard error because they
  * are different events on the wire and a caller that reports close reasons has
  * to be able to tell them apart without inspecting errno, which may be stale. */
@@ -190,5 +197,26 @@ size_t conn_write_pending(const conn_t *c);
 /* Mark the connection CLOSING. Idempotent, and deliberately the only state
  * transition a send or read path is allowed to make. */
 void conn_mark_closing(conn_t *c);
+
+/* Write this connection's client prefix -- "<nick>!<user>@<host>" -- into `out`
+ * and return the byte count written, excluding the NUL. Returns 0 if `out` is
+ * too small or `c` is NULL, so a caller that cannot render the prefix must
+ * treat the line as unrenderable rather than emit a truncated one.
+ *
+ * WHY IT LIVES HERE AND NOT IN A HANDLER
+ * --------------------------------------
+ * RFC 2812 3.3.1 requires the JOIN/PART/KICK/TOPIC/MODE echoes to be prefixed
+ * with the ACTING USER's hostmask, and that prefix is a rendering of identity
+ * fields, so it belongs beside the fields. It is also the second thing a
+ * channel broadcast needs after the parameter list, which is why it is a
+ * function rather than a struct field: the design's 2.1 is explicit that
+ * conn_t's shape is final as of Phase 2.
+ *
+ * It is NOT 2.1's qualify() ("nick@server"). That is the internal identity
+ * form, it is needed to address a user on another server, and nothing in Phase 4
+ * addresses one -- there are no peers. qualify() belongs to the phase that
+ * first has a remote user to name, and writing it now would be a function with
+ * no caller. */
+size_t conn_hostmask(const conn_t *c, char *out, size_t cap);
 
 #endif /* IRC_CORE_CONNECTION_H */

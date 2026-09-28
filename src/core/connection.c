@@ -2,6 +2,7 @@
 #include "core/connection.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -217,4 +218,26 @@ size_t conn_write_pending(const conn_t *c)
 void conn_mark_closing(conn_t *c)
 {
     c->state = CONN_CLOSING;
+}
+
+size_t conn_hostmask(const conn_t *c, char *out, size_t cap)
+{
+    int n;
+
+    if (c == NULL || out == NULL || cap == 0) {
+        return 0;
+    }
+    /* snprintf rather than strcpy/strcat: a hostmask is three
+     * client-influenced fields concatenated, and a client that filled nick, user
+     * and host to their bounds would overflow a buffer sized for any two of
+     * them. snprintf reports the truncation instead of causing it, and returning
+     * 0 makes the caller treat the whole line as unrenderable -- 3.2's rule
+     * about never delivering a silently shortened field, applied to the
+     * prefix. */
+    n = snprintf(out, cap, "%s!%s@%s", c->nick, c->user, c->host);
+    if (n < 0 || (size_t)n >= cap) {
+        out[0] = '\0';
+        return 0;
+    }
+    return (size_t)n;
 }

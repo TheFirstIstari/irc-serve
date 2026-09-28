@@ -7,6 +7,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "core/chan_verbs.h"
 #include "core/reply.h"
 
 /* ---------------------------------------------------------------------------
@@ -465,15 +466,20 @@ static const command_t k_commands[] = {
     { "PONG",    handle_pong,  1 },
     { "QUIT",    handle_quit,  1 },
     { "MOTD",    handle_motd,  0 },
+    /* 7/Phase 4: the channel surface. LIST is here rather than being left for
+     * Phase 7, because a channel this node will not tell a client about is a
+     * channel whose origin, members and topic are all invisible, and the whole
+     * 2.2 data model would be observable only from the [observable] log. */
+    { "LIST",    handle_list,  0 },
     /* 4.1, later phases. */
-    { "JOIN",    NULL,         0 },
-    { "PART",    NULL,         0 },
+    { "JOIN",    handle_join,  0 },
+    { "PART",    handle_part,  0 },
     { "PRIVMSG", NULL,         0 },
     { "NOTICE",  NULL,         0 },
-    { "TOPIC",   NULL,         0 },
-    { "NAMES",   NULL,         0 },
-    { "MODE",    NULL,         0 },
-    { "KICK",    NULL,         0 },
+    { "TOPIC",   handle_topic, 0 },
+    { "NAMES",   handle_names, 0 },
+    { "MODE",    handle_mode,  0 },
+    { "KICK",    handle_kick,  0 },
     { "KILL",    NULL,         0 }
 };
 

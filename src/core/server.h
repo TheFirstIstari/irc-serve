@@ -142,12 +142,23 @@ struct server {
     conn_t  **by_fd;          /* FD_SETSIZE slots; NULL when the slot is free */
     size_t    nconns;
 
-    /* Registries. Both are string -> pointer maps. The nick registry is live
-     * in Phase 2; the channel registry holds names with a NULL value, because
-     * struct chan is still incomplete (2.2) and a value type that Phase 4
-     * replaces would be a shape the design explicitly forbids landing late. */
+    /* Registries. Both are string -> pointer maps. */
     struct strtab *nicks;
     struct strtab *chans;
+
+    /* The channel registry is a hash table, and a hash table cannot be
+     * enumerated -- and LIST has to enumerate every channel on the node
+     * (RFC 2812 3.3.5), in a deterministic order a test can assert on the wire.
+     * So the node also keeps an ordered vector of the same chan_t pointers,
+     * appended in creation order. Two indexes over one set of objects, and
+     * they must agree: the hash is the O(1) lookup and the vector is the
+     * enumeration, and server_chan_attach()/server_chan_detach() are the only
+     * places either changes. A channel that is in one and not the other would
+     * be a JOIN that resolves to NULL, so the invariant is asserted by
+     * test_channels.c rather than left to inspection. */
+    chan_t **chan_objs;
+    size_t   nchan_objs;
+    size_t   chan_objs_cap;
 
     /* 2.4: ids come from a per-SERVER monotonic counter, not a per-connection
      * one, and epoch is per-boot so a restart cannot collide with ids issued
@@ -287,13 +298,47 @@ conn_t *server_nick_lookup(const server_t *s, const char *nick);
 /* ---------------------------------------------------------------------------
  * Channel registry (2.2)
  * ---------------------------------------------------------------------------
- * Phase 2 owns the key space only: the name is inserted and looked up, and the
- * value is always NULL because struct chan does not exist yet. Phase 4 fills
- * the value in without touching the registry.
+ * The key space arrived in Phase 2, when struct chan did not exist and the value
+ * had to be NULL. Phase 4 lands the struct and therefore the value, and it does
+ * so by ADDING an accessor rather than by changing the probes below:
+ *
+ *   server_chan_add/remove/lookup   the key space. Case-SENSITIVE, value NULL,
+ *                                    answering "is this exact key present". They
+ *                                    are unchanged, including their case
+ *                                    sensitivity, because a case-insensitive
+ *                                    fold is not a silent side effect of holding
+ *                                    a value -- it is Phase 4's job and it
+ *                                    belongs in the accessor that canonicalises.
+ *   server_chan_attach/get/detach   the values, in core/channel.h, over the
+ *                                    opaque chan_t. This is the pair the
+ *                                    command handlers use.
+ *
+ * The `cap` suffix difference is not an accident: conn_t::cap and chan_t::cap
+ * are different arrays' capacities, and there is no ambiguity in either.
  */
 int server_chan_add(server_t *s, const char *name);
 void server_chan_remove(server_t *s, const char *name);
 const char *server_chan_lookup(const server_t *s, const char *name);
+
+/* ---------------------------------------------------------------------------
+ * Peer lookup by server name (2.3)
+ * ---------------------------------------------------------------------------
+ * Find a registered CONN_SERVER connection whose peer_name is `name`,
+ * case-insensitively. Returns NULL when there is none.
+ *
+ * This is where "can this node route to the origin?" is answered from, and it
+ * exists already because Phase 2's dial FSM is what creates a CONN_SERVER
+ * connection and it already sets peer_name. It is a linear scan of by_fd, which
+ * is O(FD_SETSIZE) -- the same cost 3.4 already accepts for iterating every
+ * connection on the node -- and it is short-circuited by the caller on the
+ * overwhelmingly common case, because a channel this node owns never reaches
+ * here at all.
+ *
+ * Phase 6 narrows it: a link that exists but has not finished the handshake FSM
+ * is not yet a route, and the FSM state lives with the link. The signature does
+ * not have to change for that, which is the point of keeping the question in a
+ * function rather than in a flag. */
+conn_t *server_find_peer(const server_t *s, const char *name);
 
 /* Next id from the per-SERVER monotonic counter (2.4). Never returns 0: id 0
  * is reserved for "unset" so a missing tag is never read as a real id. */
