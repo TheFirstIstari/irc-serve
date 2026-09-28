@@ -68,10 +68,16 @@ char *qualify(const conn_t *c, char *out, size_t cap);
 `@ # & + ! : ;` are not legal nick characters, and the first character may not
 be a digit, so `nick@server` is unambiguous and splits at the **last** `@`. A
 local `valid_nick()` predicate enforces this (§7 Phase 1) — `parse_nick` as it
-stands does not; see §5. The digit rule is not only spec fidelity: `:123
-PRIVMSG #c :hi` and `:server 123 target :text` are indistinguishable once split
-on the first SP, and §7 Phase 3 emits both. `:` is the prefix and
-trailing-parameter marker in §3.2's grammar; `;` is the IRCv3 tag separator.
+stands does not; see §5. The digit rule is **RFC 2812 §2.3.1**: the first
+character of a nickname is a letter or a "special", and a digit is neither.
+Enforcing it at registration also keeps identities comparable across nodes — a
+digit-leading nick accepted here is one a peer may refuse — which matters
+because federation stays cheap only while the nodes agree. It is *not* a
+wire-parsing rule: `:123 PRIVMSG #c :hi` and `:server 123 target :text` are
+distinguishable, because the parser puts the prefix and the command word in
+separate fields and `PRIVMSG` is not a three-digit numeric. `:` is the prefix
+and trailing-parameter marker in §3.2's grammar; `;` is the IRCv3 tag
+separator.
 
 Nick uniqueness is enforced **per server**, not globally, and needs no policy and
 no lock: `bob@a` and `bob@b` are distinct registry keys, so there is no
@@ -465,11 +471,12 @@ validation — `parse_nick("NICK a@evil", …)` returns 1 and yields the nicknam
 `a@evil`. The previous draft claimed both were "correct validation discipline";
 that was wrong. A nick **CHARSET RULE IS MISSING** and must be added: `@`,
 `#&+!`, `:` and `;` are not legal nick characters, the first character may not
-be a digit, and `nick@server` splits at the **last** `@` (§2.1). Add a
-`valid_nick()` predicate to Phase 1 (§7) — the whole scoped-nick scheme is
-unsound without it. The charset is deliberately narrower than "almost any
-character": the delimiter set is what later phases build on, and every character
-admitted here is one a mode string, a channel list or a prefix is made of.
+be a digit (RFC 2812 §2.3.1), and `nick@server` splits at the **last** `@`
+(§2.1). Add a `valid_nick()` predicate to Phase 1 (§7) — the whole scoped-nick
+scheme is unsound without it. The charset is deliberately narrower than "almost
+any character": the delimiter set is what later phases build on, and every
+character admitted here is one a mode string, a channel list or a prefix is
+made of.
 
 ---
 
