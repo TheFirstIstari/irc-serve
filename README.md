@@ -27,7 +27,7 @@
 
 ---
 
-> **Development milestone.** 3 of 9 phases are merged; Phase 4 is in review. The node binds, accepts,
+> **Development milestone.** 4 of 9 phases are complete. The node binds, accepts,
 > registers a client and speaks the channel and messaging verbs — but there is
 > no authentication, no TLS, and no federation between nodes yet. Numbers below
 > are measured, not typed: see
@@ -81,8 +81,7 @@ Verified against the shipped binary over a real socket, not a test double:
 - **Registration** — `PASS` `NICK` `USER` `MOTD` `PING` `PONG` `QUIT`, with
   numerics `001`–`005`, `372`/`375`/`376`, `421`, `432`, `433`, `451`, `461`
 - **Channels** — `JOIN` `PART` `TOPIC` `NAMES` `LIST` `KICK` `MODE`, per-member
-  `+o`/`+v`, and the origin-ownership and single-writer rules above. *Landing now
-  in #95, not yet on `main`.*
+  `+o`/`+v`, and the origin-ownership and single-writer rules above
 - **Test suite** — 39 wire-level integration tests that spawn the real binary
   and speak to it over loopback. No `sleep()` anywhere; every wait is a deadline
 
@@ -97,9 +96,6 @@ Named rather than implied. Each is a tracked phase, not a maybe.
 | Remaining command surface | 7 | [#81](https://github.com/TheFirstIstari/irc-serve/issues/81) |
 | IRCv3 — CAP negotiation, SASL PLAIN, real tag escaping | 8 | [#82](https://github.com/TheFirstIstari/irc-serve/issues/82) |
 | Multi-prefix, topic persistence, auto-scaling | 4–9 | — |
-
-Phase 4 (channels) is complete on its branch and in review; the table reflects
-what is on `main`.
 
 `PASS` **records** a password and does not check it. SASL is Phase 8. There is
 no TLS, so everything on the wire is plaintext.
