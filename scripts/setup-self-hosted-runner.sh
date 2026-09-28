@@ -90,10 +90,32 @@ systemctl --user enable --now actions-runner.service
 sleep 3
 systemctl --user --no-pager --lines=5 status actions-runner.service || true
 
-say "Verifying GitHub sees the runner"
-gh api "repos/$REPO/actions/runners" --jq \
-  '.runners[] | "  \(.name)  labels=\(.labels | map(.name) | join(","))  status=\(.status)"' \
-  2>/dev/null || echo "  (could not query; check the Settings -> Actions -> Runners page)"
+say "Verifying the label actually took effect"
+# This check is not ceremonial. `config.sh --labels` has been observed to leave
+# only the default labels on the runner, and because the default set
+# (self-hosted, Linux, X64) looks like a normal successful registration, the
+# failure is invisible until a job targeting the custom label sits queued
+# forever.
+RID=$(gh api "repos/$REPO/actions/runners" --jq '.runners[] | select(.name=="'"$RUNNER_NAME"'") | .id')
+if [ -z "$RID" ]; then
+  say "could not find runner '$RUNNER_NAME' (is gh authenticated?)"
+  say "verify on the Settings -> Actions -> Runners page"
+else
+  LABELS=$(gh api "repos/$REPO/actions/runners/$RID" --jq '.labels[].name' | tr '\n' ' ')
+  printf '  runner has labels: %s\n' "$LABELS"
+
+  if printf '%s\n' "$LABELS" | tr ' ' '\n' | grep -qx "$LABEL"; then
+    printf '  ok: %s is present\n' "$LABEL"
+  else
+    say "'$LABEL' is MISSING -- a job targeting it would queue forever."
+    say "applying it through the API instead"
+    # Send ONLY the custom label. The defaults (self-hosted, Linux, X64) are
+    # read-only and GitHub rejects the request with HTTP 422 if included.
+    gh api -X PUT "repos/$REPO/actions/runners/$RID/labels" -F "labels[]=$LABEL" >/dev/null
+    printf '  labels now: %s\n' \
+      "$(gh api "repos/$REPO/actions/runners/$RID" --jq '.labels[].name' | tr '\n' ' ')"
+  fi
+fi
 
 cat <<EOF
 
