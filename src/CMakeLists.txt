@@ -1,10 +1,12 @@
 # CMake for src
 add_library(irc_core STATIC
-  server.c
   protocol_parse.c
   ircv3_tags.c
   federation_handshake.c
   core/message.c
+  core/connection.c
+  core/server.c
+  core/poll_loop.c
 )
 
 target_link_libraries(irc_core PRIVATE pthread)
