@@ -65,9 +65,13 @@ The **qualified name** `nick@server` is computed on demand:
 char *qualify(const conn_t *c, char *out, size_t cap);
 ```
 
-`@` and `#&+!` are not legal nick characters, so `nick@server` is unambiguous
-and splits at the **last** `@`. A local `valid_nick()` predicate enforces this
-(§7 Phase 1) — `parse_nick` as it stands does not; see §5.
+`@ # & + ! : ;` are not legal nick characters, and the first character may not
+be a digit, so `nick@server` is unambiguous and splits at the **last** `@`. A
+local `valid_nick()` predicate enforces this (§7 Phase 1) — `parse_nick` as it
+stands does not; see §5. The digit rule is not only spec fidelity: `:123
+PRIVMSG #c :hi` and `:server 123 target :text` are indistinguishable once split
+on the first SP, and §7 Phase 3 emits both. `:` is the prefix and
+trailing-parameter marker in §3.2's grammar; `;` is the IRCv3 tag separator.
 
 Nick uniqueness is enforced **per server**, not globally, and needs no policy and
 no lock: `bob@a` and `bob@b` are distinct registry keys, so there is no
@@ -245,26 +249,55 @@ tokenizer:
 
 ```c
 typedef struct {
-    char  *tags;          /* raw tag block, may be NULL */
+    char  *tags;          /* tag block, WIRE form (escaped), may be NULL */
     char  *prefix;        /* source, may be NULL */
     char  *command;       /* uppercased */
     char  *params[15];
     int    nparams;
-    const char *raw;      /* original line; interior pointer into buf */
+    const char *raw;      /* original line; SECOND region of buf */
     char  *buf;           /* the one heap allocation described below */
 } message_t;
 
 int  message_parse(const char *line, message_t *out);  /* 0 ok, -1 reject */
+int  message_parse_n(const char *line, size_t len, message_t *out);
+int  message_build(message_t *out, const char *tags, const char *prefix,
+                   const char *command, const char *const *params, int nparams);
 void message_free(message_t *m);
 size_t message_format(const message_t *m, char *out, size_t cap);
 ```
 
 **Memory model.** `message_parse` allocates **one** heap buffer; `tags`,
-`prefix`, `command` and `params[]` are interior pointers into it, `raw` points
-at the same buffer, and `message_free` frees once. The formatter **always
-re-renders** and never echoes `raw` — echoing `raw` would relay internal
-`irc-serve-*` tags to clients, which the previous draft contradicted itself
-about. The seam is parse↔format, so Phase 1 tests both, not parse alone.
+`prefix`, `command` and `params[]` are interior pointers into it and
+`message_free` frees once. The buffer has **two regions**: the received line,
+verbatim, at the front — that is what `raw` points at — and the parsed fields,
+NUL-terminated and packed, after it. `raw` is therefore a **second region of the
+same single allocation, not the same bytes as the fields**. Keeping them apart
+is the whole point: NUL-terminating the fields in place inside the line is the
+natural-looking approach and it destroys `raw`, because there is then no longer
+any copy of the original line. The formatter **always re-renders** and never
+echoes `raw` — echoing `raw` would relay internal `irc-serve-*` tags to
+clients, which the previous draft contradicted itself about. The seam is
+parse↔format, so Phase 1 tests both, not parse alone.
+
+**Tag storage is WIRE form; unescaping happens on lookup.** `tags` is the tag
+block byte-for-byte as it arrived, with IRCv3 escaping still applied. It is
+plainly *not* undecodable bytes — it is a valid, still-escaped block whose
+separator structure is walkable as received. The escape boundary sits between
+**storage and lookup**: the parser stores the escaped form untouched, and
+`message_tag_get()` unescapes a single value at the moment it is asked for.
+Unescaping the whole block at parse time was rejected because the block's own
+`;` separators are only unambiguous *while escaped*, so a block unescaped in
+bulk re-splits incorrectly. The reverse direction is `message_tag_escape()` /
+`message_tags_format()`, which escape on the way out.
+
+**Two parse entry points, not one.** `message_parse()` takes a NUL-terminated
+`const char *`; `message_parse_n()` takes an explicit byte count. A NUL
+terminates a C string, so `message_parse()` is structurally blind to any byte
+after the first NUL and cannot reject an embedded one. The framing layer of
+§3.3 knows the frame length, so it uses `message_parse_n()` and gets the
+embedded-NUL rejection, which is a hard requirement. `message_build()` is the
+outbound constructor: `message_format()` renders from a `message_t`'s fields,
+so without `message_build()` nothing could be sent.
 
 Rules (RFC 1459 §3.1, §3.3; IRCv3 message-tags):
 - optional `@tags`, then optional `:prefix`, then command
@@ -275,11 +308,43 @@ Rules (RFC 1459 §3.1, §3.3; IRCv3 message-tags):
   send 8192 and ratbox uses 8192 server-to-server, so a 512 cap truncates honest
   clients
 - **Relay truncation policy:** the §2.4 internal tags add bytes to a relayed
-  line, so the client-facing cap is `8192 − worst-case tag overhead (~96)`. A
+  line, so the client-facing cap is `8192 − worst-case tag overhead (179)`. A
   ~500-byte client `PRIVMSG` to a remote channel stays legal — under the
   rejected 512 cap it would already have been over. A line that still exceeds
   the on-wire cap is **dropped with a client-side notice**, never silently
   truncated mid-parameter
+
+  The 179 is derived, not estimated, and the derivation is spelled out because
+  the earlier figure of `~96` here was wrong and Phase 6 must not hardcode it:
+
+  ```
+    1   '@'                    block marker
+   17   irc-serve-origin=      16 name + '='
+   17   ;irc-serve-epoch=      1 + 15 name + '='
+   14   ;irc-serve-id=         1 + 12 name + '='
+   16   ;irc-serve-hops=       1 + 14 name + '='
+    1   ' '                    block/prefix separator
+   --
+   66   fixed
+   63   origin                 <= IRC_MAX_SERVER_NAME (§2.3)
+   20   epoch                  <= UINT64_MAX, 20 digits
+   20   id                     <= UINT64_MAX, 20 digits
+   10   hops                   <= UINT32_MAX, 10 digits
+   --
+  113   values
+   ==
+  179   worst case
+  ```
+
+  The four tag names with their `=` are 61 bytes before a single value byte
+  appears, which is most of what `~96` missed. 179 is the **exact** worst case,
+  not a padded one: the largest legal block measures 177 and the `@` plus the
+  one separating space are the remaining 2. The cap must equal the largest
+  **legal** tag set rather than an average or a rounded guess, because a
+  relayed line that overruns the on-wire limit is precisely the failure the
+  constant exists to prevent. Phase 1 formats a maximally-long legal block and
+  asserts the measured overhead **equals** 179, so raising a value bound above
+  without re-deriving fails the suite instead of the network.
 - embedded CR/LF or NUL in the middle → reject
 - **accepts a leading `:` prefix**, which is what makes peer messages parse
   identically to local ones
@@ -398,10 +463,13 @@ driver).
 such. **`parse_nick` is not preserved as-is**: it does zero character
 validation — `parse_nick("NICK a@evil", …)` returns 1 and yields the nickname
 `a@evil`. The previous draft claimed both were "correct validation discipline";
-that was wrong. A nick **CHARSET RULE IS MISSING** and must be added: `@` and
-`#&+!` are not legal nick characters, and `nick@server` splits at the **last**
-`@` (§2.1). Add a `valid_nick()` predicate to Phase 1 (§7) — the whole
-scoped-nick scheme is unsound without it.
+that was wrong. A nick **CHARSET RULE IS MISSING** and must be added: `@`,
+`#&+!`, `:` and `;` are not legal nick characters, the first character may not
+be a digit, and `nick@server` splits at the **last** `@` (§2.1). Add a
+`valid_nick()` predicate to Phase 1 (§7) — the whole scoped-nick scheme is
+unsound without it. The charset is deliberately narrower than "almost any
+character": the delimiter set is what later phases build on, and every character
+admitted here is one a mode string, a channel list or a prefix is made of.
 
 ---
 
@@ -471,8 +539,22 @@ Phase 1 tests would have locked it in. Also add `valid_nick()` (§2.1/§5).
 *Accept:* unit tests for trailing params, 15-param cap, oversized lines,
 embedded control chars, peer-style prefixed lines; a **round-trip property test**
 `parse → format → parse` over values containing space, `;`, `:` and a backslash;
-and `valid_nick` rejecting `a@evil` and `a#b`. Existing `parse_nick`/
-`parse_user` tests stay green.
+and `valid_nick` rejecting `a@evil`, `a#b`, a leading digit, an embedded `:`
+and an embedded `;`. Existing `parse_nick`/`parse_user` tests stay green.
+
+*Accept (hygiene — the seam now owns an allocation, so this is a new
+criterion rather than a detail):* exactly **one** allocation per successful
+parse; **no leak on any rejection path**; and reusing a `message_t` requires an
+explicit `message_free()` first, because `parse` and `build` zero `*out` rather
+than freeing what was in it. This is a leak check, so it needs a leak checker,
+and the platform limits are not cosmetic: **LeakSanitizer is not supported on
+macOS/Darwin.** An ASan build with `detect_leaks=0` runs clean, but asking for
+`detect_leaks=1` on Darwin does not report leaks — it hangs. So a green macOS run
+of this criterion means "ASan reported nothing", NOT "LSan ran", and it must not
+be read as evidence for the no-leak clause. Run the leak clause in CI on a
+platform where LSan is supported, and record that as a standing CI step once the
+build carries sanitizer flags. Until then this clause is asserted, not verified,
+and the tests do not cover the reuse-without-free leak.
 
 **Phase 2 — Server core.** poll loop, `conn_t`, framing, registries.
 *Accept:* a client connects and is closed cleanly (assert accept → EOF).
