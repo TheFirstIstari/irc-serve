@@ -1,10 +1,3 @@
 [tools]
 cmake = "3.20"
-python = "3.11"
-
-[env]
-CC = "clang"
-CXX = "clang++"
-
-[settings]
-python.uv_venv_auto = false
+# C-only project: CC/CXX are inherited from the environment or CI matrix.

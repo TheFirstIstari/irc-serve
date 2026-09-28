@@ -8,6 +8,9 @@ add_compile_options($<$<CONFIG:Release>:-UNDEBUG>)
 
 add_library(test_contracts STATIC contracts/regress_contracts.c)
 
+add_executable(test_lockfree_contract contracts/lockfree_contract.c)
+target_link_libraries(test_lockfree_contract PRIVATE pthread)
+add_test(NAME LockfreeContract COMMAND test_lockfree_contract)
 add_subdirectory(protocol)
 add_subdirectory(federation)
 add_subdirectory(compliance)

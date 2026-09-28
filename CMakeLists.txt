@@ -21,8 +21,12 @@ endif()
 # Source layout
 add_subdirectory(src)
 
+# Enable testing unconditionally: benchmark tests are registered under
+# BUILD_BENCHMARK (independent of BUILD_TESTING), so they must be runnable
+# via CTest whenever BUILD_BENCHMARK=ON.
+enable_testing()
+
 if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
-  enable_testing()
   add_subdirectory(tests)
 endif()
 
