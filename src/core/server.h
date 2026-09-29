@@ -146,6 +146,27 @@ struct server {
     struct strtab *nicks;
     struct strtab *chans;
 
+    /* The nick registry's ENUMERATION, which is the same arrangement as
+     * chan_objs below and for the same reason: a hash table cannot be walked,
+     * and WHO with no argument -- or with a mask -- is a query about "every
+     * nickname matching X". `*` is what irssi and weechat send on connect, so a
+     * WHO that can only name a channel is a WHO most clients never get an
+     * answer from.
+     *
+     * server_nick_claim() appends and server_nick_release() removes, and those
+     * are the only places the vector changes. The order is CLAIM order, which
+     * makes a 352 sequence a function of who connected when rather than of
+     * allocator behaviour, so a test can assert it.
+     *
+     * It is a cache, not the authority: the strtab above answers "is this nick
+     * held and by whom" in O(1) and nothing but claim/release writes either. A
+     * name in the vector and absent from the table would be a JOIN that
+     * resolved to NULL, which is the failure chan_objs documents; the tests
+     * assert the two agree rather than leaving it to inspection. */
+    conn_t  **nick_objs;
+    size_t    nnick_objs;
+    size_t    nick_objs_cap;
+
     /* The channel registry is a hash table, and a hash table cannot be
      * enumerated -- and LIST has to enumerate every channel on the node
      * (RFC 2812 3.3.5), in a deterministic order a test can assert on the wire.
@@ -294,6 +315,13 @@ int server_reap(server_t *s);
 int server_nick_claim(server_t *s, const char *nick, conn_t *c);
 void server_nick_release(server_t *s, const char *nick);
 conn_t *server_nick_lookup(const server_t *s, const char *nick);
+
+/* The enumeration, in claim order. server_nick_count()/server_nick_at() answer
+ * "every nick on this node" for WHO's <mask> form and for nothing else; a
+ * caller that wants a specific user asks server_nick_lookup() first and only
+ * falls back to a walk when it has to match case or a glob. */
+size_t server_nick_count(const server_t *s);
+conn_t *server_nick_at(const server_t *s, size_t i);
 
 /* ---------------------------------------------------------------------------
  * Channel registry (2.2)

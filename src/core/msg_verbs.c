@@ -1,0 +1,498 @@
+/* msg_verbs.c -- see msg_verbs.h. Messaging, query and status.
+ *
+ * Authority: docs/SERVER_DESIGN.md 3.1 (the routing, which lives in
+ * core/fanout.c), 3.2 (the client-facing line cap), 4.4 (the numerics), 4.2
+ * (WHO/WHOIS/ISON/AWAY) and 7/Phase 5.
+ */
+#include "core/msg_verbs.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#include "core/channel.h"
+#include "core/fanout.h"
+#include "core/reply.h"
+
+/* ---------------------------------------------------------------------------
+ * PRIVMSG and NOTICE
+ * ---------------------------------------------------------------------------
+ * One implementation, two verbs, and the ONLY difference is the `exclude`
+ * argument handed to fanout_deliver(). That is not a simplification for its own
+ * sake: RFC 2812 3.3.2 defines NOTICE as PRIVMSG with a non-reply guarantee,
+ * and the guarantee belongs in the one place that writes lines rather than in
+ * two handlers that could drift.
+ */
+
+/* ---------------------------------------------------------------------------
+ * PRIVMSG and NOTICE
+ * ---------------------------------------------------------------------------
+ * One implementation, two verbs. The echo difference is the `exclude` argument
+ * handed to fanout_deliver(), and the membership difference is the one `if`
+ * below; everything else -- arity, the line cap, 401, 403 -- is shared, which is
+ * what makes "the two verbs behave alike except where the RFC says they must
+ * not" a property of the code rather than a claim about it.
+ */
+static void send_message(server_t *s, conn_t *c, const message_t *m,
+                         const char *verb, int is_notice)
+{
+    fanout_target_t t;
+    char prefix[CONN_HOSTMASK_MAX];
+    const char *text;
+    int is_channel;
+    int member;
+    int delivered;
+
+    /* Arity. RFC 2812 3.3.1 gives PRIVMSG <msgtarget> <text> and 3.3.2 gives
+     * NOTICE the same two. A third parameter is not text the client meant to
+     * send -- the grammar has already absorbed everything after a ':' -- so it
+     * is refused rather than guessed at, which is the same call Phase 3 made
+     * for "NICK a b". */
+    if (m->nparams != 2) {
+        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        return;
+    }
+    text = m->params[1];
+
+    /* The source prefix, built BEFORE resolution because it is needed to render
+     * the line and because it is a precondition of the delivery rather than of
+     * the lookup. conn_hostmask() is the one rendering of 2.1's identity fields
+     * (RFC 2812 3.3.1 requires a client-originated message to carry the acting
+     * user's hostmask), and c->host is what accept() OBSERVED -- not what USER
+     * claimed. commands.c's handle_user() is why that is deliberate; this is
+     * where the decision stops being internal and becomes visible to a third
+     * party reading the wire. */
+    if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
+        (void)reply(s, c, "404", NULL, 0, "Cannot send: unrenderable source");
+        return;
+    }
+
+    /* 3.2's client-facing cap, applied to the TEXT rather than discovered by a
+     * failed render. See fanout_line_fits(): a render failure inside reply() is
+     * a refusal counted on n_reply_refused, which reply.c documents as a bug
+     * report and not a metric, and a client that sent a long message is not a
+     * bug. It is a limit, and a limit answers with a numeric. */
+    if (fanout_line_fits(prefix, verb, m->params[0], text) == 0) {
+        (void)reply(s, c, "417", NULL, 0, "Message too long to send");
+        printf("[observable] msg_refused: verb=%s nick=%s reason=too_long "
+               "len=%zu\n",
+               verb, c->nick, strlen(text));
+        return;
+    }
+
+    if (fanout_resolve(s, c, m->params[0], FANOUT_MESSAGE, &t) == 0) {
+        return; /* 401 or 403 already sent */
+    }
+    if (t.kind == FANOUT_REMOTE_USER) {
+        /* A `nick@server` target: 3.1's last row, with no peer to forward it to
+         * (fanout.h, on FANOUT_REMOTE_USER). 401 is the honest single-node
+         * answer -- this node holds no such user. It is sent HERE and not from
+         * inside fanout_deliver() because a numeric is a reply-path concern (3)
+         * and forwarding is not; keeping them apart is what lets Phase 6 add a
+         * forward without a numeric ever reaching a link. */
+        (void)reply(s, c, "401", (const char *const[]){ t.name }, 1,
+                    "No such nick/channel");
+        return;
+    }
+
+    is_channel = (t.kind == FANOUT_LOCAL_CHANNEL ||
+                  t.kind == FANOUT_REMOTE_CHANNEL);
+    member = fanout_is_member(&t, c);
+
+    /* ------------------------------------------------------------------------
+     * MEMBERSHIP -- the first of the two places PRIVMSG and NOTICE differ
+     * ------------------------------------------------------------------------
+     * PRIVMSG to a channel the sender is not on is 404 ERR_CANNOTSENDTOCHAN,
+     * not the 442 the channel verbs use. 4.4 mandates BOTH, so the choice has
+     * to be argued, and the argument is that they answer different questions:
+     *
+     *   - 442 is "You're not on that channel": a statement about MEMBERSHIP, and
+     *     the right answer for a verb that cannot do anything at all without it
+     *     (PART, TOPIC, MODE, KICK -- Phase 4's usage, unchanged).
+     *   - 404 is "Cannot send to channel": a REFUSAL of one specific ACTION.
+     *     PRIVMSG is an action, not a standing, and it is the numeric ircd
+     *     clients already special-case for messaging, so a client that follows
+     *     it behaves correctly.
+     *   - 3.1 makes the distinction load-bearing. PRIVMSG is `message` class,
+     *     explicitly NOT a state change, and the entire reason 3.1 splits the
+     *     classes is that the two are routed differently. Reusing the
+     *     state-change verifier on a message-class verb would apply the rule
+     *     for the class 3.1 says this is not.
+     *   - Otherwise 404 would have NO producer anywhere in this node, and 4.4
+     *     lists it. A numeric in the design's list that nothing can emit is a
+     *     list entry that is a lie -- the same standard Phase 4 applied to a
+     *     324 that disagreed with the node's actual behaviour.
+     *
+     * A channel that does not exist is 403 for both verbs: that is a complaint
+     * about the NAME, and neither 404 nor 442 is true of it.
+     */
+    if (is_channel != 0 && member == 0 && is_notice == 0) {
+        (void)reply(s, c, "404", (const char *const[]){ t.name }, 1,
+                    "Cannot send to channel");
+        printf("[observable] msg_refused: verb=%s nick=%s target=%s "
+               "reason=not_on_channel\n",
+               verb, c->nick, t.name);
+        return;
+    }
+
+    /* ------------------------------------------------------------------------
+     * AND FOR NOTICE, THAT CHECK IS SKIPPED ENTIRELY
+     * ------------------------------------------------------------------------
+     * RFC 1459 2.4.2 says it outright: "The NOTICE message is sent to a user or
+     * channel, whether or not the sender is on the channel." Three reasons
+     * that is the right reading rather than a convenient one:
+     *
+     *   - It is the reason NOTICE exists. A bot announcing into a channel it
+     *     has not joined is the canonical use; demanding a JOIN would make the
+     *     verb useless at the job it was given.
+     *   - 3.1's table puts no membership precondition on a `message`. The
+     *     design keeps ROUTING (3.1) and POLICY (membership) apart on purpose,
+     *     and inventing a policy inside the routing table would put them back
+     *     together and make 3.1 the place a verb's semantics are decided.
+     *   - The hazard 2.4.2 guards against cannot arise. It is about
+     *     auto-REPLY, and a NOTICE is never returned to the client that sent
+     *     it -- so nothing on this path can start a loop. The same reasoning
+     *     does NOT extend to a NUMERIC, which is a reply the client asked for
+     *     and would be acted on: that is why an unresolvable NOTICE still gets
+     *     its 401 or 403, and why those are described as replies rather than as
+     *     delivery.
+     *
+     * So the verbs differ in two places, not one: the echo, and this. Every
+     * other outcome is identical, and the tests run the same scenarios against
+     * both.
+     */
+    delivered = fanout_deliver(s, &t, prefix, verb, text,
+                               (is_notice != 0) ? c : NULL);
+    printf("[observable] msg: verb=%s from=%s target=%s kind=%d members=%zu "
+           "delivered=%d echo=%s member=%d\n",
+           verb, c->nick, t.name, (int)t.kind,
+           (t.chan != NULL) ? t.chan->nmembers : 0u, delivered,
+           (is_notice != 0) ? "no" : "yes", member);
+}
+
+void handle_privmsg(server_t *s, conn_t *c, const message_t *m)
+{
+    send_message(s, c, m, "PRIVMSG", 0);
+}
+
+void handle_notice(server_t *s, conn_t *c, const message_t *m)
+{
+    send_message(s, c, m, "NOTICE", 1);
+}
+
+/* ---------------------------------------------------------------------------
+ * WHO
+ * ---------------------------------------------------------------------------
+ */
+/* 352 RPL_WHOREPLY's <flags>. RFC 2812 3.3.4 defines 'H' for a user who is here
+ * and 'G' for one who is gone, and separately allows '@' and '+' for channel
+ * operator and voice. Away therefore changes one letter and nothing else, which
+ * is what lets a client render "away" out of a WHO without asking a second
+ * question. */
+static void who_flags(char *out, size_t cap, const conn_t *c, const chan_t *ch)
+{
+    size_t n = 0;
+
+    out[0] = (c->away[0] != '\0') ? 'G' : 'H';
+    n = 1u;
+    if (ch != NULL && chan_has_flag(ch, c, CHAN_MEMBER_OP)) {
+        out[n++] = '@';
+    } else if (ch != NULL && chan_has_flag(ch, c, CHAN_MEMBER_VOICE)) {
+        out[n++] = '+';
+    }
+    if (n >= cap) {
+        n = cap - 1u;
+    }
+    out[n] = '\0';
+}
+
+/* One 352: <client> <channel> <user> <host> <server> <nick> <flags>
+ *         :<hopcount> <realname>. `channel` is '*' for a WHO that was not about
+ * a channel, which is the RFC's own placeholder and the only way a client can
+ * tell the two forms apart.
+ *
+ * <hopcount> is 0 and 0 is true: it counts FORWARDS, and a user this node holds
+ * the socket for has been forwarded nowhere. A node answering 1 here would be
+ * claiming a relay that did not happen. */
+static void who_entry(server_t *s, conn_t *dst, const conn_t *who,
+                      const char *channel, const chan_t *ch)
+{
+    char flags[4];
+
+    who_flags(flags, sizeof flags, who, ch);
+    (void)reply(s, dst, "352",
+                (const char *const[]){ (channel != NULL) ? channel : "*",
+                                        who->user, who->host, s->name, who->nick,
+                                        flags },
+                6, "0 %s",
+                (who->realname[0] != '\0') ? who->realname : who->nick);
+}
+
+void handle_who(server_t *s, conn_t *c, const message_t *m)
+{
+    const char *mask = "*";
+    char canonical[CHAN_MAX_NAME + 1];
+
+    if (m->nparams > 1) {
+        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        return;
+    }
+    if (m->nparams == 1) {
+        mask = m->params[0];
+    }
+
+    if (chan_name_valid(mask)) {
+        chan_t *ch;
+
+        chan_name_upper(canonical, sizeof canonical, mask);
+        ch = server_chan_get(s, canonical);
+        if (ch == NULL) {
+            /* 403, and 315 anyway. RFC 2812 3.3.4 lists ERR_NOSUCHCHANNEL
+             * among WHO's replies precisely because "I found no users" would
+             * otherwise be the only answer available, and that answer cannot
+             * distinguish "no such channel" from "an empty channel". Both are
+             * sent: 403 says which, 315 says the list is over. */
+            (void)reply(s, c, "403", (const char *const[]){ canonical }, 1,
+                        "No such channel");
+            (void)reply(s, c, "315", (const char *const[]){ canonical }, 1,
+                        "End of WHO list");
+            return;
+        }
+        /* A QUERY against a channel this node does not own is answered from
+         * whatever cache it holds and is never refused, for the reason
+         * chan_verbs.c's authority_ok() gives: refusing to answer is not a
+         * divergence risk, and a later SJOIN from the origin corrects the
+         * answer. The server count below is what makes the incompleteness
+         * visible rather than implied. */
+        printf("[observable] who: nick=%s target=%s local=%zu servers=%zu\n",
+               c->nick, ch->name, ch->nmembers, ch->nservers);
+        for (size_t i = 0; i < ch->nmembers; i++) {
+            if (chan_member_live(&ch->members[i]) == 0 ||
+                ch->members[i].c->nick[0] == '\0') {
+                continue;
+            }
+            who_entry(s, c, ch->members[i].c, ch->name, ch);
+        }
+        (void)reply(s, c, "315", (const char *const[]){ ch->name }, 1,
+                    "End of WHO list");
+        return;
+    }
+
+    printf("[observable] who: nick=%s mask=%s nicks=%zu\n", c->nick, mask,
+           server_nick_count(s));
+    for (size_t i = 0; i < server_nick_count(s); i++) {
+        conn_t *who = server_nick_at(s, i);
+
+        if (who == NULL || who->nick[0] == '\0' || who->state == CONN_CLOSING) {
+            continue;
+        }
+        if (fanout_mask_match(mask, who->nick) == 0) {
+            continue;
+        }
+        who_entry(s, c, who, NULL, NULL);
+    }
+    (void)reply(s, c, "315", (const char *const[]){ mask }, 1,
+                "End of WHO list");
+}
+
+/* ---------------------------------------------------------------------------
+ * WHOIS
+ * ---------------------------------------------------------------------------
+ * 311, 312, 317, 318, and 301 when the target is away.
+ *
+ * 301 is NOT in 4.4's list, and the reason for using it is the one Phase 3 gave
+ * for 432: the LIST has a hole, the protocol does not. RFC 2812 3.3.4 requires
+ * 301 for an away user and it is the ONLY numeric that can carry the fact at
+ * all -- 311 holds user/host/realname, 312 holds a server name, 317 holds two
+ * timestamps, and none of them has a field for away. Without it, "WHO/WHOIS
+ * reflect AWAY" -- this phase's own acceptance criterion -- is not implementable
+ * and the alternative is a WHOIS that silently omits the one thing it was asked
+ * about. Flagged here and in the report rather than papered over. */
+void handle_whois(server_t *s, conn_t *c, const message_t *m)
+{
+    conn_t *who;
+    char idle[24];
+    char signon[24];
+    long secs;
+    time_t now;
+
+    if (m->nparams != 1) {
+        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        return;
+    }
+    who = fanout_find_nick(s, m->params[0]);
+    if (who == NULL) {
+        /* 401 and then 318. 318 is not optional: a client that asked about a
+         * nick and received only 401 cannot tell "that user does not exist" from
+         * "the server is still working on it", and 318 is the end-of-list marker
+         * the RFC pairs with every other WHOIS reply. */
+        (void)reply(s, c, "401", (const char *const[]){ m->params[0] }, 1,
+                    "No such nick/channel");
+        (void)reply(s, c, "318", (const char *const[]){ m->params[0] }, 1,
+                    "End of /WHOIS list");
+        return;
+    }
+
+    /* 311: <client> <nick> <user> <host> * :<real name>. The '*' is RFC 2812's
+     * placeholder for the superseded <hostmask> field, and it is a MIDDLE
+     * parameter rather than part of the trailing text. c->host is the OBSERVED
+     * peer address -- the same field the message prefix renders -- so WHOIS and
+     * a delivered message cannot disagree about who somebody is, and neither can
+     * be moved by anything the client asserted in USER. */
+    (void)reply(s, c, "311",
+                (const char *const[]){ who->nick, who->user, who->host, "*" }, 4,
+                "%s", (who->realname[0] != '\0') ? who->realname : who->nick);
+
+    /* 312 names the node holding the nick, which on a single node is always us.
+     * That is not a placeholder: 2.1 makes the nick table per-server, so naming
+     * the server IS the honest answer, and it is what lets a client decide
+     * whether a `nick@server` target is local before sending to it. */
+    (void)reply(s, c, "312", (const char *const[]){ who->nick, s->name }, 2, "%s",
+                IRC_SERVE_VERSION);
+
+    if (who->away[0] != '\0') {
+        (void)reply(s, c, "301", (const char *const[]){ who->nick }, 1, "%s",
+                    who->away);
+    }
+
+    /* 317: <idle> <signon>, both real values. conn_t records them at accept and
+     * on every read (see connection.c), so neither number is a placeholder --
+     * which is the standard Phase 4 set for 329, where borrowing topic_when
+     * would have been "a numeric that lies about what it is". */
+    now = time(NULL);
+    secs = (long)(now - who->last_active);
+    if (secs < 0) {
+        secs = 0; /* a clock that went backwards reports 0, never a negative */
+    }
+    (void)snprintf(idle, sizeof idle, "%ld", secs);
+    (void)snprintf(signon, sizeof signon, "%lld", (long long)who->signon_at);
+    (void)reply(s, c, "317", (const char *const[]){ who->nick, idle, signon }, 3,
+                "seconds idle");
+
+    (void)reply(s, c, "318", (const char *const[]){ who->nick }, 1,
+                "End of /WHOIS list");
+    printf("[observable] whois: by=%s nick=%s host=%s away=%d\n", c->nick,
+           who->nick, who->host, (who->away[0] != '\0') ? 1 : 0);
+}
+
+/* ---------------------------------------------------------------------------
+ * ISON
+ * ---------------------------------------------------------------------------
+ * 303, and nothing else. A nickname this node does not hold is simply ABSENT
+ * from the list, and that absence IS the answer: there is no numeric for "that
+ * user is not online", and inventing one would turn a set query into a run of
+ * errors, which is how an ISON of fifty nicks becomes fifty lines of noise on a
+ * network where one of them happens to be away.
+ *
+ * 303 is not in 4.4's list either -- it names "311-319" for queries and 303 is
+ * below that range -- and it is the same gap 301 is: RFC 2812 3.3.4 defines 303
+ * as the reply to ISON, and nothing else is a reply to it.
+ *
+ * The nickname list is CHUNKED at REPLY_MAX_MID rather than refused past that
+ * point. The wire grammar caps a message at IRC_MAX_PARAMS and the client itself
+ * holds one of those slots, so a single 303 can carry at most 13 nicknames, and
+ * reply() refuses a longer one outright. RFC 1459 2.4.3 anticipates exactly
+ * this: a client MAY ask about more nicknames than fit in one reply, and the
+ * server reports those it can. Refusing the whole command past 13 would be worse
+ * than splitting it, because the caller could not tell a refusal from an answer
+ * that happened to be empty. */
+void handle_ison(server_t *s, conn_t *c, const message_t *m)
+{
+    /* Sized by the WIRE, not by the reply. The parser accepts up to
+     * IRC_MAX_PARAMS parameters, so an ISON may name 15 nicknames, and a 303
+     * may carry only REPLY_MAX_MID of them. Sizing this array to REPLY_MAX_MID
+     * and then writing however many were found is a one-line buffer overflow on
+     * a perfectly ordinary command -- `ISON a b ... o` with fourteen nicks this
+     * node holds -- and it is exactly the kind of defect the two sizes being
+     * different is meant to prevent. */
+    const char *found[IRC_MAX_PARAMS];
+    size_t nfound = 0;
+    size_t nout = 0;
+
+    if (m->nparams < 1 || m->nparams > (int)(sizeof found / sizeof found[0])) {
+        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        return;
+    }
+
+    for (int i = 0; i < m->nparams; i++) {
+        conn_t *who = fanout_find_nick(s, m->params[i]);
+
+        if (who == NULL || who->nick[0] == '\0') {
+            continue; /* absent from the reply: that IS this nick's answer */
+        }
+        found[nfound++] = who->nick;
+    }
+
+    /* At least one 303, even with nothing found: RFC 1459 2.4.3 is explicit
+     * that an empty 303 is the answer when no nickname matches, and silence
+     * would be indistinguishable from a dropped command. */
+    do {
+        size_t batch = nfound - nout;
+        const char *const *slice = (batch > 0u) ? (found + nout) : NULL;
+
+        if (batch > (size_t)REPLY_MAX_MID) {
+            batch = (size_t)REPLY_MAX_MID;
+        }
+        (void)reply(s, c, "303", slice, batch, "are online");
+        nout += batch;
+    } while (nout < nfound);
+
+    printf("[observable] ison: by=%s asked=%d online=%zu\n", c->nick, m->nparams,
+           nfound);
+}
+
+/* ---------------------------------------------------------------------------
+ * AWAY
+ * ---------------------------------------------------------------------------
+ * `AWAY :message` sets, bare `AWAY` clears. The bound is CONN_MAX_AWAY and an
+ * over-long message is REFUSED with 417, leaving the previous state exactly as
+ * it was; the argument is on the constant, and it is 3.2's argument for a
+ * message that will not fit on the wire -- delivering a shortened parameter is
+ * delivering something the user did not write.
+ *
+ * 417 is the third hole in 4.4's numeric list, for the same reason as 301 and
+ * 303: the list has a gap rather than the protocol doing so. RFC 2812 3.3.1
+ * defines 417 ERR_INPUTTOOLONG and every client understands it, while 4.4's own
+ * candidates are all false here -- 461 says "you did not send enough", and the
+ * client sent exactly what it meant to.
+ *
+ * 305 and 306 are not in 4.4 either, and this one is not a close call. A
+ * state-changing command that answers nothing leaves a client unable to tell
+ * success from a dropped line, which is precisely the silence 4.4's numerics
+ * exist to prevent; Phase 4's 472, 474, 696 and 368 took the same decision for
+ * the same reason. */
+void handle_away(server_t *s, conn_t *c, const message_t *m)
+{
+    const char *message;
+    size_t len;
+
+    if (m->nparams > 1) {
+        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        return;
+    }
+
+    if (m->nparams == 0 || m->params[0][0] == '\0') {
+        /* Bare AWAY, and `AWAY :` which parses to one empty parameter. Both
+         * mean "not away": RFC 1459 2.4.2 has no separate syntax for clearing,
+         * so a client that sends an empty trailing parameter means exactly what
+         * a client that sends none does. */
+        c->away[0] = '\0';
+        (void)reply(s, c, "305", NULL, 0, "You are no longer marked as being away");
+        printf("[observable] away: nick=%s state=clear\n", c->nick);
+        return;
+    }
+
+    message = m->params[0];
+    len = strlen(message);
+    if (len > (size_t)CONN_MAX_AWAY) {
+        (void)reply(s, c, "417", NULL, 0, "Away message is too long");
+        printf("[observable] away: nick=%s state=refused reason=too_long "
+               "len=%zu max=%d\n",
+               c->nick, len, CONN_MAX_AWAY);
+        return;
+    }
+
+    memcpy(c->away, message, len + 1u);
+    (void)reply(s, c, "306", NULL, 0, "You have been marked as being away");
+    printf("[observable] away: nick=%s state=set len=%zu\n", c->nick, len);
+}

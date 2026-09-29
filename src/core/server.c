@@ -358,7 +358,15 @@ void server_shutdown(server_t *s)
     free(s->chan_objs);
     s->chan_objs = NULL;
     s->nchan_objs = 0;
-    s->chan_objs_cap = 0;
+    /* Same for the nick enumeration. Every conn was closed above and every one
+     * of those closures released its nickname, so this is normally already
+     * empty; it is freed unconditionally because a conn that never claimed a
+     * nickname leaves nothing here either way, and a list that could still hold
+     * a pointer to a freed conn_t must never survive shutdown. */
+    free(s->nick_objs);
+    s->nick_objs = NULL;
+    s->nnick_objs = 0;
+    s->nick_objs_cap = 0;    s->chan_objs_cap = 0;
     free(s->by_fd);
     s->by_fd = NULL;
     s->nconns = 0;
@@ -631,6 +639,35 @@ int server_reap(server_t *s)
  * ---------------------------------------------------------------------------
  */
 
+/* Append `c` to the nick enumeration. Returns 0 on success, -1 on allocation
+ * failure or a bad argument. The vector grows geometrically like conn_t's own
+ * channel list does, and is not bounded: it holds one entry per registered
+ * connection, so the loop's own FD_SETSIZE ceiling is the bound.
+ *
+ * Growing is the ONLY way it changes size, and it is reached from exactly one
+ * caller (server_nick_claim), which is what keeps the two nick indexes in
+ * agreement without a periodic reconciliation. */
+static int nick_objs_add(server_t *s, conn_t *c)
+{
+    if (s == NULL || c == NULL) {
+        return -1;
+    }
+    if (s->nnick_objs == s->nick_objs_cap) {
+        size_t want = (s->nick_objs_cap == 0) ? 16u : s->nick_objs_cap * 2u;
+        conn_t **grown = (conn_t **)realloc(s->nick_objs,
+                                           want * sizeof *grown);
+
+        if (grown == NULL) {
+            return -1;
+        }
+        s->nick_objs = grown;
+        s->nick_objs_cap = want;
+    }
+    s->nick_objs[s->nnick_objs] = c;
+    s->nnick_objs++;
+    return 0;
+}
+
 int server_nick_claim(server_t *s, const char *nick, conn_t *c)
 {
     if (s == NULL || nick == NULL || !valid_nick(nick)) {
@@ -639,13 +676,47 @@ int server_nick_claim(server_t *s, const char *nick, conn_t *c)
     if (server_nick_lookup(s, nick) != NULL) {
         return -1;
     }
-    return strtab_put(s->nicks, nick, c);
+    if (strtab_put(s->nicks, nick, c) != 0) {
+        return -1;
+    }
+    /* The table is written FIRST and the vector second, and a failed append
+     * rolls the table entry back. A half-applied claim would be worse than a
+     * refused one: the two indexes disagreeing means a nickname this node
+     * answers 433 for while WHO does not list it, or the reverse, and there is
+     * no event that would ever reconcile them. Refusing the claim leaves the
+     * state exactly as it was, which is the only outcome a caller can reason
+     * about. */
+    if (nick_objs_add(s, c) != 0) {
+        (void)strtab_del(s->nicks, nick);
+        return -1;
+    }
+    return 0;
+}
+
+/* Drop `nick` from the enumeration, preserving claim order. Idempotent, and a
+ * no-op for a name the table does not hold -- server_nick_release() is reached
+ * twice on the ordinary QUIT path (once by the handler, once by the reaper)
+ * and must not turn the second call into a corruption. */
+static void nick_objs_del(server_t *s, const char *nick)
+{
+    for (size_t i = 0; i < s->nnick_objs; i++) {
+        if (s->nick_objs[i] != NULL && s->nick_objs[i]->nick[0] != '\0' &&
+            strcmp(s->nick_objs[i]->nick, nick) == 0) {
+            for (size_t j = i + 1u; j < s->nnick_objs; j++) {
+                s->nick_objs[j - 1u] = s->nick_objs[j];
+            }
+            s->nnick_objs--;
+            s->nick_objs[s->nnick_objs] = NULL;
+            return;
+        }
+    }
 }
 
 void server_nick_release(server_t *s, const char *nick)
 {
-    if (s != NULL) {
+    if (s != NULL && nick != NULL) {
         (void)strtab_del(s->nicks, nick);
+        nick_objs_del(s, nick);
     }
 }
 
@@ -655,6 +726,19 @@ conn_t *server_nick_lookup(const server_t *s, const char *nick)
         return NULL;
     }
     return (conn_t *)strtab_get(s->nicks, nick);
+}
+
+size_t server_nick_count(const server_t *s)
+{
+    return (s == NULL) ? 0u : s->nnick_objs;
+}
+
+conn_t *server_nick_at(const server_t *s, size_t i)
+{
+    if (s == NULL || i >= s->nnick_objs) {
+        return NULL;
+    }
+    return s->nick_objs[i];
 }
 
 int server_chan_add(server_t *s, const char *name)

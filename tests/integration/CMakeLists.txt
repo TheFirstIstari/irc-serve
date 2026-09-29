@@ -107,3 +107,15 @@ irc_add_integration_test(test_reply_guard test_reply_guard.c)
 # the node created -- which is 2.2's own creation-race path, driven from the
 # tick hook rather than simulated around.
 irc_add_integration_test(test_channels test_channels.c)
+
+# 7/Phase 5: "two clients exchange a PRIVMSG; NOTICE not echoed to sender" --
+# the "working server" line, so the acceptance criterion is the centre of the
+# test rather than one case among many. Runs against the SHIPPED BINARY, like
+# every other integration test.
+irc_add_integration_test(test_messaging test_messaging.c)
+
+# 7/Phase 5: WHO/WHOIS/ISON/AWAY, and the away field 4.3's SBURST will have to
+# carry. Separate from test_messaging because the AWAY state is what WHO and
+# WHOIS report on, so the three cannot be separated by a file boundary without
+# the file testing itself.
+irc_add_integration_test(test_queries test_queries.c)

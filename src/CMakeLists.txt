@@ -9,8 +9,10 @@ add_library(irc_core STATIC
   core/channel.c
   core/poll_loop.c
   core/reply.c
+  core/fanout.c
   core/commands.c
   core/chan_verbs.c
+  core/msg_verbs.c
 )
 
 target_link_libraries(irc_core PRIVATE pthread)
