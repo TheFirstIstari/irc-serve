@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include "core/connection.h"
+#include "federation/burst.h"
 #include "federation/dedup.h"
 #include "federation/verbs.h"
 
@@ -541,6 +542,15 @@ static void fed_link_down(server_t *s, server_link_t *link)
      * 4.3 says a resync REPLACES rather than merges, and the flag is what makes
      * that true of a link that comes back. */
     link->burst_done = 0;
+    /* AND THE IN-FLIGHT TRANSACTION GOES WITH IT. A burst that never reached its
+     * terminator because the link died has nothing to compare its counts against,
+     * and leaving the shadow open would mean the next burst on this link's name
+     * started by appending to a half-built one -- which is a state this node
+     * cannot explain and no reader of the counters could. The BEGIN in the next
+     * burst would discard it anyway; discarding it here means the discard is
+     * reported against the link that went down rather than against the next
+     * burst, which is where an operator looking for a flapping link will look. */
+    fed_burst_abandon(link);
     link->last_sent_ms = 0;
     link->last_recv_ms = 0;
     fed_dump(s, "link_down");
@@ -737,6 +747,34 @@ static void fed_link_established(server_t *s, server_link_t *link, conn_t *c,
            link->name, link->fd, link->initiator,
            (unsigned long long)link->epoch);
     fed_dump(s, "established");
+    /* THE RESYNC, and it goes HERE rather than in either of the two paths that
+     * reach this function, because 2.3 wants the accepting side and the dialling
+     * side's promotion to be the same transition and 4.3's "on every link
+     * establishment" has to be true of both of them. A call in the accept path
+     * only would be the INITIATOR's burst, which is 4.3's literal wording and is
+     * not sufficient: a node only forwards to peers that already hold the
+     * chan_t, so in a two-node fixture the RESPONDER's channels would never reach
+     * the initiator, a user there would be invisible to the initiator for ever,
+     * and 7/Phase 6's full-353 criterion would fail on one of the two nodes.
+     *
+     * BOTH SIDES BURSTING IS A DELIBERATE SUPERSET of the doc's sentence "the
+     * initiator sends full state", and it costs one extra burst per link. What it
+     * buys is that "on every link establishment" means what a reader of 4.3 would
+     * expect it to mean, and that neither node's view of the other depends on
+     * which of the two happened to dial. The asymmetry the doc describes is
+     * real -- the initiator does have to send its state or the other node learns
+     * nothing -- but it is a statement about the MINIMUM, and a minimum is not a
+     * rule about what the responder may do.
+     *
+     * ONE ORDERING CONSTRAINT, and it is the reason this is not at the top of
+     * the function: the burst needs the link's descriptor and the peer's epoch,
+     * so it has to be after both are set. It does NOT wait for the peer's own
+     * burst, and cannot: neither side is going to block on the other, so the two
+     * transactions cross on the wire and each is applied on arrival. There is no
+     * ordering to agree on because neither transaction depends on the other -- a
+     * burst is a statement about the sender, and the sender's state does not
+     * change because somebody received it. */
+    (void)federation_resync(s, link);
 }
 
 fed_federate_result_t fed_check_federate(const server_t *s,

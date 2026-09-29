@@ -7,6 +7,7 @@
 
 #include "core/channel.h"
 #include "core/fanout.h"
+#include "federation/burst.h"
 #include "federation/dedup.h"
 #include "federation/link.h"
 
@@ -826,18 +827,25 @@ static int inbound_index(const char *verb)
 
 /* The 4.3 words this build does not speak yet, and WHY THAT IS NOT "unknown".
  *
- * SNAMES, SBURST, SQUIT and SHASH are in 4.3's list and are not in INBOUND,
- * because the resync that carries them is a later commit of this phase. They
- * are listed here so that a peer sending one is told this node has not
- * implemented it rather than that it is not a verb -- a distinction an operator
- * needs, because the first means "a peer is running a build I do not have" and
- * the second means "a peer is talking nonsense". Reporting them through
- * n_fed_unknown_verb would make the counter mean two incompatible things and
- * stop being evidence of anything.
+ * SQUIT and SHASH are in 4.3's list and are not in INBOUND, because they are
+ * later commits of this phase (C5). They are listed here so that a peer sending
+ * one is told this node has not implemented it rather than that it is not a
+ * verb -- a distinction an operator needs, because the first means "a peer is
+ * running a build I do not have" and the second means "a peer is talking
+ * nonsense". Reporting them through n_fed_unknown_verb would make the counter
+ * mean two incompatible things and stop being evidence of anything.
+ *
+ * SBURST IS NOT HERE ANY MORE, and its removal is the change C4 made: the resync
+ * landed, so a peer sending one gets the transaction rather than a version fact.
+ * The list used to read `SNAMES SBURST SQUIT SHASH` and every entry in it was
+ * "not yet", which is what a list like this is for -- a verb that arrives and is
+ * handled must not leave its name in a table that says it is not handled, or the
+ * table becomes a place where a reader learns which half of the phase is
+ * finished.
  *
  * FEDERATE is NOT here: it never reaches G8, because G2 consumes it, and it is
  * the verb that ESTABLISHES the epoch every other tag rule is stated against. */
-static const char *const DEFERRED[] = { "SNAMES", "SBURST", "SQUIT", "SHASH" };
+static const char *const DEFERRED[] = { "SNAMES", "SQUIT", "SHASH" };
 
 static int is_deferred(const char *verb)
 {
@@ -958,6 +966,28 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
              * relay would send the operator looking for a loop. */
             s->n_fed_verb_deferred++;
             printf("[observable] fed_verb_deferred: fd=%d peer=%s command=%s\n",
+                   c->fd, link->name, m->command);
+            return;
+        }
+
+        if (fed_burst_verb(m->command) != 0) {
+            /* CASE E, AND IT EXISTS BECAUSE A BURST IS NOT A MESSAGE. Every other
+             * verb in this chain is happy to have its identity MINTED for it by
+             * case A below, because a message's identity is per line and a
+             * missing one costs that line. A burst is O(n) lines forming ONE
+             * transaction, and case A mints a fresh id PER LINE -- which is
+             * exactly right for dedup and exactly wrong for the thing the
+             * transaction is for. A peer that could send an untagged burst would
+             * therefore be able to make this node replace its entire view of
+             * that origin, as often as it liked, with lines whose 2.4 identity
+             * this node invented. So the one verb family that is state REPLACEMENT
+             * is required to carry its identity on the wire, and the refusal is
+             * counted as malformed rather than as a relay: a peer sending it is
+             * not relaying somebody else's burst, it is sending a burst it did
+             * not stamp. */
+            s->n_fed_malformed++;
+            printf("[observable] fed_untagged: fd=%d peer=%s command=%s "
+                   "reason=BURST_UNTAGGED\n",
                    c->fd, link->name, m->command);
             return;
         }
@@ -1109,6 +1139,29 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
     }
 
     /* --- G8: the verb ----------------------------------------------------- */
+    /* THE BURST FAMILY IS ASKED BEFORE THE TABLE, and it is a separate branch
+     * rather than five rows because it is not this kind of verb. INBOUND's rows
+     * all describe a line about a CHANNEL, at a position the verb fixes, within
+     * a two-or-three parameter arity; SBURSTC names the channel first and
+     * carries six parameters, SBURSTM carries three, and SBURST carries two
+     * numerics and names no channel at all. Rows for them would have arity ranges
+     * that are individually correct and collectively a lie, and the handler
+     * dispatch below reads the channel out of a position that means something
+     * different for each verb.
+     *
+     * THEY ARE STILL GATED BY EVERYTHING ABOVE, which is the point of asking
+     * here rather than earlier: a burst is state REPLACEMENT, so it is
+     * hop-checked, own-origin-checked and deduplicated like anything else, and a
+     * REPLAYED burst is the worst case this phase has. G9's arity check is not
+     * applied to these five -- their shapes are five different shapes and the
+     * format is where they are stated -- so each arm validates its own, and
+     * federation/burst.c owns that because federation/burst.c is where the wire
+     * format is. */
+    if (fed_burst_verb(m->command) != 0) {
+        (void)fed_burst_apply(s, link, m);
+        return;
+    }
+
     idx = inbound_index(m->command);
     if (idx < 0) {
         if (is_deferred(m->command) != 0) {

@@ -359,15 +359,31 @@ static int write_to_members(server_t *s, const fanout_target_t *t,
      * parameter list instead would mean every call site had to remember to
      * canonicalise, which is the mistake fanout_resolve() exists to prevent.
      *
-     * One slot over the 15-parameter cap, and the cap is ENFORCED here rather
-     * than left to message_build(): a caller that hands over 15 tail parameters
-     * gets 16 with the target, which is not representable, and the honest
-     * outcome is zero writes rather than a line the formatter refused. Every
-     * caller in this node passes two or three. */
+     * One slot over the 15-parameter cap, and THE CAP IS ENFORCED HERE rather
+     * than left to message_build(). The test is `nparams >= IRC_MAX_PARAMS`, not
+     * `>`, and it is `>=` because the array below is IRC_MAX_PARAMS + 1 LONG and
+     * the target takes one of those: a caller that hands over 15 tail parameters
+     * would get 16 with the target, which message_build() refuses, and the
+     * honest outcome for that is ZERO WRITES rather than a line the formatter
+     * refused deep inside send_line() -- where the only available outcome is a
+     * refusal counted on n_reply_refused, the counter reply.c keeps at zero
+     * because a non-zero value of it is a bug report.
+     *
+     * IT WAS `>` UNTIL C4, and the comment above it said `>` was enough because
+     * the comment claimed 15 tail parameters gave "zero writes". It did not: 15
+     * passed the guard, filled all 16 slots, and built a 16-parameter line that
+     * message_build() refused. Nothing in this node ever passes 15 -- every
+     * caller passes two or three -- so the bug was unreachable from any call
+     * site, which is exactly how a defect of this shape survives a phase: the
+     * comment was the only thing asserting the bound, and the comment and the
+     * code disagreed, so neither could be checked. The FANOUT_LOCAL_USER arm
+     * below had the same guard and the same comment, and is fixed the same way;
+     * both are here rather than in one helper because they are two separate
+     * emissions with two separate destinations. */
     const char *all[IRC_MAX_PARAMS + 1];
     int n = 0;
 
-    if (t->chan == NULL || nparams < 0 || nparams > IRC_MAX_PARAMS) {
+    if (t->chan == NULL || nparams < 0 || nparams >= IRC_MAX_PARAMS) {
         return 0;
     }
     all[0] = t->name;
@@ -425,7 +441,12 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
         const char *all[IRC_MAX_PARAMS + 1];
         int n = 0;
 
-        if (t->user == NULL || nparams > IRC_MAX_PARAMS) {
+        /* The same `>=` and the same reason as write_to_members() above: the
+         * array is one longer than the cap because the target takes one slot, so
+         * 15 tail parameters would be 16 and would be refused by the builder.
+         * See the comment there for why the claim and the code used to disagree
+         * without anything noticing. */
+        if (t->user == NULL || nparams >= IRC_MAX_PARAMS) {
             return 0;
         }
         all[0] = t->name;

@@ -36,6 +36,14 @@ add_library(irc_core STATIC
   # the outbound side of the wire -- which is the first time anything in this
   # tree has had a reason to depend on more than one module under federation/.
   federation/link.c
+  # The resync: 4.3's SBURST, the wire format it froze, and the transaction that
+  # replaces rather than merges. It is listed LAST because it is the one module
+  # here that depends on both of the others -- link.c calls federation_resync()
+  # at establishment and fed_burst_abandon() on link-down, and burst.c reaches the
+  # guard chain's vocabulary through federation/verbs.h. A shadow is a
+  # transaction the size of a channel list, which is the reason it is a file and
+  # not a function in the module that decides which sockets are up.
+  federation/burst.c
 )
 
 target_link_libraries(irc_core PRIVATE pthread)
