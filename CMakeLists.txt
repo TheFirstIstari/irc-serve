@@ -90,12 +90,31 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   add_compile_options(-Wall -Wextra -Werror -Wpedantic -O2)
   if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
     add_compile_options(-fstrict-aliasing -fno-omit-frame-pointer)
-  elseif(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+  elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    # -------------------------------------------------------------------------
+    # THIS GATE IS MATCHES, NOT STREQUAL, AND THAT IS THE WHO FIX (#85)
+    # -------------------------------------------------------------------------
+    # It used to be `STREQUAL "Clang"`. CMake reports Apple's compiler as
+    # "AppleClang", so STREQUAL never matched on any macOS developer machine and
+    # -Weverything was silently skipped locally -- while ci_macos, which is a
+    # REQUIRED check, builds with exactly that compiler. In other words the
+    # strictest warning set in the tree has never run on the platform most of it
+    # is written on, and nothing said so.
+    #
+    # The fix has a complication, which is why the suppressions below are
+    # conditional rather than one flat list: Apple clang's -Weverything is a
+    # DIFFERENT SET from upstream clang's. A flat list is wrong in both
+    # directions -- it passes options Apple has no member for, and omits the ones
+    # only Apple has. So the shared set is below, and the two conditional blocks
+    # after it each add exactly what their compiler needs and nothing else.
+    #
     # -Weverything is kept on purpose: it is what surfaced the real API-hygiene
     # defects fixed alongside it (-Wmissing-prototypes on tags_parse /
-    # tags_serialize / sasl_* / assert_contract_exact_result). Narrowing it to
-    # a hand-picked list would hide the next one, so only the specific
-    # diagnostics below are opted out, each with its reason.
+    # tags_serialize / sasl_*). Narrowing it to a hand-picked list would hide the
+    # next one, so only the specific diagnostics below are opted out, each with
+    # its reason.
+    #
+    # THE SHARED SET, and the reasoning is upstream clang's, unchanged:
     #
     # -Wno-unsafe-buffer-usage: an experimental Clang diagnostic that fires on
     # essentially ALL pointer arithmetic and indexing in C (`p++`, `line[i]`,
@@ -104,15 +123,23 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     # Satisfying it would mean rewriting correct parsers into unnatural forms
     # with no safety gain, so it is disabled rather than obeyed. Do NOT
     # re-enable it and then "fix" the parsers to satisfy it.
+    # ** UPSTREAM CLANG ONLY -- see the conditional block below. Apple clang
+    # does not have this diagnostic in its -Weverything group at all. **
     #
     # -Wno-declaration-after-statement: enforces C89 declaration placement.
     # This project is explicitly C11 (CMAKE_C_STANDARD 11 above), where
     # mid-block declarations are legal and idiomatic; -Wpedantic turns this on
     # for C99+ and it contradicts the declared standard. Disabled so the
-    # dialect and the warning set agree.
+    # dialect and the warning set agree. Both compilers have it, for the same
+    # reason, so it is in the shared set.
     #
-    # -Wno-padded / -Wno-unused-macros: struct padding is deliberate and the
+    # -Wno-padded / -Wno-unused-macros: struct padding is deliberate, and the
     # log/assertion macros are used across translation-unit boundaries.
+    # (A caveat recorded rather than acted on: the -Wunused-macros half of that
+    # reason does not cover the nine FILE-LOCAL macros it actually hides --
+    # T_READY_MS in test_conn_lifecycle.c and one like it in eight other
+    # integration tests -- which really are dead. Both compilers report them.
+    # See docs/SPEC_TRACKING.md; they are pre-existing and deliberately left.)
     #
     # -Wno-disabled-macro-expansion: a GLIBC HEADER artifact, not a code defect.
     # bits/sigaction.h defines sa_handler as __sigaction_handler.sa_handler --
@@ -124,13 +151,50 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
                            -Wno-declaration-after-statement
                            -Wno-disabled-macro-expansion)
 
+    # ---- UPSTREAM CLANG ONLY ---------------------------------------------
     # -Wno-unsafe-buffer-usage is only RECOGNISED by Clang 16+ (the diagnostic
     # itself was added in 16). On Clang 15 or older the unknown option becomes
     # -Wunknown-warning-option, which -Werror promotes to a hard build failure
     # -- so a suppression intended to keep the build green would instead turn it
     # red. Guard it on the compiler version rather than assuming a modern Clang.
-    if(CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 16)
-      list(APPEND IRC_CLANG_WARNINGS -Wno-unsafe-buffer-usage)
+    #
+    # Scoped to STREQUAL "Clang" now, and that is the second half of #85: Apple
+    # clang excludes -Wunsafe-buffer-usage from its -Weverything group, so the
+    # option is not needed there. It happens to still be a RECOGNISED flag name
+    # in Apple clang 21, but relying on that would be relying on a driver detail
+    # with no bearing on whether the diagnostic exists -- and if a future Apple
+    # clang ever adds it to the group, this block is the one place to notice.
+    if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+      if(CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 16)
+        list(APPEND IRC_CLANG_WARNINGS -Wno-unsafe-buffer-usage)
+      endif()
+    endif()
+
+    # ---- APPLE CLANG ONLY -------------------------------------------------
+    # -Wno-poison-system-directories. This is the ONE diagnostic Apple clang has
+    # that upstream clang does not, and it is the only suppression added by #85.
+    #
+    # It is not a code diagnostic at all. Apple clang puts /usr/local/include in
+    # the SYSTEM include search path, and then warns, once per translation unit,
+    # that a system directory outside the active SDK is "unsafe for
+    # cross-compilation". It fires on an empty file with no #include in it, so it
+    # says nothing whatever about this project's source.
+    #
+    # It fires here because a Homebrew Node install has left /usr/local/include on
+    # this machine, populated with a `node` directory. That is a property of the
+    # TOOLCHAIN INSTALLATION, not of the repository, and there is nothing this
+    # CMakeLists can do about it -- the only fix would be to remove the
+    # directory. Suppressing it here rather than leaving the build red is the
+    # lesser evil, and it is scoped to AppleClang because upstream clang never had
+    # the diagnostic in the group and must keep the gate it already passes.
+    #
+    # Honest caveat: this suppression will NOT fire on a runner that does not have
+    # /usr/local/include in its clang search path, so ci_macos is not made green
+    # by suppressing it -- it simply will not produce the diagnostic. The
+    # suppression exists for the developer machine, which is the population #85 is
+    # actually about.
+    if(CMAKE_C_COMPILER_ID STREQUAL "AppleClang")
+      list(APPEND IRC_CLANG_WARNINGS -Wno-poison-system-directories)
     endif()
 
     add_compile_options(${IRC_CLANG_WARNINGS})

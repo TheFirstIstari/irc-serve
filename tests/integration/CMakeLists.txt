@@ -119,6 +119,16 @@ irc_add_integration_test(test_disconnect_nick test_disconnect_nick.c)
 # these states -- which is the reason they were not caught.
 irc_add_integration_test(test_nick_index test_nick_index.c)
 
+# 2.1 / 2.2: the open-addressed table both registries are served by, and the
+# probe chains deletion used to break (issue #107). A release that left a hole
+# rather than shifting the chain back made every nickname that probed past it
+# unreachable -- 401 for a connected user, and claimable by a second client --
+# while WHO kept listing it, because WHO walks the enumeration. Collision-
+# dependent, so it is not reachable from a one-name wire test; the two hand-
+# picked cases assert their own hash premise, and the bulk sweeps need no
+# particular pair to collide.
+irc_add_integration_test(test_strtab_probe test_strtab_probe.c)
+
 # 3: numerics are never written to a peer link. Source inspection, and labelled
 # as such; Phase 6 adds the end-to-end version once a peer exists.
 irc_add_integration_test(test_reply_guard test_reply_guard.c)

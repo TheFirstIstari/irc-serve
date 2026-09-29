@@ -1,8 +1,18 @@
 # CMake for src
+#
+# sasl_framework.c is here because it was NOT, and that was the defect (#86): it
+# was compiled as a source of the test_sasl_handshake executable from
+# tests/compliance/CMakeLists.txt, so SASL was absent from the shipped library
+# entirely -- a Phase-8 feature with no place in irc_core to grow into. It is
+# still the Phase-8 placeholder implementation (see docs/SERVER_DESIGN.md and
+# #82), and being in the library now means the code that replaces it has a target
+# to live in and a header (src/sasl_framework.h) that is on the include path for
+# everything linking irc_core, rather than a test-local extern declaration.
 add_library(irc_core STATIC
   protocol_parse.c
   ircv3_tags.c
   federation_handshake.c
+  sasl_framework.c
   core/message.c
   core/connection.c
   core/server.c

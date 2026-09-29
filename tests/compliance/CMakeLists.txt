@@ -1,12 +1,16 @@
 add_executable(test_ircv3_tags test_ircv3_tags.c)
 add_executable(test_tags_roundtrip test_tags_roundtrip.c)
-add_executable(test_sasl_handshake test_sasl_handshake.c ${PROJECT_SOURCE_DIR}/src/sasl_framework.c)
+# SASL is part of irc_core now (#86), so this links the library rather than
+# compiling src/sasl_framework.c as a source of its own. Linking the library is
+# the point: a test target that compiles the file itself passes whether or not
+# SASL is in the shipped node.
+add_executable(test_sasl_handshake test_sasl_handshake.c)
 add_executable(test_cap_negotiation test_cap_negotiation.c)
 
-target_link_libraries(test_ircv3_tags PRIVATE irc_core test_contracts)
-target_link_libraries(test_tags_roundtrip PRIVATE irc_core test_contracts)
-target_link_libraries(test_sasl_handshake PRIVATE test_contracts)
-target_link_libraries(test_cap_negotiation PRIVATE irc_core test_contracts)
+target_link_libraries(test_ircv3_tags PRIVATE irc_core)
+target_link_libraries(test_tags_roundtrip PRIVATE irc_core)
+target_link_libraries(test_sasl_handshake PRIVATE irc_core)
+target_link_libraries(test_cap_negotiation PRIVATE irc_core)
 
 add_test(NAME Ircv3Tags COMMAND test_ircv3_tags)
 add_test(NAME TagsRoundtrip COMMAND test_tags_roundtrip)
