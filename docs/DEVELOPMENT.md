@@ -32,27 +32,72 @@ history, force push and deletion disabled, admins enforced.
 The self-hosted CachyOS runner is where most Linux work happens, for three
 reasons that each rule out the obvious alternative:
 
-**One runner runs one job at a time.** Six matrix jobs on a single self-hosted
-runner would execute *serially* — around 6 × 30s, which is slower in wall clock
-than the parallel hosted matrix it replaces. So the Linux verification is a
-single job that loops through all four compiler × build-type combinations
-internally. Sequential-but-native beats parallel-but-emulated.
+**One runner process runs one job at a time.** A single self-hosted runner
+therefore serialises a 4-way matrix into four sequential builds. The fix is not
+one job that loops internally — that trades the parallelism away — it is **more
+runner processes**.
+
+`cachyos-x8664` is a 32-core / 29 GB box, so it runs **six instances** from a
+templated systemd unit, each in its own directory and each registered
+separately. `ci_linux` is a real 4-way matrix again, and the four jobs land on
+four different runners at once. Measured: `gcc Release` and `clang Debug` each
+completed in 19 s, concurrently, on the same box.
 
 **macOS cannot run there.** `ci_macos` stays hosted. That is the platform, not a
 preference.
 
 **The merge gate must not depend on a machine that can be switched off.**
 `ci_test` is deliberately small and deliberately hosted. It is the check that
-keeps a merge possible when `cachyos-x8664` is offline — which, as of writing, it
-intermittently is. If every required check lived on a personal machine,
-powering it off would be a development freeze, and turning it off would be the
-fastest way to break the project.
+keeps a merge possible when `cachyos-x8664` is unavailable. If every required
+check lived on a personal machine, powering it off would be a development
+freeze, and turning it off would be the fastest way to break the project.
 
 The consequence worth stating plainly: the required set is smaller than it was.
 Nine checks became three. That is a real reduction in what gates a merge, made
 deliberately in exchange for speed and independence from hosted capacity. What
 survives is a hosted Linux test run and both macOS configurations, so no required
 check is produced solely by the maintainer's own machine.
+
+### Installing or repairing the runner
+
+The runner runs as a **system** unit, not a user unit. The original
+`~/.config/systemd/user` installation only started while that user had an active
+login session, so it died at every reboot and reported nothing wrong; that is
+what "runner is offline" meant here. `multi-user.target.wants` symlinks are what
+make it survive a reboot, and they are installed by the script.
+
+```sh
+# needs sudo: it writes /etc/systemd/system and enables units at boot
+GH_RUNNER_TOKEN=$(gh api -X POST repos/TheFirstIstari/irc-serve/actions/runners/registration-token --jq .token) \
+sudo -E ./scripts/setup-self-hosted-runner.sh          # add INSTANCES=N to change the count
+```
+
+Then check it:
+
+```sh
+systemctl list-units 'actions-runner@*'                              # all should be active
+gh api repos/TheFirstIstari/irc-serve/actions/runners --jq '.runners[] | "\(.name) \(.status)"'
+sudo systemctl restart actions-runner@3                              # one instance, not all
+journalctl -u actions-runner@1 -f
+```
+
+Two behaviours are worth knowing, both found on the live machine rather than by
+reading the unit:
+
+- **A crash is reported as success.** `run.sh` does not propagate one: killing
+  `Runner.Listener` makes it log `Exiting with unknown error code: 137` and then
+  exit **0**, so `Restart=on-failure` never fires and the runner just stays dead.
+  The unit uses `Restart=always`. A genuinely broken config still surfaces
+  visibly: `StartLimitBurst=10` within `StartLimitIntervalSec=600` trips and the
+  unit goes to `failed`.
+- **A hard kill leaves a stale session.** GitHub then answers
+  `A session for this runner already exists` and the runner retries the conflict
+  in a loop, appearing `active` to systemd but `offline` to GitHub. It clears
+  itself in about 90 s. If it does not, delete the stale registration and
+  re-run `config.sh` for that instance.
+
+**Removing an instance** — `sudo systemctl disable --now actions-runner@4`, then
+delete it from GitHub's runner list, or it lingers as a ghost.
 
 ### Exposure from the self-hosted runner
 
