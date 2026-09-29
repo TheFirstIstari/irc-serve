@@ -104,6 +104,21 @@ irc_add_integration_test(test_ping_pong test_ping_pong.c)
 # 3.4 + Phase 3: QUIT closes through the reaper, and the nickname is released.
 irc_add_integration_test(test_quit test_quit.c)
 
+# Issue #102: a client that disconnects WITHOUT QUIT -- the ordinary end of a
+# connection, and the path QUIT's test cannot reach -- must leave nothing behind
+# in the nick index. Separate from test_quit.c because QUIT is a line the node
+# gets to interpret and a dropped TCP connection is not: this is the one where
+# the teardown was doing half the work. Under -DIRC_SANITIZE=ON the WHO in here
+# is the statement that reads the freed conn_t.
+irc_add_integration_test(test_disconnect_nick test_disconnect_nick.c)
+
+# Issue #103, and the ownership guard the #102 fix rests on: one connection is in
+# the enumeration at most once however many names it claims, a teardown retires
+# every name it holds, and a connection that was DENIED a name cannot evict the
+# holder's. In process against server_t, because no command sequence reaches
+# these states -- which is the reason they were not caught.
+irc_add_integration_test(test_nick_index test_nick_index.c)
+
 # 3: numerics are never written to a peer link. Source inspection, and labelled
 # as such; Phase 6 adds the end-to-end version once a peer exists.
 irc_add_integration_test(test_reply_guard test_reply_guard.c)
