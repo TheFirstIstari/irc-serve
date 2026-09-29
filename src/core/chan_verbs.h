@@ -74,6 +74,33 @@
 int chan_split_list(char *store, size_t dstcap, const char *src,
                     const char **names, int max);
 
+/* The three answers to "may this node make that change?", which is the question
+ * 2.2's single-writer rule asks and which every state verb asks before it
+ * touches anything.
+ *
+ * IT HAD TWO ANSWERS AND NOW HAS THREE, and the third is the interesting one.
+ * `REFUSED` is 2.2's fail-closed case and is still exactly what it was: the
+ * origin is gone, so nothing that needs the origin may happen. `FORWARD` is the
+ * case a single node cannot produce and a federated one hits on its first
+ * non-owned channel: the origin is somewhere this node CAN reach, so 3.1's
+ * "forward to the owner" is a real destination, and refusing is throwing away a
+ * request the mesh can carry. The two are opposites for the operator -- one
+ * says "this server is misconfigured or the mesh is broken", the other says
+ * "this works, look at the forward" -- and folding them into one boolean
+ * produced the pre-C3 behaviour, where a linked non-owned channel answered 437
+ * and the state verb had no forward arm to take. */
+typedef enum {
+    /* Proceed. This node owns the channel, or the call is a query. */
+    CHAN_VERDICT_OK = 0,
+    /* Do NOT write locally. The caller must hand the change to
+     * fanout_deliver(..., FANOUT_STATE_CHANGE, ...) and answer the client
+     * with its own success numeric: the ORIGIN performed the action, so the
+     * client is not lied to. */
+    CHAN_VERDICT_FORWARD,
+    /* Refused. 437 has already been sent and NOTHING has been modified. */
+    CHAN_VERDICT_REFUSED
+} chan_verdict_t;
+
 /* The command surface. Each is a `command_t::fn` and each obeys the same shape:
  * validate arity, resolve the channel, ask the authority question, and only then
  * touch state. The authority question is asked in chan_verbs.c's own

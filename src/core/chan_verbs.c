@@ -42,6 +42,7 @@
 #include <string.h>
 
 #include "core/channel.h"
+#include "core/fanout.h"
 #include "core/reply.h"
 
 /* ---------------------------------------------------------------------------
@@ -158,16 +159,35 @@ static chan_t *resolve_joined(server_t *s, conn_t *c, const char *arg)
  * a later SJOIN corrects -- and transient, self-healing divergence is precisely
  * what section 1 says the single-writer rule converts permanent divergence into.
  *
- * Returns 1 when the caller may proceed. On 0, 437 has already been sent to `c`
- * and NOTHING has been modified.
- */
-static int authority_ok(server_t *s, conn_t *c, const chan_t *ch,
-                        const char *verb, int stateful)
+ * THREE ANSWERS, and the middle one is why this is no longer an int:
+ *
+ *   OK        proceed. This node owns the channel, or the call is a query.
+ *   FORWARD   do not write locally; hand it to 3.1's forward arm. The origin is
+ *             somewhere this node can reach, so the request is carryable.
+ *   REFUSED   437, already sent, nothing modified. The origin is unreachable.
+ *
+ * The pre-C3 version returned 0 for BOTH of the last two and printed one
+ * observable line for them with a `state=` field to tell them apart. That was
+ * the same information, but the CALLER could only act on it as "do nothing",
+ * which is why 3.1's state-change forward arm had no caller at all: the only
+ * thing a boolean verdict could say about a non-owned channel was no.
+ *
+ * AND THE CLIENT IS NOT TOLD. A FORWARD is answered with the verb's own success
+ * numeric exactly as an OK would be, because the origin performs the action:
+ * the client asked a server to make a change to a channel and the mesh will make
+ * it. 437 there would tell a client its own operator status was not accepted,
+ * which is a lie about something that is about to be true. The one thing a
+ * client is told that is a lie, and it was already a lie before this change --
+ * a forward can still be refused further along, at the peer's 437 or at a NO_ROUTE
+ * -- so the honest statement is that the node accepted the request and is not
+ * promising the mesh accepted it. */
+static chan_verdict_t authority_ok(server_t *s, conn_t *c, const chan_t *ch,
+                                   const char *verb, int stateful)
 {
     chan_origin_state_t st = chan_origin_state(s, ch);
 
     if (st == CHAN_ORIGIN_SELF) {
-        return 1;
+        return CHAN_VERDICT_OK;
     }
     if (stateful == 0) {
         /* A query against a channel this node does not own. The answer may be
@@ -176,32 +196,39 @@ static int authority_ok(server_t *s, conn_t *c, const chan_t *ch,
         printf("[observable] chan_query: channel=%s verb=%s origin=%s "
                "state=LINKED_CACHE nservers=%zu\n",
                ch->name, verb, ch->origin, ch->nservers);
-        return 1;
+        return CHAN_VERDICT_OK;
     }
 
-    /* The refusal. Two situations reach here and they are reported differently
-     * because they have different causes and different fixes:
-     *
-     *   ORPHANED           the origin is gone and no link bears its name. This is
-     *                     2.2's "locally orphaned" case, and 437 is the whole of
-     *                     fail-closed: local members still see each other, and
-     *                     nothing that needs the origin is permitted.
-     *   LINKED_NO_FORWARD  a peer connection for the origin exists, so 3.1's
-     *                     "forward to the owner" is the right destination -- and
-     *                     there is no forward path in this phase, because 4.3's
-     *                     SJOIN/SPART/STOPIC/SSMODE/SKICK are Phase 6.
-     *
-     * The second is the honest limit of this phase. The alternative -- apply it
-     * locally because the action looks harmless -- is precisely the permanent
-     * divergence 2.2 forbids, and the node would have no way to notice it had
-     * done it. */
+    if (st == CHAN_ORIGIN_LINKED) {
+        /* FORWARD, not 437. 3.1's "non-owned channel | state-change | forward
+         * ONLY" has a real destination here: a link bears the origin's name and
+         * is ESTABLISHED, which is precisely what server_find_peer() means by a
+         * route. The pre-C3 comment here said "there is no forward path in this
+         * phase, because 4.3's SJOIN/SPART/STOPIC/SSMODE/SKICK are Phase 6" --
+         * that is now FALSE and is retracted: the forward path is
+         * fanout_deliver()'s, 4.3's verbs are in federation/verbs.c, and the
+         * arm is reachable.
+         *
+         * NO LOCAL WRITE, and the reason is 2.2's rather than 3.1's: a node that
+         * applied a state change on a channel it does not own holds a copy the
+         * origin will not reconcile, permanently. Applying it because the action
+         * "looks harmless" is the exact failure the single-writer rule exists to
+         * prevent, and the node would have no way to notice it had done it. */
+        printf("[observable] chan_state_forward: channel=%s verb=%s origin=%s\n",
+               ch->name, verb, ch->origin);
+        return CHAN_VERDICT_FORWARD;
+    }
+
+    /* The refusal, and now only the refusal: 2.2's LOCALLY ORPHANED case, with
+     * no ESTABLISHED link bearing the origin's name. This is fail-closed in the
+     * whole sense -- local members still see each other, and nothing that needs
+     * the origin is permitted. */
     printf("[observable] chan_state_refused: channel=%s verb=%s origin=%s "
-           "state=%s numeric=437\n", ch->name, verb, ch->origin,
-           (st == CHAN_ORIGIN_UNREACHABLE) ? "ORPHANED" : "LINKED_NO_FORWARD");
+           "state=ORPHANED numeric=437\n", ch->name, verb, ch->origin);
     (void)reply(s, c, "437", (const char *const[]){ ch->name }, 1,
                 "Cannot change %s: this server is not its origin (%s)", ch->name,
                 ch->origin);
-    return 0;
+    return CHAN_VERDICT_REFUSED;
 }
 
 /* ---------------------------------------------------------------------------
@@ -234,6 +261,70 @@ static int names_group(const struct member *m)
     return 0;
 }
 
+/* The same three groups for a REMOTE member, as a flag word rather than a
+ * `struct member *`. The two lists are walked by the same render below and the
+ * grouping has to agree, which is why it is derived from the same two bits
+ * rather than being a second rule written somewhere else. */
+static int names_group_flags(unsigned flags)
+{
+    if ((flags & CHAN_MEMBER_OP) != 0u) {
+        return 1;
+    }
+    if ((flags & CHAN_MEMBER_VOICE) != 0u) {
+        return 2;
+    }
+    return 0;
+}
+
+/* Emit `nick` into the 353 line under construction, flushing first if it will not
+ * fit. Returns the new `used`. The flush is RFC 2812 3.3.5's "a 353 MAY be
+ * split across lines" and 3.2's "never deliver a shortened value" together: a
+ * half-written nickname is worse than one more line.
+ *
+ * This is the ONE place a name is rendered into a 353, and it takes the two
+ * lists as (nick, flags) rather than reading either of them itself. That is what
+ * makes 7/Phase 4's fixed order -- nicks, then ops, then voiced -- a property of
+ * this function rather than of whichever list a member happens to be in, and it
+ * is what lets the LOCAL roster and the REMOTE roster share one order instead of
+ * two that could disagree. */
+static size_t names_emit(server_t *s, conn_t *dst, const char *const *mid,
+                         int group, const char *nick, char *line, size_t used,
+                         int *produced)
+{
+    const char *sign = (group == 1) ? "@" : (group == 2) ? "+" : "";
+    size_t nicklen = strlen(nick);
+    size_t need = strlen(sign) + nicklen + 1u; /* +1 for the joining space */
+
+    if (used != 0 && used + need > (size_t)CHAN_NAMES_LINE) {
+        (void)reply(s, dst, "353", mid, 2, "%s", line);
+        *produced = 1;
+        used = 0;
+    }
+    if (used != 0) {
+        line[used++] = ' ';
+    }
+    if (sign[0] != '\0') {
+        line[used++] = sign[0];
+    }
+    memcpy(line + used, nick, nicklen);
+    used += nicklen;
+    line[used] = '\0';
+    return used;
+}
+
+/* Six passes over two small arrays, no sort, no allocation, no comparison
+ * function. O(6n) rather than O(n log n), and it is the same cost a counting
+ * sort would be.
+ *
+ * WHY SIX AND NOT THREE. The grouping is a property of the RENDER and the two
+ * rosters are separate storage, so the order has to be computed across both:
+ * every group is walked over members[] and then over remotes[]. The alternative
+ * -- two separate 353s, one per roster -- would put the local names before the
+ * remote ones regardless of their flags, so a channel with a remote op and a
+ * local plain member would render in an order Phase 4 does not specify and
+ * 7/Phase 6's acceptance criterion cannot be asserted. Within a group the local
+ * list keeps join order and the remote list keeps arrival order, and both are
+ * deterministic. */
 static void send_names_list(server_t *s, conn_t *dst, const chan_t *ch)
 {
     const char *const mid[2] = { "=", ch->name };
@@ -247,9 +338,6 @@ static void send_names_list(server_t *s, conn_t *dst, const chan_t *ch)
 
         for (size_t i = 0; i < ch->nmembers; i++) {
             const struct member *m = &ch->members[i];
-            const char *sign;
-            size_t nicklen;
-            size_t need;
 
             if (m->c == NULL || m->c->nick[0] == '\0') {
                 continue;
@@ -257,27 +345,15 @@ static void send_names_list(server_t *s, conn_t *dst, const chan_t *ch)
             if (names_group(m) != group) {
                 continue;
             }
-            sign = (group == 1) ? "@" : (group == 2) ? "+" : "";
-            nicklen = strlen(m->c->nick);
-            need = strlen(sign) + nicklen + 1u; /* +1 for the joining space */
-            if (used != 0 && used + need > (size_t)CHAN_NAMES_LINE) {
-                /* Flush rather than truncate. RFC 2812 3.3.5 explicitly allows a
-                 * 353 to be split across lines, and 3.2 forbids delivering a
-                 * shortened value -- a half-written nickname is worse than one
-                 * more line. */
-                (void)reply(s, dst, "353", mid, 2, "%s", line);
-                produced = 1;
-                used = 0;
+            used = names_emit(s, dst, mid, group, m->c->nick, line, used, &produced);
+        }
+        for (size_t i = 0; i < ch->nremotes; i++) {
+            const chan_remote_t *r = &ch->remotes[i];
+
+            if (r->nick[0] == '\0' || names_group_flags(r->flags) != group) {
+                continue;
             }
-            if (used != 0) {
-                line[used++] = ' ';
-            }
-            if (sign[0] != '\0') {
-                line[used++] = sign[0];
-            }
-            memcpy(line + used, m->c->nick, nicklen);
-            used += nicklen;
-            line[used] = '\0';
+            used = names_emit(s, dst, mid, group, r->nick, line, used, &produced);
         }
         if (used != 0) {
             (void)reply(s, dst, "353", mid, 2, "%s", line);
@@ -351,27 +427,76 @@ static void send_creation_time(server_t *s, conn_t *dst, const chan_t *ch)
 }
 
 /* ---------------------------------------------------------------------------
- * The per-member broadcast
+ * 3.1's state-change arm, and the reason every state verb goes through it
  * ---------------------------------------------------------------------------
- * The ONE place a channel emission reaches more than one connection. A handler
- * states WHO and WHAT; this decides that it goes to every local member, and it
- * does so through reply.h's send_line(), so the peer-link and CLOSING refusals
- * still apply to a JOIN echo as much as to a numeric.
- */
-static void broadcast(server_t *s, const chan_t *ch, const char *command,
-                      const char *prefix, const char *const *params, int nparams)
+ * WHY THE FIVE STATE VERBS NO LONGER BROADCAST FOR THEMSELVES.
+ *
+ * This file used to have its own broadcast() -- the helper above -- and so did
+ * core/fanout.c, and the two implemented the same half of 3.1's table with only
+ * one of them having a forward arm. That is not tidiness, it is the shape a
+ * missing forward takes: a JOIN that reaches every local member and reaches no
+ * peer is indistinguishable, from the log, from a JOIN that reached every peer
+ * and was refused by all of them. The duplication is where a forward gets lost,
+ * so it is gone: these five verbs now resolve their channel, apply the change
+ * locally, and hand the EMISSION to fanout_deliver() under
+ * FANOUT_STATE_CHANGE, which is the one place that decides "local write, forward
+ * to the owner, forward to servers[] -- or all of them".
+ *
+ * The verb class is NOT a parameter here, and that is what makes "delivered
+ * exactly once" structural rather than a convention: fanout_resolve() recorded
+ * the class in the resolved target and fanout_deliver() reads it out of that
+ * same struct, so a handler cannot resolve a target as a `message` and deliver
+ * it as a `state-change`. The row a target took when it was resolved is the row
+ * it is delivered by, and there is no second decision in between to disagree
+ * with the first.
+ *
+ * `params` are the CLIENT parameters after the target, which is 3.1's target
+ * already resolved and canonicalised. `exclude` is NULL for all five: RFC 1459
+ * 2.3.1 has the actor see its own JOIN, PART, TOPIC, MODE and KICK, and
+ * excluding anyone would be a second, different rule per verb.
+ *
+ * THE WHOLE PARAMETER LIST IS DELIVERED, and it used to be possible to say
+ * otherwise. There was an `nvisible` argument here, added by C3 to preserve
+ * byte-exact Phase 4 assertions -- two of them, both in test_channels.c's
+ * test_topic(), on the echo a setter and a second member see. Its only user was
+ * TOPIC: the client-facing channel echo was rendered as the bare `:setter TOPIC
+ * #chan` with the topic dropped, which RFC 2812 3.3.1 does not describe -- the
+ * topic is the trailing parameter of the TOPIC command, and the peer-side STOPIC
+ * already carries it. A parameter that exists only to preserve a wrong output is
+ * a permanent tax on every future caller in exchange for a one-time migration of
+ * our own tests, so it is gone, the echo is RFC-correct, and those two
+ * assertions were updated to the RFC form.
+ *
+ * A verb that ever needs a shorter view wants a DIFFERENT FUNCTION for it,
+ * named for the shorter view, rather than a count threaded through the one that
+ * routes -- because "how much of this list the client sees" and "where does this
+ * line go" are unrelated questions and a caller that can answer the second
+ * wrongly by answering the first creatively is a bug waiting for a second verb.
+ *
+ * IT IS SAFE TO CALL WHEN NOTHING WAS APPLIED LOCALLY. On a CHAN_VERDICT_FORWARD
+ * the caller applies nothing -- 2.2 forbids it -- and still calls this, because
+ * the non-owned `state-change` row is "forward only, never a local write" and
+ * forwarding IS the action. A caller that treated FORWARD as "do nothing" would
+ * answer every client on a non-owned channel with success and change nothing
+ * anywhere. */
+static void deliver_state_change(server_t *s, conn_t *c, chan_t *ch,
+                                 const char *verb, const char *prefix,
+                                 const char *const *params, int nparams)
 {
-    for (size_t i = 0; i < ch->nmembers; i++) {
-        /* The same rule chan_member_leave() applies, for the same reason: a
-         * member whose conn the loop has already marked CLOSING cannot be
-         * written to, and attempting it would be a guaranteed n_reply_refused
-         * -- the counter reply.c keeps at zero because a non-zero value is a
-         * bug report and a teardown is not one. */
-        if (chan_member_live(&ch->members[i]) == 0) {
-            continue;
-        }
-        (void)send_line(s, ch->members[i].c, prefix, command, params, nparams);
+    fanout_target_t t;
+
+    if (ch == NULL || !fanout_resolve(s, c, ch->name, FANOUT_STATE_CHANGE, &t)) {
+        /* fanout_resolve() answers 403/401 on failure and the channel is one
+         * this node holds, so this is a caller that lost its chan_t. Nothing is
+         * counted here: it is a bug, and fanout_resolve() has already said
+         * something to the client. */
+        return;
     }
+    /* `carry` is NULL because this is an ORIGINATING emission: a client sent the
+     * command and this node is minting its 2.4 identity at the forward. The
+     * relay path is federation/verbs.c, and it hands its own tags to
+     * fanout_deliver() instead. */
+    (void)fanout_deliver(s, &t, prefix, verb, params, nparams, NULL, NULL);
 }
 
 /* ---------------------------------------------------------------------------
@@ -416,7 +541,7 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
         chan_t *ch;
         int created = 0;
         char prefix[CONN_HOSTMASK_MAX];
-        const char *params[1];
+        chan_verdict_t verdict;
 
         if (!canonical_channel(s, c, names[i], canonical, sizeof canonical)) {
             continue; /* 403 already sent */
@@ -456,8 +581,31 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
          * user-visible, which is the failure the single-writer rule exists to
          * prevent. The authority check is therefore what makes the enforcement
          * below legitimate rather than a cache pretending to enforce. */
-        if (!authority_ok(s, c, ch, "JOIN", 1)) {
-            continue;
+        /* A FORWARD VERDICT DOES NOT STOP A JOIN, and this is the ONE exception
+         * to "an origin-requiring state change on a non-owned channel applies
+         * nothing here", and the exception is the whole of JOIN's meaning.
+         *
+         * A JOIN is a LOCAL MEMBERSHIP FACT: this node has just decided that one
+         * of its own clients is on a channel, and that fact is true whether or
+         * not this node owns the channel. The channel's STATE -- its topic, its
+         * modes, who is an op -- belongs to the origin, and a JOIN adds none of
+         * those except the creator's +o. So the local half runs (chan_add_member,
+         * the broadcast, the joiner's own numerics) AND the SJOIN is forwarded,
+         * and the origin is the one that decides what the membership means.
+         *
+         * WRITING THIS AS THE GENERAL RULE INSTEAD GIVES AN EMPTY PEER ROSTER.
+         * If a JOIN on a non-owned channel applied nothing locally, then a user
+         * who joins a channel their own server does not own would not be a
+         * member of it as far as 353 is concerned, would not receive that
+         * channel's messages, and the SJOIN that would have told the origin
+         * about them would never be sent -- because the forwarding is part of
+         * the same call. The user would be on a channel they cannot see and
+         * cannot talk in, and the only trace would be their own 366. That is
+         * the single most visible way to get this wrong, which is why it is
+         * spelled out at the call rather than left to the general rule. */
+        verdict = authority_ok(s, c, ch, "JOIN", 1);
+        if (verdict == CHAN_VERDICT_REFUSED) {
+            continue; /* 437 already sent; nothing has been touched */
         }
         if (chan_banned(ch, c->nick, c->user, c->host)) {
             (void)reply(s, c, "474", (const char *const[]){ ch->name }, 1,
@@ -519,8 +667,13 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
                         "Cannot join channel");
             continue;
         }
-        params[0] = ch->name;
-        broadcast(s, ch, "JOIN", prefix, params, 1);
+        /* Through 3.1's table rather than through broadcast(): on an OWNED
+         * channel this writes to the members and forwards to servers[] UNION the
+         * ESTABLISHED links, and on a non-owned one it forwards to the owner
+         * without a second local write -- the local one already happened above,
+         * and the non-owned row is "forward ONLY" precisely so that the ORIGIN
+         * is the node that emits to its members. */
+        deliver_state_change(s, c, ch, "JOIN", prefix, NULL, 0);
 
         send_topic(s, c, ch);
         send_names_list(s, c, ch);
@@ -557,16 +710,38 @@ void handle_part(server_t *s, conn_t *c, const message_t *m)
 
     for (int i = 0; i < n; i++) {
         chan_t *ch = resolve_joined(s, c, names[i]);
+        char prefix[CONN_HOSTMASK_MAX];
+        const char *params[1];
+        chan_verdict_t verdict;
 
         if (ch == NULL) {
             continue;
         }
-        if (!authority_ok(s, c, ch, "PART", 1)) {
-            continue;
+        verdict = authority_ok(s, c, ch, "PART", 1);
+        if (verdict == CHAN_VERDICT_REFUSED) {
+            continue; /* 437 already sent */
         }
-        /* The echo reaches the parting client too (echo_to_who 1) because it is
-         * still a usable connection and RFC 1459 2.3.1 has it see its own
-         * departure. */
+        if (verdict == CHAN_VERDICT_FORWARD) {
+            /* No local write, and the client is NOT told: it left a channel it
+             * was on, locally, and that is a fact about this node's membership
+             * that no origin can undo. A PART is not a state change to the
+             * channel's state -- it is a withdrawal from it -- and 2.2's
+             * single-writer rule is about the channel's state, so the local half
+             * runs on both paths. What differs is the forward: on a non-owned
+             * channel the departure has to reach the origin too, or its roster
+             * keeps a member this node no longer has. */
+            if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
+                continue;
+            }
+            params[0] = (reason != NULL) ? reason : c->nick;
+            deliver_state_change(s, c, ch, "PART", prefix, params,
+                                 (reason != NULL) ? 1 : 0);
+        }
+        /* The echo reaches the parting client too because it is still a usable
+         * connection and RFC 1459 2.3.1 has it see its own departure -- which is
+         * the SAME emission the origin gets, so the local write is the forwarding
+         * row's write on an owned channel and this explicit one on a non-owned
+         * one, where 3.1 forbids a second pass through the table. */
         chan_member_leave(s, ch, c, 1, reason);
         (void)chan_detach_conn(c, ch);
         /* Disposal AFTER the departure, and this is the only place a PART frees
@@ -588,6 +763,7 @@ void handle_part(server_t *s, conn_t *c, const message_t *m)
 void handle_topic(server_t *s, conn_t *c, const message_t *m)
 {
     chan_t *ch;
+    chan_verdict_t verdict;
     int setting;
 
     if (m->nparams < 1) {
@@ -603,10 +779,47 @@ void handle_topic(server_t *s, conn_t *c, const message_t *m)
     if (ch == NULL) {
         return;
     }
-    if (!authority_ok(s, c, ch, "TOPIC", setting)) {
-        return;
+    /* Asked ONCE, and the answer held, because authority_ok() reports on the
+     * observable output and a reader seeing two `chan_state_forward` lines for
+     * one TOPIC would reasonably ask what the second one was. */
+    verdict = authority_ok(s, c, ch, "TOPIC", setting);
+    if (verdict == CHAN_VERDICT_REFUSED) {
+        return; /* 437 already sent */
     }
     if (setting == 0) {
+        send_topic(s, c, ch);
+        return;
+    }
+    if (verdict == CHAN_VERDICT_FORWARD) {
+        /* THE FORWARD PATH, and it is the clearest case of the two consequences
+         * this change has. Nothing is applied locally -- a topic this node does
+         * not own is a CACHE, and writing a cache field on a client's say-so is
+         * the permanent divergence 2.2 forbids -- and the client is still
+         * answered 332/333 with whatever the node currently holds.
+         *
+         * THE CLIENT IS NOT LIED TO, and that is the point. The origin performs
+         * the action, so the client asked a server to change a channel and the
+         * mesh will change it; answering 437 would tell the client its own
+         * request was rejected, which is false. The honest limits are stated
+         * rather than hidden: the forward can still be refused further along --
+         * at the peer's 437, or at a NO_ROUTE if the origin's link went down
+         * between the authority check and the queue -- so what this node promises
+         * is that it ACCEPTED the request, not that the mesh accepted it. */
+        char prefix[CONN_HOSTMASK_MAX];
+        const char *params[1];
+
+        if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
+            return;
+        }
+        /* The topic IS the parameter, and it goes out to the members as well as
+         * to the peer. RFC 2812 3.3.1's TOPIC is `<channel> [:<topic>]`, so the
+         * client-facing echo is `:setter TOPIC #CHAN :<topic>` and dropping the
+         * trailing parameter would leave every member to re-read 332 to learn
+         * what a line it was just sent says. A peer cannot rebuild a topic from a
+         * bare `STOPIC #chan` either, which is why the same parameter serves
+         * both renderings. */
+        params[0] = m->params[1];
+        deliver_state_change(s, c, ch, "TOPIC", prefix, params, 1);
         send_topic(s, c, ch);
         return;
     }
@@ -624,13 +837,13 @@ void handle_topic(server_t *s, conn_t *c, const message_t *m)
 
     {
         char prefix[CONN_HOSTMASK_MAX];
-        const char *params[2];
+        const char *params[1];
 
         if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
             return;
         }
-        params[0] = ch->name;
-        broadcast(s, ch, "TOPIC", prefix, params, 1);
+        params[0] = m->params[1];
+        deliver_state_change(s, c, ch, "TOPIC", prefix, params, 1);
     }
     /* The setter is told the topic back as 332/333, which is how it learns the
      * canonical form and the server's clock. */
@@ -802,9 +1015,16 @@ void handle_kick(server_t *s, conn_t *c, const message_t *m)
     if (ch == NULL) {
         return;
     }
-    if (!authority_ok(s, c, ch, "KICK", 1)) {
-        return;
+    if (authority_ok(s, c, ch, "KICK", 1) == CHAN_VERDICT_REFUSED) {
+        return; /* 437 already sent */
     }
+    /* NOT A FORWARD CASE, and the reason is 2.2 rather than 3.1. A KICK is only
+     * meaningful on a channel this node ORIGINATES, because the kicker has to be
+     * an operator OF THAT CHANNEL and the operator set is the origin's record;
+     * a cache cannot decide who may remove whom. So a KICK on a non-owned but
+     * linked channel is answered 437 by the verdict path below rather than
+     * forwarded -- the privilege check that follows is the origin's rule and
+     * applying it here would be the cache pretending to enforce. */
     if (!chan_has_flag(ch, c, CHAN_MEMBER_OP)) {
         /* 482, not 481. 481 is "you need to be a channel operator to do this"
          * for a mode the client may not set at all; 482 is "you are not
@@ -841,10 +1061,14 @@ void handle_kick(server_t *s, conn_t *c, const message_t *m)
 
     /* The echo, in RFC 1459 2.3.1's parameter order: prefix, channel, target,
      * reason. */
-    params[0] = ch->name;
-    params[1] = target->c->nick;
-    params[2] = reason;
-    broadcast(s, ch, "KICK", prefix, params, 3);
+    /* Through 3.1's table, and the target is included in the parameter list
+     * because the CLIENT shape of a KICK is (channel, target, reason) and 3.1's
+     * target is prepended by the fan-out. The frozen SKICK shape puts the
+     * KICKER first and the channel second; the re-shaping is fed_sverb_params()'s
+     * job and is not something this handler knows about. */
+    params[0] = target->c->nick;
+    params[1] = reason;
+    deliver_state_change(s, c, ch, "KICK", prefix, params, 2);
 
     {
         conn_t *kicked = target->c;
@@ -894,9 +1118,10 @@ void handle_kick(server_t *s, conn_t *c, const message_t *m)
 void handle_mode(server_t *s, conn_t *c, const message_t *m)
 {
     chan_t *ch;
+    chan_verdict_t verdict;
     int plus;
     char prefix[CONN_HOSTMASK_MAX];
-    const char *params[4];
+    const char *params[3];
 
     if (m->nparams < 1) {
         (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
@@ -932,9 +1157,12 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
     }
 
     /* A mode change is a state change, so the single-writer rule applies before
-     * anything else is examined. */
-    if (!authority_ok(s, c, ch, "MODE", 1)) {
-        return;
+     * anything else is examined. The verdict is ASKED HERE AND HELD, because the
+     * 482 and 472 refusals below come first in the RFC order and a caller that
+     * re-asked would report `chan_state_forward` once per refused attempt. */
+    verdict = authority_ok(s, c, ch, "MODE", 1);
+    if (verdict == CHAN_VERDICT_REFUSED) {
+        return; /* 437 already sent */
     }
     if (m->params[1][0] != '+' && m->params[1][0] != '-') {
         (void)reply(s, c, "472", (const char *const[]){ ch->name }, 1,
@@ -962,6 +1190,26 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
      * argument to a prefix or ban mode is params[2] for EVERY letter in the
      * string, which is what RFC 1459 2.3.1 specifies: "+oov nick" is two
      * promotions of one nick, not two different nicks. */
+    /* THE FORWARD CASE IS REFUSED, and this is a DELIBERATE difference from
+     * TOPIC. 2.2 says only the origin evaluates +b, +e and +I and that +o and
+     * +v are prefix modes -- and 4.3's frozen SMODES shape names the node that
+     * EVALUATED the change as its first field, so a forwarded SMODES would have
+     * to name a node this one is not. There is no honest line to send, and
+     * sending one that names this node as the evaluator would be asserting an
+     * authority 2.2 does not grant. So the verdict's FORWARD outcome becomes 437
+     * for MODE specifically, and the reason is printed rather than swallowed so
+     * an operator can see it is a policy and not a missing forward. */
+    if (verdict == CHAN_VERDICT_FORWARD) {
+        printf("[observable] chan_mode_refused: channel=%s nick=%s "
+               "reason=MODE_NEEDS_ORIGIN\n",
+               ch->name, c->nick);
+        (void)reply(s, c, "437", (const char *const[]){ ch->name }, 1,
+                    "Cannot change %s: channel modes are the origin's to "
+                    "evaluate (%s)",
+                    ch->name, ch->origin);
+        return;
+    }
+
     for (size_t i = 1; m->params[1][i] != '\0'; i++) {
         char mode = m->params[1][i];
         char rendered[4];
@@ -1011,10 +1259,15 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
             rendered[0] = plus ? '+' : '-';
             rendered[1] = mode;
             rendered[2] = '\0';
-            params[0] = ch->name;
-            params[1] = rendered;
-            params[2] = target->c->nick;
-            broadcast(s, ch, "MODE", prefix, params, 3);
+            /* The four-parameter echo, split into the two the fan-out wants: the
+             * rendered mode is a MIDDLE parameter and the nickname is the
+             * trailing one, which is why they are two array slots and not one
+             * string with a space in it -- 3.2 refuses to deliver a value
+             * containing a separator in a non-final position rather than
+             * reshaping it, and RFC 1459 2.3.1 has them as two. */
+            params[0] = rendered;
+            params[1] = target->c->nick;
+            deliver_state_change(s, c, ch, "MODE", prefix, params, 2);
             printf("[observable] chan_member_mode: channel=%s by=%s nick=%s "
                    "mode=%c set=%d\n", ch->name, c->nick, target->c->nick, mode,
                    plus);
@@ -1050,10 +1303,9 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
             rendered[0] = plus ? '+' : '-';
             rendered[1] = 'b';
             rendered[2] = '\0';
-            params[0] = ch->name;
-            params[1] = rendered;
-            params[2] = m->params[2];
-            broadcast(s, ch, "MODE", prefix, params, 3);
+            params[0] = rendered;
+            params[1] = m->params[2];
+            deliver_state_change(s, c, ch, "MODE", prefix, params, 2);
             printf("[observable] chan_ban_mode: channel=%s by=%s mask=%s set=%d "
                    "nbans=%zu origin=%s\n", ch->name, c->nick, m->params[2], plus,
                    ch->nbans, ch->origin);

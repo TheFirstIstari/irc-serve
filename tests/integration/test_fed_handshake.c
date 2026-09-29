@@ -12,13 +12,14 @@
  * WHAT IS ASSERTED, AND ON WHAT
  * ---------------------------------------------------------------------------
  * Every assertion here is on OBSERVABLE OUTPUT -- the child's own [observable]
- * lines and, in three cases, the bytes this test sends and receives. No case
+ * lines and, in four cases, the bytes this test sends and receives. No case
  * reads a struct field, and none of them would notice a reorder of server_t.
- * The eight cases, in the order they run:
+ * The nine cases, in the order they run:
  *
  *   1. same name, both directions    SELF_NAME, and NOBODY reaches ESTABLISHED
  *   2. wrong secret                  BAD_SECRET, and the exchange still failed
  *   3. NO secret configured          NO_SECRET, and NOT BAD_SECRET
+ *   3b. answer names another server  NAME_MISMATCH, and NOT a duplicate
  *   4. name already ESTABLISHED      DUPLICATE_LINK, and fed_duplicate=1
  *   5. handshake never answered      link_timeout / state=TIMED_OUT
  *   6. liveness, the positive case   keepalives flow and lines= climbs
@@ -706,6 +707,134 @@ static void case_no_secret_refused(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * Case 3b: a sink that answers with a DIFFERENT claim
+ * ---------------------------------------------------------------------------
+ * FED_NAME_MISMATCH is the one verdict 2.3 lists that no case reached, and it is
+ * the one that is WIRE-CONFIRMED BUT UNTESTED: fed_check_federate() produces it
+ * on the fourth step, and nothing in the suite drove the path.
+ *
+ * The situation is a misconfiguration with a specific signature. Node A is told
+ * to DIAL a peer it calls `irc.b`, so A creates a link NAMED irc.b and sends
+ * `:irc.a FEDERATE irc.a <epoch> <secret> <version>` down it. The far end here
+ * is a socket this test owns, and it answers with a claim for a DIFFERENT name --
+ * `irc.wrong`. The name on the wire therefore disagrees with the name on the
+ * link it arrived on, which is the only way to reach that verdict, and the node
+ * has to say so rather than adopting the stranger's name or treating it as a
+ * duplicate of something.
+ *
+ * WHY A RAW SOCKET AND NOT A SECOND NODE. A second node would have to be told to
+ * answer with the wrong name, which means configuring it wrong on purpose, and
+ * the failure would then be visible in the second node's own log as well as the
+ * first's -- so a test would pass if EITHER node noticed. Here the far end is
+ * four lines of answer, and the only node with a verdict is the one under test.
+ *
+ * THE TWO ASSERTIONS THAT ARE NOT THE REASON, and they matter more than the
+ * reason does:
+ *
+ *   - `fed_duplicate=0`. A name disagreement is a MISCONFIGURATION and not a
+ *     second route to a peer, so reporting it under the duplicate verdict would
+ *     tell an operator reading the dump that the mesh has split. The verdict has
+ *     its own counter for exactly this, and this case is what proves it.
+ *   - NO link_established. A node that adopted the stranger's name would have a
+ *     link to irc.wrong that its configuration does not mention, which is how a
+ *     mesh ends up with a route nobody configured.
+ */
+static void case_name_mismatch(void)
+{
+    nf_node_t a;
+    int listen_fd;
+    int port = 0;
+    int peer_fd;
+    char reply[512];
+
+    listen_fd = listen_loopback(&port);
+    TF_CHECK_MSG(listen_fd >= 0, "the test could not open a listening socket");
+
+    /* The link is named irc.b, so the claim that comes back as irc.wrong is a
+     * mismatch and not a fresh claim on the listener. */
+    cfg_dials("irc.b", port, SECRET_OK, 1000, 0);
+    TF_CHECK_MSG(nf_spawn_inline_named(&a, "irc.a", child_setup) == 0,
+                 "could not spawn node A");
+
+    peer_fd = accept_deadline(listen_fd, T_IO_MS);
+    TF_CHECK_MSG(peer_fd >= 0, "node A never dialled the socket this test owns");
+
+    /* Read A's claim first, for the reason case 5 gives: without it, "the node
+     * rejected the exchange" would be satisfied by a node that never sent
+     * anything. Pinned on both sides of the epoch, which is a clock reading. */
+    {
+        const char *const needles[] = {
+            ":irc.a FEDERATE irc.a ",
+            " " SECRET_OK " " IRC_SERVE_VERSION "\r\n"
+        };
+
+        TF_CHECK_MSG(read_until(peer_fd, needles,
+                                sizeof needles / sizeof needles[0], T_IO_MS) == 0,
+                     "node A never sent a FEDERATE, so the mismatch below would "
+                     "be asserting nothing");
+    }
+
+    /* The wrong answer. Everything about it is legal -- four parameters, a legal
+     * name, a legal epoch, the RIGHT SECRET and the right version -- and the
+     * only thing wrong with it is that it names a server this link is not
+     * configured for. That is what makes it a test of the mismatch step rather
+     * than of any of the other three, all of which it deliberately passes. */
+    (void)snprintf(reply, sizeof reply,
+                   ":irc.wrong FEDERATE irc.wrong 1700000000 %s %s\r\n",
+                   SECRET_OK, IRC_SERVE_VERSION);
+    TF_CHECK_MSG(write(peer_fd, reply, strlen(reply)) > 0,
+                 "the test could not answer with the mismatched claim");
+
+    TF_CHECK_MSG(nf_expect(&a, "link_rejected: peer=irc.b reason=NAME_MISMATCH",
+                           T_IO_MS) == 0,
+                 "a claim naming a different server than the link it arrived on "
+                 "was not reported as NAME_MISMATCH. Everything else about that "
+                 "claim was correct, so the only check it could have failed is "
+                 "the one this case is about.");
+
+    /* The sink closed its half, which the node observes: 3.4 makes the close the
+     * reaper's, so a rejected exchange left open is a descriptor the node is
+     * still reading from. */
+    {
+        fd_set rfds;
+        struct timeval tv;
+        char scratch[256];
+        int rc;
+
+        FD_ZERO(&rfds);
+        FD_SET(peer_fd, &rfds);
+        tv.tv_sec = 10;
+        tv.tv_usec = 0;
+        rc = select(peer_fd + 1, &rfds, NULL, NULL, &tv);
+        TF_CHECK_MSG(rc == 1, "node A did not close the mismatched handshake");
+        if (rc == 1) {
+            ssize_t got = read(peer_fd, scratch, sizeof scratch);
+
+            TF_CHECK_MSG(got == 0, "the connection was reset rather than closed "
+                                    "cleanly (read returned %ld)",
+                         (long)got);
+        }
+    }
+
+    TF_CHECK_MSG(nf_stop(&a) == 0, "node A did not exit cleanly");
+    /* Read after the stop, so the buffer holds everything the node will ever
+     * say. The duplicate verdict is the one that must NOT be here: a name
+     * disagreement is a misconfiguration and reporting it as a split brain is
+     * the specific confusion this verdict was separated to prevent. */
+    TF_CHECK_MSG(nf_find_u64(&a, "fed_duplicate", NULL) == -1,
+                 "a name mismatch was counted as a duplicate link, so an "
+                 "operator reading the dump would be told the mesh had split: %s",
+                 a.out);
+    TF_CHECK_MSG(strstr(a.out, "link_established") == NULL,
+                 "the node adopted the stranger's name and reported a link as "
+                 "ESTABLISHED: %s",
+                 a.out);
+    nf_free(&a);
+    close(peer_fd);
+    close(listen_fd);
+}
+
+/* ---------------------------------------------------------------------------
  * Case 4: a second claim on a name that is already ESTABLISHED
  * ---------------------------------------------------------------------------
  * A and B link normally, and then THIS TEST opens a third connection to A and
@@ -1200,6 +1329,7 @@ int main(void)
     case_self_name();
     case_bad_secret();
     case_no_secret_refused();
+    case_name_mismatch();
     case_duplicate_link();
     case_handshake_timeout();
     case_keepalive_flows();

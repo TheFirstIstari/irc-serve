@@ -565,13 +565,21 @@ static void test_topic(nf_node_t *node)
      * who set the topic, not from the server and not from the recipient. A test
      * expecting tpb's own mask here would be expecting a line this node does
      * not send, and would pass against a node that attributed every channel
-     * action to its own name. */
+     * action to its own name.
+     *
+     * AND IT CARRIES THE TOPIC, as the trailing parameter of the same RFC
+     * command. The bare `:setter TOPIC #TP` this node used to send is not a
+     * TOPIC the RFC describes: a member that received it had to re-read 332 to
+     * learn what the line it was just handed was about. (The setter is told the
+     * topic again as 332/333 below, which is a different requirement -- the
+     * canonical form and this node's clock -- and does not make the channel
+     * echo's silence correct.) */
     client_send(&a, "TOPIC #tp :the phase four topic");
     (void)send_and_drain(&a, "t-set");
     expect_line(&a.c, "the TOPIC echo tpa sees",
-                ":tpa!tpa@127.0.0.1 TOPIC #TP\r\n");
+                ":tpa!tpa@127.0.0.1 TOPIC #TP :the phase four topic\r\n");
     expect_line(&b.c, "the TOPIC echo tpb sees",
-                ":tpa!tpa@127.0.0.1 TOPIC #TP\r\n");
+                ":tpa!tpa@127.0.0.1 TOPIC #TP :the phase four topic\r\n");
     expect_line(&a.c, "332 carrying the topic",
                 ":irc.test 332 tpa #TP :the phase four topic\r\n");
 

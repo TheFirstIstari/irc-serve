@@ -74,15 +74,28 @@
  * base would fail on the shape as well as on the value.
  *
  * ---------------------------------------------------------------------------
- * THE PREFIX, AND THE THING THAT IS WRONG IN IT
+ * THE PREFIX, AND THE GAP THIS COMMIT CLOSED
  * ---------------------------------------------------------------------------
- * The expected lines carry `irc.a` -- this node's own name -- as the source
- * prefix, and that is correct for five of the seven S-verbs and wrong for
- * SPRIVMSG and SNOTICE, whose subject is a user rather than the server.
- * federation/verbs.h records why at length: the forwarding function this commit
- * gives a trailing tag-stamp parameter does not also carry a prefix, so the
- * caller has nothing to pass. It is written down here as well so that whoever
- * reads the expected line knows it is the current behaviour and not the intent.
+ * C1 emitted this node's own name -- `irc.a` -- as the source prefix of all
+ * seven S-verbs, and this file documented that as a known gap: the forwarding
+ * function had no prefix parameter, so the caller had nothing to pass. That is
+ * correct for five of the seven, whose subject IS the server, and WRONG for
+ * SPRIVMSG and SNOTICE, whose subject is a user. A peer handed
+ * `:irc.b SPRIVMSG #T :hi` cannot build a hostmask for the message it delivers
+ * to its own members, because 2.1's `nick!user@host` is the only thing a client
+ * can be shown as an author and a server name is not one.
+ *
+ * fanout_forward_link() now takes a prefix, and the expected lines below are
+ * THE FIXED ONES: SPRIVMSG and SNOTICE carry the sending client's hostmask, and
+ * the five state verbs carry the client's hostmask too -- because 4.3's frozen
+ * shapes name the SUBJECT in a parameter (`SJOIN #T alice +o`) and take it from
+ * the prefix, so a state verb's prefix and its subject are the same bytes. The
+ * state verbs' prefix is therefore the hostmask as well, and the difference from
+ * the five S-verbs' subject is that the subject appears TWICE.
+ *
+ * The positive control above is what makes those expectations meaningful: the
+ * node never echoes a client's CLAIMED hostname, so the hostmask in the expected
+ * lines can only have come from the observed one.
  */
 #include <errno.h>
 #include <netinet/in.h>
@@ -431,15 +444,31 @@ static void peer_link_up(server_t *s, wire_t *far, int listen_fd, int port)
  * and the id, which the fixture pins before each command so the id is a
  * literal in every call site.
  */
-static void want_line(char *out, size_t cap, uint64_t epoch, uint64_t id,
-                      uint32_t hops, const char *sverb)
+/* `prefix` is the source prefix the line is expected to carry, WITHOUT the
+ * leading ':' -- the same convention core/fanout.h uses -- and `tail` is
+ * EVERYTHING after the verb, the channel included and in whatever position
+ * 4.3's frozen shape puts it.
+ *
+ * THE CHANNEL IS INSIDE `tail` AND NOT IN THE FORMAT, and that is the whole
+ * point of this file's per-verb table. C1 emitted `<target> :<text>` for all
+ * seven verbs; 4.3 freezes the channel's POSITION per verb -- first for SJOIN
+ * and SMODES, second for SPART, STOPIC and SKICK, first for the two message
+ * verbs too -- and a format that assumed one position would assert a shape the
+ * design does not have. The shapes are frozen in federation/verbs.h; this is
+ * the other copy of them, and a copy in a test on purpose: an expectation
+ * derived from the encoder's own table would pass whatever that table said,
+ * which is the failure 4.3's "a wire format cannot be invented later" is about.
+ */
+static void want_line(char *out, size_t cap, const char *prefix, uint64_t epoch,
+                      uint64_t id, uint32_t hops, const char *sverb,
+                      const char *tail)
 {
     (void)snprintf(out, cap,
                    "@irc-serve-origin=" NODE_NAME
                    ";irc-serve-epoch=%llu;irc-serve-id=%llu;irc-serve-hops=%lu"
-                   " :" NODE_NAME " %s " CHAN " :" TEXT "\r\n",
+                   " :%s %s %s\r\n",
                    (unsigned long long)epoch, (unsigned long long)id,
-                   (unsigned long)hops, sverb);
+                   (unsigned long)hops, prefix, sverb, tail);
 }
 
 /* The 7 client verbs and their S-verbs, in the order 4.3 lists them, and with
@@ -449,14 +478,31 @@ static void want_line(char *out, size_t cap, uint64_t epoch, uint64_t id,
 static const struct {
     const char *client;
     const char *sverb;
+    /* Everything after the verb, per 4.3's frozen shapes, and how many CLIENT
+     * parameters went in. See want_line() for why the shapes are written out
+     * here rather than derived from the encoder's own table. */
+    const char *tail;
+    /* The CLIENT parameters after the target, one entry each, and how many of
+     * them there are. A client KICK is `KICK #chan <target> [:reason]`, so it is
+     * the one row with two, and a client JOIN is `JOIN #chan`, so it is the one
+     * row with none -- and the row that proves the frozen shape is not
+     * "<target> :<text>" for all seven. */
+    const char *c0;
+    const char *c1;
+    int         nclient;
 } VERBS[] = {
-    { "PRIVMSG", "SPRIVMSG" },
-    { "NOTICE",  "SNOTICE"  },
-    { "JOIN",    "SJOIN"    },
-    { "PART",    "SPART"    },
-    { "TOPIC",   "STOPIC"   },
-    { "MODE",    "SMODES"   },
-    { "KICK",    "SKICK"    }
+    { "PRIVMSG", "SPRIVMSG", CHAN " :" TEXT,            TEXT, NULL, 1 },
+    { "NOTICE",  "SNOTICE",  CHAN " :" TEXT,            TEXT, NULL, 1 },
+    /* The member is the nick of the source prefix, and the flag token is `-`
+     * because this fixture has no channel and therefore no flags to report. */
+    { "JOIN",    "SJOIN",    CHAN " " CLIENT_NICK " -", NULL, NULL, 0 },
+    { "PART",    "SPART",    CLIENT_NICK " " CHAN " :" TEXT, TEXT, NULL, 1 },
+    { "TOPIC",   "STOPIC",   CLIENT_NICK " " CHAN " :" TEXT, TEXT, NULL, 1 },
+    /* SMODES' subject is the SERVER that evaluated the change, per 2.2, and it
+     * comes BEFORE the channel. */
+    { "MODE",    "SMODES",   NODE_NAME " " CHAN " :" TEXT, TEXT, NULL, 1 },
+    { "KICK",    "SKICK",
+      CLIENT_NICK " " CHAN " " CLIENT_NICK " :" TEXT, CLIENT_NICK, TEXT, 2 }
 };
 
 /* The whole peer stream, built up as the expected lines are confirmed. The final
@@ -587,19 +633,20 @@ int main(void)
      * 2. THE VERB MAP, BYTE FOR BYTE, THROUGH THE DOCUMENTED SEAM
      * ==================================================================== */
     /* fanout_forward_link() is called directly here rather than through a client
-     * command, and the reason is which 3.1 row each verb can reach in this
-     * commit. SPRIVMSG and SNOTICE reach it: PRIVMSG to a channel this node does
-     * not own is section 3's "write to local members AND forward to the owner",
-     * and section 3 below proves that end to end. The five state verbs cannot
-     * reach it yet -- core/chan_verbs.c broadcasts JOIN/PART/TOPIC/MODE/KICK
-     * through its own helper rather than through fanout_deliver(), so the
-     * state-change forward arm of 3.1 has no caller on the wire.
+     * command, and the reason is which 3.1 row each verb can reach DIRECTLY. A
+     * client JOIN is now routed through fanout_deliver() by core/chan_verbs.c,
+     * so the state-change arm has a caller on the wire and section 3 below
+     * asserts that end to end -- but the other four state verbs are only
+     * reachable from a handler that has already applied its local change, and
+     * driving them here keeps the byte comparison for all seven in one place
+     * with one fixture.
      *
      * So the map is exercised at the seam, which is what fanout.h says the seam
      * is exposed FOR, and the two rows that ARE on the wire are exercised end to
-     * end. A test that asserted all seven through the command surface would
-     * have to be a test of core/chan_verbs.c's broadcast, which is not what this
-     * commit changed.
+     * end as well. A test that asserted all seven through the command surface
+     * would need a channel with a non-op client for KICK, a non-op for MODE and
+     * a second nick for the KICK target -- and would then be asserting
+     * core/chan_verbs.c's refusals rather than the wire format.
      *
      * The message id is PINNED rather than read, so `id=41` and `id=60` are
      * literals in the expected strings and a per-SERVER counter that did not
@@ -607,23 +654,39 @@ int main(void)
     {
         fanout_target_t tgt;
         uint64_t id = 41;
+        const char *sp[2];
+        char hostmask[CONN_HOSTMASK_MAX];
 
         memset(&tgt, 0, sizeof tgt);
         tgt.kind = FANOUT_NONE;
         tgt.vclass = FANOUT_STATE_CHANGE;
         memcpy(tgt.name, CHAN, sizeof CHAN);
+        /* The OBSERVED hostmask, built the same way the node builds it, and the
+         * file's positive control above is what makes it trustworthy: the client
+         * claimed "spoofed.example" in USER's <unused> slot and the node echoed
+         * none of it, so a prefix carrying this string can only have come from
+         * accept()'s observation. */
+        (void)snprintf(hostmask, sizeof hostmask, "%s!%s@%s", CLIENT_NICK,
+                       CLIENT_NICK, CLIENT_HOST);
 
         for (i = 0; i < sizeof VERBS / sizeof VERBS[0]; i++) {
             int rc;
 
             s.msg_id = id;
-            rc = fanout_forward_link(&s, PEER_NAME, &tgt, VERBS[i].client, TEXT,
-                                     NULL);
+            /* Both client parameter slots are WRITTEN on every iteration, not
+             * only the used ones: an array read past what was written is a
+             * dangling read, and a test that segfaults on the KICK row proves
+             * nothing about the KICK row. */
+            sp[0] = VERBS[i].c0;
+            sp[1] = VERBS[i].c1;
+            rc = fanout_forward_link(&s, PEER_NAME, &tgt, VERBS[i].client, sp,
+                                     VERBS[i].nclient, hostmask, NULL);
             TF_CHECK_MSG(rc == 1,
                          "forwarding %s returned %d; the link is established and "
                          "the line fits, so this should be a delivery",
                          VERBS[i].client, rc);
-            want_line(want, sizeof want, epoch, id, 0u, VERBS[i].sverb);
+            want_line(want, sizeof want, hostmask, epoch, id, 0u, VERBS[i].sverb,
+                      VERBS[i].tail);
             TF_CHECK_MSG(drive_until(&s, &cli, &peer, &peer, want, T_IO_MS) == 0,
                          "the peer link did not receive the %s line\n"
                          "  expected: %s\n  peer saw: %s",
@@ -683,6 +746,32 @@ int main(void)
                      "the creation-race re-key did not move %s's ownership to %s",
                      CHAN, PEER_NAME);
     }
+    /* THE JOIN'S OWN FORWARD, and it is the line C3 adds to this stream. Before
+     * it, core/chan_verbs.c broadcast a JOIN to the members through its own
+     * helper and 3.1's state-change arm had no caller at all, so a JOIN reached
+     * every local member and no peer. The comment above used to say exactly that
+     * and it is now false.
+     *
+     * The flags are `+o` rather than the `-` of section 2's direct call, and the
+     * difference is the whole of why the SJOIN carries flags: this client created
+     * the channel, so RFC 1459 2.3.1 made it an operator, and the frozen shape
+     * reports that. The id is 48 because the loop above pinned the counter there
+     * and seven forwards consumed 41 through 47. */
+    {
+        char hostmask[CONN_HOSTMASK_MAX];
+
+        (void)snprintf(hostmask, sizeof hostmask, "%s!%s@%s", CLIENT_NICK,
+                       CLIENT_NICK, CLIENT_HOST);
+        want_line(want, sizeof want, hostmask, epoch, 48u, 0u, "SJOIN",
+                  CHAN " " CLIENT_NICK " +o");
+    }
+    TF_CHECK_MSG(drive_until(&s, &cli, &peer, &peer, want, T_IO_MS) == 0,
+                 "a JOIN did not reach the owning server, so 3.1's state-change "
+                 "row still has no caller on the wire.\n"
+                 "  expected: %s\n  peer saw: %s",
+                 want, wire_text(&peer));
+    expect_stream_line(want, "the end-to-end SJOIN");
+
     s.msg_id = 60;
     TF_CHECK_MSG(wire_send(&cli, "PRIVMSG " CHAN " :" TEXT) == 0,
                  "PRIVMSG send failed");
@@ -697,7 +786,14 @@ int main(void)
                  "  client: %s",
                  wire_text(&cli));
     /* The remote half, byte for byte, from the same command. */
-    want_line(want, sizeof want, epoch, 60u, 0u, "SPRIVMSG");
+    {
+        char hostmask[CONN_HOSTMASK_MAX];
+
+        (void)snprintf(hostmask, sizeof hostmask, "%s!%s@%s", CLIENT_NICK,
+                       CLIENT_NICK, CLIENT_HOST);
+        want_line(want, sizeof want, hostmask, epoch, 60u, 0u, "SPRIVMSG",
+                  CHAN " :" TEXT);
+    }
     TF_CHECK_MSG(drive_until(&s, &cli, &peer, &peer, want, T_IO_MS) == 0,
                  "a PRIVMSG to a channel this node does not own did not reach the "
                  "owning server.\n  expected: %s\n  peer saw: %s",
@@ -772,7 +868,7 @@ int main(void)
     /* The strongest form of the assertion, and the one that catches everything
      * the per-line checks above would let through individually: the peer
      * link's whole buffer equals the concatenation of the expected lines, byte
-     * for byte and in order. Nine S-verbs, nine lines, and nothing else --
+     * for byte and in order. Ten S-verbs, ten lines, and nothing else --
      * no 353, no 001, no PONG, no stray CRLF, no tag on a line that should not
      * have one. */
     TF_CHECK_MSG(strcmp(wire_text(&peer), expected_stream) == 0,

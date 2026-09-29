@@ -74,7 +74,46 @@
 #define CHAN "#T"
 #define TEXT "dedup probe"
 
+/* The source prefix the state-verb forwards are given. See fed_fwd(). */
+#define STATE_PREFIX "joiner!u@h"
+
 #define T_IO_MS 10000
+
+/* ---------------------------------------------------------------------------
+ * The forward, with the two new arguments filled in
+ * ---------------------------------------------------------------------------
+ * fanout_forward_link() takes the CLIENT parameters as a list and a source prefix
+ * now, and this helper is where this file's calls answer both. It is a helper
+ * rather than a dozen edits because the two answers are the same in every call
+ * and the point of the test is 2.4's loop guard, not the shape of an emission.
+ *
+ * MESSAGE VERBS PASS A NULL PREFIX and therefore get this node's own name, which
+ * is what every expected line below already says and is the right answer for a
+ * line this node is ORIGINATING: there is no client on this fixture, so there is
+ * no hostmask to observe, and a server name is a legal source for a
+ * server-originated message.
+ *
+ * THE STATE VERBS PASS STATE_PREFIX, because 4.3's frozen SJOIN shape names its
+ * subject and the subject has to come from the source prefix. This is the one
+ * expected line below that C3 changes, and the argument for the change is at
+ * fed_sverb_params(): a real SJOIN carries the member, the channel and the
+ * member's flags, and this fixture has no client on the channel and therefore no
+ * flags, so the flag token is the literal `-`. */
+static int fed_fwd(server_t *s, fanout_target_t *t, const char *verb,
+                   const char *text, const irc_serve_tags_t *carry)
+{
+    const char *sp[1];
+    int is_message = (strcmp(verb, "PRIVMSG") == 0 || strcmp(verb, "NOTICE") == 0);
+
+    /* JOIN is the one verb whose client form has nothing after the target, and
+     * that is the point of the row: it is what makes 4.3's SJOIN shape a
+     * different shape from "<target> :<text>". */
+    int n = (strcmp(verb, "JOIN") == 0) ? 0 : 1;
+
+    sp[0] = text;
+    return fanout_forward_link(s, PEER_NAME, t, verb, sp, n,
+                               (is_message != 0) ? NULL : STATE_PREFIX, carry);
+}
 
 /* ---------------------------------------------------------------------------
  * A socket this test owns
@@ -621,8 +660,7 @@ int main(void)
                  "authenticated and whose server name is not yet known");
     memset(&tgt, 0, sizeof tgt);
     memcpy(tgt.name, CHAN, sizeof CHAN);
-    TF_CHECK_MSG(fanout_forward_link(&s, PEER_NAME, &tgt, "PRIVMSG", TEXT,
-                                     NULL) == 0,
+    TF_CHECK_MSG(fed_fwd(&s, &tgt, "PRIVMSG", TEXT, NULL) == 0,
                  "forwarding to a link that is not ESTABLISHED returned success");
     expect_nothing_new(&s, &peer, marked,
                        "a forward to a link that is not ESTABLISHED");
@@ -651,8 +689,7 @@ int main(void)
     s.msg_id = 500;
     marked = peer.len;
     tag_of(&carry, "irc.z", 1756464000123ULL, 777u, 0u);
-    TF_CHECK_MSG(fanout_forward_link(&s, PEER_NAME, &tgt, "PRIVMSG", TEXT,
-                                     &carry) == 1,
+    TF_CHECK_MSG(fed_fwd(&s, &tgt, "PRIVMSG", TEXT, &carry) == 1,
                  "relaying a message with hops=0 was refused");
     (void)snprintf(want, sizeof want,
                    "@irc-serve-origin=irc.z;irc-serve-epoch=1756464000123"
@@ -672,8 +709,7 @@ int main(void)
     /* Two more relays, so the hop count walks 1 -> 2 -> 3 on the wire and the
      * counter still has not moved. */
     carry.hops = 1u;
-    TF_CHECK_MSG(fanout_forward_link(&s, PEER_NAME, &tgt, "NOTICE", TEXT,
-                                     &carry) == 1,
+    TF_CHECK_MSG(fed_fwd(&s, &tgt, "NOTICE", TEXT, &carry) == 1,
                  "the second relay was refused");
     (void)snprintf(want, sizeof want,
                    "@irc-serve-origin=irc.z;irc-serve-epoch=1756464000123"
@@ -698,16 +734,14 @@ int main(void)
      * satisfy "the message is dropped at 10" read loosely. */
     marked = peer.len;
     carry.hops = (uint32_t)(IRC_MAX_HOPS - 1u);
-    TF_CHECK_MSG(fanout_forward_link(&s, PEER_NAME, &tgt, "PRIVMSG", TEXT,
-                                     &carry) == 0,
+    TF_CHECK_MSG(fed_fwd(&s, &tgt, "PRIVMSG", TEXT, &carry) == 0,
                  "a relay that would carry hops=%d was ALLOWED; 2.4 drops the "
                  "message at %d",
                  IRC_MAX_HOPS, IRC_MAX_HOPS);
     expect_nothing_new(&s, &peer, marked, "a relay past the hop ceiling");
 
     carry.hops = (uint32_t)(IRC_MAX_HOPS - 2u);
-    TF_CHECK_MSG(fanout_forward_link(&s, PEER_NAME, &tgt, "PRIVMSG", TEXT,
-                                     &carry) == 1,
+    TF_CHECK_MSG(fed_fwd(&s, &tgt, "PRIVMSG", TEXT, &carry) == 1,
                  "a relay that would carry hops=%d was refused; the ceiling "
                  "must let everything below %d through",
                  IRC_MAX_HOPS - 1, IRC_MAX_HOPS);
@@ -728,8 +762,7 @@ int main(void)
      * by its grammar. What matters here is that it does not get out. */
     marked = peer.len;
     carry.hops = UINT32_MAX;
-    TF_CHECK_MSG(fanout_forward_link(&s, PEER_NAME, &tgt, "PRIVMSG", TEXT,
-                                     &carry) == 0,
+    TF_CHECK_MSG(fed_fwd(&s, &tgt, "PRIVMSG", TEXT, &carry) == 0,
                  "a relay carrying hops=UINT32_MAX was allowed");
     expect_nothing_new(&s, &peer, marked, "a relay with an absurd hop count");
 
@@ -746,8 +779,7 @@ int main(void)
      * self-originated message straight back to where it came from. */
     marked = peer.len;
     tag_of(&carry, NODE_NAME, s.epoch, 4242u, 0u);
-    TF_CHECK_MSG(fanout_forward_link(&s, PEER_NAME, &tgt, "PRIVMSG", TEXT,
-                                     &carry) == 0,
+    TF_CHECK_MSG(fed_fwd(&s, &tgt, "PRIVMSG", TEXT, &carry) == 0,
                  "a message whose origin is THIS node was forwarded to a peer, "
                  "which is the two-node loop 2.4 forbids outright");
     expect_nothing_new(&s, &peer, marked,
@@ -755,8 +787,7 @@ int main(void)
 
     (void)snprintf(want, sizeof want, "IRC.%c", NODE_NAME[strlen(NODE_NAME) - 1u]);
     tag_of(&carry, want, s.epoch, 4242u, 0u);
-    TF_CHECK_MSG(fanout_forward_link(&s, PEER_NAME, &tgt, "PRIVMSG", TEXT,
-                                     &carry) == 0,
+    TF_CHECK_MSG(fed_fwd(&s, &tgt, "PRIVMSG", TEXT, &carry) == 0,
                  "a message whose origin is this node UPPERCASED was forwarded; "
                  "server names are case-insensitive, so the own-origin check has "
                  "to fold ASCII the way the peer lookup does");
@@ -768,8 +799,7 @@ int main(void)
      * everything that arrives with a stamp. Without it, a forward that returned
      * 0 for every carry would satisfy both refusals above. */
     tag_of(&carry, "irc.z", 1756464000123ULL, 777u, 4u);
-    TF_CHECK_MSG(fanout_forward_link(&s, PEER_NAME, &tgt, "PRIVMSG", TEXT,
-                                     &carry) == 1,
+    TF_CHECK_MSG(fed_fwd(&s, &tgt, "PRIVMSG", TEXT, &carry) == 1,
                  "a relay from another node at hops=4 was refused, so the "
                  "own-origin check is refusing more than its own origin");
     (void)snprintf(want, sizeof want,
@@ -821,8 +851,7 @@ int main(void)
 
         marked = peer.len;
         tag_of(&carry, "irc.z", 1756464000123ULL, 777u, 0u);
-        TF_CHECK_MSG(fanout_forward_link(&s, PEER_NAME, &tgt, "PRIVMSG", body,
-                                         &carry) == 0,
+        TF_CHECK_MSG(fed_fwd(&s, &tgt, "PRIVMSG", body, &carry) == 0,
                      "a relay of a body one byte longer than this node will relay "
                      "was ALLOWED; 3.2 says an over-long line is dropped, never "
                      "truncated");
@@ -831,8 +860,7 @@ int main(void)
         /* And the same body at the boundary IS sent, so the case above is the
          * cap and not the forward refusing everything of that shape. */
         body[lo] = '\0';
-        TF_CHECK_MSG(fanout_forward_link(&s, PEER_NAME, &tgt, "PRIVMSG", body,
-                                         &carry) == 1,
+        TF_CHECK_MSG(fed_fwd(&s, &tgt, "PRIVMSG", body, &carry) == 1,
                      "the largest relayable body was refused, so the over-long "
                      "refusal above is not a size test at all");
         free(body);
@@ -845,13 +873,12 @@ int main(void)
      * with it: this node's name, this node's epoch, a fresh id, hops 0. After
      * four relays that consumed no ids, the next id is 500 -- a literal, because
      * the counter was pinned and the relays were required not to move it. */
-    TF_CHECK_MSG(fanout_forward_link(&s, PEER_NAME, &tgt, "JOIN", TEXT,
-                                     NULL) == 1,
+    TF_CHECK_MSG(fed_fwd(&s, &tgt, "JOIN", TEXT, NULL) == 1,
                  "an originating forward was refused");
     (void)snprintf(want, sizeof want,
                    "@irc-serve-origin=" NODE_NAME ";irc-serve-epoch=%llu"
-                   ";irc-serve-id=500;irc-serve-hops=0 :" NODE_NAME
-                   " SJOIN " CHAN " :" TEXT "\r\n",
+                   ";irc-serve-id=500;irc-serve-hops=0 :" STATE_PREFIX
+                   " SJOIN " CHAN " joiner -\r\n",
                    (unsigned long long)s.epoch);
     TF_CHECK_MSG(drive_until(&s, &peer, want, T_IO_MS) == 0,
                  "an originating forward did not arrive stamped with this node's "

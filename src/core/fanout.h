@@ -28,26 +28,28 @@
  * different class -- the most likely way a table like 3.1 gets subtly wrong.
  *
  * ---------------------------------------------------------------------------
- * WHAT IS REACHABLE TODAY, STATED PLAINLY
+ * WHAT IS REACHABLE NOW, STATED PLAINLY
  * ---------------------------------------------------------------------------
- * On a single node every channel was created by this node, so
- * chan_origin_state() is CHAN_ORIGIN_SELF for all of them and origin ==
- * s->name. EVERY row of 3.1 that involves a peer is therefore unreachable from
- * the wire, and this header does not pretend otherwise:
+ * A node with a peer link can reach every row except the last one. What it
+ * cannot reach, still, is the last row's RESOLUTION: `nick@server` names a user
+ * on another server, and the registry of remote nicks 2.1 says that needs
+ * (qualify()'s inverse) only exists once SBURST has run. The row is routed and
+ * the resolution is not, which is a different statement from "the row is
+ * unreachable" and the honest one.
  *
  *   local user           reachable, both classes
- *   owned channel        reachable, both classes (PRIVMSG/NOTICE here; the
- *                        state-change verbs reached the same rows through
- *                        chan_verbs.c's own broadcast)
- *   non-owned channel    NOT reachable -- no peer has ever reported a channel
- *   remote user          NOT reachable -- no peer link exists
+ *   owned channel        reachable, both classes
+ *   non-owned channel    reachable, both classes -- a peer reports the channel
+ *                        and this node's authority_ok() returns FORWARD rather
+ *                        than 437
+ *   remote user          NOT resolvable yet (no remote nick registry; SBURST)
  *
- * The unreachable rows are implemented anyway, and the reason is not optimism:
+ * The unreachable row is implemented anyway, and the reason is not optimism:
  * 3.1 is the contract Phase 6 has to honour, and a row that is not written down
- * is a row Phase 6 re-derives, probably differently. Each of them refuses
- * rather than pretending, and says so on the node's observable output, so a
- * federated node that reached one would be visibly missing something rather
- * than silently dropping a message.
+ * is a row Phase 6 re-derives, probably differently. It refuses rather than
+ * pretending, and says so on the node's observable output, so a federated node
+ * that reached one would be visibly missing something rather than silently
+ * dropping a message.
  *
  * ---------------------------------------------------------------------------
  * THE FORWARD LEG IS NOT reply()
@@ -83,10 +85,18 @@
  *                 KICK. 2.2's single-writer rule applies, so a node that cannot
  *                 route one to the origin must not apply it locally.
  *
- * PRIVMSG and NOTICE are `message`. Nothing in this node is a state-change yet
- * -- the channel verbs of Phase 4 already carry their own local broadcast and
- * their own 437 refusal -- but the class is in the resolved target so that
- * Phase 6 has one place to ask. */
+ * PRIVMSG and NOTICE are `message`; JOIN, PART, TOPIC, MODE and KICK are
+ * `state-change`, and since C3 they reach fanout_deliver() through
+ * chan_verbs.c rather than through that file's own broadcast helper. The class
+ * is in the resolved target so that there is one place to ask.
+ *
+ * WHAT THE CLASS NOW DECIDES, after §3.1's owned/`message` row was amended: one
+ * thing only -- whether the caller also writes locally. It does NOT choose a
+ * forward target set, because the two owned rows name the same one and the two
+ * non-owned rows name the same one. The split still earns its keep: it is what
+ * keeps 2.2's single-writer rule (no local write for a state change this node
+ * cannot route) separate from "a message this node has nobody to deliver to is
+ * still worth forwarding". Read the correction in 3.1 before changing either. */
 typedef enum {
     FANOUT_MESSAGE = 0,
     FANOUT_STATE_CHANGE = 1
@@ -105,14 +115,14 @@ typedef enum {
     FANOUT_REMOTE_CHANNEL,
     /* "remote user nick@server | either | forward to that server".
      *
-     * 3.1's LAST ROW IS DELIBERATELY NOT HERE, and that is a real omission
-     * rather than an oversight: the row's target is a user on another server,
-     * and 2.1 says naming one needs qualify()'s inverse -- "which server holds
-     * the user called X" -- which is a registry of remote nicks that only
-     * exists once SBURST has run. Until then `nick@server` resolves to nothing,
-     * and 2.1 already anticipated this ("qualify() belongs to the phase that
-     * first has a remote user to name"). Listing an enumerator nothing can
-     * produce would be a promise this node does not keep. */
+ * 3.1's LAST ROW IS DELIBERATELY NOT HERE, and that is a real omission
+ * rather than an oversight: the row's target is a user on another server,
+ * and 2.1 says naming one needs qualify()'s inverse -- "which server holds
+ * the user called X" -- which is a registry of remote nicks that only
+ * exists once SBURST has run. Until then `nick@server` resolves to nothing,
+ * and 2.1 already anticipated this ("qualify() belongs to the phase that
+ * first has a remote user to name"). Listing an enumerator nothing can
+ * produce would be a promise this node does not keep. */
     FANOUT_REMOTE_USER
 } fanout_kind_t;
 
@@ -141,10 +151,17 @@ typedef struct {
 
 /* Resolve `arg` -- a <msgtarget>, exactly as it arrived -- into `*out`.
  *
- * Returns 1 when the target was resolved, 0 when it was not. On 0 the right
- * numeric has ALREADY been sent to `from` and `*out->kind` is FANOUT_NONE, so a
+ * Returns 1 when the target was resolved, 0 when it was not. On 0 `*out->kind`
+ * is FANOUT_NONE, and the right numeric has ALREADY been sent to `from` -- so a
  * caller that returns on 0 has said something. A resolve that fails in silence
  * is worse than no resolve at all, because the client waits.
+ *
+ * `from` MAY BE NULL, which means "a caller with nobody to answer" and skips
+ * the numerics without changing what resolves. That is federation/verbs.c's
+ * guard chain: a peer naming a channel this node does not hold is a fact about
+ * the mesh, not about a client, and a numeric on a CONN_SERVER connection would
+ * be refused anyway and would put a non-zero on the counter server.h says should
+ * be zero forever.
  *
  * Which numerics, and why these:
  *
@@ -180,8 +197,17 @@ int fanout_is_member(const fanout_target_t *t, const conn_t *c);
  * ---------------------------------------------------------------------------
  */
 
-/* Deliver one line of `verb` carrying `text`, prefixed with `prefix`, to
+/* Deliver one line of `verb` carrying `params`, prefixed with `prefix`, to
  * whatever `*t` resolves to under the class recorded in `*t`.
+ *
+ * `params` are the parameters AFTER the target, and the target is `t->name` --
+ * 2.2's canonical form, not the client's spelling. That split is the reason
+ * `text` is not a parameter any more: a state change is not one trailing
+ * string. `MODE #T +o bob` is three parameters, and rendering it as a single
+ * `text` would colon the mode argument and hand every local client
+ * `MODE #T :+o bob`, which RFC 2812 3.3.2 does not describe and which the
+ * Phase 4 tests correctly refuse. So the list is the list, and the target is the
+ * one the resolver already canonicalised.
  *
  * `exclude` is the sender when a verb's RFC rule says it must not see its own
  * message -- NOTICE, and only NOTICE -- and NULL when it must (PRIVMSG). It is
@@ -195,10 +221,44 @@ int fanout_is_member(const fanout_target_t *t, const conn_t *c);
  * the sender's own nick is suppressed by exactly the rule the caller asked for.
  * Callers that need to tell those apart ask the kind, not the count.
  *
+ * THE VERB CLASS IS NOT A PARAMETER AND THAT IS THE POINT. It was decided once,
+ * in fanout_resolve(), and is read out of the resolved target here, so a handler
+ * cannot resolve a target under one class and deliver it under another. That
+ * single fact is what makes "a channel message is delivered exactly once"
+ * structural: the row a target took when it was resolved is the row it is
+ * delivered by, and there is no second decision in between to disagree.
+ *
+ * `carry` is 2.4's identity for the emission, or NULL for a line this node is
+ * ORIGINATING, and it reaches only the forward arm. Every handler passes NULL,
+ * because a handler is handed a line from a client and a client has no 2.4
+ * identity; federation/verbs.c passes the tags the line arrived with, and that
+ * is the whole reason this is an argument here rather than a private detail of
+ * the relay path.
+ *
+ * IT IS AN ARGUMENT FOR THE SAME REASON IT IS NOT A FIELD ON THE TARGET, one
+ * level up: an identity is a property of ONE emission, and a resolved target is
+ * a cache entry that outlives the call. Putting it on the target would make
+ * (origin, epoch, id) a property of the channel for as long as the channel
+ * exists -- a different fact with the same name, and one that would be wrong on
+ * the very next message.
+ *
+ * IT IS ALSO THE REASON THE RELAY PATH IS NOT A SECOND DELIVERY. Before this
+ * parameter, federation/verbs.c's SPRIVMSG handler wrote locally through
+ * fanout_deliver() and then forwarded the same line itself, which meant a
+ * received `message` was forwarded TWICE on a node that had a forward arm: once
+ * by this function, with a FRESH id because it had no carry, and once by the
+ * handler with the received one. That was unreachable while an owner forwarded
+ * nothing -- a `message` only ever crossed a link leaf -> owner, and an owner
+ * had no forward arm to double up on -- and the 3.1 amendment is what made it
+ * reachable. The handler now hands its tags here and forwards nothing itself, so
+ * one emission is forwarded once, and with the identity it actually has.
+ *
  * Never blocks and never closes: the write path marks CLOSING and the reaper
  * closes, as 3.4 requires. */
 int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
-                   const char *verb, const char *text, conn_t *exclude);
+                   const char *verb, const char *const *params, int nparams,
+                   conn_t *exclude, const irc_serve_tags_t *carry);
+
 
 /* ---------------------------------------------------------------------------
  * The forward leg
@@ -243,10 +303,101 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
  * see what it is about to do. Neither can be done on receipt: a message that
  * arrives from one peer may still have to go to another, and a node that refused
  * it on arrival would have to decide, at arrival, that no peer should ever
- * receive it. */
+ * receive it.
+ *
+ * `prefix` IS THE SOURCE PREFIX, without the leading ':', and it is a PARAMETER
+ * rather than this node's own name because the seven S-verbs do not agree about
+ * what their subject is. For the five state verbs the subject IS the server --
+ * an SJOIN names a fact about the channel -- so `s->name` is right. For
+ * SPRIVMSG and SNOTICE the subject is a USER, and a receiving node that is
+ * handed `:irc.b SPRIVMSG #T :hi` cannot build a hostmask for it: 2.1's
+ * `nick!user@host` is the only thing a client can be shown as the author of a
+ * message, and a server name is not one. C1 sent the node's own name and the
+ * gap was recorded in federation/verbs.h; this parameter is the fix.
+ *
+ * IT IS AN ARGUMENT AND NOT A FIELD ON fanout_target_t, and the reason is
+ * lifetime rather than taste. A resolved target is a CACHE ENTRY that outlives
+ * the call: the same fanout_target_t is resolved once and delivered from, and
+ * several deliveries may follow. A prefix is a property of ONE emission -- "who
+ * said this, in this line" -- and putting it on the target would make it a
+ * property of the channel for as long as the channel exists, which is a
+ * different fact with the same name. It is the same argument the target-vs-
+ * argument split at the top of this file makes, one level down. The cost is one
+ * more argument at the two call sites inside fanout_deliver() and one at each
+ * verb handler, and it is paid at every call rather than only at the ones that
+ * set it.
+ *
+ * `prefix` may be NULL, in which case this node's own name is used: that is the
+ * five-state-verbs answer, and a caller with no better idea is better served by
+ * a wrong-but-legal prefix than by a refused forward. It is stated rather than
+ * left to be discovered, because a silent fallback is the kind of thing that
+ * hides a caller that forgot. */
 int fanout_forward_link(server_t *s, const char *peer_name,
                         const fanout_target_t *t, const char *verb,
-                        const char *text, const irc_serve_tags_t *carry);
+                        const char *const *params, int nparams,
+                        const char *prefix, const irc_serve_tags_t *carry);
+
+/* The same forward for a line that is ALREADY an S-verb in the shape 4.3
+ * freezes for it -- which is what a RELAY is. federation/verbs.c calls this
+ * when it passes a received state change along; it is a separate entry point
+ * because re-shaping an SJOIN's parameters (channel, member, flags) as though
+ * they were JOIN's (channel) would produce a line no peer can parse, and
+ * silently. Both entry points reach ONE body, so the loop guard and the
+ * identity-minting rules are not stated twice.
+ *
+ * `params` INCLUDES the target as its first element and is the frozen shape,
+ * from fed_sverb_params(). `target` is not a separate argument: it is
+ * `params[0]` where the shape puts it there, and the log lines use `params[0]`
+ * as the subject of the line. */
+int fanout_forward_sverb(server_t *s, const char *peer_name, const char *sverb,
+                         const char *prefix, const char *const *params,
+                         int nparams, const irc_serve_tags_t *carry);
+
+/* 3.1's forward target set for a CHANNEL, and the ONE place it is decided.
+ *
+ * Two callers, and the duplication is the reason it is exported.
+ * fanout_deliver()'s two channel rows call it for a local emission, and
+ * federation/verbs.c reaches it the same way for a line it received -- through
+ * fanout_deliver()'s `carry` -- which used to be impossible to do without
+ * copying the walk, and a copied walk is a walk that can drift.
+ * chan_verbs.c's own broadcast helper was already the other half of that
+ * duplication and had no forward arm at all.
+ *
+ * The four rows it implements, which are 3.1's and only 3.1's:
+ *
+ *   owned     | message      | servers[ch] UNION every ESTABLISHED link
+ *   non-owned | message      | the owner
+ *   owned     | state-change | servers[ch] UNION every ESTABLISHED link
+ *   non-owned | state-change | the owner
+ *
+ * The first row is the AMENDED one and the two OWNED rows are now the same
+ * target set; the definition carries the correction and the reason the original
+ * "the origin already holds every member" was false. Read that before changing
+ * this table: a roster entry is not a delivery path, and an owner that forwards
+ * nothing cannot reach a member it does not hold.
+ *
+ * The union in the owned rows is what makes the FIRST join to a channel work,
+ * and the argument is at the definition: servers[] is a set of servers that
+ * have reported a member, so it is empty on both sides of a new channel and a
+ * forward over it alone would never start.
+ *
+ * `params` are the CLIENT parameters after the target, and are re-shaped per
+ * verb here rather than taken pre-shaped, so a caller that has a client
+ * emission does not have to know the S-verb's shape. Returns how many peers the
+ * line was queued to; zero is a normal answer -- a channel with no member-server
+ * and no ESTABLISHED link has nowhere to forward to. */
+int fanout_forward_channel(server_t *s, const chan_t *ch, fanout_class_t vclass,
+                           const char *client_verb, const char *prefix,
+                           const char *const *params, int nparams,
+                           const irc_serve_tags_t *carry);
+
+/* As fanout_forward_channel(), for a line that is ALREADY an S-verb in the
+ * shape 4.3 freezes -- which is what a RELAY of a received state change is.
+ * Same target set, same refusals, reached through the same static walk. */
+int fanout_forward_channel_sverb(server_t *s, const chan_t *ch,
+                                 fanout_class_t vclass, const char *sverb,
+                                 const char *prefix, const char *const *params,
+                                 int nparams, const irc_serve_tags_t *carry);
 
 /* ---------------------------------------------------------------------------
  * Small shared helpers
@@ -261,6 +412,16 @@ int fanout_forward_link(server_t *s, const char *peer_name,
  * a bug report, not a metric. */
 int fanout_line_fits(const char *prefix, const char *verb, const char *target,
                      const char *text);
+
+/* As fanout_line_fits(), for a line with SEVERAL parameters: `params_bytes` is
+ * the sum of their lengths. It exists because a single-string budget cannot
+ * express the frozen state-verb shapes -- an SKICK carries a member, a channel,
+ * a target and a reason, and charging only the reason would let the other three
+ * run the line over 3.2's cap. The sum is a lower bound on the rendered size,
+ * so the cap is approached from the conservative side, and the arithmetic itself
+ * is unchanged from fanout_line_fits()'s. */
+int fanout_line_fits_n(const char *prefix, const char *verb, size_t target_len,
+                       size_t params_bytes);
 
 /* Resolve a nickname to a connection, folding case.
  *

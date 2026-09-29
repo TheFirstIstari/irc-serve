@@ -35,7 +35,7 @@
  * readback, a readiness line, and a way to inject a test-provided dispatch and
  * tick hook into a child so the parent can drive the scenario.
  *
- * What is NOT here yet, and would be added rather than replaced:
+ * What is NOT here, and would be added rather than replaced:
  *   - a second node dialing the first. That needs the pre-resolved-address
  *     entry point (6.1's peer list) to be configurable, and the dial FSM is
  *     already in place and tested.
@@ -44,6 +44,29 @@
  *     output would be ambiguous. 6.2 explicitly allows "one line to stdout (or
  *     to fd 3)", and the read is already per-child, so interleaved output from
  *     two children is not actually a problem.
+ *
+ * ---------------------------------------------------------------------------
+ * ONE THING A TEST WITH CLIENTS HAS TO DO ITSELF, AND IT IS WORTH NAMING
+ * ---------------------------------------------------------------------------
+ * The child installs NO command dispatch. s->dispatch is NULL on a fresh
+ * server_t, which is the honest Phase 2 state and is exactly right for a
+ * peer-only test: the federation handshake is answered by the link module's own
+ * wrapper, which fed_open() installs over whatever was there.
+ *
+ * A test that attaches a CLIENT has to install core/commands.c's
+ * commands_dispatch itself, and it has to do so BEFORE fed_open() -- fed_open()
+ * saves the dispatch that is already there and replaces it, so a
+ * commands_dispatch installed afterwards would become the node's whole dispatch
+ * and a peer line would never reach the guard chain at all. The symptom is
+ * silent and total: the client connects, registers nothing and receives no
+ * numerics, and no [observable] line says why. test_fed_roster.c's child_setup
+ * is the worked example.
+ *
+ * THAT IS ALSO THE ORDERING 3's "one dispatch" claim needs. The node's dispatch
+ * is the federation wrapper, its inner is commands_dispatch, and a peer line
+ * reaches fed_dispatch() THROUGH the client dispatch on the strength of
+ * src->kind. If they were two dispatch functions, nothing in a test would notice
+ * -- which is why the claim is made where both live.
  */
 #ifndef TEST_HARNESS_NODE_FIXTURE_H
 #define TEST_HARNESS_NODE_FIXTURE_H
