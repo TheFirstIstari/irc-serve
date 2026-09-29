@@ -79,6 +79,20 @@ typedef void (*nf_setup_fn)(server_t *s);
  * child reports readiness. Returns 0 on success, -1 on failure. */
 int nf_spawn_binary(nf_node_t *n);
 
+/* As nf_spawn_binary(), but with the binary's OWN argument vector, for a test
+ * that needs to drive the shipped command line (--name, --secret, --peer).
+ *
+ * `argv` is the FULL vector INCLUDING argv[0] and MUST be NULL-terminated;
+ * passing NULL is an error rather than a default, because a caller that
+ * reached for this and passed NULL wanted arguments and would silently get the
+ * bare one. The strings are only read in the child, before execv(), so the
+ * caller may free them as soon as the spawn returns.
+ *
+ * The readiness and port lines are read exactly as they are for
+ * nf_spawn_binary() (6.1: servers bind port 0 and report the chosen port), so
+ * a test can mix the two forms in one run. */
+int nf_spawn_binary_argv(nf_node_t *n, char *const argv[]);
+
 /* Fork a child that builds its own server_t, binds port 0, calls `setup` (may
  * be NULL), then runs the real loop until it is signalled to stop. Blocks
  * until the child reports readiness. Returns 0 on success, -1 on failure.
@@ -88,6 +102,21 @@ int nf_spawn_binary(nf_node_t *n);
  * it. What it does not do is exercise the shipped executable -- use
  * nf_spawn_binary() for that. */
 int nf_spawn_inline(nf_node_t *n, nf_setup_fn setup);
+
+/* As nf_spawn_inline(), with the child naming ITSELF `name` rather than the
+ * harness default.
+ *
+ * This exists because 2.3's name uniqueness is a property of the NODE's name
+ * and cannot be exercised any other way: a test that wants two nodes which
+ * both claim to be `irc.a` has to be able to name them, and the harness's own
+ * default name is exactly what it could not override before. The same-named
+ * handshake case in test_fed_handshake.c is the caller that needed it.
+ *
+ * `name` must satisfy 2.4's tag grammar (server_init() refuses anything else
+ * and the child exits), must be non-NULL and non-empty, and is copied by the
+ * fork rather than retained: the child is a separate process, so nothing the
+ * caller does to the string afterwards can be seen. */
+int nf_spawn_inline_named(nf_node_t *n, const char *name, nf_setup_fn setup);
 
 /* Wait until `needle` appears in the child's output, or the deadline passes.
  * Returns 0 on success, -1 on timeout, and prints what the child did say. */

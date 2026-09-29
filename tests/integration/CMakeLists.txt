@@ -189,3 +189,18 @@ irc_add_integration_test(test_fed_wire test_fed_wire.c)
 # each beside a positive control, and each with a different-case name so the
 # fold is load-bearing.
 irc_add_integration_test(test_fed_dedup test_fed_dedup.c)
+
+# 2.3 / 4.3 / 8: the FEDERATE exchange, end to end, over real TCP between real
+# child processes. Every case is a REJECTION or the happy path, and each is
+# asserted on the child's own observable output rather than on a struct field:
+# two nodes claiming one name (SELF_NAME, and neither reaches ESTABLISHED), a
+# wrong secret (BAD_SECRET, with the two secrets differing only in their LAST
+# byte so a prefix compare would pass), a second claim on a name that is
+# already ESTABLISHED (DUPLICATE_LINK), a handshake nobody answers, a link that
+# goes silent, and the happy path -- which runs the SHIPPED BINARY on a command
+# line, so --name/--secret/--peer and main()'s getaddrinfo are covered by
+# something that can fail rather than by code nothing reaches. The handshake
+# timeout and the liveness threshold are set per process in the child, so no
+# case waits the shipped five or ninety seconds, and there is no sleep anywhere:
+# every wait is a deadline over select() (6.3).
+irc_add_integration_test(test_fed_handshake test_fed_handshake.c)

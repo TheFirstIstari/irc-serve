@@ -31,6 +31,11 @@ add_library(irc_core STATIC
   # the always-on path, and a reader would expect to find them in fanout.c.
   federation/verbs.c
   federation/dedup.c
+  # The peer link: the table, the FEDERATE exchange and the tick. It is listed
+  # after the two above because it uses both -- dedup for T5 and verbs.c for
+  # the outbound side of the wire -- which is the first time anything in this
+  # tree has had a reason to depend on more than one module under federation/.
+  federation/link.c
 )
 
 target_link_libraries(irc_core PRIVATE pthread)
