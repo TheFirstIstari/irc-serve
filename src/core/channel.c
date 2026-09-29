@@ -575,9 +575,62 @@ int chan_remote_add(chan_t *ch, const char *server, const char *nick,
                       sizeof ch->remotes[0].server, server)) {
         return -1;
     }
+    /* A new entry has no host: 4.3's SJOIN does not carry one, and a burst is
+     * the only thing that can supply it. Written explicitly rather than left to
+     * the allocator, because realloc does NOT zero the slot it hands back -- this
+     * struct grew the field in C4, so an initialiser that existed only in
+     * chan_new()'s memset would leave a RECYCLED element carrying the previous
+     * member's host, which is a member impersonation bug wearing a memory bug's
+     * clothes. */
+    ch->remotes[ch->nremotes].host[0] = '\0';
     ch->remotes[ch->nremotes].flags = flags;
     ch->nremotes++;
     return 0;
+}
+
+size_t chan_remote_purge(chan_t *ch, const char *server)
+{
+    size_t i = 0;
+    size_t gone = 0;
+
+    if (ch == NULL || server == NULL) {
+        return 0;
+    }
+    /* Walking FORWARD under a shrinking array rather than backward from the end
+     * under a growing one: the only other shape is an index that has to be
+     * decremented on every removal, and the off-by-one that produces is silent
+     * -- it skips a member rather than crashing. Entries are ordered, and 7/Phase
+     * 4 fixes 353's rendering order across this array, so a forward walk is
+     * also the one that does not reorder what is kept. */
+    while (i < ch->nremotes) {
+        if (same_name(ch->remotes[i].server, server)) {
+            (void)memmove(&ch->remotes[i], &ch->remotes[i + 1u],
+                          (ch->nremotes - i - 1u) * sizeof ch->remotes[0]);
+            ch->nremotes--;
+            gone++;
+            continue; /* the element now at i is unexamined; look at it again */
+        }
+        i++;
+    }
+    return gone;
+}
+
+int chan_remote_set_host(chan_t *ch, const char *server, const char *nick,
+                         const char *host)
+{
+    chan_remote_t *seen;
+
+    if (ch == NULL || server == NULL || nick == NULL || host == NULL) {
+        return -1;
+    }
+    /* An EMPTY host is a real answer, not a bad argument: it is what a burst
+     * that carried none leaves behind, and refusing it would mean a peer could
+     * not say "this member has no host" once a host had been learned. */
+    seen = chan_remote_find(ch, server, nick);
+    if (seen == NULL) {
+        return -1;
+    }
+    return copy_bounded(seen->host, sizeof seen->host, host) ? 0 : -1;
 }
 
 int chan_remote_remove(chan_t *ch, const char *server, const char *nick)

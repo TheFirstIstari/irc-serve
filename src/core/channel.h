@@ -178,13 +178,26 @@
  *
  * 64 is IRC_MAX_NICK-relevant rather than derived from anything in this file:
  * it is the same figure as the per-SERVER nick space this node already bounds
- * every other walk by, and the cost is 64 * 136 bytes = 8.5 KiB of ADDRESSED
- * array per channel, of which only the used prefix is ever touched. The
- * alternative -- sizing it from CHAN_MAX_MEMBERS, the local bound -- would be
- * a 256-entry array on every channel for a mesh this size, and the local bound
- * is a different question (how many CLIENTS this node serves) from this one
- * (how many members a remote server has told us about). */
+ * every other walk by, and the cost is 64 * sizeof(chan_remote_t) per channel of
+ * ADDRESSED array, of which only the used prefix is ever touched. The number is
+ * WRITTEN as sizeof() rather than as the literal it used to be (64 * 136 = 8.5
+ * KiB) because chan_remote_t grew a `host` in Phase 6 C4 and the literal did
+ * not grow with it: the figure was correct when the struct was 136 bytes and
+ * would have been wrong the day it was not, which is the failure a written-out
+ * product invites. The alternative -- sizing it from CHAN_MAX_MEMBERS, the local
+ * bound -- would be a 256-entry array on every channel for a mesh this size, and
+ * the local bound is a different question (how many CLIENTS this node serves)
+ * from this one (how many members a remote server has told us about). */
 #define CHAN_MAX_REMOTE_MEMBERS 64
+
+/* conn_t::host is char[128], and the bound is one less than the field -- the
+ * same relationship CHAN_MAX_NAME has to chan_t::name. Written as the struct
+ * width rather than as a literal for the reason CHAN_MAX_REMOTE_MEMBERS no
+ * longer writes one out: a bound that is a copy of a field cannot fall behind
+ * it. A member of this roster and a member of channels[].members[] describe the
+ * same person, and this is the width a 2.1 hostmask would render the remote one
+ * at. */
+#define CHAN_MAX_REMOTE_HOST (sizeof(((conn_t *)0)->host) - 1u)
 
 /* 353's trailing parameter is rendered through reply()'s REPLY_TEXT_MAX (512),
  * and RFC 2812 3.3.5 says a 353 MAY be split across several lines. This is the
@@ -275,35 +288,36 @@ struct chan_ban {
  * ever heard of.
  *
  * ---------------------------------------------------------------------------
- * A `host` FIELD IS COMING, AND THIS STRUCT IS READY FOR IT
+ * A `host` FIELD, which C4 ADDED AND THIS COMMENT USED TO FORECAST
  * ---------------------------------------------------------------------------
- * Phase 6 C4 extends this with a `host`, so a remote member can be rendered as
- * a hostmask rather than as a bare nick. That is a C4 change and it is NOT made
- * here; what C4 needs to know about this declaration is that it is additive and
- * cheap, which it is:
+ * This field exists because 4.3's SBURST carries a host for every nick, and a
+ * remote member this node cannot render as a hostmask is a remote member 2.1
+ * cannot describe. It is the additive change this struct's own comment promised
+ * C4 would make, and the three properties that comment gave for the addition are
+ * what made it safe:
  *
  *   - Nothing serialises this struct. There is no memcpy of a chan_remote_t, no
- *     wire form and no SBURST shape keyed on it, so adding a field cannot move a
- *     byte on the wire. The remote roster reaches peers as 4.3's SJOIN, which
- *     carries (channel, member, flags) and no host at all today.
- *   - Nothing is keyed by its LAYOUT either. chan_remote_add(),
- *     chan_remote_find() and chan_remote_at() address it by field, 353 renders
- *     from `nick` and `flags` by name, and servers[] is a separate set of names
- *     keyed by STRING, so a new field cannot alias with an existing one or
- *     invalidate an index.
+ *     wire form and no layout key, so a wider element cannot move a byte on the
+ *     wire and cannot alias with an index.
  *   - The array is grown with realloc() in whole elements, so a wider struct
  *     needs no allocator and no capacity change beyond sizeof.
+ *   - Everything that reads it addresses it by field name, so a new field
+ *     cannot change an answer.
  *
- * The one thing a `host` field will NOT be is reliable on a member this node
- * learned from a LIVE `SJOIN`: 4.3's SJOIN does not carry a host, so the field
- * is legitimately EMPTY for such a member and only a resync (SBURST) can fill
- * it. 2.1's `nick!user@host` is what a client needs to see, so anything that
- * renders a remote member must handle the empty case rather than printing a
- * half-built hostmask -- and the empty case is the normal one until the resync
- * runs, not a corner. */
+ * THE ONE THING IT IS NOT IS RELIABLE, and the asymmetry is the design rather
+ * than an oversight. 4.3's SJOIN does not carry a host, so a member learned from
+ * a LIVE SJOIN has an EMPTY host and only a resync can fill it -- and a resync
+ * is the rarer event. An empty host is therefore the NORMAL state for a member
+ * this node has not been re-synced about, not a corruption, and nothing in this
+ * tree may report it as one. Anything that renders a remote member has to handle
+ * the empty case rather than printing a half-built hostmask.
+ */
 typedef struct chan_remote {
     char     nick[IRC_MAX_NICK + 1];
     char     server[CHAN_MAX_SERVER + 1];
+    /* The member's host, or "" when this node learned the member from a live
+     * SJOIN rather than from a burst. See the note above. */
+    char     host[CHAN_MAX_REMOTE_HOST + 1];
     unsigned flags; /* CHAN_MEMBER_OP / CHAN_MEMBER_VOICE, as for a local one */
 } chan_remote_t;
 
@@ -559,7 +573,8 @@ int chan_server_has(const chan_t *ch, const char *name);
  * ---------------------------------------------------------------------------
  * A member this node cannot deliver to and has never had a socket for. 2.2
  * stores remote state as a CACHE the origin corrects, and 4.3's SJOIN/SPART
- * are what fills it. These five are the whole of that surface in C3.
+ * are what fills it, with SBURST filling what they cannot. These are the whole
+ * of that surface.
  */
 
 /* Record `nick` on `server` as a member, with `flags`. Idempotent on
@@ -573,7 +588,12 @@ int chan_server_has(const chan_t *ch, const char *name);
  * point in the tree where a nickname arrives from a network rather than from a
  * client, and 2.1's charset rule exists because later phases build on it. A
  * roster entry that failed the charset would be a name the node could not
- * qualify, compare or render. */
+ * qualify, compare or render.
+ *
+ * A NEW entry is created with an EMPTY host, and a repeat leaves the host
+ * alone. The asymmetry is the point: 4.3's SJOIN carries no host, so a repeat
+ * from a live SJOIN has nothing to say about one a burst filled, and clearing
+ * it would make a re-assert throw away the only field this struct grew for. */
 int chan_remote_add(chan_t *ch, const char *server, const char *nick,
                     unsigned flags);
 
@@ -582,6 +602,36 @@ int chan_remote_add(chan_t *ch, const char *server, const char *nick,
  * set is per SERVER and only the caller can tell whether this entry was the
  * server's last. */
 int chan_remote_remove(chan_t *ch, const char *server, const char *nick);
+
+/* Drop EVERY entry belonging to `server`, and return how many went. 0 when the
+ * server had none, which is the ordinary case on a node that has not been told
+ * about it.
+ *
+ * IT EXISTS FOR 4.3's REPLACE-RATHER-MERGE, and nothing else uses it. A resync
+ * replaces this node's knowledge of what ONE origin holds, so the entries that
+ * origin contributed have to go before its new ones arrive: without this, a
+ * member who left at the origin stays in the roster forever, because SPART is a
+ * per-member line and a burst is the only thing that can say "none of them are
+ * here any more". It is a function rather than a loop at the call site because
+ * the walk-and-remove is the one place that has to be careful about removing
+ * under a cursor, and a caller that wrote it would write it wrong at least once.
+ *
+ * Entries from OTHER servers are untouched, which is what makes the operation
+ * per-ORIGIN and therefore safe to apply to a node that is also holding
+ * channels and members of its own. */
+size_t chan_remote_purge(chan_t *ch, const char *server);
+
+/* Set the (server, nick) member's host. Returns 0 on success, -1 on a bad
+ * argument, on an entry that is not there, or on a host longer than
+ * CHAN_MAX_REMOTE_HOST -- REFUSED, not truncated, for 3.2's reason: a truncated
+ * host renders a hostmask that is not the one the peer reported.
+ *
+ * It is a setter rather than a field write because the bounded copy belongs in
+ * the module that owns the struct, and a caller doing `memcpy(r->host, h,
+ * strlen(h))` against a 128-byte field is the shape of the bug this exists to
+ * prevent. */
+int chan_remote_set_host(chan_t *ch, const char *server, const char *nick,
+                         const char *host);
 
 /* The entry for this (server, nick), or NULL. Nicknames fold (2.1) and server
  * names fold (2.4). The SERVER is part of the key because 8/Phase 9's

@@ -13,11 +13,11 @@
  * The link LIFECYCLE and the handshake, and nothing else. This file can take a
  * peer from "configured" to "ESTABLISHED", keep it alive, notice that it is not,
  * and say so on stdout. It does not carry messages: the inbound S-verb guard
- * chain and its handlers are federation/verbs.c's fed_dispatch() (C3), and
- * burst.c/`SBURST` is C4. The
- * consequence to be aware of while reading the tick is written out under
- * "WHAT T3 COSTS A TEST" below -- it is the one place where this file's
- * behaviour changes a number a Phase 5 test asserts on.
+ * chain and its handlers are federation/verbs.c's fed_dispatch() (C3), and the
+ * resync is federation/burst.c's -- which this file CALLS, at establishment and on
+ * link-down, and does not implement. The consequence to be aware of while reading
+ * the tick is written out under "WHAT T3 COSTS A TEST" below -- it is the one place
+ * where this file's behaviour changes a number a Phase 5 test asserts on.
  *
  * ---------------------------------------------------------------------------
  * THE EXCHANGE, AND WHY IT IS SYMMETRIC

@@ -434,10 +434,172 @@ static void case_zero_member_node_relays(void)
     nf_free(&b);
 }
 
+/* ---------------------------------------------------------------------------
+ * THE SAME ROW, ON THE OTHER SIDE: AN OWNER WITH NO LOCAL MEMBERS
+ * ---------------------------------------------------------------------------
+ * The case above is the amended 3.1 row's NON-OWNED arm. The OWNED arm carries an
+ * obligation the design states in the same amendment and that C3 did not test, and
+ * the reason it was not tested is worth recording rather than leaving: a fault
+ * injected at the spot -- "only forward if the local write reached somebody" --
+ * produced no failure, because in every message test the owner had a local member
+ * to write to. A node that owns a channel it holds NOBODY in is a state the wire
+ * reaches only by a member leaving, and that is what this case does.
+ *
+ * HOW THE STATE IS REACHED, with no fixture poking at all:
+ *
+ *   A owns #T and bob is its only local member. carol, on B, joins -- so A records
+ *   a member-server for irc.b, and A's #T has nservers == 1.
+ *   bob PARTs on A. 2.2 removes the member, the SPART is forwarded, and A is left
+ *   with nmembers == 0 and nservers == 1 -- which is precisely the state
+ *   chan_dispose_if_empty() exists to KEEP, and a part is the only ordinary way a
+ *   node reaches it.
+ *   A therefore still OWNS a channel it is in nobody in, and origin is immutable
+ *   for a channel's lifetime (2.2), so A takes the OWNED row for that channel's
+ *   next `message`.
+ *
+ * THE ASSERTION IS THE OWNED ARM'S OWN CONSEQUENCE, which is the only observable
+ * for it: A cannot deliver the message to anybody, so if the forward were gated on
+ * the local write nothing would leave A, and B would never see the message come
+ * back. B dropping it as its own origin (2.4) is therefore the proof, and it is
+ * the same observable the case above uses -- which is not a duplication, because
+ * the two cases put the zero-membership node on OPPOSITE sides of the table and a
+ * single forward arm serves both.
+ */
+static void case_owner_with_no_local_members_relays(void)
+{
+    nf_node_t a;
+    nf_node_t b;
+    test_client_t bob;
+    test_client_t carol;
+    char want[256];
+    size_t a_drops;
+
+    /* A first this time, and it configures no peer; B dials it and B's client is
+     * the one on the far side of the forward. Same one-direction rule as the case
+     * above and for the same reason (federation/link.h names the limitation). */
+    g_peer_name = NAME_B;
+    g_peer_port = 0;
+    g_trace = 0;
+    TF_CHECK_MSG(nf_spawn_inline_named(&b, NAME_B, child_setup) == 0,
+                 "could not spawn node B");
+    TF_CHECK_MSG(b.port > 0, "node B reported no port");
+    g_peer_port = b.port;
+    TF_CHECK_MSG(nf_spawn_inline_named(&a, NAME_A, child_setup) == 0,
+                 "could not spawn node A");
+
+    TF_CHECK_MSG(nf_expect(&a, "link_established: peer=" NAME_B, T_IO_MS) == 0,
+                 "node A never established its link to node B");
+    TF_CHECK_MSG(nf_expect(&b, "link_established: peer=" NAME_A, T_IO_MS) == 0,
+                 "node B never established its link to node A");
+
+    register_client(&bob, a.port, NICK_B);
+    register_client(&carol, b.port, NICK_C);
+
+    /* bob JOINs on A, so A OWNS #T and has a local member of it. */
+    TF_CHECK_MSG(tc_send(&bob, "JOIN " CHAN) == 0, "bob's JOIN send failed");
+    TF_CHECK_MSG(tc_expect(&bob, " 366 ", T_IO_MS) == 0,
+                 "bob's JOIN never completed on the node that owns the channel");
+    /* carol JOINs on B, which does not own it, so the SJOIN reaches A and A's #T
+     * gains a member-server. This is the step that makes the later PART leave a
+     * channel behind instead of disposing of it. */
+    TF_CHECK_MSG(tc_send(&carol, "JOIN " CHAN) == 0, "carol's JOIN send failed");
+    TF_CHECK_MSG(tc_expect(&carol, " 366 ", T_IO_MS) == 0,
+                 "carol's JOIN never completed on the node that does not own the "
+                 "channel");
+    TF_CHECK_MSG(nf_expect(&a, "fed_sjoin: channel=" CHAN " member=" NICK_C, T_IO_MS)
+                     == 0,
+                 "node A never learned about carol, so its #T has no member-server "
+                 "and the state this case is about is not reachable: %s",
+                 a.out);
+
+    /* bob PARTs, and A is left owning a channel it is in nobody in. The
+     * `members=0 servers=1` in A's own line is the precondition stated as a
+     * single observation: the second half is why the channel still exists, and the
+     * first half is what the case is about. */
+    TF_CHECK_MSG(tc_send(&bob, "PART " CHAN) == 0, "bob's PART send failed");
+    TF_CHECK_MSG(nf_expect(&a, "chan_part: channel=" CHAN " nick=" NICK_B
+                               " members=0 servers=1",
+                           T_IO_MS) == 0,
+                 "node A did not end up owning a channel it holds NO local member "
+                 "of, which is the state 3.1's amended owned/`message` row has to "
+                 "carry: %s",
+                 a.out);
+
+    /* THE MESSAGE, from the one member A knows about, over the link. */
+    (void)snprintf(want, sizeof want, "PRIVMSG " CHAN " :" TEXT);
+    TF_CHECK_MSG(tc_send(&carol, want) == 0, "carol's PRIVMSG send failed");
+
+    /* IT CROSSED TO A, AND A DELIVERED IT TO NOBODY. The `origin=` is irc.b and
+     * the sender is a real hostmask, so this is A receiving a relayed message
+     * rather than one of its own. */
+    TF_CHECK_MSG(nf_expect(&a, "fed_message: channel=" CHAN " from=" NICK_C "!",
+                           T_IO_MS) == 0,
+                 "node A never received the message for the channel it owns and "
+                 "holds nobody in: %s",
+                 a.out);
+    TF_CHECK_MSG(nf_expect(&a, "delivered=0 origin=" NAME_B " hops=0", T_IO_MS) == 0,
+                 "node A reported a local delivery for a channel it holds no member "
+                 "of, so the state this case is about was not reached: %s",
+                 a.out);
+    TF_CHECK_MSG(tf_count(a.out, "fed_message: channel=" CHAN) == 1,
+                 "node A received the message %lu times; an owner that forwards "
+                 "twice is a fan-out defect rather than a routing one",
+                 (unsigned long)tf_count(a.out, "fed_message: channel=" CHAN));
+
+    /* AND A FORWARDED IT ANYWAY, which is the whole of the obligation. It is read
+     * on B, because the only observable for A's forward is what the line does when
+     * it lands: the message's origin IS B, so 2.4's never-forward-own-origin rule
+     * drops it there. Gating A's forward on the local write's result removes that
+     * line and this assertion fails -- which is the point, because that gate is
+     * exactly the bug the amended row exists to forbid. */
+    TF_CHECK_MSG(nf_expect(&b, "peer=" NAME_A " command=SPRIVMSG origin=" NAME_B
+                           " self=" NAME_B " hops=1",
+                           T_IO_MS) == 0,
+                 "node B never dropped A's SPRIVMSG as its own origin, so nothing "
+                 "came back and the owner that holds NO local member did NOT relay "
+                 "it. 3.1's amended owned/`message` row applies to an owner with "
+                 "zero members just as much as to a non-owner.\n  node said: %s",
+                 b.out);
+    a_drops = tf_count(b.out, "command=SPRIVMSG origin=" NAME_B);
+    TF_CHECK_MSG(a_drops == 1,
+                 "node B dropped %lu copies of the relayed SPRIVMSG, expected 1",
+                 (unsigned long)a_drops);
+
+    /* AND CAROL SAW IT EXACTLY ONCE. B delivered it locally -- she is a member
+     * there -- and the bounce was DROPPED, not delivered, so a second copy here
+     * would be a loop rather than a relay.
+     *
+     * THE PING IS A DRAIN AND NOT A POLITENESS. times_seen() counts what the
+     * PARENT has read off the socket, and nothing above forced a read of carol's,
+     * so without this the count is a statement about the parent's read schedule
+     * rather than about the node. The PONG is ordered behind the message on the
+     * same connection, so once it is in the buffer the whole answer is. */
+    TF_CHECK_MSG(tc_send(&carol, "PING :relay") == 0, "carol's drain PING failed");
+    /* The TOKEN, not "PONG": register_client() already drained this client with a
+     * PING, so a needle of "PONG" is satisfied by that earlier answer and returns
+     * before this connection has read a byte of the message. */
+    TF_CHECK_MSG(tc_expect(&carol, "relay", T_IO_MS) == 0,
+                 "carol got no PONG, so her buffer is not yet drained and the count "
+                 "below is a statement about the read schedule");
+    TF_CHECK_MSG(times_seen(&carol, TOKEN) == 1,
+                 "carol saw the text %lu times, expected 1: she is the sender's "
+                 "peer on the non-owning node, so the local delivery is the one "
+                 "legitimate copy and the bounce must not add another",
+                 (unsigned long)times_seen(&carol, TOKEN));
+
+    TF_CHECK_MSG(nf_stop(&a) == 0, "node A did not exit cleanly");
+    TF_CHECK_MSG(nf_stop(&b) == 0, "node B did not exit cleanly");
+    tc_close(&bob);
+    tc_close(&carol);
+    nf_free(&a);
+    nf_free(&b);
+}
+
 
 int main(void)
 {
     case_zero_member_node_relays();
+    case_owner_with_no_local_members_relays();
     tf_done("fed_relay");
     return 0;
 }
