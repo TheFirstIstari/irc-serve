@@ -22,6 +22,14 @@
  *                  grown and every element slot stays NULL. Phase 4 fills it
  *                  without changing the layout.
  *
+ * The struct's shape has since been FINAL in the sense 7/Phase 4 meant: the
+ * fields Phase 4 and Phase 5 added (member flags and the remote caches on
+ * chan_t; away, signon_at and last_active here) are additions, not
+ * rearrangements, and every one of them is a field a later phase or a numeric
+ * needs. A phase that finds itself wanting a DIFFERENT struct is the signal
+ * that the design above is wrong, not that the field should be shoved in
+ * wherever it happens to fit.
+ *
  * There is deliberately NO per-connection message id. Ids come from a
  * per-SERVER monotonic counter owned by server_t (2.4), because a
  * per-connection counter makes two connections on one server both emit the
@@ -47,6 +55,7 @@
 #define IRC_CORE_CONNECTION_H
 
 #include <stddef.h>
+#include <time.h>
 
 #include "core/message.h"
 
@@ -93,12 +102,76 @@ struct chan; /* opaque until Phase 4 (2.2) */
                            sizeof(((conn_t *)0)->user) + \
                            sizeof(((conn_t *)0)->host) + 3u)
 
+/* conn_t::away, the AWAY message. Empty means "not away", the same idiom
+ * nick[0]/user[0] already use for "this fact is not established yet", so no
+ * separate flag is needed and the two can never disagree.
+ *
+ * THE BOUND, AND WHY IT IS 255
+ * -----------------------------
+ * Three independent reasons converge on the same number, which is why it is
+ * derived rather than picked:
+ *
+ *   1. RFC 1459 2.4.2 caps the AWAY message at 255 characters. 255 is the RFC's
+ *      number, not this project's.
+ *   2. 301 RPL_AWAY carries it as a numeric's TRAILING TEXT, and reply() renders
+ *      that into REPLY_TEXT_MAX (512). At 255 it fits with room to spare, so an
+ *      away message this node accepted is always an away message 301 can report.
+ *      A larger bound would make "accepted" and "reportable" different sets.
+ *   3. It equals CHAN_MAX_TOPIC (255), the other client-supplied free-text field
+ *      this node stores, so there is ONE bound for "a sentence a user typed",
+ *      not two that differ for no stated reason.
+ *
+ * IT IS A CAP, NOT A TRUNCATION POINT
+ * ----------------------------------
+ * An AWAY message longer than this is REFUSED (417), and the previous away state
+ * is left exactly as it was. Truncating would store a message the user did not
+ * write and then report the shortened one in 301 as if it were theirs -- which
+ * is the same "never silently truncate a parameter" rule 3.2 states and Phase 4
+ * applied to a topic and a mode string.
+ *
+ * ---------------------------------------------------------------------------
+ * PHASE 6 NEEDS THIS FIELD: SECTION 4.3's SBURST
+ * ---------------------------------------------------------------------------
+ * 4.3: "SBURST is the resync verb. On every link establishment the initiator
+ * sends full state: ... all nicks: user / host / modes / away". So `away` is
+ * NOT a Phase 5 convenience -- it is a field with no other producer, and
+ * whoever writes SBURST must populate it. It is here, in the phase that first
+ * has a use for it, so that SBURST is a wire format rather than a struct change.
+ *
+ * The size is part of that contract: 4.3 sends "all nicks", so the away message
+ * is a per-nick cost in a burst whose size is O(nicks). A bound of 255 keeps
+ * that burst O(nicks) with a KNOWN ceiling; an unbounded message would make one
+ * client's AWAY able to inflate a resync for the whole node. */
+#define CONN_MAX_AWAY 255
+
 /* conn_fill() outcomes. EOF is a distinct value from a hard error because they
  * are different events on the wire and a caller that reports close reasons has
  * to be able to tell them apart without inspecting errno, which may be stale. */
 #define CONN_FILL_EOF 1
 
-/* The connection. Layout is 2.1 (identity) plus 3.3 (buffers), in that order. */
+/* The connection. Layout is 2.1 (identity) plus 3.3 (buffers), in that order.
+ *
+ * The three fields Phase 5 adds sit inside the identity block, beside the
+ * fields they are derived from, and each earns its place by being REPORTED on
+ * the wire -- none of them is bookkeeping a client cannot see:
+ *
+ *   away        4.3's SBURST must send it for every nick, and 301/352 report
+ *               it. See CONN_MAX_AWAY above, which is where the bound and the
+ *               over-long policy are argued.
+ *   signon_at   317 RPL_WHOISIDLE carries a signon time. There is no other
+ *               value on the node that could fill it, and a numeric that lies
+ *               about what it is is what Phase 4 refused to do for 329 ("reusing
+ *               topic_when for it would be a numeric that lies about what it
+ *               is"). Borrowing the node's boot time would be the same lie one
+ *               level up: it is when the SERVER started, not when the user
+ *               connected.
+ *   last_active 317's other half. It is updated in conn_fill(), which is the
+ *               only place that observes the connection doing anything, so the
+ *               idle time it yields is measured from real socket activity rather
+ *               than from the last command that happened to be dispatched.
+ *
+ * All three are set or updated inside the connection layer, and none of them is
+ * something Phase 6 has to add. */
 typedef struct conn {
     int         fd;
     int         kind;              /* CONN_CLIENT | CONN_SERVER */
@@ -108,6 +181,9 @@ typedef struct conn {
     char        host[128];
     char        realname[256];
     int         state;             /* CONN_REG_* | CONN_CLOSING */
+    char        away[CONN_MAX_AWAY + 1];
+    time_t      signon_at;         /* accept time; 317's <signon time> */
+    time_t      last_active;       /* last byte read; 317's <idle> */
     struct chan **chans;           /* channels joined; Phase 4 */
     size_t      nchans;
     size_t      cap;

@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include "core/chan_verbs.h"
+#include "core/msg_verbs.h"
 #include "core/reply.h"
 
 /* ---------------------------------------------------------------------------
@@ -474,13 +475,25 @@ static const command_t k_commands[] = {
     /* 4.1, later phases. */
     { "JOIN",    handle_join,  0 },
     { "PART",    handle_part,  0 },
-    { "PRIVMSG", NULL,         0 },
-    { "NOTICE",  NULL,         0 },
     { "TOPIC",   handle_topic, 0 },
     { "NAMES",   handle_names, 0 },
     { "MODE",    handle_mode,  0 },
     { "KICK",    handle_kick,  0 },
-    { "KILL",    NULL,         0 }
+    { "KILL",    NULL,         0 },
+    /* 7/Phase 5: the messaging surface, and the point at which the node becomes
+     * usable. PRIVMSG and NOTICE are 4.1 MUST; WHO, WHOIS, ISON and AWAY are
+     * 4.2 SHOULD, pulled forward here because 4.2's own list puts them in the
+     * same phase as the message path and a client that cannot ask "who is here"
+     * or "is this nick online" is a client this milestone has not delivered.
+     *
+     * The table is ordered by the RFC's 4.1/4.2 order, and 3.3.2's grouping, so
+     * the surface reads as the specification does. */
+    { "PRIVMSG", handle_privmsg, 0 },
+    { "NOTICE",  handle_notice,  0 },
+    { "WHO",     handle_who,     0 },
+    { "WHOIS",   handle_whois,   0 },
+    { "ISON",    handle_ison,    0 },
+    { "AWAY",    handle_away,    0 }
 };
 
 static const command_t *lookup(const char *verb)
