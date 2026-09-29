@@ -103,6 +103,59 @@ int main(void)
     server_nick_release(&s, "nobody");
     server_nick_release(&s, "nobody");
 
+    /* --- the same registry, folded (2.1 / RFC 2812 2.3.1) ---
+     * A fresh conn rather than a or b, because those two were deliberately given
+     * nicknames that do not match the names they were made to hold -- "bob" is
+     * held by a conn whose conn_t::nick is "bob", but "alice" is held by a conn
+     * whose conn_t::nick is also "bob" -- and this block is about the ENUMERATION
+     * agreeing with the table, which a fixture like that cannot answer for.
+     *
+     * Every count is a DELTA rather than an absolute, for the same reason: what
+     * this block must show is that a folded claim and a folded release move the
+     * enumeration by exactly one, not what the enumeration happens to hold.
+     * test_nick_case.c is the wire-level statement of the same rule. */
+    {
+        conn_t *d = fake_conn(12, "carol");
+        size_t before = server_nick_count(&s);
+
+        TF_CHECK_MSG(server_nick_claim(&s, "carol", d) == 0,
+                     "a free nickname was refused");
+        TF_CHECK_MSG(server_nick_count(&s) == before + 1,
+                     "a claim did not add exactly one entry to the enumeration: "
+                     "%zu held, expected %zu",
+                     server_nick_count(&s), before + 1u);
+        TF_CHECK_MSG(server_nick_lookup(&s, "CAROL") == d,
+                     "a differently-cased spelling did not find a held nickname: "
+                     "2.1 and RFC 2812 2.3.1 both make a nickname "
+                     "case-insensitive");
+        TF_CHECK_MSG(server_nick_claim(&s, "CaRoL", a) != 0,
+                     "'CaRoL' was claimable while 'carol' was held: they are one "
+                     "name, so this node would be running two users whose "
+                     "nicknames differ only in case");
+        TF_CHECK_MSG(server_nick_count(&s) == before + 1,
+                     "a REFUSED claim still added to the enumeration (%zu held, "
+                     "expected %zu): a name nobody holds would be listed by WHO",
+                     server_nick_count(&s), before + 1u);
+        /* Releasing by the OTHER spelling must reach both halves of the index.
+         * The count is the half that goes wrong quietly: a release that removed
+         * the table entry and left the vector holding the connection would leave
+         * WHO <mask> listing somebody this node no longer holds a nickname for,
+         * with nothing to reconcile the two. */
+        server_nick_release(&s, "cAROL");
+        TF_CHECK_MSG(server_nick_lookup(&s, "carol") == NULL,
+                     "a release by a differently-cased spelling did not remove "
+                     "the name");
+        TF_CHECK_MSG(server_nick_count(&s) == before,
+                     "the release removed the table entry but not the "
+                     "enumeration: %zu enumerated, expected %zu",
+                     server_nick_count(&s), before);
+        TF_CHECK_MSG(server_nick_claim(&s, "CarOl", d) == 0,
+                     "the name was not claimable in any case after a folded "
+                     "release");
+        server_nick_release(&s, "CAROL");
+        conn_free(d); /* never registered in by_fd, so shutdown will not own it */
+    }
+
     /* --- channel registry: names in Phase 2, values in Phase 4 --- */
     TF_CHECK_MSG(server_chan_add(&s, "#Chan") == 0, "adding a channel failed");
     TF_CHECK_MSG(server_chan_add(&s, "#Chan") != 0,

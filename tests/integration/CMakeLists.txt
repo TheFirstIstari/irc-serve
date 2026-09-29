@@ -84,6 +84,15 @@ irc_add_integration_test(test_nick_rule test_nick_rule.c)
 # 7/Phase 3: duplicate nick -> 433, and the incumbent keeps it.
 irc_add_integration_test(test_dup_nick test_dup_nick.c)
 
+# 2.1 / RFC 2812 2.3.1: nicknames are case-INsensitive. One name is held at a
+# time whichever way it is spelled -- `BOB` is refused while `bob` is held, and
+# `bob` is refused while `BOB` is -- and the case the user CHOSE is what appears
+# in 353, in a message prefix, in 352 and in 311. Separate from test_dup_nick
+# because that file asserts the claim rule for one spelling and this one asserts
+# it across spellings; folding the stored nickname would satisfy test_dup_nick
+# and break every display assertion here.
+irc_add_integration_test(test_nick_case test_nick_case.c)
+
 # 4.4: 451 before registration, 421 for a verb this build does not have. Nothing
 # falls through in silence.
 irc_add_integration_test(test_pre_register test_pre_register.c)

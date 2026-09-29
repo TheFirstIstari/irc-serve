@@ -28,8 +28,47 @@
  * is sized once from a generous bound, and a full table is reported rather than
  * rehashed, so a lookup in the send path cannot fail because of an allocation
  * that would have to block the loop.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY ONE TABLE IS FOLDED AND THE OTHER IS NOT
+ * ---------------------------------------------------------------------------
+ * The two registries disagree about case for a REASON, not by accident:
+ *
+ *   channels  2.2 says a channel name is stored uppercase-normalised and is
+ *             displayed uppercase, so the canonical form IS the display form.
+ *             The table is exact, and channel.c's accessor canonicalises the
+ *             caller's spelling before it probes (see chan_name_upper and the
+ *             reasoning at channel.c:48).
+ *   nicks     2.1 and RFC 2812 2.3.1 say nicknames are case-INsensitive, so
+ *             two spellings are one name -- but IRC convention and every client
+ *             display the case the user chose. A user who registers as `Bob` must
+ *             appear as `Bob` in 353, in a PRIVMSG prefix, in 352 and in 311.
+ *
+ * So a nick cannot be stored the way a channel is. `folded` is therefore a
+ * property OF THE TABLE, set at construction, and every key that enters a folded
+ * table is folded before it is hashed, compared or stored. It is not a
+ * discipline every caller has to remember: the failure mode of getting it wrong
+ * was issue #100, where `PRIVMSG BOB :hi` answered 401 to a user connected as
+ * `bob` and -- worse -- `bob` and `BOB` were two claimable slots on a node whose
+ * identity scheme is nick@server.
+ *
+ * The fold is ASCII and deliberately NOT tolower() in a locale, for
+ * channel.c:48's reason: 005 advertises CASEMAPPING=ascii, so this node has
+ * already told every client that []\~ and {}|^ are NOT equivalent, and folding
+ * them here would break that promise in a way no test elsewhere would catch. A
+ * registry key that depended on LC_CTYPE would additionally make two nodes on
+ * differently-configured hosts disagree about whether a nickname is taken.
  */
 #define STRTAB_BUCKETS 1024u
+
+/* The longest key a FOLDED table can hold, and so the size of the scratch buffer
+ * strtab_probe()/strtab_put() fold into. It is the nick bound rather than an
+ * invented one: the only folded table is the nick registry, whose every key
+ * arrives through server_nick_claim() -> valid_nick(), and valid_nick() caps a
+ * nickname at IRC_MAX_NICK (message.h, from conn_t::nick's own width). A longer
+ * string therefore cannot be a key of a folded table, and is refused rather than
+ * truncated into one that could collide with a real name. */
+#define STRTAB_FOLD_MAX (IRC_MAX_NICK + 1)
 
 struct strtab_entry {
     char  *key;
@@ -40,6 +79,7 @@ struct strtab_entry {
 struct strtab {
     struct strtab_entry *buckets;
     size_t               nentries;
+    int                  folded;  /* keys are ASCII-folded on the way in */
 };
 
 static uint64_t strtab_hash(const char *s)
@@ -55,7 +95,38 @@ static uint64_t strtab_hash(const char *s)
     return h;
 }
 
-static struct strtab *strtab_new(void)
+static char down_ascii(char c)
+{
+    if (c >= 'A' && c <= 'Z') {
+        return (char)(c + ('a' - 'A'));
+    }
+    return c;
+}
+
+/* Fold `key` into `out`, which holds `cap` bytes including the NUL. Returns 0 on
+ * success, -1 if the result would not fit.
+ *
+ * The `char` parameter is passed and returned without an (unsigned char) cast
+ * deliberately, and the reason is the same one channel.c:48 gives for not calling
+ * toupper() at all: no libc function sees the value, and the range tests are
+ * against ASCII literals, so a byte outside 'A'..'Z' is returned unchanged
+ * whatever the sign of char is. Casting would be noise here and a cast is
+ * exactly what a future caller would have to remember not to drop. */
+static int strtab_fold(char *out, size_t cap, const char *key)
+{
+    size_t i;
+
+    for (i = 0; key[i] != '\0'; i++) {
+        if (i + 1u >= cap) {
+            return -1;
+        }
+        out[i] = down_ascii(key[i]);
+    }
+    out[i] = '\0';
+    return 0;
+}
+
+static struct strtab *strtab_new(int folded)
 {
     struct strtab *t = (struct strtab *)calloc(1, sizeof *t);
 
@@ -67,6 +138,7 @@ static struct strtab *strtab_new(void)
         free(t);
         return NULL;
     }
+    t->folded = folded;
     return t;
 }
 
@@ -87,13 +159,33 @@ static void strtab_free(struct strtab *t)
 /* Locate `key` in the table. Returns the bucket index, sets *found to 1 when the
  * key is present or 0 when the returned bucket is free, and returns
  * (size_t)-1 only when the table is completely full. One probe loop, so the
- * const-correct lookup and the mutating insert cannot drift apart. */
+ * const-correct lookup and the mutating insert cannot drift apart.
+ *
+ * For a FOLDED table the key is folded first, here, rather than by each of the
+ * four operations below. That is the whole point: strtab_get/contains/del/put
+ * are the only doors to this table, they all come through this loop, and a caller
+ * added later gets the case-insensitive rule whether or not it knows the rule
+ * exists. */
 static size_t strtab_probe(const struct strtab *t, const char *key, int *found)
 {
-    size_t idx = (size_t)(strtab_hash(key) % STRTAB_BUCKETS);
-    size_t probe;
+    char        fold[STRTAB_FOLD_MAX];
+    const char *k = key;
+    size_t      idx;
+    size_t      probe;
 
     *found = 0;
+    if (t->folded && strtab_fold(fold, sizeof fold, key) != 0) {
+        /* Too long to be a key of this table, so it can neither match an entry
+         * nor become one. The same sentinel as a full table, and deliberately so:
+         * every caller treats both as "give up" -- put() returns -1, get() and
+         * contains() report absence, del() reports nothing to remove. Which of
+         * the two it was is not a fact any caller can act on. */
+        return (size_t)-1;
+    }
+    if (t->folded) {
+        k = fold;
+    }
+    idx = (size_t)(strtab_hash(k) % STRTAB_BUCKETS);
     for (probe = 0; probe < STRTAB_BUCKETS; probe++) {
         size_t at = (idx + probe) % STRTAB_BUCKETS;
         const struct strtab_entry *e = &t->buckets[at];
@@ -102,7 +194,7 @@ static size_t strtab_probe(const struct strtab *t, const char *key, int *found)
             *found = 0;
             return at;
         }
-        if (strcmp(e->key, key) == 0) {
+        if (strcmp(e->key, k) == 0) {
             *found = 1;
             return at;
         }
@@ -129,9 +221,11 @@ static int strtab_contains(const struct strtab *t, const char *key)
 static int strtab_put(struct strtab *t, const char *key, void *val)
 {
     struct strtab_entry *e;
-    int found = 0;
+    char   fold[STRTAB_FOLD_MAX];
+    const char *stored = key;
+    int    found = 0;
     size_t at;
-    char *copy;
+    char  *copy;
 
     if (t == NULL || key == NULL || key[0] == '\0') {
         return -1;
@@ -145,11 +239,21 @@ static int strtab_put(struct strtab *t, const char *key, void *val)
         e->val = val; /* overwrite: re-claim of the same key */
         return 0;
     }
-    copy = (char *)malloc(strlen(key) + 1u);
+    /* The key is STORED folded, so the table's own bytes are the canonical form
+     * rather than whichever spelling the first claimer happened to type. Every
+     * later probe folds its own key to match, and nothing has to remember that
+     * the entry was inserted as "Bob" rather than "bob". */
+    if (t->folded) {
+        if (strtab_fold(fold, sizeof fold, key) != 0) {
+            return -1;
+        }
+        stored = fold;
+    }
+    copy = (char *)malloc(strlen(stored) + 1u);
     if (copy == NULL) {
         return -1;
     }
-    memcpy(copy, key, strlen(key) + 1u);
+    memcpy(copy, stored, strlen(stored) + 1u);
     e->key = copy;
     e->val = val;
     e->used = 1;
@@ -293,8 +397,12 @@ int server_init(server_t *s, const char *name)
     memcpy(s->name, name, strlen(name) + 1u);
 
     s->by_fd = (conn_t **)calloc(SERVER_FD_TABLE, sizeof *s->by_fd);
-    s->nicks = strtab_new();
-    s->chans = strtab_new();
+    /* Folded and exact, for the reasons spelled out at the strtab: 2.1 makes
+     * nicknames case-insensitive while the case the user chose is what gets
+     * displayed, and 2.2 makes a channel name uppercase-normalised, which is
+     * also how it is displayed. */
+    s->nicks = strtab_new(1);
+    s->chans = strtab_new(0);
     if (s->by_fd == NULL || s->nicks == NULL || s->chans == NULL) {
         server_shutdown(s);
         return -1;
@@ -693,15 +801,59 @@ int server_nick_claim(server_t *s, const char *nick, conn_t *c)
     return 0;
 }
 
+/* ASCII-folded nickname equality -- the SAME rule the nick table's keys use, so
+ * the two halves of the nick index cannot disagree about what a name is.
+ *
+ * It has to be spelled out rather than borrowed from the table, because this one
+ * compares a nickname against conn_t::nick, which holds the case the user chose
+ * and is therefore deliberately NOT the stored key. (Folding both sides into
+ * scratch buffers and calling strcmp would be the same six lines with two
+ * copies and a capacity argument on top.)
+ *
+ * This is the third copy of this fold in the node -- same_server_name() below
+ * and channel.c's same_name() are the other two -- and it is written out for the
+ * reason server.h records for the first pair: the function is six lines, a
+ * public helper two of the three callers would never call again is a wider API
+ * than the duplication is worth, and test_channels.c already asserts that the
+ * copies agree. What must NOT happen is one of them growing a different rule;
+ * that is what CASEMAPPING=ascii in 005 is a promise about.
+ *
+ * Every release path in the tree today passes the holder's OWN spelling, so this
+ * fold is what makes a differently-spelled release safe rather than relying on
+ * every caller continuing to be careful -- and the check that says so is
+ * test_registries.c's, which releases "cAROL" for a nickname claimed as "carol"
+ * and then asserts the ENUMERATION shrank too. That half goes wrong quietly: the
+ * table entry would be gone and WHO <mask> would still list the connection. */
+static int nick_same(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+    while (*a != '\0' && *b != '\0') {
+        if (down_ascii(*a) != down_ascii(*b)) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
 /* Drop `nick` from the enumeration, preserving claim order. Idempotent, and a
  * no-op for a name the table does not hold -- server_nick_release() is reached
  * twice on the ordinary QUIT path (once by the handler, once by the reaper)
- * and must not turn the second call into a corruption. */
+ * and must not turn the second call into a corruption.
+ *
+ * The comparison folds, because server_nick_release() may be handed a spelling
+ * the holder never typed: a caller that released "BOB" must remove the vector
+ * entry for the connection registered as "bob", or the table and the vector
+ * disagree about who holds the name -- which is the state server.h names as a
+ * JOIN that resolves to NULL, with no event that would ever reconcile it. */
 static void nick_objs_del(server_t *s, const char *nick)
 {
     for (size_t i = 0; i < s->nnick_objs; i++) {
         if (s->nick_objs[i] != NULL && s->nick_objs[i]->nick[0] != '\0' &&
-            strcmp(s->nick_objs[i]->nick, nick) == 0) {
+            nick_same(s->nick_objs[i]->nick, nick)) {
             for (size_t j = i + 1u; j < s->nnick_objs; j++) {
                 s->nick_objs[j - 1u] = s->nick_objs[j];
             }
