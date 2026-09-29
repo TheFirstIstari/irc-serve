@@ -142,7 +142,11 @@ struct server {
     conn_t  **by_fd;          /* FD_SETSIZE slots; NULL when the slot is free */
     size_t    nconns;
 
-    /* Registries. Both are string -> pointer maps. */
+    /* Registries. Both are string -> pointer maps. The nick one is FOLDED
+     * (ASCII, case-insensitive keys) and the channel one is EXACT -- for the
+     * reason spelled out where the table is defined in server.c: a nickname
+     * compares case-insensitively but is DISPLAYED in the case the user chose,
+     * whereas a channel name is both stored and displayed uppercase. */
     struct strtab *nicks;
     struct strtab *chans;
 
@@ -311,7 +315,35 @@ int server_reap(server_t *s);
  * server_nick_claim() returns 0 when the name was free and is now owned by `c`,
  * or -1 when it is already claimed. A -1 is the fact Phase 3 turns into 433; it
  * is not turned into a rename here, because rename-the-loser needs a broadcast
- * that does not exist until Phase 9. */
+ * that does not exist until Phase 9.
+ *
+ * ---------------------------------------------------------------------------
+ * NICKNAMES ARE CASE-INSENSITIVE, AND THAT IS A PROPERTY OF THIS REGISTRY
+ * ---------------------------------------------------------------------------
+ * 2.1 and RFC 2812 2.3.1 both say nicknames are case-insensitive, so `BOB` and
+ * `bob` are ONE name: exactly one of them can be held at a time, and a lookup of
+ * either finds the other. The table folds on the way in, so this holds for every
+ * operation above without any of them remembering to fold -- the thing a new
+ * caller must not have to get right, because getting it wrong is issue #100: a
+ * case-sensitive registry answered 401 to `PRIVMSG BOB :hi` for a user connected
+ * as `bob`, and let `bob` and `BOB` both be claimed.
+ *
+ * The fold is ASCII, matching the CASEMAPPING=ascii this node advertises in 005.
+ *
+ * ---------------------------------------------------------------------------
+ * THE DISPLAYED CASE IS NOT THE STORED CASE, AND MUST NOT BE
+ * ---------------------------------------------------------------------------
+ * conn_t::nick keeps the spelling the user chose, and every numeric and prefix
+ * renders from it (353 in chan_verbs.c, reply.c's target and prefix, 352 and 311
+ * in msg_verbs.c). So a user who registers as `Bob` is `Bob` on the wire
+ * everywhere, and the folded key is invisible. Only the DUPlicate decision is
+ * case-blind: `NICK BOB` from the holder of `bob` is the same nickname and is
+ * silent (RFC 2812 3.2), while `NICK BOB` from anybody else is 433.
+ *
+ * That is why the folded form is a COPY kept inside the table and not the field
+ * itself: making conn_t::nick lowercase would be simpler to reason about and
+ * would break every client that displays a user's chosen case.
+ */
 int server_nick_claim(server_t *s, const char *nick, conn_t *c);
 void server_nick_release(server_t *s, const char *nick);
 conn_t *server_nick_lookup(const server_t *s, const char *nick);

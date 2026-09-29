@@ -237,20 +237,16 @@ int fanout_line_fits(const char *prefix, const char *verb, const char *target,
 
 /* Resolve a nickname to a connection, folding case.
  *
- * This is NOT server_nick_lookup(), and the difference is a known defect in the
- * registry rather than a design choice: 2.1 says nicknames are case-insensitive
- * (RFC 2812 2.3.1), and the Phase 2 strtab compares keys with strcmp, so
- * `server_nick_lookup(s, "BOB")` misses a connection registered as "bob". Until
- * that is fixed at the registry, a node that answered 401 to `PRIVMSG BOB :hi`
- * would be refusing a message whose recipient is connected -- which is the
- * single most visible thing this phase can get wrong, and worse than the
- * inconsistency it works around.
+ * The fold is the nick registry's, not this function's: `server_nick_lookup()`
+ * folds ASCII on the way into the table (2.1 and RFC 2812 2.3.1 both say
+ * nicknames are case-insensitive), so this is a lookup like any other and needs
+ * no second opinion about case. It carries the NULL and empty-name guards the
+ * registry cannot, because a caller can hand it a target that was never a
+ * nickname -- `PRIVMSG :` reaches here with an empty middle parameter.
  *
- * The fold is an exact match FIRST and only then a case-folded scan, so a node
- * that somehow holds two names differing only in case still answers the
- * unambiguous one correctly. A case-folded hit is reported on the observable
- * output, because it is evidence of the registry defect rather than of
- * anything the user did. */
+ * Until the registry folded, this function did instead: an exact lookup, then a
+ * case-folded scan of the whole enumeration on a miss. That is issue #100, and
+ * it is why the rule now lives at the table rather than here. */
 conn_t *fanout_find_nick(server_t *s, const char *nick);
 
 /* `*` and `?` glob over nicknames, case-insensitive, for WHO's <mask> form.

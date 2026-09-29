@@ -41,25 +41,11 @@
 /* ASCII-only case folding, deliberately: 005 advertises CASEMAPPING=ascii, so
  * this node has already told every client that []\~ and {}|^ are NOT
  * equivalent, and folding them here would break that promise in a way no test
- * elsewhere would catch. */
+ * elsewhere would catch. The (unsigned char) cast is what makes that true for
+ * every byte rather than only for the ones that are already ASCII. */
 static int ascii_lower(int ch)
 {
     return (ch >= 'A' && ch <= 'Z') ? (ch - 'A' + 'a') : ch;
-}
-
-static int same_nick(const char *a, const char *b)
-{
-    if (a == NULL || b == NULL) {
-        return 0;
-    }
-    while (*a != '\0' && *b != '\0') {
-        if (ascii_lower((unsigned char)*a) != ascii_lower((unsigned char)*b)) {
-            return 0;
-        }
-        a++;
-        b++;
-    }
-    return *a == '\0' && *b == '\0';
 }
 
 int fanout_mask_match(const char *mask, const char *value)
@@ -101,33 +87,27 @@ int fanout_mask_match(const char *mask, const char *value)
     return *m == '\0';
 }
 
+/* Resolve a nickname to a connection.
+ *
+ * This used to be a workaround rather than a lookup: it asked the registry
+ * exactly, and only on a miss walked the whole enumeration comparing
+ * case-folded -- which is how `PRIVMSG BOB :hi` found a client registered as
+ * `bob` while the registry stayed case-sensitive underneath it. It printed
+ * `[observable] nick_resolve ... match=case_folded` when it took that path,
+ * because a case-folded hit was evidence of the registry's defect.
+ *
+ * The registry folds now, so that scan was dead code, and it is gone: a
+ * mitigation left standing after the bug is fixed is how the bug comes back.
+ * The extra O(n) walk on every miss -- on the message-delivery hot path -- went
+ * with it. `bob` and `BOB` can no longer both be held either, which the scan
+ * itself could never have prevented: it resolved the ambiguity, it did not
+ * remove it. */
 conn_t *fanout_find_nick(server_t *s, const char *nick)
 {
-    conn_t *exact;
-    size_t n;
-
     if (s == NULL || nick == NULL || nick[0] == '\0') {
         return NULL;
     }
-    exact = server_nick_lookup(s, nick);
-    if (exact != NULL) {
-        return exact;
-    }
-    n = server_nick_count(s);
-    for (size_t i = 0; i < n; i++) {
-        conn_t *c = server_nick_at(s, i);
-
-        if (c == NULL || c->nick[0] == '\0') {
-            continue;
-        }
-        if (same_nick(c->nick, nick)) {
-            printf("[observable] nick_resolve: asked=%s resolved=%s "
-                   "match=case_folded\n",
-                   nick, c->nick);
-            return c;
-        }
-    }
-    return NULL;
+    return server_nick_lookup(s, nick);
 }
 
 /* ---------------------------------------------------------------------------
