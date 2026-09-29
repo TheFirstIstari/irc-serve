@@ -404,6 +404,23 @@ struct server {
      * whether or not tracing is on. */
     uint64_t  n_reply_refused;
 
+    /* ------------------------------------------------------------------------
+     * Phase 6 federation claims. All four are events the link module
+     * (federation/link.c) records, and all four are here rather than in that
+     * module because they are properties of the NODE, which is what this
+     * struct is: a counter that lives in the module is a counter a second node
+     * in the same process could not have, and the one-node-per-process
+     * arrangement fed_open() enforces is a constraint rather than a property.
+     *
+     * The per-reason breakdown of n_link_rejected is deliberately NOT here --
+     * eight more fields on this struct for eight rare events, readable from
+     * the link_dump line fed_dump() prints instead. Four headline numbers a
+     * test waits on, plus a breakdown for a human reading a log. */
+    uint64_t  n_link_rejected;  /* FEDERATE claims refused, any reason */
+    uint64_t  n_link_duplicate; /* refused because that name was ESTABLISHED */
+    uint64_t  n_fed_hs_timeout; /* links that reached no answer within T2 */
+    uint64_t  n_fed_dead;       /* ESTABLISHED links that went silent (T4) */
+
     int       trace;             /* emit [observable] per-line output */
 };
 

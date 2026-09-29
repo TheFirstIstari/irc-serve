@@ -54,6 +54,27 @@
  *
  * The OTHER five names are exactly 4.3's: SPRIVMSG, SNOTICE, SJOIN, SPART,
  * STOPIC, SKICK.
+ *
+ * THE TABLE IS CLOSED, and Phase 6 found out why that matters the hard way.
+ * federation/link.c's T3 needs to put a link-liveness PING on a peer link, and
+ * the obvious way to do it -- add a `PING -> PING` row so fed_send_sverb() can
+ * build it -- is refused by tests/integration/test_fed_wire.c, which asserts
+ * that PING has no S-verb and says why: "4.3's list is the forwarded vocabulary,
+ * and adding to it is a wire-format change." It is right. This table maps CLIENT
+ * verbs a node is RELAYING, and a link keepalive is not a relay of anything, so
+ * a row for it would put a word into the forwarded vocabulary that no other
+ * implementation has, and a second implementation written from 4.3 would refuse
+ * a PING on a peer link as a client verb it does not forward.
+ *
+ * So the keepalive cannot come through fed_send_sverb(), and it does not: the
+ * KEEPALIVE IS A LINE THIS NODE ORIGINATES, NOT A VERB IT RELAYS, and the two
+ * are built by the same steps from different inputs. What IS shared -- stamp
+ * the 2.4 block, build the message, render it, bound-check it, terminate it and
+ * queue it -- is fed_queue_line() below, and both fed_send_sverb() and the T3
+ * keepalive in federation/link.c call it. What stays out of it is the verb
+ * TABLE, which is why the two callers can share a helper and still not share a
+ * vocabulary: a PING on a peer link is not a forwarded PING, and the table is
+ * still closed.
  */
 #ifndef IRC_FEDERATION_VERBS_H
 #define IRC_FEDERATION_VERBS_H
@@ -76,6 +97,78 @@
  * forwarded line with no S-verb is refused rather than sent as something the
  * peer would misparse. */
 const char *fed_sverb_for(const char *client_verb);
+
+/* ---------------------------------------------------------------------------
+ * The shared render-and-queue step
+ * ---------------------------------------------------------------------------
+ * Why it exists: two callers in two files need "stamp the 2.4 block, build a
+ * message_t, render it, bound-check it, terminate it, queue it" and had it
+ * written out twice -- fed_send_sverb() here, and T3's keepalive in
+ * federation/link.c. The duplication was a deliberate Phase 6 decision with a
+ * note saying the shared helper was the honest fix and belonged to whoever made
+ * the change deliberately. This is that change.
+ *
+ * WHAT IS STILL NOT SHARED, and it is the part that matters: the verb TABLE.
+ * fed_send_sverb() maps a client verb to an S-verb before it gets here, and the
+ * keepalive names PING directly, because a keepalive is a line this node
+ * ORIGINATED rather than one it RELAYED (see the note at the top of this file).
+ * So the helper takes a verb that is already decided and a parameter list that
+ * the CALLER decided, and PING stays out of the forwarded vocabulary --
+ * tests/integration/test_fed_wire.c asserts fed_sverb_for("PING") == NULL and
+ * that assertion is unaffected by anything on this page.
+ *
+ * The third thing it deliberately does not do is build the FEDERATE handshake
+ * line, which federation/link.c also renders by hand. A FEDERATE carries NO 2.4
+ * block -- its epoch and secret are parameters, not tags, because 2.4's block
+ * is what a RECEIVER needs in order to deduplicate and loop-check, and a
+ * handshake is neither relayed nor looped -- so a helper that stamps a block
+ * would have to be told to skip its own first step. That line stays where it is
+ * used, and says so.
+ */
+typedef enum {
+    FED_QUEUE_OK = 0,       /* queued                                                */
+    FED_QUEUE_BAD_TAGS,     /* the stamp failed irc_serve_tags_valid()              */
+    FED_QUEUE_TAG_TOO_LONG, /* the stamp is legal but does not fit the block buffer   */
+    FED_QUEUE_UNBUILDABLE,  /* message_build() refused the parts                    */
+    FED_QUEUE_UNRENDERABLE, /* message_format() refused, so nothing was written     */
+    FED_QUEUE_SATURATED     /* server_queue() dropped it: a saturated link (3.4)    */
+} fed_queue_why_t;
+
+/* The stable spelling of a refusal, for the caller's own [observable] line. The
+ * tokens are the ones this node has always printed for these five failures, so
+ * folding the callers together did not change a word an operator reads: the
+ * S-verb line's `reason=TAG_BLOCK_TOO_LONG` and the keepalive's `reason=BAD_TAGS`
+ * are both unchanged, because each caller maps this answer onto its own
+ * vocabulary. Never NULL: a value that is not a member of the enum is reported
+ * as "UNKNOWN" rather than as a NULL %s. */
+const char *fed_queue_why_name(fed_queue_why_t why);
+
+/* Stamp, build, render, terminate and queue one line on a peer link. Returns 0
+ * when the line was queued, -1 when it was refused, and writes the reason to
+ * `why_out` (which may be NULL) -- a reason rather than a bare -1 because the
+ * two callers report refusals in their own words and a shared function that
+ * picked one set of words would take that vocabulary away from them.
+ *
+ *   tags      the complete 2.4 stamp, VALIDATED here rather than trusted: a
+ *             stamp that fails irc_serve_tags_valid() cannot be put on the wire
+ *             in a form a peer would accept, and the alternative to the check
+ *             is a tagless line on a peer link, which every node must then
+ *             guess about and which defeats loop prevention entirely.
+ *   prefix    the source prefix WITHOUT the leading ':'.
+ *   verb      the command word, already uppercased or already an S-verb. The
+ *             helper does not map it and must not be asked to.
+ *   params    the parameters, and nparams of them. NULL is legal when nparams
+ *             is 0, which is what message_build() documents.
+ *
+ * THE SATURATED CASE IS ALREADY COUNTED AND ALREADY MARKED CLOSING by
+ * server_queue(): a saturated link is DROPPED, not buffered (3.4), and this
+ * function must not count it a second time. And nothing here closes a
+ * descriptor -- the refusal is a return value, and the reaper closes.
+ */
+int fed_queue_line(server_t *s, conn_t *peer, const irc_serve_tags_t *tags,
+                   const char *prefix, const char *verb,
+                   const char *const *params, int nparams,
+                   fed_queue_why_t *why_out);
 
 /* Queue one S-verb on a peer link, with the 2.4 internal tag block stamped on
  * it. Returns 0 when the line was queued, -1 when it was refused.
