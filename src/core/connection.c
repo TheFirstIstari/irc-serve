@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 
 /* Grow `*buf` to at least `need` bytes, doubling from the current capacity and
  * clamping to `limit` so a capped buffer cannot be grown past its bound. Sets
@@ -48,6 +49,23 @@ conn_t *conn_new(int fd, int kind)
     c->fd = fd;
     c->kind = kind;
     c->state = CONN_REG_PASS;
+    /* The two 317 RPL_WHOISIDLE timestamps, stamped where the connection comes
+     * into existence rather than where they are asked for. signon_at is the
+     * answer to "when did this user connect", which is a fact about accept and
+     * is therefore true from this instant; last_active starts equal to it so an
+     * idle time measured before the client has said anything is zero rather
+     * than whatever the epoch happened to be.
+     *
+     * This is a wall-clock read, which 3.4 otherwise forbids in handlers ("the
+     * poll tick drives time"). The rule is about TIME-OUT logic -- handshake
+     * deadlines, link liveness, LRU eviction -- which must be immune to a clock
+     * jump. 317 is the opposite case: its <signon time> is a calendar time the
+     * client is meant to compare against its own clock, so no monotonic
+     * substitute would be the right value. It is read once per connection,
+     * never per tick, and commands.c's 003 already established the precedent
+     * and the reasoning for exactly one such read on the reply path. */
+    c->signon_at = time(NULL);
+    c->last_active = c->signon_at;
     return c;
 }
 
@@ -82,6 +100,13 @@ int conn_fill(conn_t *c)
         n = recv(c->fd, c->rbuf + c->rlen, c->rcap - c->rlen, 0);
         if (n > 0) {
             c->rlen += (size_t)n;
+            /* Bytes arrived, so the connection is not idle. This is the only
+             * place in the node that observes the connection DOING something,
+             * which is what makes it the right place to stamp 317's <idle>
+             * from: stamping it in a command handler would report a client as
+             * idle while it was mid-burst, and stamping it nowhere would make
+             * the number a constant. */
+            c->last_active = time(NULL);
             continue;
         }
         if (n == 0) {

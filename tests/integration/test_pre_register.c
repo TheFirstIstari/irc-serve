@@ -232,13 +232,19 @@ int main(void)
      * the counts are checked.
      * --------------------------------------------------------------------- */
     {
-        /* Still a later phase's: one 421 each, and nothing else. */
+        /* Still a later phase's: one 421 each, and nothing else.
+         *
+         * PRIVMSG and NOTICE were HERE until Phase 5 landed them, and this batch
+         * is where a verb moves to as each phase ships. Nothing about the
+         * assertion is relaxed by the move: batch 2 below then demands that both
+         * produce output AND that neither produces a 421, which is a stronger
+         * statement about them than being one more 421 ever was. KILL is the
+         * only 4.1 verb still outstanding, so it is the only one left here. */
         static const char *const later[] = {
-            "PRIVMSG #x :hi", "NOTICE #x :hi", "KILL bob"
+            "KILL bob"
         };
         /* One so far (NICKX), plus one for each verb in `later`. */
-        size_t expect_421 = 1 + sizeof later / sizeof later[0];
-        /* Where the "before" window ends. The casefold-drain PONG above is the
+        size_t expect_421 = 1 + sizeof later / sizeof later[0];        /* Where the "before" window ends. The casefold-drain PONG above is the
          * last thing the node had written at this point, so everything after it
          * is an answer to the sweep. Counting from a remembered offset is what
          * makes "no 421 arrived" a statement about those verbs rather than about
@@ -266,13 +272,21 @@ int main(void)
                      sizeof later / sizeof later[0],
                      tf_count(tc_buffer(&c) + drain, " 421 "));
 
-        /* Batch 2: Phase 4's verbs, against a FRESH window. Reusing batch 1's
-         * offset would conflate the two categories, which is the whole
-         * distinction -- batch 1 must be 421 and batch 2 must not be, and a
-         * shared window cannot show that. */
+        /* Batch 2: Phase 4's and Phase 5's verbs, against a FRESH window.
+         * Reusing batch 1's offset would conflate the two categories, which is
+         * the whole distinction -- batch 1 must be 421 and batch 2 must not be,
+         * and a shared window cannot show that.
+         *
+         * PRIVMSG and NOTICE are here from Phase 5. Both are sent to #x, which
+         * this client never joined and which does not exist, so each is answered
+         * with a 403 -- output, and emphatically not a 421. Sending them at
+         * something that DOES resolve would be a weaker choice: a message that
+         * is delivered to nobody produces no line at all on this connection, and
+         * the count below would then be measuring nothing. */
         {
             static const char *const now[] = {
-                "PART #x", "TOPIC #x :t", "NAMES #x", "MODE #x", "KICK #x bob"
+                "PART #x", "TOPIC #x :t", "NAMES #x", "MODE #x", "KICK #x bob",
+                "PRIVMSG #x :hi", "NOTICE #x :hi"
             };
             const char *const at2 =
                 strstr(tc_buffer(&c), "PONG irc.test drain-later");
@@ -287,7 +301,7 @@ int main(void)
             TF_CHECK_MSG(tc_expect(&c, "PONG irc.test drain-now", T_IO_MS) == 0,
                          "no PONG after the implemented-verb sweep");
             TF_CHECK_MSG(tf_count(tc_buffer(&c) + drain2, " 421 ") == 0,
-                         "a verb Phase 4 implements was answered 421: %zu "
+                         "a verb this build implements was answered 421: %zu "
                          "421 lines arrived in the implemented-verb window",
                          tf_count(tc_buffer(&c) + drain2, " 421 "));
             /* And they were ANSWERED, not dropped: each produced output. A verb
@@ -312,7 +326,7 @@ int main(void)
      * distinction at all. */
     TF_CHECK_MSG(nf_expect(&node, "cmd_unimplemented: fd=", T_IO_MS) == 0,
                  "the node did not record an unimplemented-but-planned verb "
-                 "(PRIVMSG, NOTICE and KILL are all still Phase 5+ verbs)");
+                 "(KILL is the one 4.1 verb still outstanding)");
 
     TF_CHECK_MSG(nf_stop(&node) == 0, "node did not exit cleanly");
     TF_CHECK_MSG(nf_expect_u64(&node, "reply_refused=", 0, T_IO_MS) == 0,

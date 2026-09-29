@@ -410,7 +410,7 @@ src/federation/link.c  peer sockets, handshake FSM driving, keepalive
 `PASS` `NICK` `USER` `PING` `PONG` `QUIT` `JOIN` `PART` `PRIVMSG` `NOTICE`
 `TOPIC` `NAMES` `MODE` `KICK` `KILL`
 
-### 4.2 SHOULD (Phase 6)
+### 4.2 SHOULD (Phase 7)
 
 `WHO` `WHOIS` `ISON` `LIST` `AWAY` `INVITE` `MOTD` `LUSERS` `ADMIN` `INFO`
 `USERHOST` `KNOCK` `CHOPER`
@@ -443,6 +443,13 @@ Registration `001`–`005`; channel `331` `332` `333` `353` `366` `324` `329`;
 query `311`–`319` `321`–`323` `351`–`352` `315`; server info `251`–`266`
 `372`–`376`; errors `401` `403` `404` `405` `421` `422` `431` `432` `433` `441` `442`
 `443` `451` `461` `462` `464` `465` `482`.
+
+Three more, each added when a phase needed it and each a gap in the list above:
+`301` `RPL_AWAY` (WHOIS away text — the only numeric that can carry an away
+message, so without it "WHOIS reflects AWAY" is unimplementable); `303`
+`RPL_ISON`; and `417` `ERR_INPUTTOOLONG` (an over-long away message is
+**refused**, not truncated — truncating would store a message the user did
+not write and then report it in `301` as theirs).
 
 `432` `ERR_ERRONEUSNICKNAME` is for a nickname that is **malformed** — illegal
 under §2.1. It is distinct from `433` `ERR_NICKNAMEINUSE`, which is for a legal
