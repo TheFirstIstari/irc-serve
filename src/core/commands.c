@@ -327,7 +327,16 @@ static void handle_nick(server_t *s, conn_t *c, const message_t *m)
 
     /* The new name is ours, so the old one can go. Released only AFTER the new
      * claim succeeded: releasing first would leave a window in which the name
-     * is unowned and a second client could take it. */
+     * is unowned and a second client could take it.
+     *
+     * The order is also what makes the enumeration survive a rename. A claim
+     * adds an entry for a connection not already in the vector, and a release
+     * removes one only from a connection left holding no name at all -- so at
+     * this instant the table maps `want` to this conn, the release of `previous`
+     * finds it still holding `want`, and the connection stays exactly where it
+     * was in WHO's walk. Claim-then-release is not an accident of the order
+     * these two lines happen to be in; it is the order the two operations are
+     * defined to require. */
     if (c->nick[0] != '\0') {
         char previous[sizeof c->nick];
 
@@ -423,24 +432,32 @@ static void handle_pong(server_t *s, conn_t *c, const message_t *m)
  * idempotence is checked against, and a second close path makes every one of
  * those tests weaker.
  *
- * c->nick is deliberately left set. The reaper releases the name again, and its
- * ownership check (is this conn still the holder?) makes that a no-op unless
- * some other client has already taken the name, in which case that check is
- * exactly what stops this conn evicting the new holder on its way out.
+ * c->nick is deliberately left set. The reaper retires the connection again, and
+ * because the table no longer maps any name to this conn by then, that call is a
+ * no-op -- unless some other client has already taken the name, in which case
+ * retiring the connection removes the new holder's entry only if the table still
+ * points at THIS conn, which is exactly what stops a closing conn from evicting
+ * its successor on the way out.
  *
- * The release here is therefore belt to that braces rather than the only line
- * holding it up: server_close_conn() releases the nickname for every close
+ * The release here is therefore belt to those braces rather than the only thing
+ * holding them up: server_close_conn() retires the nickname for every close
  * whatever caused it, so the name is safe even if this line were forgotten. It
- * is kept because this is the semantically right place for it, and because
- * "safe if you forget" is a property of the design worth being able to rely on
- * rather than a reason to stop being explicit. */
+ * is kept because this is the semantically right place for it, and because "safe
+ * if you forget" is a property of the design worth being able to rely on rather
+ * than a reason to stop being explicit.
+ *
+ * It is the same function the reaper calls, and that is not tidiness. QUIT and a
+ * client that vanishes without one are the two ways a connection ends, and they
+ * used to release the name by different routes -- the handler through the
+ * name-keyed release, the reaper by hand. That difference is issue #102: the
+ * reaper's hand-written half removed the table entry and left the enumeration
+ * entry, so a freed conn_t stayed in WHO's walk. A QUIT hid it, because the
+ * handler had already done the vector's half correctly. */
 static void handle_quit(server_t *s, conn_t *c, const message_t *m)
 {
     const char *reason = (m->nparams > 0) ? m->params[0] : NULL;
 
-    if (c->nick[0] != '\0') {
-        server_nick_release(s, c->nick);
-    }
+    server_nick_unclaim(s, c);
     /* The reason is logged, never stored: there is no NickServ, no quit cache,
      * and no reason for one to exist until Phase 9. */
     printf("[observable] quit: fd=%d nick=%s reason=%s\n", c->fd, c->nick,

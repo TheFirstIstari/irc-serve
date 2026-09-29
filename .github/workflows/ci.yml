@@ -130,6 +130,128 @@ jobs:
           grep -q "https://ircv3.net/" docs/SPEC_TRACKING.md || { echo "missing IRCv3 spec reference" >&2; exit 1; }
           echo "Spec references verified"
 
+  # --- Advisory: AddressSanitizer + UndefinedBehaviorSanitizer (issue #92) ---
+  # Nothing in this suite was going to catch a use-after-free, and issue #102 is
+  # the proof rather than the argument: a client that closed its laptop freed a
+  # conn_t that WHO then dereferenced, on a path as ordinary as a dropped TCP
+  # connection, and the whole suite was green. A read of freed memory that
+  # happens to return bytes nobody uses is invisible to a test written in C --
+  # only a sanitizer knows the allocation is gone. So this job is the gate, and
+  # it needed building rather than switching on: there was no way to compile the
+  # tree with -fsanitize at all, and the integration tests exec the shipped
+  # binary, so instrumenting only the test executables would have asserted
+  # against an uninstrumented node and reported a clean run.
+  #
+  # LINUX ONLY, and that is not a preference. LeakSanitizer is unsupported on
+  # Darwin, and an ASan binary built with detect_leaks=1 HANGS on macOS instead
+  # of reporting, so a macOS run of this configuration is not a slower version of
+  # this job -- it is a job that hangs. The hosted Linux runner is used rather
+  # than the self-hosted one for ci_test's reason, sharpened: this gate must
+  # produce a result on infrastructure the maintainer does not control, and the
+  # self-hosted machine is mid-reconfiguration.
+  #
+  # ADVISORY, and it stays that way. continue-on-error means this job can never
+  # fail a workflow, and it is not in the required-check list, so it can never
+  # block a merge either. A sanitizer is a gate that earns trust by being
+  # believed, and a new gate reports its first findings as failures; making that
+  # merge-blocking on the day it is added would be a way of not finding out.
+  ci_sanitizers:
+    name: ci_sanitizers (ASan+UBSan)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          echo "  host   : $(uname -srm)"
+          echo "  gcc    : $(gcc --version | head -1)"
+      # Release, not Debug, on purpose. The suite is assert()-based outside the
+      # integration tests (only TF_CHECK is used there), and those asserts are
+      # compiled out of a Release build unless -UNDEBUG reaches them -- so a
+      # Debug sanitizer run would quietly check less than the build CI gates on.
+      # The step below proves the flag is actually there rather than assuming it.
+      - name: Configure
+        run: |
+          set -euo pipefail
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=ON \
+            -DBUILD_BENCHMARK=ON \
+            -DIRC_SANITIZE=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+      # The option is opt-in, so a misspelled -D would produce a completely
+      # uninstrumented build that passes every test and reports a green gate for
+      # a sanitizer that is not running. Three things have to be true and are
+      # therefore checked rather than assumed:
+      #   1. every translation unit carries the flags, tests AND the node;
+      #   2. -UNDEBUG survived, so the assert()-based tests are still asserting;
+      #   3. the binary the integration tests exec is the instrumented one.
+      - name: Verify the instrumented build is what is under test
+        run: |
+          set -euo pipefail
+          # compile_commands.json is parsed rather than grepped. Grepping it is
+          # wrong in a way that looks right: a "command" line carries every -I
+          # path in the build, so a text match for a test directory matches
+          # translation units that have nothing to do with it.
+          python3 - <<'PY'
+          import json, re, sys
+
+          # Only the directories whose tests are assert()-based. The integration
+          # tests use TF_CHECK, which is never compiled out, so -UNDEBUG is
+          # load-bearing for these and not for those.
+          assert_dirs = re.compile(r"/tests/(protocol|compliance|contracts|federation|loadbal)/")
+          entries = json.load(open("build/compile_commands.json"))
+          total = len(entries)
+          instrumented = [e for e in entries if "-fsanitize=address,undefined" in e["command"]]
+          asserted = [e for e in entries if assert_dirs.search(e["file"])]
+          asserted_live = [e for e in asserted if "-UNDEBUG" in e["command"]]
+          # -UNDEBUG only works if it comes AFTER -DNDEBUG on the command line.
+          ordered = all(
+              e["command"].index("-UNDEBUG") > e["command"].index("-DNDEBUG")
+              for e in asserted_live if "-DNDEBUG" in e["command"])
+          print(f"translation units: {total}, instrumented: {len(instrumented)}")
+          print(f"assert-based test TUs: {len(asserted)}, carrying -UNDEBUG: {len(asserted_live)}, "
+                f"and after -DNDEBUG: {ordered}")
+          bad = []
+          if len(instrumented) != total:
+              bad.append("every translation unit must be instrumented, including the node and every test")
+          if len(asserted_live) != len(asserted) or not ordered:
+              bad.append("-UNDEBUG must reach the assert()-based tests, after -DNDEBUG, "
+                         "or a Release build compiles their assertions away")
+          for problem in bad:
+              print(f"::error::{problem}", file=sys.stderr)
+          sys.exit(1 if bad else 0)
+          PY
+          # The integration tests exec $<TARGET_FILE:irc-serve>, so an
+          # uninstrumented node would mean the job tests the harness and nothing
+          # else. This is the check that makes the job able to catch #102 at all.
+          # ldd's output goes through a variable rather than a pipe: under
+          # pipefail, `ldd | grep -q` can fail on SIGPIPE when grep exits first,
+          # which turns a passing check into a spurious failure.
+          deps=$(ldd build/src/irc-serve)
+          echo "shipped binary dynamic dependencies:"
+          echo "$deps" | grep -Ei 'asan|ubsan' || {
+            echo "::error::build/src/irc-serve does not link a sanitizer runtime, so the integration tests are running against an uninstrumented node" >&2
+            exit 1
+          }
+      - name: Unit Tests
+        working-directory: build
+        env:
+          # detect_leaks=1 is the part that only works here, and the part that
+          # finds the leaks a green suite cannot see. halt_on_error=1 turns a
+          # UBSan diagnostic into a failed run rather than a line in a log that
+          # nobody reads: a sanitizer configured to print and carry on is a
+          # sanitizer nobody acts on.
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1
+        run: ctest --output-on-failure --timeout 120
+
   # --- Advisory only, hosted ---------------------------------------------
   # Benchmark and compliance run on the hosted runner rather than the
   # self-hosted one so that their results are produced by infrastructure the
