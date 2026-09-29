@@ -23,11 +23,12 @@ concurrency:
 # Three constraints shape the layout, and each is a reason the obvious
 # "move everything" version is wrong:
 #
-#   1. ONE RUNNER RUNS ONE JOB AT A TIME. Six separate matrix jobs on a single
-#      self-hosted runner would run *serially* -- roughly 6 x 30s, slower in wall
-#      clock than the parallel hosted matrix they replace. So the Linux
-#      verification is one job that loops internally. Parallelism is not
-#      available; sequential-but-native beats parallel-but-emulated.
+#   1. PARALLELISM IS SET BY RUNNER INSTANCES, NOT BY THE WORKFLOW. A runner
+#      process handles exactly one job at a time, so a single runner serialises a
+#      4-way matrix. FOUR runners are registered (cachyos-x8664-1..4) by
+#      scripts/setup-self-hosted-runner.sh, all carrying the same label, so the
+#      matrix below is picked up concurrently. Raise the instance count to raise
+#      the ceiling.
 #
 #   2. macOS CANNOT RUN THERE. ci_macos stays on a hosted macOS runner. That is
 #      not a preference, it is the platform.
@@ -48,13 +49,22 @@ jobs:
   # --- Preferred path: the fast native Linux machine -----------------------
   # One job, all four compiler x build-type combinations, sequentially.
   ci_linux_cachyos:
-    name: ci_linux (self-hosted)
+    name: ci_linux ${{ matrix.compiler }} ${{ matrix.build_type }}
     runs-on: [self-hosted, Linux, X64, cachyos-x8664]
     timeout-minutes: 45
     environment:
       name: ${{ github.actor == 'TheFirstIstari' && 'self-hosted-auto' || 'self-hosted' }}
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     continue-on-error: true
+    # Four runners are registered on the machine (cachyos-x8664-1..4), so this
+    # matrix runs CONCURRENTLY rather than queueing behind a single runner. A
+    # runner process handles one job at a time, so the instance count is what
+    # sets the parallelism -- see scripts/setup-self-hosted-runner.sh.
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Release, Debug]
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain
@@ -65,26 +75,13 @@ jobs:
           echo "  cmake  : $(cmake --version | head -1)"
           echo "  gcc    : $(gcc --version | head -1)"
           echo "  clang  : $(clang --version | head -1)"
-      - name: Build and test every compiler and build type
+      - name: Build and test
         run: |
           set -euo pipefail
-          rc=0
-          for cc in gcc clang; do
-            for bt in Release Debug; do
-              echo "::group::$cc $bt"
-              d="build-$cc-$bt"
-              if cmake -B "$d" -S . -DCMAKE_BUILD_TYPE="$bt" -DBUILD_TESTING=ON -DCMAKE_C_COMPILER="$cc" \
-                 && cmake --build "$d" --parallel "$(nproc)" \
-                 && ctest --test-dir "$d" --output-on-failure --timeout 60; then
-                echo "  PASS  $cc $bt"
-              else
-                echo "  FAIL  $cc $bt"
-                rc=1
-              fi
-              echo "::endgroup::"
-            done
-          done
-          exit "$rc"
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=${{ matrix.compiler }}
+          cmake --build build --parallel "$(nproc)"
+          ctest --test-dir build --output-on-failure --timeout 60
 
   # --- Independent merge gate: hosted, so it works when the runner is off ---
   # Deliberately small and deliberately hosted. This is the check that keeps a

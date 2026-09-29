@@ -1,0 +1,54 @@
+# TEMPLATED system unit for the GitHub Actions runner.
+#
+# Two problems this fixes, which a plain unit cannot:
+#
+# 1. PERMANENCE. The earlier version was a *user* service
+#    (~/.config/systemd/user, systemctl --user, WantedBy=default.target).
+#    User units only start when that user has an active login session, so the
+#    runner died at every reboot and whenever the last session ended. This is a
+#    SYSTEM unit: WantedBy=multi-user.target, started at boot with no login.
+#
+# 2. PARALLELISM. One runner process handles exactly one job at a time, so a
+#    single runner serialises a 4-way matrix into 4 sequential builds. Each
+#    instance of this template runs its OWN runner from its OWN directory, so
+#    enabling 4 instances gives 4 concurrent jobs and the matrix parallelises
+#    again.
+#
+# Instance i uses $INSTALL_ROOT/<name>-%i and registers as <name>-%i, so
+# `systemctl start actions-runner@2` adds a second concurrent runner.
+#
+# Deliberately NOT using Restart=always on its own: if the registration token
+# expires or config.sh is missing, an always-restarting unit becomes a crash
+# loop that hides the real error. Restart=on-failure with a delay, plus
+# StartLimitIntervalSec, makes a genuine failure visible in `systemctl status`
+# instead of silently failing.
+[Unit]
+Description=GitHub Actions runner (irc-serve) instance %i
+Documentation=https://github.com/TheFirstIstari/irc-serve
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=__RUNNER_USER__
+EnvironmentFile=-/etc/default/irc-serve-runner
+Environment=RUNNER_TRACKING_ID=""
+# %i is the instance suffix; the directory and binary are derived from it.
+WorkingDirectory=__INSTALL_ROOT__/__RUNNER_NAME__-%i
+ExecStart=__INSTALL_ROOT__/__RUNNER_NAME__-%i/run.sh
+KillSignal=SIGINT
+# The runner needs a moment to finish an in-flight job cleanly.
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=15
+# The runner executes untrusted build steps, so it must be able to install
+# packages and start services; it must NOT be able to change its own unit or
+# write to /etc. NoNewPrivileges would break the sudo-based steps that a
+# build environment legitimately needs, so it is deliberately not set.
+NoNewPrivileges=false
+ProtectSystem=off
+
+[Install]
+WantedBy=multi-user.target
