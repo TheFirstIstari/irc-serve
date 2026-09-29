@@ -28,7 +28,7 @@
  *   :<origin> SBURST  <epoch> <nnicks>
  *   :<origin> SBURSTN <nick> <user> <host> <modes> <signon> :<away>
  *   :<origin> SBURSTC <chan> <origin> <topic_who> <topic_when> <modes> :<topic>
- *   :<origin> SBURSTM <chan> <nick> <flags>
+ *   :<origin> SBURSTM <chan> <server> <nick> <flags>
  *   :<origin> SBURSTE <epoch> <nnicks> <nchans> <nmembers>
  *
  * Every line carries 2.4's internal tag block, like every other relayed line,
@@ -36,11 +36,61 @@
  * The prefix is the BURST ORIGIN -- the server whose state the transaction is
  * about -- which is this node, on both sides of the exchange.
  *
- * The RECORDS COME BEFORE THE CHANNELS, and that order is a contract rather
- * than a preference: an SBURSTM names a nick, and the nick's host arrives in the
- * SBURSTN that preceded it. A member whose nick was never announced gets an
- * empty host, which is exactly the state a live SJOIN leaves a member in and is
- * not an error.
+ * ---------------------------------------------------------------------------
+ * SBURSTM'S <server>, AND WHY IT IS IN THE FORMAT AT ALL
+ * ---------------------------------------------------------------------------
+ * The <server> field is the server that HOLDS the member, which is not the same
+ * answer as the prefix's BURST ORIGIN and is not the same answer again on a
+ * three-node mesh. The prefix is "whose state is this"; <server> is "where is
+ * this person". They coincide on a two-node mesh, they coincide for a member the
+ * origin hosts itself, and they DIVERGE the moment the origin is a relay
+ * reporting somebody else's member.
+ *
+ * It is here, in the frozen format, because 4.3 says "a wire format cannot be
+ * invented later" and a field added after a second implementation exists is a
+ * compatibility break rather than a change. Without it a member that lives on a
+ * third node is stored under the relaying server, which is wrong in two places
+ * at once: the roster misattributes the member, and 2.1's scoped `nick@server`
+ * cannot be resolved from the roster AT ALL, because the roster would answer
+ * with the name of a server that does not host the member. Neither is repairable
+ * from inside a receiver -- the information is simply not on the wire.
+ *
+ * The cost, stated rather than implied: +64 bytes on the worst-case SBURSTM line
+ * (446 rather than 382 -- see the arithmetic below), one more field in the
+ * shadow's member record, and one more field in channel.h's chan_remote_t. The
+ * receiver keeps both names, because the burst origin's name is what a resync
+ * replaces AGAINST and the member's own name is what it is FOR; see that
+ * struct's comment for why the two part company.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT SBURSTN CARRIES AND WHAT THIS NODE DOES WITH IT -- A DEFERRAL, NOT A SLIP
+ * ---------------------------------------------------------------------------
+ * SBURSTN names six fields and the shadow keeps TWO of them, the nick and the
+ * host. The other four -- `user`, `modes`, `signon` and `away` -- are on the wire
+ * and DISCARDED here, and that is deliberate.
+ *
+ * Those four exist for a COMPLETE nick record, and the thing that needs one is
+ * 2.1's remote-nick registry: "which server holds the user called X", without
+ * which `nick@server` cannot be resolved for a member this node has no conn_t
+ * for and 311 and 301 have nothing to answer for a remote user. That registry is
+ * **Phase 9** and has no home on server_t yet, so there is nowhere to store them
+ * -- building the registry here would be Phase 9's design decision taken in
+ * Phase 6 without the rest of Phase 9. `modes` is the odd one out: it is `-` on
+ * every build, because commands.c says in terms that this node evaluates neither
+ * umodes nor cmodes, and it is on the wire because 4.3 names it so that a node
+ * which does evaluate user modes fills it in with no format change.
+ *
+ * They are on the wire anyway, and 4.3 is explicit that a format which omitted
+ * them would have to be EXTENDED the moment the registry arrives, which is
+ * exactly the compatibility break this file's <server> paragraph above exists to
+ * avoid. A reader who finds them discarded should read this paragraph, not infer
+ * an oversight. The count of accepted nick records is what SBURSTE's first count
+ * is compared against, and a counter does not need the records themselves to do
+ * that.
+ *
+ * ---------------------------------------------------------------------------
+ * THE RECORDS COME BEFORE THE CHANNELS, AND THAT ORDER IS A CONTRACT
+ * ---------------------------------------------------------------------------
  *
  * SBURST'S <epoch> IS HOW A PEER RESTART IS DETECTED, and it is also how
  * server_link_t::epoch is populated on the far side: 2.4's dedup key is
@@ -126,8 +176,10 @@
  *
  *   SBURSTN, the largest of the rest: 179 + 65 + 8 ("SBURSTN ") + 64 (nick) +
  *   64 (user, conn_t::user) + 128 (host, conn_t::host) + 2 (the modes token) +
- *   21 (signon) + 256 (away) = 787. SBURSTM is 179 + 65 + 8 + 64 + 64 + 2 = 382.
- *   SBURST and SBURSTE carry only numerics and are under 320.
+ *   21 (signon) + 256 (away) = 787. SBURSTM is 179 + 65 + 8 + 64 (<chan>,
+ *   CHAN_MAX_NAME) + 64 (<server>, IRC_MAX_SERVER_NAME) + 64 (nick) + 2 (the
+ *   flags token) = 446, which is 5.4% of the cap and is NOT what the budget
+ *   turns on. SBURST and SBURSTE carry only numerics and are under 320.
  *
  * 753 and 787 against 8192 is 9.2% and 9.6% of the cap, so LINE LENGTH IS NOT
  * THE BURST'S CONSTRAINT and a per-line check would be a formality. THE REAL
@@ -263,6 +315,41 @@ int fed_burst_apply(server_t *s, server_link_t *link, const message_t *m);
  * and a caller that reached for this on a mid-burst drop would be adding a
  * second mechanism to a problem that has one. */
 void fed_burst_abandon(server_link_t *link);
+
+/* Release any open shadow, as a node teardown rather than as a protocol event.
+ *
+ * THE CALLER IS server_shutdown(), and this arm exists because the shadow is a
+ * MODULE GLOBAL rather than a field on server_t, so every other allocation this
+ * node makes has an owner that can be reached from the shutdown and this one
+ * did not. Without it, a process that stops mid-transaction -- a SIGTERM while a
+ * peer is bursting -- leaves the shadow's records behind for the kernel to
+ * reclaim, bounded by IRC_BURST_MAX_BYTES but still the only leak-shaped thing
+ * in this file.
+ *
+ * IT IS EXPORTED AND HAS A PROTOTYPE rather than being static, and the reason is
+ * the one server.h gives for the dedup table being freed from a place that does
+ * not own it: a teardown arm that a core file has to call cannot be static to
+ * that core file, and a declaration that only existed at the definition would be
+ * a symbol the shutdown reaches through a private door.
+ *
+ * IT COUNTS NOTHING. A shutdown is not a protocol event, so this is not an
+ * abandon, not an n_burst_abandoned, and not an `[observable]` fed_burst_
+ * diagnostic; what it prints is whether a shadow was open, which is the fact a
+ * reader of a node's last line wants and the fact a test can assert on a
+ * platform whose LeakSanitizer cannot check it (see below).
+ *
+ * VERIFIED BY LEAKSANITIZER ON LINUX, ASSERTED ON DARWIN. LSan does not exist on
+ * Darwin, so the free itself is invisible to a local sanitizer run and the Linux
+ * CI job is what actually proves it; the `[observable]` line exists so the arm is
+ * not merely unverified but also untested, and a test asserting
+ * `fed_burst_close: shadow=OPEN` is checking that the arm RAN rather than that
+ * it freed anything.
+ *
+ * `s` is unused today and is taken anyway: the shadow is a module global, but a
+ * teardown that may one day need to touch the node should not have its signature
+ * changed, and every other teardown in this tree has the same shape. Safe on a
+ * node that never called fed_open(). */
+void fed_burst_close(server_t *s);
 
 /* The resync, as a PRODUCT of the node rather than as a step in establishing
  * one.

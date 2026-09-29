@@ -138,6 +138,17 @@
  * framed and counted in n_lines, so on a linked node that number climbs with no
  * client involved.
  *
+ * AND ON CEILING WHAT A CASE CAN PROVE ABOUT THE WIRE. SBURSTM now carries the
+ * member's own <server> (4.3.1), and on a two-node mesh that field is always the
+ * burst origin -- which is exactly the mesh this file builds. So the assertions
+ * here CANNOT tell a receiver that stored the wire's <server> from one that fell
+ * back to the origin, and this file does not pretend otherwise: the four
+ * parameters' shape is asserted (a three-parameter SBURSTM is a malformed line,
+ * and fed_malformed= at the end of the truncation case is what says so), the
+ * field is exercised, and what it is WORTH is not measurable until there is a
+ * third node. docs/SERVER_DESIGN.md 4.3.1 records the same limit in the design
+ * rather than in a test, and the honest statement of it is here.
+ *
  * NO FIXED sleep() ANYWHERE (6.3). Every wait is a deadline: nf_expect() over a
  * child's stdout, tc_expect() over a socket.
  */
@@ -198,12 +209,21 @@
  * 1400 IS CHOSEN TO TRIP INSIDE THE MEMBER RECORDS, and that is the number's
  * whole job rather than a round figure. The transaction this case sends is a BEGIN,
  * two nick records, one channel record, three member records and a COMMIT; measured
- * on this node it charges 1286 by the end of the FIRST member line and about 1766
- * in full. 1400 is above 1286 by 114 and below 1766 by 366, so the transaction is
+ * on this node it charges 1298 by the end of the FIRST member line and 1508 in
+ * full. 1400 is above 1298 by 102 and below 1508 by 108, so the transaction is
  * refused part way through its MEMBERS -- which is the only place a leak is
  * observable on this node, because a member record the node already holds is
  * idempotent and only a CHANGED one shows. A budget that tripped on the channel
  * header would prove the same arithmetic and nothing about a member.
+ *
+ * BOTH NUMBERS ARE MEASURED AND BOTH MOVE WHEN A FIELD WIDTH DOES: SBURSTM's
+ * <server> field added 6 bytes per member line in Phase 6 C5 (strlen("irc.a") + a
+ * separator, on the two records the transaction trips over), and the full figure
+ * was 1766 in the comment before that change while actually being 1508 -- which is
+ * why this says "measured" rather than giving a derivation nobody re-ran. A test
+ * asserting either number would be testing the constants rather than the
+ * behaviour, so neither is asserted; they are stated so the next person who
+ * changes a width knows to re-measure.
  *
  * Both margins are two orders of magnitude larger than the one byte per line the
  * message-id counter can add, so the case cannot sit on the boundary. */
@@ -238,10 +258,16 @@ static int g_tiny_recv;
  * case_truncated_burst_changes_nothing(). Pre-fork state, like the rest. */
 static int g_truncate;
 
+/* SEND A BEGIN AND NOTHING ELSE INSTEAD OF A RESYNC, for
+ * case_open_transaction_released_at_shutdown(). Pre-fork state, like the rest --
+ * the tick hook cannot see anything the parent sets after the fork. */
+static int g_open_burst;
+
 /* Defined below, with the wire format written out. Forward-declared rather than
  * moved so the RESYNC DRIVER -- the thing every case in this file is about -- reads
  * first and the one case that bypasses it reads as the exception it is. */
 static void send_truncated_burst(server_t *s, server_link_t *link);
+static void send_open_burst(server_t *s, server_link_t *link);
 
 /* ---------------------------------------------------------------------------
  * THE RESYNC DRIVER
@@ -297,6 +323,15 @@ static void offer_resync(server_t *s)
         return; /* not yet: alice has not JOINed */
     }
     if (g_stage == 0) {
+        if (g_open_burst != 0) {
+            /* Straight to 3, for the reason the truncated case below gives: this
+             * case sends one hand-built transaction ONCE, and the stage-1 branch
+             * would send a second one on the next tick, so the node under test
+             * would be holding a shadow the case cannot account for. */
+            g_stage = 3;
+            send_open_burst(s, server_find_link(s, NAME_B));
+            return;
+        }
         if (g_truncate != 0) {
             /* THIS CASE SENDS A HAND-BUILT TRANSACTION INSTEAD OF A RESYNC, and it
              * waits for the de-op first so that the one member record the
@@ -437,7 +472,7 @@ static void send_truncated_burst(server_t *s, server_link_t *link)
     const char *n0[2];
     const char *n1[6];
     const char *c1[6];
-    const char *m1[3];
+    const char *m1[4];
     const char *e1[4];
     char epoch[24];
     int ok = 0;
@@ -464,10 +499,17 @@ static void send_truncated_burst(server_t *s, server_link_t *link)
     c1[5] = ""; /* no topic */
     /* alice, PLAIN. The origin has de-opped her, so this is a change -- and a
      * receiver that applied a transaction it should have thrown away would show it
-     * as a 353 with no op group at all. */
+     * as a 353 with no op group at all. The <server> field says irc.a, because
+     * that is where alice is, which on this two-node mesh is also the burst
+     * origin -- so the field is correct WITHOUT being load-bearing here, and the
+     * test that would catch a wrong one is the three-node one, which does not
+     * exist yet. What this case does prove is that the four-parameter shape is
+     * what the receiver accepts: a three-parameter SBURSTM is a malformed line,
+     * and the assertion on fed_malformed= at the end of the case is what says so. */
     m1[0] = CHAN_T;
-    m1[1] = NICK_A;
-    m1[2] = "-";
+    m1[1] = NAME_A;
+    m1[2] = NICK_A;
+    m1[3] = "-";
     e1[0] = epoch;
     e1[1] = "1"; /* nicks: correct */
     e1[2] = "1"; /* chans: correct */
@@ -482,13 +524,49 @@ static void send_truncated_burst(server_t *s, server_link_t *link)
                        NULL) == 0 &&
         fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURSTC", c1, 6,
                        NULL) == 0 &&
-        fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURSTM", m1, 3,
+        fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURSTM", m1, 4,
                        NULL) == 0 &&
         fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURSTE", e1, 4,
                        NULL) == 0) {
         ok = 1;
     }
     printf("[fixture] truncated_sent: ok=%d\n", ok);
+    fflush(stdout);
+}
+
+/* ---------------------------------------------------------------------------
+ * AN OPEN TRANSACTION: a BEGIN AND NOTHING ELSE
+ * ---------------------------------------------------------------------------
+ * This is the second place in the tree where a test writes the wire format, for
+ * the same reason send_truncated_burst() is the first: a transaction that never
+ * ENDS is the one thing a correctly behaving sender cannot produce and a
+ * fixture has to build by hand.
+ *
+ * ONE LINE IS ENOUGH, and that is worth saying so a reader does not go looking
+ * for the records: the transaction is open the moment a BEGIN arrives, and
+ * nothing in this node's memory budget depends on there being any. The BEGIN
+ * also charges a few hundred bytes against the shadow, so the shape being closed
+ * at teardown is one that ALLOCATED -- a shadow that was open and empty would
+ * make the teardown arm look exercised by accident.
+ */
+static void send_open_burst(server_t *s, server_link_t *link)
+{
+    conn_t *peer = server_link_conn(s, link);
+    const char *n0[2];
+    char epoch[24];
+    int ok = 0;
+
+    if (peer == NULL) {
+        return;
+    }
+    burst_render_u64(epoch, sizeof epoch, s->epoch);
+    n0[0] = epoch;
+    n0[1] = "0"; /* zero nicks follow, and none do */
+    if (fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURST", n0, 2,
+                       NULL) == 0) {
+        ok = 1;
+    }
+    printf("[fixture] open_sent: ok=%d\n", ok);
     fflush(stdout);
 }
 
@@ -526,11 +604,13 @@ static void child_setup(server_t *s)
          * same IRC_BURST_MAX_BYTES, so a peer that ignored the sender-side check
          * could not make this node's shadow grow without bound -- but the two
          * halves are different MECHANISMS and this case is about one of them.
-         * Shrinking B's budget as well would make the RECOVERY burst (724 bytes,
-         * against a 320-byte bound) a second refusal, on the far side, for a
-         * reason that has nothing to do with node A declining to send it -- and the
-         * case would then be asserting that A's refusal was invisible while the
-         * far side threw the next transaction away.
+         * Shrinking B's budget as well would make the RECOVERY burst (about 730
+         * bytes, against a 320-byte bound) a second refusal, on the far side, for
+         * a reason that has nothing to do with node A declining to send it -- and
+         * the case would then be asserting that A's refusal was invisible while
+         * the far side threw the next transaction away. The figure moves by a
+         * byte or two with the per-line message id, which is why the word is
+         * "about"; the margin against the bound is two orders of magnitude.
          *
          * The per-process override is also the ONLY reason this case exists in a
          * reasonable time. IRC_BURST_MAX_BYTES is the shipped bound and a
@@ -1622,6 +1702,23 @@ static void case_truncated_burst_changes_nothing(void)
                  "node B detected the truncation somewhere other than the member "
                  "count, so this case is not measuring the count assertion: %s",
                  b.out);
+    /* THE COUNTER THAT NAMES THE DIAGNOSIS, asserted BEFORE the general discard
+     * count on purpose. burst_abandoned=1 below is also true of an over-budget
+     * discard and of a malformed record, so a test that asserted it first and
+     * failed would leave the reader guessing which of the three happened; this
+     * one is only ever incremented on the branch that printed
+     * `fed_burst_truncated` above, so asserting it first means the failure names
+     * the truncation rather than the discard it caused. That ordering is the
+     * whole point of the counter existing: before it, this case had exactly one
+     * number for three different faults.
+     *
+     * AND IT IS NOT A SUBSTITUTE FOR THE WIRE ASSERTIONS ABOVE, which are what
+     * says the node behaved correctly; this says it said so in a countable way. */
+    TF_CHECK_MSG(nf_expect_u64(&b, "burst_truncated=", 1, 2000) == 0,
+                 "node B's truncation counter is not 1, so the truncation above and "
+                 "this count are not the same event -- the discard is real but the "
+                 "node cannot say which rule threw the transaction away: %s",
+                 b.out);
     TF_CHECK_MSG(nf_expect_u64(&b, "burst_abandoned=", 1, 2000) == 0,
                  "node B's discard counter is not 1, so the truncation above and this "
                  "count are not the same event: %s",
@@ -1655,12 +1752,129 @@ static void case_truncated_burst_changes_nothing(void)
     g_truncate = 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * A TRANSACTION OPEN AT SHUTDOWN
+ * ---------------------------------------------------------------------------
+ * 4.3's shadow is the one allocation on a node whose owner is a module global
+ * rather than a field on server_t, so it is the one teardown arm server_shutdown()
+ * has to CALL rather than free. C4 declined to add that arm because it could not
+ * be verified locally -- LeakSanitizer does not run on Darwin -- which is the
+ * reasoning this case exists to contradict: an arm that is unverifiable locally
+ * is exactly the one worth adding when LSan DOES run on the CachyOS Linux CI
+ * runner, and the arm is made verifiable HERE instead, by printing whether a
+ * shadow was open at teardown.
+ *
+ * SO WHAT IS ASSERTED is that the arm RAN while a shadow was open, not that it
+ * freed anything -- this platform cannot observe the free, and saying so in the
+ * assertion rather than implying otherwise is the honest form. Linux CI reads the
+ * same line next to its leak check.
+ *
+ * THE ORDER IS LOAD-BEARING AND IS THE OTHER HALF OF THE CLAIM. Node B is
+ * stopped while node A is still ALIVE, so B's link never goes down and
+ * fed_burst_abandon() -- the link-down discard -- is never reached. If A were
+ * stopped first, the shadow would be released by the ordinary link-down path, the
+ * teardown arm would report NONE, and the case would be measuring the wrong arm.
+ * burst_abandoned=0 at the end is what proves that is what happened rather than a
+ * shutdown that found nothing.
+ */
+static void case_open_transaction_released_at_shutdown(void)
+{
+    nf_node_t a;
+    nf_node_t b;
+    test_client_t alice;
+
+    g_peer_port = 0;
+    g_trace = 0;
+    g_is_b = 0;
+    g_stage = 0;
+    g_tiny_send = 0;
+    g_tiny_recv = 0;
+    g_truncate = 0;
+    g_open_burst = 1;
+    TF_CHECK_MSG(nf_spawn_inline_named(&a, NAME_A, child_setup) == 0,
+                 "could not spawn node A");
+    g_peer_port = a.port;
+    g_is_b = 1;
+    TF_CHECK_MSG(nf_spawn_inline_named(&b, NAME_B, child_setup) == 0,
+                 "could not spawn node B");
+
+    TF_CHECK_MSG(nf_expect(&a, "link_established: peer=" NAME_B, T_IO_MS) == 0,
+                 "node A never established its link to node B");
+    TF_CHECK_MSG(nf_expect(&b, "fed_burst_applied: peer=" NAME_A, T_IO_MS) == 0,
+                 "node B never applied the empty establishment transaction, so the "
+                 "begin/record machinery this case leaves open is not the one under "
+                 "test: %s",
+                 b.out);
+    /* A client so the node is a node with real state rather than an empty one, and
+     * so the establishment transaction above is not the only thing that has ever
+     * been true of it. Nothing in the case depends on this -- it is here because a
+     * shadow left open on a node that has never had a client is an arrangement no
+     * deployment produces. */
+    register_client(&alice, a.port, NICK_A);
+    TF_CHECK_MSG(tc_send(&alice, "JOIN " CHAN_T) == 0, "alice's JOIN send failed");
+    TF_CHECK_MSG(tc_expect(&alice, " 366 ", T_IO_MS) == 0,
+                 "alice's JOIN never completed on the node that owns the channel");
+
+    /* THE OPEN TRANSACTION. The tick hook fires it the moment alice has JOINed,
+     * which is the same gate the truncated case uses, and the `[fixture] open_sent`
+     * line is what makes the rest of the case non-vacuous: it says the line was
+     * queued, so a later failure is about what the receiver did with it. */
+    TF_CHECK_MSG(nf_expect(&a, "open_sent: ok=1", T_IO_MS) == 0,
+                 "node A never sent the open transaction: %s", a.out);
+    /* AND NOTHING HAPPENED YET, which is the point of leaving one open: a BEGIN
+     * with no terminator installs nothing, and the two assertions below are the
+     * pair -- the link is still up AND node B has discarded nothing -- that says
+     * the shadow is sitting there rather than having been thrown away on the way
+     * in. A receiver that discarded an unterminated transaction immediately would
+     * have burst_abandoned=1 here and the case would be measuring a different
+     * design. */
+    TF_CHECK_MSG(nf_expect(&b, "link: peer=" NAME_A " state=ESTABLISHED", T_IO_MS) == 0,
+                 "node B's link to node A is not ESTABLISHED, so an open "
+                 "transaction cost it the link: %s",
+                 b.out);
+    TF_CHECK_MSG(nf_expect_u64(&b, "burst_abandoned=", 0, 1000) == 0,
+                 "node B discarded something while the transaction was open, so the "
+                 "teardown arm below would be finding nothing and this case would "
+                 "be measuring a transaction that was never open: %s",
+                 b.out);
+
+    /* B FIRST, A SECOND. See the header: this is what keeps fed_burst_abandon()
+     * out of the picture. */
+    TF_CHECK_MSG(nf_stop(&b) == 0, "node B did not exit cleanly");
+    TF_CHECK_MSG(nf_expect(&b, "fed_burst_close: shadow=OPEN", T_IO_MS) == 0,
+                 "node B's shutdown did not report an open shadow, so "
+                 "server_shutdown()'s arm either did not run or found nothing -- and "
+                 "a node that stops mid-burst is the case the arm exists for: %s",
+                 b.out);
+    /* THE NEGATIVE HALF, because a line that always says OPEN would satisfy the
+     * assertion above as easily as a real teardown would. Every other case in this
+     * file ends with its node's shadow closed, so this is the one place in the
+     * suite that can see the NONE reading. */
+    TF_CHECK_MSG(nf_stop(&a) == 0, "node A did not exit cleanly");
+    TF_CHECK_MSG(nf_expect(&a, "fed_burst_close: shadow=NONE", T_IO_MS) == 0,
+                 "node A reported an open shadow at shutdown, and node A never had "
+                 "one -- so the OPEN reading above is a constant rather than a "
+                 "measurement: %s",
+                 a.out);
+    TF_CHECK_MSG(nf_expect_u64(&a, "burst_abandoned=", 0, 1000) == 0,
+                 "node A abandoned a transaction of its own, so the NONE reading "
+                 "above may be a shadow that had already been thrown away rather "
+                 "than one that never existed: %s",
+                 a.out);
+
+    tc_close(&alice);
+    nf_free(&a);
+    nf_free(&b);
+    g_open_burst = 0;
+}
+
 int main(void)
 {
     case_resync_replaces();
     case_burst_refused();
     case_over_budget_changes_nothing();
     case_truncated_burst_changes_nothing();
+    case_open_transaction_released_at_shutdown();
     tf_done("fed_burst");
     return 0;
 }

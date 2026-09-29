@@ -534,7 +534,7 @@ list. Five verbs:
 :<origin> SBURST  <epoch> <nnicks>
 :<origin> SBURSTN <nick> <user> <host> <modes> <signon> :<away>
 :<origin> SBURSTC <chan> <origin> <topic_who> <topic_when> <modes> :<topic>
-:<origin> SBURSTM <chan> <nick> <flags>
+:<origin> SBURSTM <chan> <server> <nick> <flags>
 :<origin> SBURSTE <epoch> <nnicks> <nchans> <nmembers>
 ```
 
@@ -547,6 +547,22 @@ differs from the link's is a restart, and the link adopts it, because §2.4's de
 key pairs the epoch with the id and a mismatched pair aliases. An empty middle
 parameter is the literal `-` (empty middle tokens are unrepresentable — see 3.2);
 `<flags>` is `-`, `o`, `v` or `ov`, **not** the SJOIN token's `+ov`.
+
+**`<server>` was added to `SBURSTM` before a second implementation existed, and it
+is the reason the frozen format is worth freezing.** The prefix answers *whose
+state is this*; `<server>` answers *where is this person*. They coincide on a
+two-node mesh and for a member the origin hosts itself, and they **diverge** the
+moment the origin is a relay reporting somebody else's member. Without the field
+a member living on a third node is stored under the relaying server, which is
+wrong twice over: the roster misattributes it, and §2.1's scoped `nick@server`
+cannot be resolved from the roster at all, because the roster would answer with
+the name of a server that does not host the member. Neither is repairable from
+inside a receiver — the information is not on the wire. The cost, stated rather
+than implied: **+64 bytes** on the worst-case `SBURSTM` line (446 rather than
+382), one field in the receiver's shadow member record, and one field in
+`chan_remote_t`. It is in the format now precisely because §4.3 says a wire
+format cannot be invented later, and a field added after two implementations run
+is a compatibility break rather than a change.
 
 **One line per record, and not a packed list, is the load-bearing choice.** `topic`
 is 256 bytes and `away` is 256 bytes and both may contain spaces, `:` and `;`, so
@@ -573,17 +589,36 @@ carry is counted and a dropped one makes the terminator disagree.
 
 **The budget is volume, not line length.** The worst case is 753 bytes for
 `SBURSTC` and 787 for `SBURSTN` against an `IRC_MAX_LINE` of 8192 — 9%, so a
-per-line check would be a formality. The real constraint is that 3.4 **drops** a
-saturated peer link rather than buffering it, and a burst is O(nicks + members), so
-a large node's burst can be megabytes and queueing it all would starve every live
-message behind it. A burst is therefore assembled into a staging buffer of
-`IRC_BURST_MAX_BYTES` = `CONN_WQ_MAX / 2` — half a link's queue, so a resync can
-never crowd out a live message — and a burst that does not fit is **refused in
-full** with one `n_burst_refused`: nothing queued, the link untouched, no
-truncation. The receiver charges every record against the same bound, because the
-shadow is memory made out of what a peer *said*. `fanout_line_fits()` is not used:
-it charges the *client* envelope (a 64-byte channel name and a 64-byte hostmask)
-against `IRC_MAX_RELAY_LINE`, and a `SBURST*` line is neither.
+per-line check would be a formality (`SBURSTM`, at 446 after the `<server>`
+field, is 5.4% and is not what the budget turns on). The real constraint is that
+3.4 **drops** a saturated peer link rather than buffering it, and a burst is
+O(nicks + members), so a large node's burst can be megabytes and queueing it all
+would starve every live message behind it. A burst is therefore assembled into a
+staging buffer of `IRC_BURST_MAX_BYTES` = `CONN_WQ_MAX / 2` — half a link's
+queue, so a resync can never crowd out a live message — and a burst that does not
+fit is **refused in full** with one `n_burst_refused`: nothing queued, the link
+untouched, no truncation. The receiver charges every record against the same
+bound, because the shadow is memory made out of what a peer *said*.
+`fanout_line_fits()` is not used: it charges the *client* envelope (a 64-byte
+channel name and a 64-byte hostmask) against `IRC_MAX_RELAY_LINE`, and a
+`SBURST*` line is neither.
+
+**A truncated transaction is counted twice, under two names, and the second name
+is the one that says why.** `n_burst_abandoned` counts an inbound burst discarded
+before its terminator — a count mismatch, an over-large transaction, a malformed
+record, or a link that went away. `n_burst_truncated` counts the one of those
+that is a *truncation*: `SBURSTE`'s counts disagreeing with what arrived. They
+are incremented on the same branch, for the same reason §2.4's
+`n_fed_dup_drop`/`n_fed_dedup_dup` are two names for one event — they are read at
+two different levels. The first says "a transaction was thrown away", which is the
+number an operator diagnosing a stale roster wants; the second says "and the peer's
+terminator disagreed with its own records", which is a different fault with a
+different fix (a lossy or saturating link, not a peer that does not implement
+4.3). Before `n_burst_truncated` existed that fault was visible only as one
+`[observable] fed_burst_truncated:` log line. Neither is counted as
+`n_fed_malformed`, which is documented as *a line* failing validation: every line
+of a transaction that reaches the terminator passed, and what failed is the
+transaction.
 
 **Both sides burst, which is a deliberate superset of "the initiator sends full
 state".** A node only forwards to peers that already hold the `chan_t`, so if only
@@ -600,18 +635,71 @@ received it.
 a relayed one: a burst whose tag block names a third server is refused, and the
 whole family is refused *untagged*, because a node that could replace its entire
 view of an origin with lines whose 2.4 identity the receiver invented has no loop
-prevention at that point. A member record is keyed by the **burst origin**, not by
-the member's own server, because 4.3's frozen `SBURSTM` carries no server field;
-that is exact on a two-node mesh and a cache on a larger one, and a member the
-receiver already knows under any key is left alone rather than installed twice —
-two entries for one person is a `353` that renders the same nickname twice with
-nothing on the node able to explain it. `SBURSTN` carries `user`, `modes`, `signon`
-and `away` and the receiver keeps only `host`; the rest are for 2.1's remote-nick
-registry, which is Phase 9. A channel's creation race is **not** re-keyed from a
-burst: 2.2's tie-break needs the (epoch, name) of the *first* creator and the wire
-carries one epoch. **Driving** the resync — link loss, reconnect, backoff — is
+prevention at that point. A member record is **keyed** by the **burst origin**, not
+by the member's own server, and that is a deliberate separation rather than a
+leftover: the key is what a resync replaces *against* (§4.3.1's replace-never-merge
+is per-origin, so the entries a previous resync from the same origin installed have
+to be nameable as a set), while `SBURSTM`'s `<server>` field is what the entry is
+*for* — the member's actual holder, stored in `chan_remote_t::member_server`.
+Keying by the holder would make a relay's resync unable to replace what the relay
+itself installed, and a member the origin dropped would linger for ever. On a
+two-node mesh the two strings are always the same; on a larger one they part
+company, which is what the field is for. A member the receiver already knows
+*under any key* is left alone rather than installed twice — two entries for one
+person is a `353` that renders the same nickname twice with nothing on the node
+able to explain it. `SBURSTN` carries `user`, `modes`, `signon` and `away` and the
+receiver **keeps only `host`**; the other four are on the wire and **discarded on
+purpose**, because they exist for §2.1's remote-nick registry ("which server holds
+the user called `X`", the thing that makes `nick@server` resolvable for a member
+this node has no `conn_t` for) and that registry is **Phase 9** with no home on
+`server_t` yet. Building it here would be Phase 9's design decision taken in
+Phase 6 without the rest of Phase 9; a reader who finds the fields discarded should
+read that as the deferral it is. A channel's creation race is **not** re-keyed from
+a burst: 2.2's tie-break needs the (epoch, name) of the *first* creator and the
+wire carries one epoch. **Driving** the resync — link loss, reconnect, backoff — is
 Phase 9, which is why 8's "link loss and reconnect re-syncs channel state via
 `SBURST`" is still open: Phase 6 owns the verb and the format, not the policy.
+
+**A node's resync shadow is released at shutdown, and that arm is verified by
+LeakSanitizer on the Linux runner rather than on the developer machine.** The
+shadow is a module global — the one allocation on a node whose owner is not a field
+on `server_t` — so `server_shutdown()` calls `fed_burst_close()` for it, next to
+the dedup table free that is the same kind of arm. C4 declined to add it, on the
+reasoning that it could not be checked on Darwin (LeakSanitizer is Linux-only, per
+the hygiene note in 7/Phase 1). That reasoning was backwards and is retracted here
+and at the three places it was written down: an arm that is unverifiable *locally*
+is precisely the one worth adding when LSan **does** run on the CachyOS CI runner,
+and leaving it out meant a node that stopped mid-transaction leaked up to
+`IRC_BURST_MAX_BYTES` to the kernel on every shutdown. The arm prints whether a
+shadow was open at teardown, so it is *asserted* on every platform and *verified*
+on the one that has a leak checker.
+
+**OPEN, AND DELIBERATELY UNRESOLVED: should a relay burst its own caches to peers
+that already hold the channel?** Today it does, because `fed_burst_send()` walks
+every channel the node holds and the receiving side has no filter for "you already
+know this". The design does not say, and this pass does not decide it. The two
+answers are:
+
+- **Yes, as today.** A relay's cache is a cache (2.2) and is exactly as stale as
+  the origin's own report would be, so re-sending it is redundant but harmless:
+  the receiver's per-origin purge then replaces the relay's earlier copy with the
+  relay's later one, which converges to the same answer. It costs one transaction
+  per link establishment and it is what makes "on **every** link establishment the
+  initiator sends full state" mean what a reader expects, because a relayed
+  channel would otherwise never reach a node that linked up later.
+- **No — burst only what this node is authoritative for.** A relay's caches are
+  somebody else's state, and 4.3's per-origin rule already says a node replaces
+  state *for an origin*; a relay claiming a third server's roster in a transaction
+  of its own is the same category as the RELAYED_BURST refusal the guard chain
+  already performs, one layer up. Filtering would cut the bytes a relay sends by
+  most of them on a large mesh, at the cost of a rule that has to decide what
+  "authoritative" means for a channel this node does not own — and that
+  definition is Phase 9's re-election question, which 9 says must not be begun.
+
+Nothing in the tree depends on the answer, and neither answer is cheaper enough to
+be obviously right: today's costs bytes, the alternative's costs a policy. It is
+recorded here so that whoever first sees the cost decide it with the numbers in
+front of them rather than rediscovering them.
 
 ### 4.4 Numerics
 
@@ -797,7 +885,7 @@ came from is **expected** under the amended row and is bounded by §2.4 rather
 than forbidden by the routing table: `test_fed_loop.c` requires exactly one such
 bounce and then requires the loop counters to stop moving.
 
-*Accept status after C4 (what is provably met, and what is not).* Criterion 2 is
+*Accept status after C5 (what is provably met, and what is not).* Criterion 2 is
 met **after a resync** as well as before one, which is the stronger form: three
 resyncs over one established link, and the full `353` contents on both nodes after
 each. The replace-not-merge property behind the word "resync" has four distinct
@@ -805,13 +893,20 @@ tests, and two of the four could **not** be produced by client commands on a
 two-node mesh at all — a member the origin loses is always removed on the far side
 by an `SPART` first, and a channel A no longer has is always removed by its
 forwarded `PART` — so the fixtures create those states deliberately and say so.
-Not met, and deliberately so: **link loss and reconnect driving a resync** is
+C5 added `SBURSTM`'s `<server>` field (§4.3.1) before a second implementation
+existed, and `n_burst_truncated` for the one discard reason that had only a log
+line. Neither changes what the tests can prove on a two-node mesh: on that mesh a
+member's server and the burst origin are the same string, so the field is
+exercised but not *distinguished* — which is the honest limit, and the reason
+§4.3.1 says what the field is worth rather than claiming it is covered. Not met,
+and deliberately so: **link loss and reconnect driving a resync** is
 Phase 9, so §8's "link loss and reconnect re-syncs channel state via `SBURST`"
 remains open and this phase makes no claim about it. A three-node mesh, the only
 topology in which a resync is a genuine *re*-sync rather than a first exchange, is
 also out of scope here; §4.3.1 records what the format gives up on a larger mesh
-(member records are keyed by the burst origin, and a receiver that already knows a
-nickname leaves the existing attribution alone).
+(a receiver that already knows a nickname leaves the existing attribution alone)
+and §4.3.1's open question records the one relay behaviour the design has not
+picked.
 
 **Phase 7 — Command surface + skip gate empty.** The SHOULD commands; CI fails
 on any skip. *Accept:* zero skipped tests.

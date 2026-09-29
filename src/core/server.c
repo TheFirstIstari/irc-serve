@@ -16,6 +16,13 @@
 
 #include "core/channel.h"
 #include "core/message.h"
+/* The one include that points the other way. 4.3's inbound resync shadow is a
+ * module global rather than a field on server_t, so the shutdown has to reach
+ * into its owner to release it -- the same reason the dedup table below is freed
+ * here rather than left to federation/dedup.c. core/fanout.c and
+ * core/commands.c already include federation/ headers for the same class of
+ * reason, so this is a direction this tree already has. */
+#include "federation/burst.h"
 
 /* ---------------------------------------------------------------------------
  * A small open-addressed string -> pointer map
@@ -663,6 +670,28 @@ void server_shutdown(server_t *s)
     s->dedup_tail = NULL;
     s->dedup_used = 0;
     s->dedup_swept_ms = 0;
+    /* 4.3's resync shadow, the second federation allocation this function
+     * releases and the only one it has to CALL rather than free. C4 declined to
+     * add this arm because it could not be checked on Darwin; that reasoning was
+     * backwards, and the correction is the reason this arm exists: an arm that
+     * is unverifiable LOCALLY is exactly the one worth adding when LeakSanitizer
+     * DOES run on the CachyOS Linux CI runner. A node stopped mid-transaction --
+     * a SIGTERM while a peer is bursting -- was leaking up to
+     * IRC_BURST_MAX_BYTES to the kernel, and the only evidence was a build nobody
+     * ran locally.
+     *
+     * IT IS SAFE HERE AND AT ANY POINT in the walk above: the shadow is records
+     * this node copied out of what a peer said. It holds no conn_t*, no chan_t*
+     * and no server_link_t*, so nothing it can be holding has been freed yet.
+     * And it is safe on a node that never called fed_open(), which is every
+     * test that links this library without the federation fixture -- the shadow
+     * is a file-scope static and therefore already zero.
+     *
+     * ASSERTED, NOT VERIFIED, ON THIS PLATFORM -- and the arm prints an
+     * `[observable] fed_burst_close: shadow=OPEN|NONE` line precisely so it is
+     * ASSERTED here too: a test can prove the arm ran without a leak checker,
+     * and Linux CI can read the same line next to its LSan run. */
+    fed_burst_close(s);
     strtab_free(s->nicks);
     s->nicks = NULL;
     strtab_free(s->chans);
