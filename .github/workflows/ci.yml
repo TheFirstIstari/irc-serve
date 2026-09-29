@@ -2,14 +2,10 @@ name: CI / Test / Benchmark / Compliance
 
 on:
   push:
-    branches: [main, feat/*, fix/*]
+    branches: [main, feat/*, fix/*, phase/*, docs/*, ci/*]
   pull_request:
     branches: [main]
 
-# Least privilege, and it is also what satisfies CodeQL's
-# actions/missing-workflow-permissions rule: that rule wants permissions
-# declared PER JOB, because workflow scope silently hands every future job
-# the same token scope. Every job here only checks out code and runs it.
 permissions:
   contents: read
 
@@ -17,12 +13,88 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# ---------------------------------------------------------------------------
+# Where the work runs, and why
+#
+# The self-hosted CachyOS runner is preferred for Linux work: it is a much
+# faster machine, its toolchain is the same one the project is developed
+# against, and it costs nothing against hosted minutes.
+#
+# Three constraints shape the layout, and each is a reason the obvious
+# "move everything" version is wrong:
+#
+#   1. ONE RUNNER RUNS ONE JOB AT A TIME. Six separate matrix jobs on a single
+#      self-hosted runner would run *serially* -- roughly 6 x 30s, slower in wall
+#      clock than the parallel hosted matrix they replace. So the Linux
+#      verification is one job that loops internally. Parallelism is not
+#      available; sequential-but-native beats parallel-but-emulated.
+#
+#   2. macOS CANNOT RUN THERE. ci_macos stays on a hosted macOS runner. That is
+#      not a preference, it is the platform.
+#
+#   3. THE MERGE GATE MUST NOT DEPEND ON A MACHINE THAT CAN BE SWITCHED OFF.
+#      ci_test stays on a hosted Linux runner and stays required, so a merge is
+#      still possible when the self-hosted runner is offline. If every required
+#      check lived on a personal machine, powering it off would be a
+#      development freeze.
+#
+# Exposure: ci_linux_cachyos runs on the self-hosted machine, so anything that
+# reaches it executes code there. It is gated twice -- push to main only, and
+# the `self-hosted` environment, whose only required reviewer is the owner and
+# which the owner's own pushes bypass by design (see docs/DEVELOPMENT.md).
+# ---------------------------------------------------------------------------
+
 jobs:
+  # --- Preferred path: the fast native Linux machine -----------------------
+  # One job, all four compiler x build-type combinations, sequentially.
+  ci_linux_cachyos:
+    name: ci_linux (self-hosted)
+    runs-on: [self-hosted, Linux, X64, cachyos-x8664]
+    timeout-minutes: 45
+    environment:
+      name: ${{ github.actor == 'TheFirstIstari' && 'self-hosted-auto' || 'self-hosted' }}
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          echo "  host   : $(uname -srm)"
+          echo "  distro : $(. /etc/os-release && echo "$PRETTY_NAME")"
+          echo "  cmake  : $(cmake --version | head -1)"
+          echo "  gcc    : $(gcc --version | head -1)"
+          echo "  clang  : $(clang --version | head -1)"
+      - name: Build and test every compiler and build type
+        run: |
+          set -euo pipefail
+          rc=0
+          for cc in gcc clang; do
+            for bt in Release Debug; do
+              echo "::group::$cc $bt"
+              d="build-$cc-$bt"
+              if cmake -B "$d" -S . -DCMAKE_BUILD_TYPE="$bt" -DBUILD_TESTING=ON -DCMAKE_C_COMPILER="$cc" \
+                 && cmake --build "$d" --parallel "$(nproc)" \
+                 && ctest --test-dir "$d" --output-on-failure --timeout 60; then
+                echo "  PASS  $cc $bt"
+              else
+                echo "  FAIL  $cc $bt"
+                rc=1
+              fi
+              echo "::endgroup::"
+            done
+          done
+          exit "$rc"
+
+  # --- Independent merge gate: hosted, so it works when the runner is off ---
+  # Deliberately small and deliberately hosted. This is the check that keeps a
+  # merge possible when cachyos-x8664 is offline, and the one Linux result that
+  # is not produced by the maintainer's own machine.
   ci_test:
-    permissions:
-      contents: read
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - name: Configure
@@ -33,64 +105,16 @@ jobs:
         working-directory: build
         run: ctest --output-on-failure --timeout 60
 
-  ci_benchmark:
-    permissions:
-      contents: read
-    runs-on: ubuntu-22.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - name: Configure
-        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCHMARK=ON
-      - name: Build
-        run: cmake --build build --parallel $(nproc)
-      - name: Benchmark
-        working-directory: build
-        run: ctest -L Benchmark --output-on-failure --timeout 60
-
-  ci_compliance:
-    permissions:
-      contents: read
-    runs-on: ubuntu-22.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - name: Configure
-        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
-      - name: Build
-        run: cmake --build build --parallel $(nproc)
-      - name: Compliance Tests
-        working-directory: build
-        run: ctest -L Compliance --output-on-failure --timeout 60
-      - name: Verify Spec References
-        shell: bash
-        run: |
-          test -f docs/SPEC_TRACKING.md || { echo "docs/SPEC_TRACKING.md missing" >&2; exit 1; }
-          grep -q "https://datatracker.ietf.org/doc/html/rfc1459" docs/SPEC_TRACKING.md || { echo "missing RFC1459 spec reference" >&2; exit 1; }
-          grep -q "https://modern.ircdocs.horse/" docs/SPEC_TRACKING.md || { echo "missing modern spec reference" >&2; exit 1; }
-          grep -q "https://ircv3.net/" docs/SPEC_TRACKING.md || { echo "missing IRCv3 spec reference" >&2; exit 1; }
-          echo "Spec references verified"
-
-  # macOS is a first-class target, not an afterthought: the parser uses POSIX
-  # APIs that behave differently under Darwin headers, and the _DARWIN_C_SOURCE
-  # fix in the root CMakeLists exists precisely because of it. Development has
-  # always been on macOS while CI ran Linux only, which is how the glibc POSIX
-  # break stayed hidden until CI caught it. The reverse direction needs covering
-  # too.
-  #
-  # Caveat, stated rather than implied: AppleClang does not match
-  # `STREQUAL "Clang"` in CMakeLists.txt, so `-Weverything` does NOT run on this
-  # job. That is issue #85. This job therefore covers the default macOS
-  # toolchain, not the full warning set.
+  # --- macOS: cannot run on the self-hosted machine -----------------------
   ci_macos:
-    permissions:
-      contents: read
     runs-on: macos-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         build_type: [Release, Debug]
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - name: Configure
@@ -109,90 +133,37 @@ jobs:
           grep -q "https://ircv3.net/" docs/SPEC_TRACKING.md || { echo "missing IRCv3 spec reference" >&2; exit 1; }
           echo "Spec references verified"
 
-  # Self-hosted CachyOS job. Deliberately scoped:
-  #
-  #   * `runs-on` targets a LABEL, so only this job can land on that machine
-  #   * this job is the only one gated on `if: github.event_name == 'push'`
-  #   * it therefore does NOT run for pull_request, so a PR from anyone --
-  #     including a public fork -- cannot execute code on it
-  #
-  # That restriction is the whole point. The repository is public; a self-hosted
-  # runner attached to any pull_request-triggered job would let arbitrary people
-  # run code on this machine. If you add this label to such a job, that
-  # protection is gone.
-  #
-  # This job is a smoke test that the distro builds, NOT a required status
-  # check. A machine you have switched off must not block the project.
-  build_cachyos:
+  # --- Advisory only, hosted ---------------------------------------------
+  # Benchmark and compliance run on the hosted runner rather than the
+  # self-hosted one so that their results are produced by infrastructure the
+  # owner does not control. Neither is a required check, so they cost nothing
+  # in merge latency and their numbers are independent of the fast machine.
+  ci_benchmark:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
     permissions:
       contents: read
-    # `environment` is the control that matters here. It points at an
-    # environment whose only required reviewer is the repository owner, and
-    # whose deployment branch policy allows only `main`. The job therefore
-    # STOPS and waits for a human to approve it before a single line runs on
-    # that machine.
-    #
-    # The `if:` below is a second, independent gate -- the environment would
-    # still gate it if this were removed, and this would still gate it if the
-    # environment were removed. Belt and braces, because each fails differently:
-    # `if:` stops the job existing for a pull request, and the environment stops
-    # a bad or unreviewed commit on main from running unreviewed.
-    # The gate is conditional on WHO pushed. This is the mechanism behind
-    # "run my own work automatically, but nothing else":
-    #
-    #   github.actor is the authenticated identity that performed the push, and
-    #   for a push event that is trustworthy -- it comes from the credential,
-    #   not from anything a workflow or a commit message can set. (It would NOT
-    #   be trustworthy for pull_request, where the actor is the PR author, which
-    #   is one more reason the if: below restricts this job to pushes to main.)
-    #
-    #   your own push   -> self-hosted-auto   (no protection rules; starts at once)
-    #   anyone else's   -> self-hosted        (required reviewer: you; waits)
-    #
-    # Both are pinned to main, so neither can be used from another branch.
-    environment:
-      name: ${{ github.actor == 'TheFirstIstari' && 'self-hosted-auto' || 'self-hosted' }}
-    runs-on: [self-hosted, Linux, x64, cachyos-x8664]
-    timeout-minutes: 30
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: Toolchain
-        run: |
-          set -euo pipefail
-          uname -a
-          cat /etc/os-release 2>/dev/null | head -3 || true
-          cmake --version | head -1
-          gcc --version | head -1
-          clang --version | head -1
+      - name: Configure
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCHMARK=ON
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+      - name: Benchmark
+        working-directory: build
+        run: ctest -L Benchmark --output-on-failure --timeout 60
+
+  ci_compliance:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
       - name: Configure
         run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
       - name: Build
         run: cmake --build build --parallel $(nproc)
-      - name: Unit Tests
+      - name: Compliance Tests
         working-directory: build
-        run: ctest --output-on-failure --timeout 60
-
-  build_arch:
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        compiler: [gcc, clang]
-        build_type: [Release, Debug]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build (Arch target)
-        shell: bash
-        env:
-          CC: ${{ matrix.compiler }}
-        run: |
-          cmake -B build -S . -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DBUILD_TESTING=ON
-          cmake --build build --parallel $(nproc)
-      - name: Unit Tests (Arch target)
-        working-directory: build
-        run: ctest --output-on-failure --timeout 60
+        run: ctest -L Compliance --output-on-failure --timeout 60
