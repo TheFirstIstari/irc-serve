@@ -225,8 +225,8 @@ which is a separate concern. The original claim was overstated:
 | Target | Verb class | Action |
 |---|---|---|
 | local user | either | write to `conn_t` |
-| owned channel | `message` | write to each local member; no forward — the origin already holds every member |
-| owned channel | `state-change` | apply locally **and** forward to every peer in `servers[]` |
+| owned channel | `message` | write to each local member **and** forward to every peer in `servers[]` ∪ every `ESTABLISHED` link — the same forward arm as `state-change` |
+| owned channel | `state-change` | apply locally **and** forward to every peer in `servers[]` ∪ every `ESTABLISHED` link |
 | non-owned channel | `message` | write to local members **and** forward to the owner |
 | non-owned channel | `state-change` | **forward only** — never a local write |
 | remote user `nick@server` | either | forward to that server |
@@ -238,13 +238,59 @@ Concretely, `SPRIVMSG` to a non-owned channel does **both** (local write +
 forward to owner); `SJOIN` does **only** forward. §2.2's "do not broadcast" is
 true only for state-changes.
 
+After the amendment above the class decides one thing only: **whether the caller
+also writes locally.** It no longer selects a forward target set — the two owned
+rows name the same one and the two non-owned rows name the same one. A `message`
+that a node has nobody to deliver to is still forwarded, because membership this
+node happens to hold is not evidence about whether the line should travel.
+
+**Correction (Phase 6, corrective pass after C3): the owned/`message` row's
+stated reason was wrong.** It read *"write to each local member; no forward — the
+origin already holds every member"*, and "the origin already holds every member"
+is false on a mesh of three or more nodes. The origin holds those members in its
+**remote roster**, and a roster entry is not a delivery path: only a peer link
+can deliver to them. The row is recorded rather than silently rewritten, because
+the original claim is exactly the kind of thing a reader re-derives from the
+code and believes, and because a table that was wrong for a whole phase is
+evidence that the reasoning — not just the row — needs to be visible.
+
+Three consequences, which is why it is written down:
+
+- The origin forwarded nothing, so a member sitting on a **third** node never
+  heard a message for a channel it was on. The channel looked live from inside
+  the origin and silent from the far side.
+- A relay node in a mesh exists to carry a message onward to servers the origin
+  holds no members on directly. With the old row there were **no such relays**:
+  the only path a `message` took across a link was leaf → owner, so a node that
+  was neither origin nor leaf never received one.
+- That made Phase 6's fifth acceptance criterion — *"a node with zero local
+  members in the channel still relays that channel's `SPRIVMSG` to the owner"* —
+  **unreachable from the code as specified**. It is reachable now, and
+  `test_fed_relay.c` asserts its literal wording rather than a client `NOTICE`
+  substitute.
+
+**The cost, stated plainly.** An owner re-broadcasts, so a channel whose members
+sit on *N* member-servers costs *N* forwards per message where it cost 1, and an
+owner holding no local member of a channel now spends a forward on a message it
+delivers to nobody. `servers[]` ∪ `ESTABLISHED` links is a broadcast, not a
+unicast (§3.1's topology paragraph below concedes exactly that). This is bought
+with a loop that did not exist before: see the guard note.
+
 **Topology.** Full mesh, one bidirectional link per pair of nodes, and a node
 relays onward from peer P to peer Q. Forwarding to each peer holding members
 *is* a broadcast — the earlier claim of "no broadcast of every join to every
 node" was wrong for a full mesh. What is avoided is the *global* list: fan-out
-targets the member-server set, not every node.
+targets the member-server set plus the node's own links, never every node.
 
-Loop guard applies at forward time (§2.4).
+**Loop guard applies at forward time (§2.4), and the amended `message` row is
+what makes it load-bearing.** Owner and relay can now hand one message back and
+forth, so §2.4's three rules bound the bounce rather than being belt-and-braces
+around a topology that could not loop: the `hops` ceiling bounds how far it
+spreads, never-forward-own-origin stops the copy returning to the server whose
+client wrote it, and the per-node dedup store drops the copy that comes back to a
+node that has already seen that `(origin, epoch, id)`. Exactly one bounce is the
+*designed* behaviour and is asserted as such — `test_fed_loop.c` waits for it,
+requires it to be exactly one, and then requires the counters to stop moving.
 
 ### 3.2 Message representation
 
@@ -613,6 +659,13 @@ the same channel; the **full `353` contents** on each node, in the Phase 4
 order — a truncated roster does not pass; a PRIVMSG from A reaches B exactly
 once; a two-node ping-pong does not loop; and a node with **zero local members**
 in the channel still relays that channel's `SPRIVMSG` to the owner.
+
+The last of those is only reachable because §3.1's owned/`message` row was
+amended — see the correction recorded there; with the original row there were no
+relay nodes for the criterion to be about. A message relayed back to where it
+came from is **expected** under the amended row and is bounded by §2.4 rather
+than forbidden by the routing table: `test_fed_loop.c` requires exactly one such
+bounce and then requires the loop counters to stop moving.
 
 **Phase 7 — Command surface + skip gate empty.** The SHOULD commands; CI fails
 on any skip. *Accept:* zero skipped tests.

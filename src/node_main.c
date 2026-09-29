@@ -580,7 +580,10 @@ int main(int argc, char **argv)
            "writeq_overflow=%llu write_error=%llu partial_writes=%llu "
            "rejected_fd=%llu pass_seen=%llu reply_refused=%llu "
            "fed_rejected=%llu fed_duplicate=%llu fed_hs_timeout=%llu "
-           "fed_dead=%llu\n",
+           "fed_dead=%llu fed_preauth_drop=%llu fed_hop_drop=%llu "
+           "fed_own_origin=%llu fed_untagged_relay=%llu "
+           "fed_unknown_verb=%llu fed_verb_deferred=%llu fed_malformed=%llu "
+           "fed_dup_drop=%llu fed_dedup_dup=%llu\n",
            (unsigned long long)srv.n_ticks, (unsigned long long)srv.n_eintr,
            (unsigned long long)srv.n_accepted, (unsigned long long)srv.n_closed,
            (unsigned long long)srv.n_lines,
@@ -595,7 +598,16 @@ int main(int argc, char **argv)
            (unsigned long long)srv.n_link_rejected,
            (unsigned long long)srv.n_link_duplicate,
            (unsigned long long)srv.n_fed_hs_timeout,
-           (unsigned long long)srv.n_fed_dead);
+           (unsigned long long)srv.n_fed_dead,
+           (unsigned long long)srv.n_fed_preauth_drop,
+           (unsigned long long)srv.n_fed_hop_drop,
+           (unsigned long long)srv.n_fed_own_origin,
+           (unsigned long long)srv.n_fed_untagged_relay,
+           (unsigned long long)srv.n_fed_unknown_verb,
+           (unsigned long long)srv.n_fed_verb_deferred,
+           (unsigned long long)srv.n_fed_malformed,
+           (unsigned long long)srv.n_fed_dup_drop,
+           (unsigned long long)srv.n_fed_dedup_dup);
 
     /* The link table itself, and last, after the counters: 8 asks for "a way to
      * dump peers and their FSM states" and the state is what the counters are

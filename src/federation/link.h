@@ -12,8 +12,9 @@
  * ---------------------------------------------------------------------------
  * The link LIFECYCLE and the handshake, and nothing else. This file can take a
  * peer from "configured" to "ESTABLISHED", keep it alive, notice that it is not,
- * and say so on stdout. It cannot carry a message: fed_dispatch() and the
- * inbound S-verb guard chain are C3, and burst.c/`SBURST` is C4. The
+ * and say so on stdout. It does not carry messages: the inbound S-verb guard
+ * chain and its handlers are federation/verbs.c's fed_dispatch() (C3), and
+ * burst.c/`SBURST` is C4. The
  * consequence to be aware of while reading the tick is written out under
  * "WHAT T3 COSTS A TEST" below -- it is the one place where this file's
  * behaviour changes a number a Phase 5 test asserts on.
@@ -449,6 +450,25 @@ server_link_t *fed_link_configure(server_t *s, const char *name,
  *   - T7  INIT and this node dialled it and it has never been dialled: dial.
  */
 void fed_tick(server_t *s, uint64_t now_ms);
+
+/* Answer one inbound FEDERATE: validate the claim, accept it or reject it.
+ *
+ * It is exported, and it is exported as a NAMED function rather than left as
+ * three lines inside the dispatch hook, because two callers need it and they
+ * are reached by different paths. federation/verbs.c's fed_dispatch() reaches it
+ * at its G2 guard, for a FEDERATE that arrives on a link that is ALREADY
+ * established -- a re-claim, which fed_check_federate() reports as
+ * DUPLICATE_LINK or NAME_MISMATCH. The hook in this file reaches it for the
+ * ordinary case, a claim on a connection that is not yet a peer, which is the
+ * only way a peer ever arrives: 2.3 makes the HANDSHAKE, not the accept, the
+ * place a peer is identified, and c->kind is still CONN_CLIENT here.
+ *
+ * Both callers hand the line here rather than each doing its own validation,
+ * because the verdict set is wire-adjacent (fed_federate_reason() prints it) and
+ * a second implementation of the checks would be a second set of answers to
+ * questions whose spelling a test matches on.
+ */
+void fed_on_federate(server_t *s, conn_t *c, const message_t *m);
 
 /* The reconnect seam: return the link to INIT, keeping `initiator` and the
  * pre-resolved address, and CLEAR the no-auto-redial latch so the next tick

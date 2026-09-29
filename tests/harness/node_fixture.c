@@ -346,6 +346,14 @@ static uint64_t g_last_fed_rejected = 0;
 static uint64_t g_last_fed_hs_timeout = 0;
 static uint64_t g_last_fed_dead = 0;
 static uint64_t g_last_dial_failed = 0;
+/* The inbound guard-chain counters (Phase 6 C3). Republished on change for the
+ * same reason as the four above: a two-node test asserts "the loop settles",
+ * which means reading a counter twice, and a republication driven only by
+ * connection counts would not print it until the next accept -- by which time
+ * the second read could not distinguish "settled" from "never republished". */
+static uint64_t g_last_fed_own_origin = 0;
+static uint64_t g_last_fed_dup_drop = 0;
+static uint64_t g_last_fed_lines = 0;
 
 static void nf_on_stop(int sig)
 {
@@ -382,6 +390,9 @@ static void nf_child_tick(server_t *s, uint64_t now_ms)
         s->n_link_rejected != g_last_fed_rejected ||
         s->n_fed_hs_timeout != g_last_fed_hs_timeout ||
         s->n_fed_dead != g_last_fed_dead ||
+        s->n_fed_own_origin != g_last_fed_own_origin ||
+        s->n_fed_dup_drop != g_last_fed_dup_drop ||
+        s->n_lines != g_last_fed_lines ||
         s->n_dial_failed != g_last_dial_failed) {
         g_last_nconns = s->nconns;
         g_last_closed = s->n_closed;
@@ -389,6 +400,9 @@ static void nf_child_tick(server_t *s, uint64_t now_ms)
         g_last_fed_rejected = s->n_link_rejected;
         g_last_fed_hs_timeout = s->n_fed_hs_timeout;
         g_last_fed_dead = s->n_fed_dead;
+        g_last_fed_own_origin = s->n_fed_own_origin;
+        g_last_fed_dup_drop = s->n_fed_dup_drop;
+        g_last_fed_lines = s->n_lines;
         g_last_dial_failed = s->n_dial_failed;
         nf_child_print_stats(s);
     }
@@ -408,7 +422,10 @@ static void nf_child_print_stats(const server_t *s)
            "write_error=%llu partial_writes=%llu eintr=%llu rejected_fd=%llu "
            "nconns=%llu dial_connected=%llu dial_failed=%llu "
            "fed_rejected=%llu fed_duplicate=%llu fed_hs_timeout=%llu "
-           "fed_dead=%llu\n",
+           "fed_dead=%llu fed_preauth_drop=%llu fed_hop_drop=%llu "
+           "fed_own_origin=%llu fed_untagged_relay=%llu "
+           "fed_unknown_verb=%llu fed_verb_deferred=%llu fed_malformed=%llu "
+           "fed_dup_drop=%llu fed_dedup_dup=%llu\n",
            (unsigned long long)s->n_accepted, (unsigned long long)s->n_closed,
            (unsigned long long)s->n_lines,
            (unsigned long long)s->n_parse_reject,
@@ -424,7 +441,16 @@ static void nf_child_print_stats(const server_t *s)
            (unsigned long long)s->n_link_rejected,
            (unsigned long long)s->n_link_duplicate,
            (unsigned long long)s->n_fed_hs_timeout,
-           (unsigned long long)s->n_fed_dead);
+           (unsigned long long)s->n_fed_dead,
+           (unsigned long long)s->n_fed_preauth_drop,
+           (unsigned long long)s->n_fed_hop_drop,
+           (unsigned long long)s->n_fed_own_origin,
+           (unsigned long long)s->n_fed_untagged_relay,
+           (unsigned long long)s->n_fed_unknown_verb,
+           (unsigned long long)s->n_fed_verb_deferred,
+           (unsigned long long)s->n_fed_malformed,
+           (unsigned long long)s->n_fed_dup_drop,
+           (unsigned long long)s->n_fed_dedup_dup);
     fflush(stdout);
 }
 

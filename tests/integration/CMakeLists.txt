@@ -204,3 +204,21 @@ irc_add_integration_test(test_fed_dedup test_fed_dedup.c)
 # case waits the shipped five or ninety seconds, and there is no sleep anywhere:
 # every wait is a deadline over select() (6.3).
 irc_add_integration_test(test_fed_handshake test_fed_handshake.c)
+
+# 7/Phase 6: a user on A JOINs a channel and a user on B JOINs the same one, and
+# the FULL 353 contents on each node are asserted in the Phase 4 order. Two child
+# processes over real TCP, per 6.2.
+irc_add_integration_test(test_fed_roster test_fed_roster.c)
+
+# 7/Phase 6: a PRIVMSG from A reaches B exactly once, the two-node ping-pong
+# settles, and 2.4's own-origin rule is the counter that proves it.
+irc_add_integration_test(test_fed_loop test_fed_loop.c)
+
+# 7/Phase 6: a node with ZERO local members in the channel still relays that
+# channel's SPRIVMSG to the owner.
+irc_add_integration_test(test_fed_relay test_fed_relay.c)
+
+# 2.4: the inbound guard chain, driven by a peer that is trying to get past it.
+# Every guard is a refusal of a line a well-behaved node would never send, so the
+# far end of the link has to be a raw socket rather than a second node.
+irc_add_integration_test(test_fed_guards test_fed_guards.c)
