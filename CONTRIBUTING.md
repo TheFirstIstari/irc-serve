@@ -1,5 +1,21 @@
 # Contributing
 
+## Licensing
+
+By opening a pull request you agree that your contribution is licensed under the
+project's terms: the **GNU Affero General Public License v3.0 or later**. See
+[LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+If your contribution is derived from code under a different licence, say so in
+the PR description — that needs settling before it can be merged, not after.
+
+The AGPL was chosen specifically because this is a federated network service:
+section 13 means a modified node offered over a network must offer its source.
+Some organisations cannot deploy the AGPL. That is a real constraint rather than
+a detail, and it is the licence the project has chosen.
+
+Participation is also governed by [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
 ## Branching and review
 
 `main` is protected. Work on a branch and open a pull request.

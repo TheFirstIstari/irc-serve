@@ -1,0 +1,59 @@
+irc-serve
+Copyright (C) 2026 TheFirstIstari and contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License along
+with this program. If not, see <https://www.gnu.org/licenses/>.
+
+---
+
+Why the AGPL rather than the GPL
+--------------------------------
+
+The AGPL is the GPL plus section 13, Remote Network Interaction. That clause is
+the whole reason it was chosen, and it is worth being precise about what it does
+and does not do.
+
+This is a *federation* protocol. The plausible way for the ecosystem to be
+damaged is not someone copying the code and shipping it under a different name --
+the AGPL covers that -- but someone running a modified node as a hosted service,
+so the federation protocol exists in practice while the code that keeps it
+working stays private. Section 13 is what closes that. GPL-3.0 does not: it
+covers distribution, not network use, so a private hosted fork is legal under
+GPL-3.0 and illegal under the AGPL.
+
+What the licence does NOT do
+----------------------------
+
+It does not protect the *protocol*. Anyone may implement the wire format from a
+specification without owing anything, and that is deliberate. A federation
+protocol is only healthy with independent implementations, so the aim here is
+the normal arrangement for a networked project: the specification stays open so
+anyone can write a server, and the reference implementation stays copyleft so
+nobody can take it closed. If a protocol specification is published alongside
+this code, it should carry its own open licence (CC BY-SA or similar) rather
+than inheriting the AGPL, because a specification nobody may read is not a
+specification.
+
+Adoption cost, stated plainly
+-----------------------------
+
+The AGPL is a real constraint. Some organisations are prohibited from
+deploying it, and commercial use generally requires that you offer your
+modifications. That is the trade being made, and it is a deliberate one rather
+than an oversight.
+
+Licensing third-party components
+--------------------------------
+
+irc-serve has no third-party runtime dependencies. The build requires a C11
+compiler and CMake. If that changes, the corresponding licences must be recorded
+here.
