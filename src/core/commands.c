@@ -300,8 +300,20 @@ static void handle_nick(server_t *s, conn_t *c, const message_t *m)
         return;
     }
 
-    if (strcmp(want, c->nick) == 0) {
-        return; /* re-asserting the nick you already hold: not an error */
+    /* Re-asserting the nickname you already hold is silent: RFC 2812 3.2 says a
+     * NICK to the name you already have changes nothing and generates no error.
+     *
+     * Asked as a REGISTRY question rather than as `strcmp(want, c->nick) == 0`,
+     * and the difference is the whole of issue #100. The registry folds case, so
+     * `NICK BOB` from the client registered as `bob` is the same name -- and a
+     * string comparison here would miss that, fall through to the claim, find
+     * the name already held by this very connection, and answer 433 to a client
+     * for the nickname it already holds. Asking the registry also keeps this
+     * correct for the same reason the fix lives there: the definition of "the
+     * same nickname" is a property of the table, so there is no second copy of
+     * the rule here to fall out of step with it. */
+    if (server_nick_lookup(s, want) == c) {
+        return;
     }
     if (server_nick_claim(s, want, c) != 0) {
         /* The incumbent keeps it: server_nick_claim() is a lookup-and-insert,
