@@ -1,10 +1,16 @@
 /* Real SASL handshake state-machine test, exercising sasl_framework.c. The
- * SASL framework is compiled into this test target so it is the genuine
- * implementation under test, not a hand-rolled simulation. */
+ * SASL framework is part of irc_core (#86), so this is the genuine
+ * implementation under test and not a hand-rolled simulation.
+ *
+ * It includes src/sasl_framework.h rather than declaring sasl_state_machine()
+ * itself, which is what this file used to do on the stated grounds that no
+ * header existed. One does: sasl_framework.h has declared all seven entry
+ * points for some time, and the hand-written extern declaration here was a
+ * second copy of a prototype that had drifted far enough to be worth trusting
+ * over the real one. */
 #include <assert.h>
 
-/* sasl_framework.c exposes its self-test entry point (no header exists). */
-extern int sasl_state_machine(void);
+#include "sasl_framework.h"
 
 int main(void) {
     int ok = sasl_state_machine();

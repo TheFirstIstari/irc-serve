@@ -219,7 +219,7 @@ that has not been actioned (it has been neutralised instead).
 |---|---|---|---|
 | `parse_nick` charset rule | RFC 1459 §2.4 | **Not implemented** | above; `protocol_parse.c:68-103` contains no character test |
 | `parse_user` field discipline | RFC 2812 §3.1 | **Implemented** | `protocol_parse.c:105-166`; `test_nick_user.c` |
-| `parse_command` token counting | — | **Implemented, superseded** | `protocol_parse.c:17`. Only counts tokens; replaced by `message_parse_n`. Still the function the throughput benchmark measures (§4) |
+| `parse_command` token counting | — | **Implemented, superseded** | `protocol_parse.c:17`. Only counts tokens; replaced by `message_parse_n`. Retained as the throughput benchmark's labelled LEGACY BASELINE, alongside the production measurement of `message_parse_n` (§4) |
 
 #### `src/ircv3_tags.c` — weak
 
@@ -253,13 +253,14 @@ empty values, empty key, empty pair, stray space, lone `@`, NULL args, and
 capacity rejection without truncation. **That test is real; the roundtrip test
 is not.** Design §5 puts the real fix in Phase 8.
 
-#### `src/sasl_framework.c` — not in the shipped library
+#### `src/sasl_framework.c` — now in the shipped library, still a placeholder
 
-- **Not in `irc_core`.** `src/CMakeLists.txt:2-12` lists `protocol_parse.c`,
-  `ircv3_tags.c`, `federation_handshake.c`, and the five `core/*.c`. No
-  `sasl_framework.c`. `nm` on the linked `irc-serve` binary: no `sasl_*` symbol.
-- Its only build site in the whole repo is
-  `tests/compliance/CMakeLists.txt:3`, which compiles it *into the test binary*.
+- **In `irc_core` since #86.** It used to be absent, with its only build site
+  `tests/compliance/CMakeLists.txt:3` compiling it *into the test binary*; the
+  file is now a source of `irc_core` and `test_sasl_handshake` links the library
+  like every other test. `nm` on `libirc_core.a`: seven `sasl_*` symbols. What
+  remains true below is that the implementation is a placeholder -- #86 put it in
+  the library, it did not make it real. #82 does that.
 - **`sasl_step` discards its input and auto-completes after 2 calls.**
   `sasl_framework.c:44-45` is `(void)server_data; (void)len;`, `client_out` is
   set to length 0, and `:50-52` sets `SASL_COMPLETED` on `step_count >= 2`.
@@ -273,25 +274,28 @@ is not.** Design §5 puts the real fix in Phase 8.
 |---|---|---|---|
 | SASL PLAIN | IRCv3 SASL / design §5 | **Not implemented** | No mechanism code, no credential store |
 | SASL state machine shape | IRCv3 SASL | **Vacuous** | The test exercises `sasl_state_machine()` in `src/`, not a real exchange. It passes because the machine completes on call count. |
-| SASL is in `irc_core` | design §5 | **No** | `src/CMakeLists.txt:2-12`; `nm` on the binary |
+| SASL is in `irc_core` | design §5 | **Yes** | Fixed by #86: `sasl_framework.c` is a source of `irc_core`; `nm libirc_core.a` shows seven `sasl_*` symbols |
 
-#### `src/message_id.c` — dead
+#### `src/message_id.c` — deleted (#86)
 
-- **Not in any `CMakeLists.txt` in the repo.** `grep -rn 'message_id'
-  --include=CMakeLists.txt .` returns nothing. `Makefile` and `local-ci.sh` both
-  drive CMake (`Makefile:26-27`, `local-ci.sh:35-36`), so there is no second
+- **Was not in any `CMakeLists.txt` in the repo.** `grep -rn 'message_id'
+  --include=CMakeLists.txt .` returned nothing. `Makefile` and `local-ci.sh` both
+  drive CMake (`Makefile:26-27`, `local-ci.sh:35-36`), so there was no second
   build path that could pick it up.
-- Never compiled, never tested, no test file references it.
-- Last touched in `738f254`; unchanged since.
-- Its format is wrong for the design anyway: a file-static `int`
-  `msg_id_counter` (`message_id.c:5`) and `"msg%d"` (`:14`) — not IRCv3-shaped,
-  and not the per-SERVER `(epoch, id)` pair design §2.4 requires. There is no
-  `epoch` at all.
+- Never compiled, never tested, no test file referenced it.
+- Its format was wrong for the design anyway: a file-static `int`
+  `msg_id_counter` and `"msg%d"` — not IRCv3-shaped, and not the per-SERVER
+  `(epoch, id)` pair design §2.4 requires. There was no `epoch` at all.
+- **Now deleted**, along with its two entries in `test_close_sites.c`'s
+  file lists (the file no longer exists, and that test fails on an unreadable
+  one). Real message-ids land in Phase 8 (#82) via `(origin, epoch, id)`.
 
-**Trap worth naming:** the repo root contains **34 stale `.o` files**,
-gitignored by the `*.o` rule at `.gitignore:7`, including `message_id.o` and
-`sasl_framework.o`. Their presence at the top of the tree is almost certainly
-what led the previous revision of this document to call message-id "observable".
+**Trap worth naming (historical):** the repo root once contained **34 stale `.o`
+files**, gitignored by the `*.o` rule at `.gitignore:7`, including
+`message_id.o` and `sasl_framework.o`. Their presence at the top of the tree is
+almost certainly what led an earlier revision of this document to call
+message-id "observable". They have since been cleaned up — there are no `.o`
+files at the repo root now.
 
 | Feature | Spec | Status | Evidence |
 |---|---|---|---|
@@ -436,7 +440,7 @@ Two caveats on §8's "no test asserts internal plumbing":
 
 | Feature | Spec | Status | Evidence |
 |---|---|---|---|
-| Throughput benchmark | design goals | **Runs, and measures the wrong function** | `tests/benchmark/throughput.c` benchmarks `parse_command()` — the legacy token **counter** (`protocol_parse.c:17`) — not `message_parse_n()`, the tokenizer the node actually calls on the wire (`poll_loop.c:94`). Real output: `mean=0.046us p50=0.000us p99=1.000us ops_sec=21574973`. It measures 8 distinct lines cycled 20000 times in one process. |
+| Throughput benchmark | design goals | **Runs, and measures the production path** | `tests/benchmark/throughput.c` benchmarks `message_parse_n()` — the tokenizer the node actually calls on the wire (`poll_loop.c:94`) — over a federated workload with peer prefixes, tag blocks, escaped tag values, the 15-param cap and a line at the 8192-byte cap. The legacy `parse_command()` counter is retained as an explicitly labelled baseline, not as server throughput. Real output (clang 23, arm64, Release): production `batched_mean=0.143us`, legacy baseline `batched_mean=0.028us`, 5.2x. p50/p99 are quantised to the 1000ns CLOCK_MONOTONIC granularity, which the run now reports. |
 | Memory footprint | `docs/ARCHITECTURE.md` "<10MB per federated node" | **No threshold is enforced** | `tests/benchmark/footprint.c:36-44` reads an **opt-in** `FOOTPRINT_RSS_MB_THRESHOLD` env var. Nothing in the repo sets it — `grep -rn FOOTPRINT_RSS_MB_THRESHOLD` matches only `footprint.c` itself. CI therefore cannot fail on it. Running it gives `rss_peak: ... rss=1.58 MiB`, but that is a process whose entire body is one `getrusage()` call: **it does not measure a running node with connections, so it does not support a per-node footprint claim.** |
 
 The previous revision of this document said `footprint.c` "asserts
@@ -546,10 +550,10 @@ Blunt, because the value of this document is that it can be trusted.
    cannot fail. `TagsRoundtrip` passes and proves nothing. `src/ircv3_tags.c`,
    `tests/compliance/test_tags_roundtrip.c`.
 
-3. **`message_id.c` is dead.** No `CMakeLists.txt` in the repo references it, it
-   is never compiled, never tested, and has no symbol in the binary. Its 34
-   sibling stale `.o` files at the repo root are the likely origin of the
-   previous revision's claim. `src/message_id.c`.
+3. **`message_id.c` was dead; #86 deleted it.** No `CMakeLists.txt` in the repo
+   referenced it, it was never compiled, never tested, and had no symbol in the
+   binary. The 34 sibling stale `.o` files that once sat at the repo root are
+   the likely origin of the previous revision's claim; they are gone now.
 
 4. **The lock-free contract is fake.** `tests/contracts/lockfree_contract.c:11`
    is a `volatile int` with no atomics, no CAS, no memory ordering, no mutex and
@@ -577,9 +581,10 @@ Blunt, because the value of this document is that it can be trusted.
    tree, and `sasl_step` auto-completes on call count (`:50`) while discarding
    its input (`:44-45`).
 
-9. **The throughput benchmark measures `parse_command`**, the legacy token
-   counter, not the tokenizer the node runs (`throughput.c:14,49,62` vs
-   `poll_loop.c:94`).
+9. **The throughput benchmark now measures `message_parse_n`**, the tokenizer
+   the node runs, and keeps `parse_command` as a labelled baseline (#91). Its
+   p50/p99 remain quantised to the platform's 1000ns CLOCK_MONOTONIC granularity,
+   so the batched per-call figure is the one it reports as quotable.
 
 10. **The footprint benchmark enforces nothing** and measures an empty process,
     not a node. No default threshold, no CI env var, so it cannot fail
@@ -591,6 +596,20 @@ Blunt, because the value of this document is that it can be trusted.
     calls for cannot be verified locally, and `message_parse`/`message_build`
     zero `*out` without freeing what was there (`message.h:40-46`) — a loop that
     reuses one `message_t` leaks, and no test covers that shape.
+
+12. **Nine dead file-local macros, hidden by a suppression whose reason does not
+    cover them** (found while enabling `-Weverything` on Apple clang, #85). The
+    flag set carries `-Wno-unused-macros` for the harness macros in
+    `test_util.h`, which are genuinely used across translation units — but it also
+    hides `T_READY_MS` in nine integration tests
+    (`test_conn_lifecycle.c:40`, `test_registration.c`, `test_ping_pong.c`,
+    `test_quit.c`, `test_pre_register.c`, `test_queries.c`, `test_reaper_close.c`,
+    `test_dup_nick.c`, `test_nick_rule.c`, `test_channels.c`), each defined and
+    never used. Both compilers report them, so this is pre-existing and not
+    something Apple clang found. Left in place deliberately: it is unrelated dead
+    code, not a diagnostic the #85 change surfaces, and the honest options are to
+    delete nine macros across nine test files or to narrow the suppression, which
+    would then need per-file reasoning. Worth a separate cleanup.
 
 ### Known-absent — not started, and correctly reported as such
 
