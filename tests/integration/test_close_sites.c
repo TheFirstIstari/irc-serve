@@ -93,7 +93,13 @@ static int calls_between(const char *name, const char *from, const char *to)
 int main(void)
 {
     /* Files that must never close a descriptor. poll_loop.c is the load-bearing
-     * one: 3.4 says it only marks CLOSING. connection.c is the tempting one. */
+     * one: 3.4 says it only marks CLOSING. connection.c is the tempting one.
+     *
+     * src/message_id.c was on both lists below and is not any more: it was an
+     * orphan that no CMakeLists.txt ever compiled, and #86 deleted it. The entry
+     * had to go with it, because load() treats an unreadable file as a failure
+     * and this list is a list of files that exist. No assertion is weakened --
+     * every file still in either list is checked exactly as before. */
     static const char *const never[] = {
         "src/core/connection.c",
         "src/core/poll_loop.c",
@@ -104,8 +110,7 @@ int main(void)
         "src/protocol_parse.c",
         "src/ircv3_tags.c",
         "src/federation_handshake.c",
-        "src/sasl_framework.c",
-        "src/message_id.c"
+        "src/sasl_framework.c"
     };
     char *code;
     const char *fn;
@@ -123,8 +128,7 @@ int main(void)
         "src/core/poll_loop.c", "src/core/message.c", "src/core/reply.c",
         "src/core/commands.c", "src/node_main.c",
         "src/protocol_parse.c", "src/ircv3_tags.c",
-        "src/federation_handshake.c", "src/sasl_framework.c",
-        "src/message_id.c"
+        "src/federation_handshake.c", "src/sasl_framework.c"
     };
 
     for (i = 0; i < sizeof never / sizeof never[0]; i++) {
