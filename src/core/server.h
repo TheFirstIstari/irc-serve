@@ -471,14 +471,28 @@ struct server {
      * state in place, so a node whose peer has a broken resync is a node whose
      * roster is quietly stale, and a counter is the only thing that says so.
      *
-     * They are NOT the same event and are not incremented together, which is why
-     * the pair above them -- one guard, one event, two counters at two levels of
-     * reading -- is not this pair. A burst that never left is a different problem
-     * from one that arrived and was thrown away, and an operator diagnosing a
-     * stale roster wants the second number and an operator diagnosing a node
-     * that cannot sync wants the first. */
+     * n_burst_truncated counts the ONE of those discards that is a truncation:
+     * SBURSTE's counts disagreeing with what actually arrived. It is a second
+     * name for a subset of the event above, deliberately, for the same reason
+     * n_fed_dup_drop and n_fed_dedup_dup are two names for one fact -- they are
+     * read at two different levels. n_burst_abandoned says "a transaction was
+     * thrown away" and is the number an operator diagnosing a stale roster
+     * wants; n_burst_truncated says "and the reason was that the peer's
+     * terminator disagreed with its own records", which is a different fault
+     * with a different fix -- a lossy or saturating link rather than a peer that
+     * does not implement 4.3. Before it existed, that fault was visible only as
+     * one log line. Both are incremented on the same branch and are NOT
+     * alternatives to one another.
+     *
+     * They are NOT the same event as n_burst_refused and are not incremented
+     * together, which is why the pair above them -- one guard, one event, two
+     * counters at two levels of reading -- is not these. A burst that never left
+     * is a different problem from one that arrived and was thrown away, and an
+     * operator diagnosing a stale roster wants the second number and an operator
+     * diagnosing a node that cannot sync wants the first. */
     uint64_t  n_burst_refused;
     uint64_t  n_burst_abandoned;
+    uint64_t  n_burst_truncated;
 
     int       trace;             /* emit [observable] per-line output */
 };
@@ -500,7 +514,15 @@ int server_init(server_t *s, const char *name);
  * link names a descriptor, and the only reason the free is safe is that every
  * conn is already gone by the time a link stops being able to name one. That
  * ordering is the whole invariant, so it is worth saying here where a reader
- * adding a fourth arm will see it. */
+ * adding a fourth arm will see it.
+ *
+ * The FOURTH ARM -- fed_burst_close(), which releases 4.3's inbound resync shadow
+ * -- is the one that is not a field on this struct, and it is a CALL rather than a
+ * free for the reason the dedup table's is not: the shadow is a module global in
+ * federation/burst.c, so the owner has to do it. It sits with the dedup free
+ * because both are "a federation module's memory, released here", and both are
+ * ASSERTED NOT VERIFIED on Darwin -- LeakSanitizer does not run on this platform,
+ * so the Linux CI job is what proves either free. */
 void server_shutdown(server_t *s);
 
 /* Bind and listen on `port` (host 0.0.0.0), nonblocking, with SO_REUSEADDR.

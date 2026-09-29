@@ -665,7 +665,13 @@ static void fed_in_sjoin(server_t *s, server_link_t *link, chan_t *ch,
     unsigned flags = 0u;
 
     if (nparams != 3 || fed_parse_flags(params[2], &flags) != 0 ||
-        chan_remote_add(ch, link->name, params[1], flags) != 0) {
+        /* link->name TWICE, and that is the whole of what an SJOIN can say: 4.3's
+         * SJOIN carries no server field, so the member's holder is inferred from
+         * the link the record arrived on -- exact on a two-node mesh and a
+         * relaying peer's best guess on a larger one, which is why the BURST
+         * format grew a <server> field and this one has not. See
+         * channel.h's chan_remote_t for the two-server split. */
+        chan_remote_add(ch, link->name, link->name, params[1], flags) != 0) {
         printf("[observable] fed_sjoin_reject: channel=%s member=%s server=%s\n",
                ch->name, (nparams > 1) ? params[1] : "?", link->name);
         return;
