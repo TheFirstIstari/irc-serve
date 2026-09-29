@@ -47,6 +47,44 @@ endif()
 option(BUILD_TESTING "Build tests" ON)
 option(BUILD_BENCHMARK "Build benchmarks" ON)
 
+# ---------------------------------------------------------------------------
+# IRC_SANITIZE: the opt-in AddressSanitizer + UndefinedBehaviorSanitizer build
+# ---------------------------------------------------------------------------
+# OFF, and it has to STAY off by default. These flags go on every target in the
+# tree -- irc-serve and all of the tests -- because the point of the build is
+# the shipped binary: the integration tests exec $&lt;TARGET_FILE:irc-serve&gt;, so
+# a sanitizer build that only instrumented the test executables would assert
+# against an uninstrumented node and catch nothing. Both halves of the tree are
+# instrumented here, so the node that answers WHO on a sanitized run is itself
+# the instrumented one.
+#
+# Opt-in rather than default-on because it is a DIFFERENT BUILD, not a stricter
+# one: a sanitizer run is slower, reports differently, and needs its own runtime
+# options, so folding it into the gcc/clang x Release/Debug matrix would make
+# that matrix mean "the plain build" plus four more copies of it. OFF here also
+# means no existing configuration changes: nothing in the gcc/clang matrix, on
+# any runner, gets a new flag.
+#
+# -g is here because an ASan report without file:line is close to useless, and
+# this tree's flag set has no -g at all. -fno-omit-frame-pointer is here because
+# the stack has to be walkable to be worth printing, and the warning block below
+# only asks for it under GCC.
+#
+# RUNNING IT: UBSAN_OPTIONS=halt_on_error=1, so a UBSan diagnostic fails the run
+# instead of printing and passing, and ASAN_OPTIONS=detect_leaks=1 for LSan --
+# which is a LINUX-ONLY capability here. LeakSanitizer is not supported on
+# Darwin, and an ASan binary built with detect_leaks=1 HANGS on macOS rather than
+# reporting, so the leak gate belongs to the Linux CI job and nowhere else.
+if(IRC_SANITIZE)
+  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
+  # The sanitizer runtime has to be on the LINK line of every executable as well
+  # as the compile line, or the instrumented objects reference __asan_* symbols
+  # that nothing provides. add_link_options (3.13+) applies to targets in this
+  # directory and in the subdirectories added below, exactly like the compile
+  # options above.
+  add_link_options(-fsanitize=address,undefined)
+endif()
+
 # Compiler warnings (performance + correctness)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   add_compile_options(-Wall -Wextra -Werror -Wpedantic -O2)

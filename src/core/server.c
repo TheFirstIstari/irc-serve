@@ -276,9 +276,20 @@ static void *strtab_get(const struct strtab *t, const char *key)
     return t->buckets[at].val;
 }
 
+/* Empty the bucket at `at` and count it out of the table. The one place a slot
+ * is cleared, so strtab_del() below and strtab_del_owner() further down cannot
+ * disagree about what "removed" leaves behind. */
+static void strtab_remove_at(struct strtab *t, size_t at)
+{
+    free(t->buckets[at].key);
+    t->buckets[at].key = NULL;
+    t->buckets[at].val = NULL;
+    t->buckets[at].used = 0;
+    t->nentries--;
+}
+
 static int strtab_del(struct strtab *t, const char *key)
 {
-    struct strtab_entry *e;
     int found = 0;
     size_t at;
 
@@ -289,13 +300,65 @@ static int strtab_del(struct strtab *t, const char *key)
     if (at == (size_t)-1 || !found) {
         return -1;
     }
-    e = &t->buckets[at];
-    free(e->key);
-    e->key = NULL;
-    e->val = NULL;
-    e->used = 0;
-    t->nentries--;
+    strtab_remove_at(t, at);
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * OWNER-SIDE TABLE OPERATIONS: "which keys point at this conn_t?"
+ * ---------------------------------------------------------------------------
+ * Every value in the nick table is a conn_t*, and the question "does this
+ * connection still hold a name" is not answerable from conn_t::nick -- the
+ * table is the only record, and conn_t::nick is a DISPLAY field that a rename
+ * writes after the registry has already been updated. So it is asked of the
+ * table, by scanning it.
+ *
+ * A linear scan of 1024 buckets on a table sized for a poll() set is the
+ * right trade and not a compromise: these run when a connection is being torn
+ * down or renamed, which is neither frequent nor latency-sensitive, and a
+ * per-connection name counter would have to be kept correct by every write
+ * path to the index -- which is the same class of "two places must agree"
+ * hazard the index already has one of.
+ *
+ * The nick table is FOLDED, so these are spelling-agnostic by construction:
+ * there is no comparison here to get wrong in the way a name-keyed scan of the
+ * enumeration had to be (that was nick_same(), and it is gone -- see the
+ * enumeration below). */
+static size_t strtab_count_owner(const struct strtab *t, const void *owner)
+{
+    size_t i;
+    size_t n = 0;
+
+    if (t == NULL) {
+        return 0u;
+    }
+    for (i = 0; i < STRTAB_BUCKETS; i++) {
+        if (t->buckets[i].used && t->buckets[i].val == owner) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Remove EVERY key mapped to `owner`, and return how many went. Used by the
+ * teardown, which must not leave any reference to a conn_t it is about to free
+ * -- and cannot be written as a single strtab_del() because a connection is not
+ * guaranteed to hold exactly one name (see server_nick_claim). */
+static size_t strtab_del_owner(struct strtab *t, const void *owner)
+{
+    size_t i;
+    size_t n = 0;
+
+    if (t == NULL) {
+        return 0u;
+    }
+    for (i = 0; i < STRTAB_BUCKETS; i++) {
+        if (t->buckets[i].used && t->buckets[i].val == owner) {
+            strtab_remove_at(t, i);
+            n++;
+        }
+    }
+    return n;
 }
 
 /* Case-insensitive server-name comparison, ASCII-folded.
@@ -697,13 +760,42 @@ void server_close_conn(server_t *s, int fd)
     s->by_fd[fd] = NULL;
     s->nconns--;
 
-    if (c->nick[0] != '\0') {
-        /* Only if this conn still owns the name: a conn that was denied the
-         * nick must not evict the one that holds it. */
-        if (server_nick_lookup(s, c->nick) == c) {
-            strtab_del(s->nicks, c->nick);
-        }
-    }
+    /* Retire the connection from the nick index, and through the ONE function
+     * that does it. This is the whole of issue #102: the close used to remove
+     * the conn from the registry's TABLE and then free it, leaving the
+     * ENUMERATION -- the vector WHO walks -- holding the pointer. The next bare
+     * WHO dereferenced freed memory, and the count stayed one too high for the
+     * rest of the process's life.
+     *
+     * One call, and deliberately not two. The guard that made the old code
+     * safe -- "only if this conn is still the holder, or a conn that was denied
+     * the nick evicts the one that has it" -- lived in the CALLER, wrapped
+     * around one half of the index, so nothing stopped the other half from
+     * being applied on its own. server_nick_unclaim() has no name argument at
+     * all: it removes the table entries that map to THIS conn and the vector
+     * entry that IS this conn, in that order, with no return in between. The
+     * ownership question has become the deletion predicate instead of a test
+     * somebody has to remember, and there is no longer a way to write half of
+     * the operation.
+     *
+     * It is a no-op for a connection that never claimed a name, so this is not
+     * conditional on c->nick -- that field is a display copy, and asking it
+     * whether the connection is in the index is the mistake this paragraph is
+     * about. */
+    server_nick_unclaim(s, c);
+
+    /* The counterpart of the loop's conn_close lines, and deliberately a
+     * different word: those say a connection is ON ITS WAY OUT and why, this one
+     * says it is GONE and what the node's indexes hold now that it is. The
+     * nicks= is the whole reason this line exists -- "the nick was released" is
+     * otherwise only checkable by sending a message to the name afterwards, and a
+     * client that disconnects without QUIT leaves the question open for good,
+     * because the node never receives a line saying the name is free.
+     *
+     * Printed BEFORE conn_free() because c->nick is read here, and before the
+     * counter is bumped so the two bracket the teardown in a readable order. */
+    printf("[observable] conn_reaped: fd=%d nick=%s nicks=%zu\n", fd,
+           (c->nick[0] != '\0') ? c->nick : "-", server_nick_count(s));
 
     close(fd);
     s->n_closed++;
@@ -747,18 +839,63 @@ int server_reap(server_t *s)
  * ---------------------------------------------------------------------------
  */
 
-/* Append `c` to the nick enumeration. Returns 0 on success, -1 on allocation
- * failure or a bad argument. The vector grows geometrically like conn_t's own
- * channel list does, and is not bounded: it holds one entry per registered
- * connection, so the loop's own FD_SETSIZE ceiling is the bound.
+/* ---------------------------------------------------------------------------
+ * THE NICK INDEX, and the invariant that makes it one index
+ * ---------------------------------------------------------------------------
+ * A connection is in the enumeration if and only if it holds at least one name,
+ * and it is in it AT MOST ONCE. The table holds one entry per name; the vector
+ * holds one entry per USER. Those are different cardinalities on purpose, and
+ * WHO is a question about users: 352 is one line per user, so a connection that
+ * somehow held two names must still produce one line, or the same person appears
+ * twice in a client's channel list and twice in every WHO they ask for.
  *
- * Growing is the ONLY way it changes size, and it is reached from exactly one
- * caller (server_nick_claim), which is what keeps the two nick indexes in
- * agreement without a periodic reconciliation. */
+ * Every rule below exists to keep that one sentence true, and the two failures
+ * it prevents are the two this registry has already had:
+ *
+ *   issue #102  a teardown removed the table entry and freed the conn_t, and
+ *               the vector kept the pointer. A freed conn_t stayed reachable
+ *               from server_nick_at() and WHO dereferenced it.
+ *   issue #103  a claim appended unconditionally, so one connection holding two
+ *               names was in the vector twice, the enumeration counted a
+ *               connection that appears once, and a teardown that removed ONE
+ *               copy left the other one dangling -- #102's bug reachable through
+ *               #103's.
+ *
+ * The repair in both cases is the same shape: the vector is keyed by POINTER
+ * and the table by NAME, and every operation is expressed on one side in terms
+ * of the other so that neither half can be applied alone. There is no
+ * name-keyed removal of the vector anywhere in this file, which is what
+ * guarantee #102 rests on.
+ */
+
+/* Append `c` to the nick enumeration, unless it is already in it. Returns 0 on
+ * success, -1 on allocation failure or a bad argument. The vector grows
+ * geometrically like conn_t's own channel list does, and is not bounded: it
+ * holds one entry per registered connection, so the loop's own FD_SETSIZE
+ * ceiling is the bound.
+ *
+ * "Unless it is already in it" is issue #103. The append used to be
+ * unconditional, which meant a connection holding two names appeared twice and
+ * the enumeration counted connections and names at once. Making it conditional
+ * makes the invariant hold whatever order the caller does things in, rather than
+ * holding only because handle_nick() happens to claim before it releases: that
+ * ordering is a property of one caller, and a mitigation by accident is not a
+ * design. test_registries.c reaches the two-names state by calling this API
+ * directly and asserts the count does not move.
+ *
+ * The cost is a linear scan per claim, over a vector bounded by FD_SETSIZE, on
+ * a path that already hashed a key. */
 static int nick_objs_add(server_t *s, conn_t *c)
 {
+    size_t i;
+
     if (s == NULL || c == NULL) {
         return -1;
+    }
+    for (i = 0; i < s->nnick_objs; i++) {
+        if (s->nick_objs[i] == c) {
+            return 0; /* already enumerated: one entry per connection */
+        }
     }
     if (s->nnick_objs == s->nick_objs_cap) {
         size_t want = (s->nick_objs_cap == 0) ? 16u : s->nick_objs_cap * 2u;
@@ -774,6 +911,38 @@ static int nick_objs_add(server_t *s, conn_t *c)
     s->nick_objs[s->nnick_objs] = c;
     s->nnick_objs++;
     return 0;
+}
+
+/* Remove `c` from the enumeration, preserving claim order. Idempotent.
+ *
+ * Keyed by POINTER, which is the whole point and replaces the name-keyed
+ * nick_objs_del() this used to be. Comparing nick strings meant matching a
+ * conn_t::nick -- a display field -- against a key, with the ASCII fold
+ * re-implemented on the spot, and it could remove the entry of a connection
+ * that did not hold the name at all: the case where a conn was DENIED a
+ * nickname and had the same string in conn_t::nick anyway, which is exactly what
+ * a client that asks for a name somebody else holds looks like from inside.
+ *
+ * Every copy is removed rather than the first: with the conditional append there
+ * can only be one, but a teardown that is correct only because of what the
+ * claim path does is the same fragile coupling in the other direction. */
+static void nick_objs_drop(server_t *s, conn_t *c)
+{
+    size_t i = 0;
+
+    while (i < s->nnick_objs) {
+        if (s->nick_objs[i] == c) {
+            size_t j;
+
+            for (j = i + 1u; j < s->nnick_objs; j++) {
+                s->nick_objs[j - 1u] = s->nick_objs[j];
+            }
+            s->nnick_objs--;
+            s->nick_objs[s->nnick_objs] = NULL;
+            continue; /* whatever shifted into slot i may also be c */
+        }
+        i++;
+    }
 }
 
 int server_nick_claim(server_t *s, const char *nick, conn_t *c)
@@ -793,7 +962,14 @@ int server_nick_claim(server_t *s, const char *nick, conn_t *c)
      * answers 433 for while WHO does not list it, or the reverse, and there is
      * no event that would ever reconcile them. Refusing the claim leaves the
      * state exactly as it was, which is the only outcome a caller can reason
-     * about. */
+     * about.
+     *
+     * The append is idempotent (see nick_objs_add), so a claim that only ADDS a
+     * name to a connection already in the vector cannot fail here -- there is no
+     * allocation on that path and nothing to roll back. That is deliberate: the
+     * rename in handle_nick() claims the new name before releasing the old one,
+     * and an idempotent append is what lets the two halves of a rename meet in
+     * the middle without the enumeration briefly losing the connection. */
     if (nick_objs_add(s, c) != 0) {
         (void)strtab_del(s->nicks, nick);
         return -1;
@@ -801,75 +977,91 @@ int server_nick_claim(server_t *s, const char *nick, conn_t *c)
     return 0;
 }
 
-/* ASCII-folded nickname equality -- the SAME rule the nick table's keys use, so
- * the two halves of the nick index cannot disagree about what a name is.
+/* ---------------------------------------------------------------------------
+ * WHY THERE IS NO nick_same() ANY MORE
+ * ---------------------------------------------------------------------------
+ * There used to be a third copy of the node's ASCII fold here, comparing
+ * conn_t::nick against a release key, and the reason it could be deleted is the
+ * reason it existed: the enumeration was keyed by NAME, so removing an entry
+ * meant finding it by name and meant re-implementing the table's own key rule in
+ * a second place. The enumeration is keyed by pointer now, so no comparison is
+ * needed and the fold exists in exactly one place -- inside the table's probe.
  *
- * It has to be spelled out rather than borrowed from the table, because this one
- * compares a nickname against conn_t::nick, which holds the case the user chose
- * and is therefore deliberately NOT the stored key. (Folding both sides into
- * scratch buffers and calling strcmp would be the same six lines with two
- * copies and a capacity argument on top.)
- *
- * This is the third copy of this fold in the node -- same_server_name() below
- * and channel.c's same_name() are the other two -- and it is written out for the
- * reason server.h records for the first pair: the function is six lines, a
- * public helper two of the three callers would never call again is a wider API
- * than the duplication is worth, and test_channels.c already asserts that the
- * copies agree. What must NOT happen is one of them growing a different rule;
- * that is what CASEMAPPING=ascii in 005 is a promise about.
- *
- * Every release path in the tree today passes the holder's OWN spelling, so this
- * fold is what makes a differently-spelled release safe rather than relying on
- * every caller continuing to be careful -- and the check that says so is
- * test_registries.c's, which releases "cAROL" for a nickname claimed as "carol"
- * and then asserts the ENUMERATION shrank too. That half goes wrong quietly: the
- * table entry would be gone and WHO <mask> would still list the connection. */
-static int nick_same(const char *a, const char *b)
-{
-    if (a == NULL || b == NULL) {
-        return 0;
-    }
-    while (*a != '\0' && *b != '\0') {
-        if (down_ascii(*a) != down_ascii(*b)) {
-            return 0;
-        }
-        a++;
-        b++;
-    }
-    return *a == '\0' && *b == '\0';
-}
+ * The case it was protecting is still protected, and better: test_registries.c
+ * releases "cAROL" for a nickname claimed as "carol" and asserts the ENUMERATION
+ * shrank too, and that still works, because server_nick_release() below gets
+ * the holder from the TABLE, and the table's probe folds. One implementation of
+ * the rule instead of two, and the copy that could have drifted is the one that
+ * is gone. same_server_name() below and channel.c's same_name() are the other
+ * two folds in the node, both still written out for the reason server.h records
+ * for the first pair. */
 
-/* Drop `nick` from the enumeration, preserving claim order. Idempotent, and a
- * no-op for a name the table does not hold -- server_nick_release() is reached
- * twice on the ordinary QUIT path (once by the handler, once by the reaper)
- * and must not turn the second call into a corruption.
+/* Give up ONE name, leaving the connection itself in the registry. This is the
+ * release for a connection that is STAYING: handle_nick()'s rename is the only
+ * caller in the tree. A caller that is destroying the connection must use
+ * server_nick_unclaim() below instead, and the difference is not stylistic --
+ * this function is handed a name and knows nothing about which conn_t will be
+ * freed afterwards, so it cannot promise that no reference to it survives.
  *
- * The comparison folds, because server_nick_release() may be handed a spelling
- * the holder never typed: a caller that released "BOB" must remove the vector
- * entry for the connection registered as "bob", or the table and the vector
- * disagree about who holds the name -- which is the state server.h names as a
- * JOIN that resolves to NULL, with no event that would ever reconcile it. */
-static void nick_objs_del(server_t *s, const char *nick)
-{
-    for (size_t i = 0; i < s->nnick_objs; i++) {
-        if (s->nick_objs[i] != NULL && s->nick_objs[i]->nick[0] != '\0' &&
-            nick_same(s->nick_objs[i]->nick, nick)) {
-            for (size_t j = i + 1u; j < s->nnick_objs; j++) {
-                s->nick_objs[j - 1u] = s->nick_objs[j];
-            }
-            s->nnick_objs--;
-            s->nick_objs[s->nnick_objs] = NULL;
-            return;
-        }
-    }
-}
-
+ * Both halves come from the TABLE, in this order:
+ *
+ *   1. the holder is read out of the table, so a spelling the holder never typed
+ *      still finds it: the table's probe folds, and this function does not have
+ *      a fold of its own to get wrong. (A name nobody holds is a no-op, which is
+ *      what makes the double call on the ordinary QUIT path -- handler, then
+ *      reaper -- harmless rather than a corruption.)
+ *   2. the name is removed, and the holder leaves the enumeration ONLY if it no
+ *      longer holds a name. That second test is why a rename cannot drop the
+ *      connection out of WHO's walk: handle_nick() claims the new name first,
+ *      so the holder is in the table again by the time the old one is released,
+ *      and the enumeration is a set of users rather than a count of names.
+ *
+ * A connection that holds two names keeps its entry until both are given up,
+ * which is the invariant at the top of this section rather than a special case
+ * here. */
 void server_nick_release(server_t *s, const char *nick)
 {
-    if (s != NULL && nick != NULL) {
-        (void)strtab_del(s->nicks, nick);
-        nick_objs_del(s, nick);
+    conn_t *holder;
+
+    if (s == NULL || nick == NULL) {
+        return;
     }
+    holder = (conn_t *)strtab_get(s->nicks, nick);
+    if (holder == NULL) {
+        return; /* nobody holds this name: already released */
+    }
+    (void)strtab_del(s->nicks, nick);
+    if (strtab_count_owner(s->nicks, holder) == 0u) {
+        nick_objs_drop(s, holder);
+    }
+}
+
+/* Retire a connection from the nick index. THE teardown path, and the only one:
+ * server_close_conn() and handle_quit() both come here, so a QUIT and a client
+ * that vanished without one cannot do different things.
+ *
+ * It takes a conn_t and not a name, and that is the design rather than a
+ * convenience. A name-keyed teardown has to ask "does this conn still hold the
+ * name" and then remove the name -- the ownership guard that #102 got wrong by
+ * applying to one half of the index and forgetting the other. Keyed on the
+ * connection there is nothing to ask: the table loses exactly the entries whose
+ * VALUE is this conn, and the vector loses exactly the entries that ARE this
+ * conn. A connection that was denied a nickname cannot evict the holder's entry
+ * (that entry's value is somebody else, and it is not this conn), and a
+ * connection that somehow holds several names loses all of them rather than one,
+ * which is what makes the subsequent conn_free() safe with no further argument.
+ *
+ * Idempotent, and a no-op for a connection that never claimed a name: the
+ * teardown runs on every close, including every close of a connection that was
+ * still in registration. Both halves are in this function with no early return
+ * between them, so there is no longer a way to apply one of them alone. */
+void server_nick_unclaim(server_t *s, conn_t *c)
+{
+    if (s == NULL || c == NULL) {
+        return;
+    }
+    (void)strtab_del_owner(s->nicks, c);
+    nick_objs_drop(s, c);
 }
 
 conn_t *server_nick_lookup(const server_t *s, const char *nick)

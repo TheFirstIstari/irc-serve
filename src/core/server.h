@@ -157,16 +157,31 @@ struct server {
      * WHO that can only name a channel is a WHO most clients never get an
      * answer from.
      *
-     * server_nick_claim() appends and server_nick_release() removes, and those
-     * are the only places the vector changes. The order is CLAIM order, which
-     * makes a 352 sequence a function of who connected when rather than of
-     * allocator behaviour, so a test can assert it.
+     * The enumeration is a SET OF CONNECTIONS, in first-claim order, and the
+     * invariant that makes it an index rather than a list of names is one
+     * sentence: a connection is in it if and only if it holds at least one
+     * name, and it is in it at most once. So it has one entry per USER where
+     * the table above has one per NAME, and WHO -- which is a question about
+     * users, and whose 352 is one line per user -- cannot list anybody twice.
+     *
+     * server_nick_claim() adds an entry only for a connection that is not in it
+     * already, server_nick_release() removes one when a name is given up and
+     * the connection holds no other, and server_nick_unclaim() removes one when
+     * the connection is retired. Those are the only places the vector changes,
+     * and each of them changes the table in the same breath.
      *
      * It is a cache, not the authority: the strtab above answers "is this nick
-     * held and by whom" in O(1) and nothing but claim/release writes either. A
+     * held and by whom" in O(1) and nothing but these three writes either. A
      * name in the vector and absent from the table would be a JOIN that
      * resolved to NULL, which is the failure chan_objs documents; the tests
-     * assert the two agree rather than leaving it to inspection. */
+     * assert the two agree rather than leaving it to inspection.
+     *
+     * The vector holds POINTERS and nothing is keyed by a nickname string in
+     * it, which is deliberate. A string-keyed entry has to be found by string,
+     * which meant re-implementing the table's case-fold at the call site (that
+     * copy is gone) and meant a connection whose conn_t::nick happened to match
+     * a name it did not hold could be removed on someone else's behalf. Both
+     * are issue #103 and #102 respectively. */
     conn_t  **nick_objs;
     size_t    nnick_objs;
     size_t    nick_objs_cap;
@@ -343,13 +358,68 @@ int server_reap(server_t *s);
  * That is why the folded form is a COPY kept inside the table and not the field
  * itself: making conn_t::nick lowercase would be simpler to reason about and
  * would break every client that displays a user's chosen case.
+ *
+ * ---------------------------------------------------------------------------
+ * WHICH OF THESE TO CALL, AND WHY IT IS NOT A MATTER OF TASTE
+ * ---------------------------------------------------------------------------
+ * Three operations, and picking the wrong one is a memory-safety bug rather
+ * than a style question, because the table and the enumeration are one index
+ * and neither half may be applied without the other:
+ *
+ *   server_nick_claim(s, nick, c)   A connection takes a name it was not
+ *                                   holding. Refuses a name somebody else
+ *                                   holds. Does NOT refuse a connection that
+ *                                   already holds another name: the caller may
+ *                                   be mid-rename, and refusing would force it
+ *                                   to release first and open a window in which
+ *                                   the name it is giving up is unowned. The
+ *                                   enumeration is a set, so a second name
+ *                                   does not add a second entry (issue #103).
+ *   server_nick_release(s, nick)    A connection gives up ONE name and stays.
+ *                                   The holder is read from the table, so any
+ *                                   spelling finds it, and the holder leaves
+ *                                   the enumeration only if it holds no other
+ *                                   name. This is the rename's release.
+ *   server_nick_unclaim(s, c)       A connection is being RETIRED. Both halves,
+ *                                   keyed on the connection, and the only thing
+ *                                   a teardown may use.
+ *
+ * server_nick_unclaim() is the one that has to be impossible to get half-wrong,
+ * so it is the one that takes a conn_t. A teardown handed a name has to ask
+ * whether this connection still holds it and then remove it, and that guard --
+ * "a conn that was DENIED the nick must not evict the one that holds it" -- is
+ * exactly what issue #102 had: it was correct, and it wrapped ONE half of the
+ * index, so the other half was left behind and the freed conn_t stayed in the
+ * enumeration for WHO to walk. Keyed on the connection, there is no guard to
+ * remember: the table loses the entries whose value IS this conn and the vector
+ * loses the entries that ARE this conn, so the two cannot disagree and a
+ * connection holding several names loses all of them at once.
+ *
+ * Every close goes through it, QUIT included: a QUIT releases the name early so
+ * it is available sooner, and the reaper's call is then a no-op because the
+ * table no longer maps any name to that conn. Two paths, one function, which is
+ * the point -- they are the two paths that used to differ.
  */
 int server_nick_claim(server_t *s, const char *nick, conn_t *c);
 void server_nick_release(server_t *s, const char *nick);
 conn_t *server_nick_lookup(const server_t *s, const char *nick);
 
-/* The enumeration, in claim order. server_nick_count()/server_nick_at() answer
- * "every nick on this node" for WHO's <mask> form and for nothing else; a
+/* Retire `c` from the nick index: every name it holds leaves the table, and it
+ * leaves the enumeration. Idempotent, and a no-op for a connection that never
+ * claimed a name -- which is most closes, since a connection can be closed at
+ * any point in registration.
+ *
+ * This is the ONLY nick operation a teardown may use, and it must be called
+ * before conn_free(). server_close_conn() and handle_quit() both do, and
+ * test_disconnect_nick.c fails the build if either stops, or starts touching
+ * the table or the vector itself. */
+void server_nick_unclaim(server_t *s, conn_t *c);
+
+/* The enumeration, in first-claim order. server_nick_count()/server_nick_at()
+ * answer "every USER on this node" for WHO's <mask> form and for nothing else:
+ * one entry per connection, not per name, so the count is a number of people
+ * and a 352 sequence is a function of who connected when rather than of
+ * allocator behaviour or of how many names one of them happens to hold. A
  * caller that wants a specific user asks server_nick_lookup() first and only
  * falls back to a walk when it has to match case or a glob. */
 size_t server_nick_count(const server_t *s);
