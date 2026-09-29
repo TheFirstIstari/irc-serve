@@ -21,8 +21,14 @@
 #include "core/message.h"
 #include "core/poll_loop.h"
 
-/* The child used by nf_spawn_inline(). Its name must satisfy the 2.4 tag
- * grammar, exactly as the shipped node's does. */
+/* The child used by nf_spawn_inline() and nf_spawn_inline_named(). Its name
+ * must satisfy the 2.4 tag grammar, exactly as the shipped node's does.
+ *
+ * It is a DEFAULT rather than a constant because nf_spawn_inline_named() takes
+ * a name and the two entry points must not be able to disagree about what the
+ * unnamed one uses: the existing tests that call nf_spawn_inline() have to keep
+ * getting a node called exactly what they have always got, or their observable
+ * assertions change for no reason. */
 #define NF_NODE_NAME "irc.fixture"
 
 /* How often a deadline loop checks. Short, so a response is noticed promptly;
@@ -328,10 +334,18 @@ static server_tick_fn g_test_tick = NULL;
 static void nf_child_print_stats(const server_t *s);
 
 /* Last counters republished by the tick, so the republication is change-driven
- * rather than per-tick. */
+ * rather than per-tick. The four fed_* ones are Phase 6's, and they are in
+ * here for the same reason they are in the print: a test that waits for
+ * `fed_hs_timeout=1` has to see the line republished the moment the counter
+ * moves, and a republication driven only by connection counts would not print
+ * it until the next accept. */
 static size_t g_last_nconns = (size_t)-1;
 static uint64_t g_last_closed = 0;
 static uint64_t g_last_accepted = 0;
+static uint64_t g_last_fed_rejected = 0;
+static uint64_t g_last_fed_hs_timeout = 0;
+static uint64_t g_last_fed_dead = 0;
+static uint64_t g_last_dial_failed = 0;
 
 static void nf_on_stop(int sig)
 {
@@ -364,10 +378,18 @@ static void nf_child_tick(server_t *s, uint64_t now_ms)
      * line per 50 ms tick would fill the pipe the parent reads and deadlock it
      * against a child that is waiting to write. */
     if (s->nconns != g_last_nconns || s->n_closed != g_last_closed ||
-        s->n_accepted != g_last_accepted) {
+        s->n_accepted != g_last_accepted ||
+        s->n_link_rejected != g_last_fed_rejected ||
+        s->n_fed_hs_timeout != g_last_fed_hs_timeout ||
+        s->n_fed_dead != g_last_fed_dead ||
+        s->n_dial_failed != g_last_dial_failed) {
         g_last_nconns = s->nconns;
         g_last_closed = s->n_closed;
         g_last_accepted = s->n_accepted;
+        g_last_fed_rejected = s->n_link_rejected;
+        g_last_fed_hs_timeout = s->n_fed_hs_timeout;
+        g_last_fed_dead = s->n_fed_dead;
+        g_last_dial_failed = s->n_dial_failed;
         nf_child_print_stats(s);
     }
 }
@@ -375,11 +397,18 @@ static void nf_child_tick(server_t *s, uint64_t now_ms)
 static void nf_child_print_stats(const server_t *s)
 {
     /* The same key names as the shipped binary's loop_stats line, so a test can
-     * read a counter with one helper whichever way the node was hosted. */
+     * read a counter with one helper whichever way the node was hosted. The four
+     * fed_* keys are Phase 6's link counters, and they are HERE as well as in
+     * node_main's loop_stats for the same reason the rest of the keys are: a
+     * test that can only read the counters the shipped binary prints can only
+     * run against the shipped binary, and most of the two-node cases need an
+     * inline child to set a per-process timeout. */
     printf("[fixture] stats accepted=%llu closed=%llu lines=%llu "
            "parse_reject=%llu frame_error=%llu writeq_overflow=%llu "
            "write_error=%llu partial_writes=%llu eintr=%llu rejected_fd=%llu "
-           "nconns=%llu dial_connected=%llu dial_failed=%llu\n",
+           "nconns=%llu dial_connected=%llu dial_failed=%llu "
+           "fed_rejected=%llu fed_duplicate=%llu fed_hs_timeout=%llu "
+           "fed_dead=%llu\n",
            (unsigned long long)s->n_accepted, (unsigned long long)s->n_closed,
            (unsigned long long)s->n_lines,
            (unsigned long long)s->n_parse_reject,
@@ -391,9 +420,25 @@ static void nf_child_print_stats(const server_t *s)
            (unsigned long long)s->n_rejected_fd,
            (unsigned long long)s->nconns,
            (unsigned long long)s->n_dial_connected,
-           (unsigned long long)s->n_dial_failed);
+           (unsigned long long)s->n_dial_failed,
+           (unsigned long long)s->n_link_rejected,
+           (unsigned long long)s->n_link_duplicate,
+           (unsigned long long)s->n_fed_hs_timeout,
+           (unsigned long long)s->n_fed_dead);
     fflush(stdout);
 }
+
+/* The name the CHILD will build its server_t under. Set by the spawn that is
+ * about to happen, which is before the fork, so the child inherits it through
+ * the fork rather than through an argument -- a file-static rather than a
+ * parameter because the name is only known to nf_spawn_inline_named()'s caller
+ * and the only consumer is the child.
+ *
+ * Non-static on purpose: the child is a separate PROCESS after the fork and
+ * cannot see a change the parent makes afterwards, which is exactly the
+ * property a test needs when it spawns two children with two different names
+ * and then changes its mind about the third. */
+static const char *g_child_name = NF_NODE_NAME;
 
 static int nf_child_run(nf_setup_fn setup)
 {
@@ -413,8 +458,8 @@ static int nf_child_run(nf_setup_fn setup)
     if (s == NULL) {
         return 1;
     }
-    if (server_init(s, NF_NODE_NAME) != 0) {
-        fprintf(stderr, "fixture: server_init failed\n");
+    if (server_init(s, g_child_name) != 0) {
+        fprintf(stderr, "fixture: server_init failed for name %s\n", g_child_name);
         return 1;
     }
     if (server_listen(s, 0) != 0) {
@@ -510,7 +555,8 @@ static int nf_finish_spawn(nf_node_t *n, int expect_port_line)
     return 0;
 }
 
-static int nf_spawn_common(nf_node_t *n, nf_mode_t mode, nf_setup_fn setup)
+static int nf_spawn_common(nf_node_t *n, nf_mode_t mode, nf_setup_fn setup,
+                           const char *name, char *const argv[])
 {
     int pipefd[2];
     pid_t pid;
@@ -538,14 +584,22 @@ static int nf_spawn_common(nf_node_t *n, nf_mode_t mode, nf_setup_fn setup)
         }
         close(pipefd[1]);
         if (mode == NF_BINARY) {
-            char *argv[3];
+            /* argv is either the caller's, or the one-argument default. The
+             * default is built per call rather than shared, because execv()
+             * takes a char *const [] that the child writes to and a shared
+             * static would be a global the harness mutates. */
+            static char *const fallback[] = { (char *)"irc-serve", (char *)"0",
+                                              NULL };
+            char *const *args = (argv != NULL) ? argv : fallback;
 
-            argv[0] = (char *)"irc-serve";
-            argv[1] = (char *)"0";
-            argv[2] = NULL;
-            execv(NF_SERVER_BIN, argv);
+            execv(NF_SERVER_BIN, args);
             _exit(127);
         }
+        /* Set in the parent, before the fork, so the child inherits it. Doing it
+         * here in the child would work equally well and would be worse: it would
+         * make the name a per-mode thing when it is a per-node thing, and the
+         * binary mode has no use for it. */
+        g_child_name = (name != NULL) ? name : NF_NODE_NAME;
         _exit(nf_child_run(setup));
     }
 
@@ -566,12 +620,28 @@ static int nf_spawn_common(nf_node_t *n, nf_mode_t mode, nf_setup_fn setup)
 
 int nf_spawn_binary(nf_node_t *n)
 {
-    return nf_spawn_common(n, NF_BINARY, NULL);
+    return nf_spawn_common(n, NF_BINARY, NULL, NULL, NULL);
+}
+
+int nf_spawn_binary_argv(nf_node_t *n, char *const argv[])
+{
+    if (argv == NULL) {
+        return -1;
+    }
+    return nf_spawn_common(n, NF_BINARY, NULL, NULL, argv);
 }
 
 int nf_spawn_inline(nf_node_t *n, nf_setup_fn setup)
 {
-    return nf_spawn_common(n, NF_INLINE, setup);
+    return nf_spawn_common(n, NF_INLINE, setup, NULL, NULL);
+}
+
+int nf_spawn_inline_named(nf_node_t *n, const char *name, nf_setup_fn setup)
+{
+    if (name == NULL || name[0] == '\0') {
+        return -1;
+    }
+    return nf_spawn_common(n, NF_INLINE, setup, name, NULL);
 }
 
 int nf_stop(nf_node_t *n)
