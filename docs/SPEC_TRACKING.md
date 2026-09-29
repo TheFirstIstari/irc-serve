@@ -219,7 +219,7 @@ that has not been actioned (it has been neutralised instead).
 |---|---|---|---|
 | `parse_nick` charset rule | RFC 1459 §2.4 | **Not implemented** | above; `protocol_parse.c:68-103` contains no character test |
 | `parse_user` field discipline | RFC 2812 §3.1 | **Implemented** | `protocol_parse.c:105-166`; `test_nick_user.c` |
-| `parse_command` token counting | — | **Implemented, superseded** | `protocol_parse.c:17`. Only counts tokens; replaced by `message_parse_n`. Still the function the throughput benchmark measures (§4) |
+| `parse_command` token counting | — | **Implemented, superseded** | `protocol_parse.c:17`. Only counts tokens; replaced by `message_parse_n`. Retained as the throughput benchmark's labelled LEGACY BASELINE, alongside the production measurement of `message_parse_n` (§4) |
 
 #### `src/ircv3_tags.c` — weak
 
@@ -436,7 +436,7 @@ Two caveats on §8's "no test asserts internal plumbing":
 
 | Feature | Spec | Status | Evidence |
 |---|---|---|---|
-| Throughput benchmark | design goals | **Runs, and measures the wrong function** | `tests/benchmark/throughput.c` benchmarks `parse_command()` — the legacy token **counter** (`protocol_parse.c:17`) — not `message_parse_n()`, the tokenizer the node actually calls on the wire (`poll_loop.c:94`). Real output: `mean=0.046us p50=0.000us p99=1.000us ops_sec=21574973`. It measures 8 distinct lines cycled 20000 times in one process. |
+| Throughput benchmark | design goals | **Runs, and measures the production path** | `tests/benchmark/throughput.c` benchmarks `message_parse_n()` — the tokenizer the node actually calls on the wire (`poll_loop.c:94`) — over a federated workload with peer prefixes, tag blocks, escaped tag values, the 15-param cap and a line at the 8192-byte cap. The legacy `parse_command()` counter is retained as an explicitly labelled baseline, not as server throughput. Real output (clang 23, arm64, Release): production `batched_mean=0.143us`, legacy baseline `batched_mean=0.028us`, 5.2x. p50/p99 are quantised to the 1000ns CLOCK_MONOTONIC granularity, which the run now reports. |
 | Memory footprint | `docs/ARCHITECTURE.md` "<10MB per federated node" | **No threshold is enforced** | `tests/benchmark/footprint.c:36-44` reads an **opt-in** `FOOTPRINT_RSS_MB_THRESHOLD` env var. Nothing in the repo sets it — `grep -rn FOOTPRINT_RSS_MB_THRESHOLD` matches only `footprint.c` itself. CI therefore cannot fail on it. Running it gives `rss_peak: ... rss=1.58 MiB`, but that is a process whose entire body is one `getrusage()` call: **it does not measure a running node with connections, so it does not support a per-node footprint claim.** |
 
 The previous revision of this document said `footprint.c` "asserts
@@ -577,9 +577,10 @@ Blunt, because the value of this document is that it can be trusted.
    tree, and `sasl_step` auto-completes on call count (`:50`) while discarding
    its input (`:44-45`).
 
-9. **The throughput benchmark measures `parse_command`**, the legacy token
-   counter, not the tokenizer the node runs (`throughput.c:14,49,62` vs
-   `poll_loop.c:94`).
+9. **The throughput benchmark now measures `message_parse_n`**, the tokenizer
+   the node runs, and keeps `parse_command` as a labelled baseline (#91). Its
+   p50/p99 remain quantised to the platform's 1000ns CLOCK_MONOTONIC granularity,
+   so the batched per-call figure is the one it reports as quotable.
 
 10. **The footprint benchmark enforces nothing** and measures an empty process,
     not a node. No default threshold, no CI env var, so it cannot fail
