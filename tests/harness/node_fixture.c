@@ -354,14 +354,23 @@ static uint64_t g_last_dial_failed = 0;
 static uint64_t g_last_fed_own_origin = 0;
 static uint64_t g_last_fed_dup_drop = 0;
 static uint64_t g_last_fed_lines = 0;
-/* The 4.3 resync's two counters (Phase 6 C4). They are republished for the same
- * reason the others are -- a test that has to stop the node before it can read
- * them cannot tell "settled at zero" from "never republished" -- and they are the
- * counters a burst test needs most, because the difference between a resync that
- * was applied and a resync that was silently thrown away is the difference between
- * a passing assertion and a vacuous one. */
+/* The 4.3 resync's three counters (Phase 6 C4, C5). They are republished for the
+ * same reason the others are -- a test that has to stop the node before it can
+ * read them cannot tell "settled at zero" from "never republished" -- and they
+ * are the counters a burst test needs most, because the difference between a
+ * resync that was applied and a resync that was silently thrown away is the
+ * difference between a passing assertion and a vacuous one.
+ *
+ * n_burst_truncated has its OWN trigger entry rather than riding on
+ * n_burst_abandoned, and that is not tidiness. The two are incremented on the
+ * SAME branch, so riding along would look free -- but a trigger that watches one
+ * of two counters that always move together is a trigger that stops working the
+ * day the two are separated, and a test asserting "this transaction was
+ * truncated" would then read a stale zero. The trigger lists the counters whose
+ * values a test might read, and this is one of them. */
 static uint64_t g_last_burst_refused = 0;
 static uint64_t g_last_burst_abandoned = 0;
+static uint64_t g_last_burst_truncated = 0;
 
 static void nf_on_stop(int sig)
 {
@@ -402,6 +411,7 @@ static void nf_child_tick(server_t *s, uint64_t now_ms)
         s->n_fed_dup_drop != g_last_fed_dup_drop ||
         s->n_burst_refused != g_last_burst_refused ||
         s->n_burst_abandoned != g_last_burst_abandoned ||
+        s->n_burst_truncated != g_last_burst_truncated ||
         s->n_lines != g_last_fed_lines ||
         s->n_dial_failed != g_last_dial_failed) {
         g_last_nconns = s->nconns;
@@ -414,6 +424,7 @@ static void nf_child_tick(server_t *s, uint64_t now_ms)
         g_last_fed_dup_drop = s->n_fed_dup_drop;
         g_last_burst_refused = s->n_burst_refused;
         g_last_burst_abandoned = s->n_burst_abandoned;
+        g_last_burst_truncated = s->n_burst_truncated;
         g_last_fed_lines = s->n_lines;
         g_last_dial_failed = s->n_dial_failed;
         nf_child_print_stats(s);
@@ -438,7 +449,7 @@ static void nf_child_print_stats(const server_t *s)
            "fed_own_origin=%llu fed_untagged_relay=%llu "
            "fed_unknown_verb=%llu fed_verb_deferred=%llu fed_malformed=%llu "
            "fed_dup_drop=%llu fed_dedup_dup=%llu "
-           "burst_refused=%llu burst_abandoned=%llu\n",
+           "burst_refused=%llu burst_abandoned=%llu burst_truncated=%llu\n",
            (unsigned long long)s->n_accepted, (unsigned long long)s->n_closed,
            (unsigned long long)s->n_lines,
            (unsigned long long)s->n_parse_reject,
@@ -465,7 +476,8 @@ static void nf_child_print_stats(const server_t *s)
            (unsigned long long)s->n_fed_dup_drop,
            (unsigned long long)s->n_fed_dedup_dup,
            (unsigned long long)s->n_burst_refused,
-           (unsigned long long)s->n_burst_abandoned);
+           (unsigned long long)s->n_burst_abandoned,
+           (unsigned long long)s->n_burst_truncated);
     fflush(stdout);
 }
 

@@ -528,8 +528,8 @@ chan_remote_t *chan_remote_find(const chan_t *ch, const char *server,
     return NULL;
 }
 
-int chan_remote_add(chan_t *ch, const char *server, const char *nick,
-                    unsigned flags)
+int chan_remote_add(chan_t *ch, const char *server, const char *member_server,
+                    const char *nick, unsigned flags)
 {
     chan_remote_t *seen;
 
@@ -537,13 +537,32 @@ int chan_remote_add(chan_t *ch, const char *server, const char *nick,
         return -1;
     }
     /* Validated HERE, and not left to the caller, because the caller is a peer
-     * protocol handler and the two rules it would have to remember are 2.1's
-     * nickname charset and 2.4's server-name grammar. Both exist because later
-     * phases build on them -- 2.1's split at the last '@' is unsound without
-     * the charset -- and a roster entry that skipped either would be a name the
+     * protocol handler and the three rules it would have to remember are 2.1's
+     * nickname charset and 2.4's server-name grammar (twice, because the entry
+     * now names two different servers). All of them exist because later phases
+     * build on them -- 2.1's split at the last '@' is unsound without the
+     * charset -- and a roster entry that skipped any of them would be a name the
      * node could not qualify, compare or render. This is the first place in the
-     * tree a nickname arrives from a network rather than from a client. */
+     * tree a nickname arrives from a network rather than from a client.
+     *
+     * member_server is validated when it is GIVEN and accepted as absent when it
+     * is not: "" and NULL both mean "this node has not been told", which is the
+     * ordinary state of an entry learned from a live SJOIN rather than a
+     * corruption. Refusing an empty one would mean a live SJOIN could not record
+     * a member at all.
+     *
+     * THE VALIDATION ALSO BOUNDS THE LENGTH, which is why the copy further down
+     * cannot fail: irc_serve_server_name_valid() refuses a name longer than
+     * IRC_MAX_SERVER_NAME, and CHAN_MAX_SERVER is that same bound, so a name
+     * that passed is a name that fits. The copy's result is still checked for the
+     * KEY, which is what the existing code did, and deliberately not for the
+     * holder -- a refusal there would drop a whole member over a field the
+     * member itself is fine without. */
     if (!irc_serve_server_name_valid(server) || !valid_nick(nick)) {
+        return -1;
+    }
+    if (member_server != NULL && member_server[0] != '\0' &&
+        !irc_serve_server_name_valid(member_server)) {
         return -1;
     }
     seen = chan_remote_find(ch, server, nick);
@@ -551,8 +570,17 @@ int chan_remote_add(chan_t *ch, const char *server, const char *nick,
         /* A repeated SJOIN is a re-assertion, not a second member. The flags
          * are overwritten rather than OR'd because a peer that says `alice` is
          * no longer an op has told us something, and a roster where nobody can
-         * ever lose +o is a roster that converges on the wrong answer. */
+         * ever lose +o is a roster that converges on the wrong answer.
+         *
+         * The holder is overwritten on a repeat even when the repeat is a live
+         * SJOIN carrying no server, because a caller that knows nothing says so
+         * and must not silently clear what a burst established -- a stale holder
+         * is a fact this node can still act on, a cleared one is not. */
         seen->flags = flags;
+        if (member_server != NULL && member_server[0] != '\0') {
+            (void)copy_bounded(seen->member_server, sizeof seen->member_server,
+                               member_server);
+        }
         return 0;
     }
     if (ch->nremotes == ch->rcap) {
@@ -581,8 +609,16 @@ int chan_remote_add(chan_t *ch, const char *server, const char *nick,
      * struct grew the field in C4, so an initialiser that existed only in
      * chan_new()'s memset would leave a RECYCLED element carrying the previous
      * member's host, which is a member impersonation bug wearing a memory bug's
-     * clothes. */
+     * clothes. `member_server` is written the same way and for the same reason:
+     * it grew in C5, and a recycled element must not inherit the previous
+     * member's server either -- that is the same impersonation with a
+     * different field. */
     ch->remotes[ch->nremotes].host[0] = '\0';
+    ch->remotes[ch->nremotes].member_server[0] = '\0';
+    if (member_server != NULL) {
+        (void)copy_bounded(ch->remotes[ch->nremotes].member_server,
+                           sizeof ch->remotes[0].member_server, member_server);
+    }
     ch->remotes[ch->nremotes].flags = flags;
     ch->nremotes++;
     return 0;

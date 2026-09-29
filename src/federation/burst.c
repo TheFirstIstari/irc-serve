@@ -50,16 +50,17 @@ int fed_burst_verb(const char *verb)
  *
  * WHAT A NICK RECORD KEEPS, and what it does not, is the interesting part of
  * this struct. SBURSTN carries nick, user, host, modes, signon and away, and
- * the shadow stores ONE of those six: the host. That is not a shortcut, it is the
- * whole of what there is somewhere to put. The one persistent consumer of a
- * burst's nick records in this phase is chan_remote_t::host, and 2.1's "which
- * server holds the user called X" registry -- the thing the other five fields
- * exist for -- is Phase 9's work and has no home on server_t yet. The other five
- * are ON THE WIRE anyway: 4.3 names them, and a format that omitted them would
- * have to be extended the moment that registry arrives, which is exactly what
- * 4.3's "a wire format cannot be invented later" is about. The count of accepted
- * nick records is what SBURSTE's first count is compared against, and a counter
- * does not need the records themselves to do that. */
+ * the shadow stores TWO of the six: the nick it keys the record by, and the
+ * host. Only the host is interesting, and that is not a shortcut -- it is the
+ * whole of what there is somewhere to put, and burst.h now says so at the point
+ * a reader would actually look for it: `user`, `modes`, `signon` and `away` are
+ * DISCARDED on purpose, because 2.1's "which server holds the user called X"
+ * registry -- the thing they exist for -- is Phase 9's work and has no home on
+ * server_t yet. They are on the wire anyway: 4.3 names them, and a format that
+ * omitted them would have to be EXTENDED the moment that registry arrives, which
+ * is exactly what 4.3's "a wire format cannot be invented later" is about. The
+ * count of accepted nick records is what SBURSTE's first count is compared
+ * against, and a counter does not need the records themselves to do that. */
 typedef struct {
     char nick[IRC_MAX_NICK + 1];
     char host[CHAN_MAX_REMOTE_HOST + 1];
@@ -67,9 +68,17 @@ typedef struct {
 
 /* One member line. The flags word is the wire's: '-', "o", "v" or "ov". It is
  * NOT the SJOIN token, which carries a leading '+' -- see the header on why the
- * two differ. */
+ * two differ.
+ *
+ * `server` is the field 4.3's SBURSTM gained before a second implementation
+ * existed: the server that HOLDS the member, which is neither the burst origin
+ * nor derivable from it. It is CHAN_MAX_SERVER rather than a written-out
+ * IRC_MAX_SERVER_NAME because it is the same number (63) and this is where a
+ * channel-h bound belongs; the header's arithmetic charges the field on the wire
+ * at IRC_MAX_SERVER_NAME, which is the same 63. */
 typedef struct {
     char     nick[IRC_MAX_NICK + 1];
+    char     server[CHAN_MAX_SERVER + 1];
     unsigned flags;
 } burst_member_t;
 
@@ -399,6 +408,35 @@ static int burst_flags_token(unsigned flags, char *out, size_t cap)
     return 0;
 }
 
+/* SBURSTM's <server> field for a REMOTE entry: where the member actually is.
+ *
+ * THE FALLBACK IS THE POINT, and it is not defensive padding. `member_server` is
+ * empty for every entry this node learned from a LIVE SJOIN, because 4.3's SJOIN
+ * carries no server field and the only answer available at the time was the
+ * sending link's name -- which is what `server`, the attribution key, holds. So
+ * on a two-node mesh, and for any member learned before this node has been
+ * resynced, the key IS the holder and falling back to it is EXACT rather than an
+ * approximation. The alternative -- sending "-" and having the receiver guess --
+ * would put a guess on the wire where a correct answer was sitting in the struct
+ * one field away.
+ *
+ * A local member does not come through here at all: it is held by this node, and
+ * fed_burst_send() passes `s->name` for it directly, because a LOCAL member has
+ * no conn_t on any peer and saying so from the roster would be a fiction.
+ *
+ * The `self` argument is the last-ditch guard and it is unreachable in practice:
+ * an entry's key is validated on the way in by chan_remote_add(), so it is never
+ * empty. It is here because an empty MIDDLE parameter is not representable at
+ * all (3.2) and message_format() would REFUSE the whole line -- aborting every
+ * burst this node ever sends -- over one malformed roster entry. */
+static const char *burst_member_server(const chan_remote_t *r, const char *self)
+{
+    if (r->member_server[0] != '\0') {
+        return r->member_server;
+    }
+    return (r->server[0] != '\0') ? r->server : self;
+}
+
 /* Is this local member a record the burst will actually carry?
  *
  * IT IS A FUNCTION BECAUSE THE COUNT AND THE RENDER MUST AGREE, and the receiver
@@ -551,9 +589,15 @@ int fed_burst_send(server_t *s, server_link_t *link)
                 goto refused;
             }
             params[0] = ch->name;
-            params[1] = ch->members[k].c->nick;
-            params[2] = flags;
-            if (stage_line(&st, s, s->name, "SBURSTM", params, 3) != 0) {
+            /* THIS NODE holds its own local members, so the <server> field is
+             * this node's own name. It is not derivable from the prefix either --
+             * both happen to be the burst origin here -- and writing it is what
+             * makes the field mean the same thing to a receiver on the record it
+             * is about. */
+            params[1] = s->name;
+            params[2] = ch->members[k].c->nick;
+            params[3] = flags;
+            if (stage_line(&st, s, s->name, "SBURSTM", params, 4) != 0) {
                 goto refused;
             }
         }
@@ -568,9 +612,10 @@ int fed_burst_send(server_t *s, server_link_t *link)
                 goto refused;
             }
             params[0] = ch->name;
-            params[1] = r->nick;
-            params[2] = flags;
-            if (stage_line(&st, s, s->name, "SBURSTM", params, 3) != 0) {
+            params[1] = burst_member_server(r, s->name);
+            params[2] = r->nick;
+            params[3] = flags;
+            if (stage_line(&st, s, s->name, "SBURSTM", params, 4) != 0) {
                 goto refused;
             }
         }
@@ -667,19 +712,7 @@ int federation_resync(server_t *s, server_link_t *link)
  * bursts on every link establishment would otherwise hold the peak of the
  * largest burst it has ever applied for the life of the process, and a node
  * whose peak burst is set by one client's away message has no business doing
- * that.
- *
- * THE COST, and it is the only leak-shaped thing in this file: a process that
- * exits MID-TRANSACTION leaves at most one bounded allocation behind -- the
- * records of a burst whose terminator never arrived. It is bounded by
- * IRC_BURST_MAX_BYTES, and it is released by fed_burst_abandon() the moment the
- * link carrying it goes down, which is the only way a transaction can still be
- * open when a node stops. The alternative -- a module teardown called from
- * server_shutdown() -- is a new arm on the node's shutdown for one bounded
- * allocation, and on this platform it could not be checked anyway:
- * LeakSanitizer is not supported on Darwin (see the hygiene note in 7/Phase 1),
- * so the claim would be asserted and not verified, which is a worse thing to
- * add a symbol for than a bounded residual. */
+ * that. */
 static void shadow_release(void)
 {
     free(g_shadow.nicks);
@@ -731,6 +764,49 @@ void fed_burst_abandon(server_link_t *link)
            "chans=%zu members=%zu bytes=%zu\n",
            g_shadow.origin, g_shadow.nnicks, g_shadow.nchans, g_shadow.nmembers,
            g_shadow.bytes);
+    shadow_release();
+}
+
+/* ---------------------------------------------------------------------------
+ * THE TEARDOWN ARM
+ * ---------------------------------------------------------------------------
+ * The shadow is a MODULE GLOBAL, so it is the one allocation on a node whose
+ * owner cannot be reached from server_shutdown() by freeing a field. This is the
+ * arm, and its contract is the one in burst.h: release, count nothing, say
+ * whether there was anything to release.
+ *
+ * WHY IT IS HERE NOW RATHER THAN NEVER, which is what C4 concluded and got
+ * backwards. C4's reasoning was that the arm is unverifiable on this platform --
+ * LeakSanitizer does not run on Darwin (see the hygiene note in 7/Phase 1) -- and
+ * an unverifiable arm is a worse thing to add a symbol for than a bounded
+ * residual. That reasoning inverts the rule: an arm that is unverifiable LOCALLY
+ * is precisely the arm worth adding, because LSan *does* run on the CachyOS Linux
+ * CI runner, so this is the class of change the platform limitation makes hard
+ * and the CI makes free. Leaving the shadow to the kernel meant a node that
+ * stopped mid-transaction -- a SIGTERM while a peer is bursting -- leaked up to
+ * IRC_BURST_MAX_BYTES, and the only evidence was a build nobody ran locally.
+ *
+ * The `[observable]` line is what makes the arm testable where LSan is not: it
+ * reports whether a shadow was OPEN at teardown, so a test can assert the arm ran
+ * on Darwin and Linux CI can assert the same fact alongside the leak check. It
+ * prints the counts rather than just a boolean because a reader looking at the
+ * last line a node printed wants to know what it was holding.
+ *
+ * Safe on a node that never called fed_open(): g_shadow is a file-scope static,
+ * so it is already zero and shadow_release() on it frees two NULL pointers. */
+void fed_burst_close(server_t *s)
+{
+    int open = g_shadow.open;
+
+    /* The node is not touched today and the parameter is not dropped. The shadow
+     * is a module global, but a teardown that may one day need to walk the node
+     * should not have its signature changed underneath the caller, and every
+     * other teardown in this tree takes the node it is tearing down. */
+    (void)s;
+    printf("[observable] fed_burst_close: shadow=%s origin=%s nicks=%zu chans=%zu "
+           "members=%zu bytes=%zu\n",
+           (open != 0) ? "OPEN" : "NONE", g_shadow.origin, g_shadow.nnicks,
+           g_shadow.nchans, g_shadow.nmembers, g_shadow.bytes);
     shadow_release();
 }
 
@@ -951,7 +1027,23 @@ static int apply_chan(server_t *s, server_link_t *link, const message_t *m)
     return 0;
 }
 
-/* SBURSTM <chan> <nick> <flags>: one member of the PRECEDING channel.
+/* SBURSTM <chan> <server> <nick> <flags>: one member of the PRECEDING channel.
+ *
+ * THE <server> FIELD IS VALIDATED, and it is validated here rather than being
+ * copied in blind for the reason the other two fields are: it is 2.4's server-name
+ * grammar, it arrives from a network, and a roster entry carrying a string the
+ * node cannot compare case-insensitively or render is a member this node cannot
+ * reason about. It is a MIDDLE parameter and therefore not representable empty
+ * (3.2), so a peer has no way to send "I do not know" -- the wire says a burst
+ * always knows, and this node holds it to that.
+ *
+ * IT IS ALSO NOT USED FOR THE KEY, and that is the load-bearing part. The key
+ * stays the BURST ORIGIN, because that is what 4.3's replace-never-merge
+ * replaces AGAINST: a resync has to be able to name exactly the entries the
+ * previous resync from the same origin installed, and that set is "everything
+ * keyed by the origin that is now re-reporting". Keying by the member's own
+ * server would make a relay's resync unable to replace what the relay installed,
+ * and a member the origin dropped would linger. See channel.h's chan_remote_t.
  *
  * THE <chan> FIELD IS CHECKED AGAINST THE SHADOW'S CURRENT CHANNEL, and the
  * check is redundant with the format and worth having anyway: a member line that
@@ -965,11 +1057,11 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
     burst_chan_t *sc = g_shadow.cur;
     unsigned flags = 0u;
 
-    if (sc == NULL || m->nparams != 3 || !valid_nick(m->params[1]) ||
-        !chan_name_valid(m->params[0])) {
+    if (sc == NULL || m->nparams != 4 || !irc_serve_server_name_valid(m->params[1]) ||
+        !valid_nick(m->params[2]) || !chan_name_valid(m->params[0])) {
         s->n_fed_malformed++;
         printf("[observable] fed_malformed: fd=%d command=SBURSTM member=%s\n",
-               link->fd, (m->nparams > 1) ? m->params[1] : "?");
+               link->fd, (m->nparams > 2) ? m->params[2] : "?");
         shadow_discard(s, "BAD_MEMBER_RECORD", g_shadow.origin, g_shadow.nnicks,
                        g_shadow.nchans, g_shadow.nmembers);
         return -1;
@@ -982,7 +1074,7 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
             s->n_fed_malformed++;
             printf("[observable] fed_malformed: fd=%d command=SBURSTM member=%s "
                    "reason=CHANNEL_MISMATCH\n",
-                   link->fd, m->params[1]);
+                   link->fd, m->params[2]);
             shadow_discard(s, "CHANNEL_MISMATCH", g_shadow.origin, g_shadow.nnicks,
                            g_shadow.nchans, g_shadow.nmembers);
             return -1;
@@ -993,17 +1085,17 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
      * form is this node's (see burst_flags_token) and a second implementation
      * that ordered the letters the other way is not a peer running a different
      * protocol, it is a peer whose two letters are the same two letters. */
-    if (strcmp(m->params[2], "-") != 0) {
-        if (m->params[2][0] == '\0') {
+    if (strcmp(m->params[3], "-") != 0) {
+        if (m->params[3][0] == '\0') {
             s->n_fed_malformed++;
             shadow_discard(s, "BAD_FLAGS", g_shadow.origin, g_shadow.nnicks,
                            g_shadow.nchans, g_shadow.nmembers);
             return -1;
         }
-        for (size_t i = 0; m->params[2][i] != '\0'; i++) {
-            if (m->params[2][i] == 'o' && (flags & CHAN_MEMBER_OP) == 0u) {
+        for (size_t i = 0; m->params[3][i] != '\0'; i++) {
+            if (m->params[3][i] == 'o' && (flags & CHAN_MEMBER_OP) == 0u) {
                 flags |= CHAN_MEMBER_OP;
-            } else if (m->params[2][i] == 'v' &&
+            } else if (m->params[3][i] == 'v' &&
                        (flags & CHAN_MEMBER_VOICE) == 0u) {
                 flags |= CHAN_MEMBER_VOICE;
             } else {
@@ -1015,7 +1107,7 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
         }
     }
     if (shadow_charge(s, "TOO_LARGE",
-                      wire_size(link->name, "SBURSTM", m->params, 3)) != 0) {
+                      wire_size(link->name, "SBURSTM", m->params, 4)) != 0) {
         return -1;
     }
     if (sc->nmembers == sc->mcap) {
@@ -1033,7 +1125,8 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
         sc->mcap = want;
     }
     slot = &sc->members[sc->nmembers++];
-    (void)burst_copy(slot->nick, sizeof slot->nick, m->params[1]);
+    (void)burst_copy(slot->nick, sizeof slot->nick, m->params[2]);
+    (void)burst_copy(slot->server, sizeof slot->server, m->params[1]);
     slot->flags = flags;
     g_shadow.nmembers++;
     return 0;
@@ -1063,23 +1156,28 @@ static const char *shadow_host(const char *nick)
  * member or in the remote roster?
  *
  * IT IS WHAT STOPS A BURST FROM ADDING A NICK TWICE, and the duplicate it
- * prevents is not theoretical. A channel's membership is per (nick, server) and
- * 4.3's SBURSTM does not carry the server -- the burst is about the origin, so
- * the origin is the key. That is exact on the two-node mesh this phase's
- * acceptance criteria are about, and on a larger mesh it is a cache, because a
- * member sitting on a third node would be reported by the origin under the
- * origin's key. Installing it anyway would give the channel two entries for one
- * person, and 353 renders one line per member: the client would be shown the
- * same nickname twice and nothing on the node could explain it.
+ * prevents is not theoretical. A channel's membership is per (nick, server), and
+ * 4.3's SBURSTM does not carry the key -- the key is the BURST ORIGIN, because
+ * that is the origin whose state the transaction replaces. The record's OWN
+ * <server> field says where the member lives and is stored in
+ * chan_remote_t::member_server, but it is deliberately NOT the key: keying by it
+ * would make this burst unable to replace what the origin's PREVIOUS burst
+ * installed, and a member the origin has dropped would linger for ever.
  *
- * So a name this node already knows is left exactly as it is, and only a name it
- * does not know is installed. The cost, and it is the same cost 2.1 already
- * names for duplicate nicks across servers: a member the origin reports and this
- * node already attributes to somebody else keeps the attribution it had, and
- * Phase 9's rename-the-loser is what resolves that. The rule is checked in
- * BOTH directions -- a local member counts -- so the common two-node case, where
- * the origin reports a member this node itself hosts, does not become a
- * self-membership. */
+ * So the duplicate the rule prevents is a node that already knows a NAME, under
+ * any key: installing it again would give the channel two entries for one person,
+ * and 353 renders one line per member, so the client would be shown the same
+ * nickname twice with nothing on the node able to explain it. That is exact on
+ * the two-node mesh this phase's acceptance criteria are about, and it is a
+ * heuristic on a larger one, where a relay reporting a member of a third node
+ * will find that node's own report of the same person already present and leave
+ * the existing attribution alone -- the same cost 2.1 already names for duplicate
+ * nicks across servers, and the same deferral: Phase 9's rename-the-loser is what
+ * resolves it.
+ *
+ * The rule is checked in BOTH directions -- a local member counts -- so the common
+ * two-node case, where the origin reports a member this node itself hosts, does
+ * not become a self-membership. */
 static int member_known(const chan_t *ch, const char *nick)
 {
     if (chan_find_nick(ch, nick) != NULL) {
@@ -1206,13 +1304,24 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
     if (epoch != g_shadow.epoch || nn != g_shadow.expect_nnicks ||
         nch != (uint64_t)g_shadow.nchans || nmb != (uint64_t)g_shadow.nmembers) {
         /* NOT COUNTED AS n_fed_malformed, and the distinction is the point of
-         * having two counters. That counter is documented as "arity or field
-         * validation refused it", and every line of a transaction that reaches here
-         * passed both -- what failed is the transaction, not a line, and it is
-         * n_burst_abandoned that says so. Counting it twice would make one event
-         * visible under two names whose meanings an operator has to keep apart, and
-         * the "one counter per guard, one event" property server.h states for the
-         * chain would stop being true. */
+         * having more than one counter. That counter is documented as "arity or
+         * field validation refused it", and every line of a transaction that
+         * reaches here passed both -- what failed is the transaction, not a
+         * line. It IS ALSO NOT COUNTED AS ITSELF, i.e. shadow_discard() below
+         * increments n_burst_abandoned and this increments n_burst_truncated
+         * separately: the one names WHICH RULE threw the transaction away, and
+         * the other says the transaction was discarded AT ALL. Counting it twice
+         * under two names whose meanings an operator has to keep apart would make
+         * one event visible under two counter pairs, and the "one guard, one
+         * event" property server.h states for the chain would stop being true.
+         *
+         * THE NEW COUNTER IS NOT OPTIONAL, and the thing it replaces is worth
+         * naming: before it, a truncation was visible only as this log line. A
+         * node whose peer is truncating bursts has a quietly stale view of that
+         * peer, and a counter is the only thing that says so without a log
+         * reader. Its whole cost is one uint64_t on server_t and one increment on
+         * a branch that is already discarding. */
+        s->n_burst_truncated++;
         printf("[observable] fed_burst_truncated: peer=%s epoch=%llu/%llu "
                "nicks=%llu/%llu chans=%llu/%zu members=%llu/%zu\n",
                link->name, (unsigned long long)epoch,
@@ -1287,8 +1396,8 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
             if (member_known(ch, sc->members[k].nick) != 0) {
                 continue;
             }
-            if (chan_remote_add(ch, origin, sc->members[k].nick,
-                                sc->members[k].flags) != 0) {
+            if (chan_remote_add(ch, origin, sc->members[k].server,
+                                sc->members[k].nick, sc->members[k].flags) != 0) {
                 dropped++;
                 continue;
             }
