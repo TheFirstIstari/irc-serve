@@ -6,8 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege, and it is also what satisfies CodeQL's
+# actions/missing-workflow-permissions rule: that rule wants permissions
+# declared PER JOB, because workflow scope silently hands every future job
+# the same token scope. Every job here only checks out code and runs it.
 permissions:
-  read-all
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -15,6 +19,8 @@ concurrency:
 
 jobs:
   ci_test:
+    permissions:
+      contents: read
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
@@ -28,6 +34,8 @@ jobs:
         run: ctest --output-on-failure --timeout 60
 
   ci_benchmark:
+    permissions:
+      contents: read
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
@@ -41,6 +49,8 @@ jobs:
         run: ctest -L Benchmark --output-on-failure --timeout 60
 
   ci_compliance:
+    permissions:
+      contents: read
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
@@ -73,6 +83,8 @@ jobs:
   # job. That is issue #85. This job therefore covers the default macOS
   # toolchain, not the full warning set.
   ci_macos:
+    permissions:
+      contents: read
     runs-on: macos-latest
     timeout-minutes: 30
     strategy:
@@ -112,6 +124,8 @@ jobs:
   # This job is a smoke test that the distro builds, NOT a required status
   # check. A machine you have switched off must not block the project.
   build_cachyos:
+    permissions:
+      contents: read
     # `environment` is the control that matters here. It points at an
     # environment whose only required reviewer is the repository owner, and
     # whose deployment branch policy allows only `main`. The job therefore
@@ -161,6 +175,8 @@ jobs:
         run: ctest --output-on-failure --timeout 60
 
   build_arch:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
