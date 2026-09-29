@@ -2,9 +2,9 @@ add_executable(test_peer_discovery test_peer_discovery.c)
 add_executable(test_reconnect test_reconnect.c)
 add_executable(test_autoscale test_autoscale.c)
 
-target_link_libraries(test_peer_discovery PRIVATE irc_core test_contracts)
-target_link_libraries(test_reconnect PRIVATE irc_core test_contracts)
-target_link_libraries(test_autoscale PRIVATE irc_core test_contracts)
+target_link_libraries(test_peer_discovery PRIVATE irc_core)
+target_link_libraries(test_reconnect PRIVATE irc_core)
+target_link_libraries(test_autoscale PRIVATE irc_core)
 
 add_test(NAME PeerDiscovery COMMAND test_peer_discovery)
 add_test(NAME Reconnect COMMAND test_reconnect)
