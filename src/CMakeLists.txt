@@ -23,6 +23,14 @@ add_library(irc_core STATIC
   core/commands.c
   core/chan_verbs.c
   core/msg_verbs.c
+  # Phase 6. federation/ is a DIRECTORY of its own rather than more core/*.c,
+  # because the split that matters in this phase is not "core versus
+  # federation" but "encode versus decode": verbs.c is the outbound half of
+  # 4.3's wire and dedup.c is 2.4's loop guard, and neither is reachable from
+  # the message path yet. Putting them beside core/ would imply they are part of
+  # the always-on path, and a reader would expect to find them in fanout.c.
+  federation/verbs.c
+  federation/dedup.c
 )
 
 target_link_libraries(irc_core PRIVATE pthread)

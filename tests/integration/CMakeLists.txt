@@ -153,3 +153,39 @@ irc_add_integration_test(test_messaging test_messaging.c)
 # WHOIS report on, so the three cannot be separated by a file boundary without
 # the file testing itself.
 irc_add_integration_test(test_queries test_queries.c)
+
+# 2.4 / 3.2 / 4.3: the internal tag block the relay path budgets against, from
+# the side that is not Phase 1's. test_message_format.c pins the 179 overhead as
+# a LENGTH; this one pins the block as BYTES (a length cannot tell origin from
+# epoch, so a serialiser emitting the four tags in the wrong order has exactly
+# the right length) and then measures the overhead from two real renders, and
+# asserts that the largest body the node will relay, stamped with the largest
+# legal stamp, still fits IRC_MAX_LINE while one byte more is refused.
+irc_add_integration_test(test_fed_tags test_fed_tags.c)
+
+# 4.3 / 2.4: the S-verb wire, byte for byte, toward a listener THIS test owns.
+# Every client verb with an S-verb is compared against a written-out literal --
+# the four tag names in the frozen order, hops=0, the S-verb, the target, the
+# text -- and the whole peer buffer is then asserted equal to exactly those
+# lines, so a line that was not asked for fails as surely as one that was
+# missing. The end-to-end half of test_reply_guard.c is here: real numerics
+# driven through a real peer link, with each one checked to have reached the
+# CLIENT first so that "the peer link is empty" is not satisfied by a link that
+# never worked. No sleep anywhere; waiting is a deadline loop over the node's
+# own poll step, and the negatives close their window with a PING/PONG.
+irc_add_integration_test(test_fed_wire test_fed_wire.c)
+
+# 2.4: the (origin, epoch, id) duplicate store and the loop guard that reads it.
+# The store is asserted on RETURN VALUES -- first arrival new, second seen, the
+# three key fields independent, the origin folded ASCII, an illegal key not new
+# -- plus the TTL on BOTH sides of its boundary, the sweep throttle, and the
+# capacity eviction (the store must not grow, must take the least recently seen
+# entry, and must still answer correctly afterwards, which is what catches a
+# back-shift repair that broke a probe chain). The guard is asserted on the WIRE:
+# a link that is not ESTABLISHED is not a route, a relay carries its
+# origin/epoch/id through untouched with only hops incremented (the id counter is
+# pinned and required not to move), hops one short of the ceiling is refused,
+# and a message whose origin is this node is refused in either case spelling --
+# each beside a positive control, and each with a different-case name so the
+# fold is load-bearing.
+irc_add_integration_test(test_fed_dedup test_fed_dedup.c)

@@ -23,13 +23,30 @@
  * ---------------------------------------------------------------------------
  * THE FORWARD IS AN EXPLICIT REFUSAL, NOT A SILENT DROP
  * ---------------------------------------------------------------------------
- * fanout_forward_link() has nothing to send to. It says so on the observable
- * output, naming the peer it wanted, rather than returning quietly: a federated
- * node that reached this path with the forward still unimplemented would
- * otherwise lose messages with no trace, and "no trace" is the failure mode
- * 2.2's single-writer rule exists to avoid. The local leg of a non-owned
- * `message` still happens first, because 3.1 says it does and because a message
- * is not state -- see fanout.h on the verb class.
+ * fanout_forward_link() reports every refusal on the observable output, naming
+ * the peer it wanted and the reason it could not reach it, rather than returning
+ * quietly: a federated node that lost a message with no trace would look exactly
+ * like a node whose peers were silent, and the two have opposite fixes. The
+ * local leg of a non-owned `message` still happens first, because 3.1 says it
+ * does and because a message is not state -- see fanout.h on the verb class.
+ *
+ * ---------------------------------------------------------------------------
+ * EVERY CALLER PASSES carry == NULL IN THIS COMMIT, AND THAT IS HONEST
+ * ---------------------------------------------------------------------------
+ * All four call sites are the node acting on its OWN clients' actions, so all
+ * four are originating: none of them is relaying a message that arrived from a
+ * peer, because there is no peer for one to have arrived from (fanout.h, on
+ * FANOUT_REMOTE_USER, and the fact that no inbound peer protocol exists until
+ * fed_dispatch() lands). A caller that had a carried stamp to pass would use the
+ * parameter; none of these has one, and writing a fabricated relay stamp to
+ * exercise the branch would be a lie about the traffic.
+ *
+ * The consequence, which is expected rather than surprising: with no peer link
+ * and no carried stamp, every one of these returns 0 at the NO_ROUTE refusal
+ * exactly as it did before this parameter existed, so the observable output and
+ * every existing test see no change. What changed is that the refusals BELOW
+ * NO_ROUTE are now real code with real conditions rather than a comment
+ * promising them.
  */
 #include "core/fanout.h"
 
@@ -37,6 +54,7 @@
 #include <string.h>
 
 #include "core/reply.h"
+#include "federation/verbs.h"
 
 /* ASCII-only case folding, deliberately: 005 advertises CASEMAPPING=ascii, so
  * this node has already told every client that []\~ and {}|^ are NOT
@@ -46,6 +64,29 @@
 static int ascii_lower(int ch)
 {
     return (ch >= 'A' && ch <= 'Z') ? (ch - 'A' + 'a') : ch;
+}
+
+/* The 2.4 never-forward-own-origin test, case-insensitively. This is the third
+ * copy of an ASCII server-name fold (server.c and channel.c have the other two)
+ * and the reasons it cannot be one function are spelled out where server.c's
+ * copy is: a fold nobody uses twice is a helper exported for the sake of it, and
+ * 2.1's nick@server split, 2.4's own-origin rule and 2.2's servers[] set are
+ * three genuinely separate questions that happen to need the same six lines.
+ * The copies are asserted to agree by test_channels.c, which looks a peer up by
+ * a name differing only in case. */
+static int same_origin(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+    while (*a != '\0' && *b != '\0') {
+        if (ascii_lower((unsigned char)*a) != ascii_lower((unsigned char)*b)) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
 }
 
 int fanout_mask_match(const char *mask, const char *value)
@@ -362,7 +403,7 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
              * mean "forward to us". */
             for (size_t i = 0; t->chan != NULL && i < t->chan->nservers; i++) {
                 (void)fanout_forward_link(s, t->chan->servers[i].name, t, verb,
-                                          text);
+                                          text, NULL);
             }
         } else {
             /* "message": the origin already holds every member, so there is
@@ -388,7 +429,7 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
              * that says "do not write locally". */
             (void)fanout_forward_link(s, (t->chan != NULL) ? t->chan->origin
                                                            : "",
-                                      t, verb, text);
+                                      t, verb, text, NULL);
             return 0;
         }
         /* "message": write to local members AND forward to the owner. Both
@@ -401,7 +442,7 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
 
             (void)fanout_forward_link(s, (t->chan != NULL) ? t->chan->origin
                                                            : "",
-                                      t, verb, text);
+                                      t, verb, text, NULL);
             return n;
         }
     }
@@ -423,7 +464,7 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
             size_t n;
 
             if (at == NULL || at == t->name || at[1] == '\0') {
-                (void)fanout_forward_link(s, "", t, verb, text);
+                (void)fanout_forward_link(s, "", t, verb, text, NULL);
                 break;
             }
             n = strlen(at + 1);
@@ -432,7 +473,7 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
             }
             memcpy(server, at + 1, n);
             server[n] = '\0';
-            (void)fanout_forward_link(s, server, t, verb, text);
+            (void)fanout_forward_link(s, server, t, verb, text, NULL);
         }
         break;
 
@@ -457,34 +498,125 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
 
 int fanout_forward_link(server_t *s, const char *peer_name,
                         const fanout_target_t *t, const char *verb,
-                        const char *text)
+                        const char *text, const irc_serve_tags_t *carry)
 {
     const char *target = (t != NULL) ? t->name : "-";
+    const char *sverb;
+    irc_serve_tags_t tags;
     conn_t *peer;
 
-    (void)text;
-    if (s == NULL || peer_name == NULL || peer_name[0] == '\0') {
+    if (s == NULL || peer_name == NULL || peer_name[0] == '\0' || verb == NULL ||
+        text == NULL) {
         printf("[observable] fanout_forward_skipped: verb=%s target=%s "
                "reason=unresolved_peer\n",
                (verb != NULL) ? verb : "?", target);
         return 0;
     }
-    /* server_find_peer() is the "can this node reach that server" predicate and
-     * it is real today: 2.3's connection registry already holds a peer's name in
-     * conn_t::peer_name. On a single node it always answers NULL, because
-     * server_dial() has no caller and nothing creates a CONN_SERVER. */
+    /* Resolved before anything else that costs anything, because a verb with no
+     * S-verb is a CALLER bug rather than a routing outcome, and 4.3's list is
+     * short enough that a verb arriving here that is not in it means something
+     * upstream built a line it cannot forward. */
+    sverb = fed_sverb_for(verb);
+    if (sverb == NULL) {
+        printf("[observable] fanout_forward_skipped: verb=%s target=%s "
+               "reason=NO_SVERB\n",
+               verb, target);
+        return 0;
+    }
+
+    /* 3.2's cap, applied to the TEXT before anything is stamped or built, for
+     * the reason fanout_line_fits() gives: a line that cannot be relayed is a
+     * limit and answers with a numeric, not a render failure discovered deep
+     * inside the send path where the only outcome is a refusal.
+     *
+     * It is here, above the stamp, for the same reason the peer lookup is: the
+     * checks that can refuse a forward all run before anything is spent on it.
+     * Originating takes the next id from the per-SERVER counter, and an id spent
+     * on a line that is then refused is a hole in the sequence. Nothing requires
+     * the sequence to be contiguous -- a peer's dedup only needs ids to be
+     * unique, and to differ from a previous BOOT's ids, which is what epoch is
+     * for -- but a hole per dropped forward is a hole per dropped forward, and
+     * there is no reason to spend one.
+     *
+     * The S-verb length is measured rather than assumed, because MODE -> SMODES
+     * is longer than MODE and a bound that counted the client verb would be one
+     * byte out for one of the seven. */
+    if (fanout_line_fits(s->name, sverb, target, text) == 0) {
+        printf("[observable] fanout_forward_dropped: verb=%s target=%s "
+               "peer=%s reason=too_long len=%zu\n",
+               verb, target, peer_name, strlen(text));
+        return 0;
+    }
+
+    /* The link is resolved before the message is stamped, for the reason above.
+     * server_find_peer() is the "can this node route to that server" predicate,
+     * and it is the ESTABLISHED one: a link that has not finished the handshake
+     * FSM is not a route, and 2.3 requires the server-name uniqueness check to
+     * happen before ESTABLISHED for the reason this would otherwise be a
+     * duplicate-name bug on the wire. */
     peer = server_find_peer(s, peer_name);
     if (peer == NULL) {
         printf("[observable] fanout_forward_dropped: verb=%s target=%s peer=%s "
                "reason=NO_ROUTE\n",
-               (verb != NULL) ? verb : "?", target, peer_name);
+               verb, target, peer_name);
         return 0;
     }
-    /* Reachable only once 2.3 has a peer link. The S-verb construction, the
-     * 2.4 origin/epoch/id/hops tags and the loop guard all belong to Phase 6,
-     * and this is the single line they have to be written into. */
-    printf("[observable] fanout_forward_unimplemented: verb=%s target=%s "
-           "peer=%s\n",
-           (verb != NULL) ? verb : "?", target, peer_name);
-    return 0;
+
+    /* ---- 2.4: the stamp, and the loop guard, at forward time ---- */
+    if (carry == NULL) {
+        /* ORIGINATING. This node minted the message, so the identity is minted
+         * with it -- and the origin is this node's name, which is what makes 2.4's
+         * never-forward-own-origin rule decidable on the far side without any
+         * extra state. */
+        memset(&tags, 0, sizeof tags);
+        memcpy(tags.origin, s->name, strlen(s->name) + 1u);
+        tags.epoch = s->epoch;
+        tags.id = server_next_msg_id(s);
+        tags.hops = 0u;
+    } else {
+        /* RELAYING. origin/epoch/id are carried through and only hops moves.
+         * Every word of the comment above the function is about this branch, and
+         * the copy is the whole mechanism: `tags = *carry` cannot accidentally
+         * restamp, because a restamp would have to be a write after this line
+         * and there is none. */
+        if ((uint64_t)carry->hops + 1u >= (uint64_t)IRC_MAX_HOPS) {
+            printf("[observable] fanout_forward_dropped: verb=%s target=%s "
+                   "peer=%s reason=hop_limit hops=%lu ceiling=%d\n",
+                   verb, target, peer_name, (unsigned long)carry->hops,
+                   IRC_MAX_HOPS);
+            return 0;
+        }
+        if (same_origin(carry->origin, s->name)) {
+            /* 2.4: "A node never forwards a message whose irc-serve-origin is
+             * itself." This is the second of the three loop rules, and it is the
+             * one that stops the SHORT cycle -- two nodes bouncing one message
+             * between them -- which the hop ceiling alone would only slow down.
+             *
+             * The comparison is ASCII case-insensitive, and message.h says
+             * explicitly that this is the caller's job: server names are
+             * case-insensitive (2.1, RFC 1459 2.3.2), so a peer that spells this
+             * node's name `IRC.A` in a tag is naming THIS node, and treating it
+             * as a different server would forward back into the sender for ever
+             * up to the hop ceiling. */
+            printf("[observable] fanout_forward_dropped: verb=%s target=%s "
+                   "peer=%s reason=own_origin origin=%s self=%s\n",
+                   verb, target, peer_name, carry->origin, s->name);
+            return 0;
+        }
+        tags = *carry;
+        tags.hops = carry->hops + 1u;
+    }
+
+    /* The prefix is this node's own name, and verbs.h records at length why
+     * that is right for five of the seven S-verbs and wrong for SPRIVMSG and
+     * SNOTICE. The correct fix is a prefix parameter this function does not
+     * have; the callers that would supply it are the verb handlers, which are
+     * the ones Phase 6 rewires when fed_dispatch() lands. */
+    if (fed_send_sverb(s, peer, &tags, verb, s->name, target, text) != 0) {
+        /* fed_send_sverb() has already said which refusal this was. Counting a
+         * second, vaguer one here would give an operator two lines to read for
+         * one event. */
+        return 0;
+    }
+    return 1;
 }
