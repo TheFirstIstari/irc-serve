@@ -201,11 +201,9 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
                    const char *verb, const char *text, conn_t *exclude);
 
 /* ---------------------------------------------------------------------------
- * The forward leg -- Phase 6 fills this in
+ * The forward leg
  * ---------------------------------------------------------------------------
- */
-
-/* The ONE place a line leaves this node toward a peer, as 4.3's S-verb
+ * The ONE place a line leaves this node toward a peer, as 4.3's S-verb
  * (SPRIVMSG, SNOTICE, SJOIN, ...) with the 2.4 internal tag block stamped on it.
  *
  * Exposed rather than kept static for one reason: it is the seam. It is the
@@ -213,13 +211,42 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
  * and Phase 6 implements it once, here, instead of growing a second place that
  * decides how a message leaves the node.
  *
- * Today it reports, loudly, and sends nothing: there are no peer sockets (2.3
- * -- server_dial() has no caller) and 4.3's S-verbs are Phase 6. It returns 0
- * for "not delivered", which is the same value a real forward returns when the
- * link is refused, so a caller written today keeps its meaning tomorrow. */
+ * `carry` is the 2.4 identity of the message, or NULL, and it is the whole
+ * contract of this function:
+ *
+ *   carry == NULL   this node is ORIGINATING. The stamp is minted here: origin
+ *                   is this node's name, epoch is this node's, the id is the
+ *                   next from the per-SERVER counter (2.4), and hops is 0.
+ *
+ *   carry != NULL   this node is RELAYING. origin, epoch and id are carried
+ *                   through UNCHANGED and only hops becomes carry->hops + 1.
+ *
+ * The invariance of (origin, epoch, id) across every forward is the single most
+ * load-bearing property in 2.4, and it is stated here rather than left to be
+ * discovered: restamping on relay gives the copy a new identity, the dedup store
+ * on the far side treats it as a message it has never seen, and the message
+ * comes back. That is the loop, and it is not bounded by the hop ceiling in any
+ * useful sense because each pass through the mesh mints a fresh id. hops is the
+ * ONLY field a forward may change.
+ *
+ * The refusals, all of which return 0 and all of which say so on the
+ * observable output rather than returning quietly:
+ *
+ *   no peer by that name, or the link is not ESTABLISHED   NO_ROUTE
+ *   a relay whose hops + 1 would reach IRC_MAX_HOPS         hop_limit
+ *   a relay whose origin is THIS node (2.4)                own_origin
+ *   a line that does not fit the wire                        too_long
+ *   a client verb with no S-verb (4.3)                      NO_SVERB
+ *
+ * The hop and own-origin checks are HERE, at forward time, because 3.1 says
+ * "loop guard applies at forward time" and that is the only place the node can
+ * see what it is about to do. Neither can be done on receipt: a message that
+ * arrives from one peer may still have to go to another, and a node that refused
+ * it on arrival would have to decide, at arrival, that no peer should ever
+ * receive it. */
 int fanout_forward_link(server_t *s, const char *peer_name,
                         const fanout_target_t *t, const char *verb,
-                        const char *text);
+                        const char *text, const irc_serve_tags_t *carry);
 
 /* ---------------------------------------------------------------------------
  * Small shared helpers
