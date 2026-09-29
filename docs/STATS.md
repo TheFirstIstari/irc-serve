@@ -2,15 +2,15 @@
 
 # Project status
 
-Generated `2026-09-29T09:50:43Z` from commit `b2652b1` by
+Generated `2026-09-29T10:58:17Z` from commit `b220f98` by
 [stats.yml](../../blob/main/.github/workflows/stats.yml).
 
 ## Test suite
 
 | | count |
 |---|---|
-| Total | 43 |
-| Passing | 35 |
+| Total | 45 |
+| Passing | 37 |
 | **Skipped** | **8** |
 | Failed | 0 |
 
@@ -24,8 +24,8 @@ Generated `2026-09-29T09:50:43Z` from commit `b2652b1` by
 
 | | lines |
 |---|---|
-| `src/` | 9874 |
-| `tests/` | 12265 |
+| `src/` | 10153 |
+| `tests/` | 12986 |
 
 ## Build phases
 
