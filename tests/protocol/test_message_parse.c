@@ -162,10 +162,23 @@ int main(void)
     {
         char line[128];
         size_t w = 0;
-        w += (size_t)snprintf(line + w, sizeof line - w, "CMD");
+        /* Each snprintf's return value is the length it WOULD have written, not
+         * the length it did, so accumulating it unchecked is the classic
+         * overflowing-snprintf bug: on truncation `w` runs past the end of the
+         * buffer and `sizeof line - w` wraps to a huge size_t. The total here is
+         * 73 bytes into 128, so it does not fire today, but one edit to the loop
+         * bounds would make it undefined behaviour rather than a test failure.
+         * Accumulate only what was actually written, and assert the headroom
+         * explicitly so a future change that overflows fails here. */
+        int n = snprintf(line + w, sizeof line - w, "CMD");
+        assert(n > 0 && (size_t)n < sizeof line - w);
+        w += (size_t)n;
         for (int i = 0; i < 20; i++) {
-            w += (size_t)snprintf(line + w, sizeof line - w, " t%d", i);
+            n = snprintf(line + w, sizeof line - w, " t%d", i);
+            assert(n > 0 && (size_t)n < sizeof line - w);
+            w += (size_t)n;
         }
+        assert(w < sizeof line);
         assert(message_parse(line, &m) == 0);
         assert(m.nparams == 15);
         assert(strcmp(m.params[14], "t14 t15 t16 t17 t18 t19") == 0);
