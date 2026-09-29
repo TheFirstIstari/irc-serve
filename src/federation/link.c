@@ -594,6 +594,30 @@ static int fed_queue_federate(server_t *s, server_link_t *link, conn_t *c)
      * truncation of the one field 2.4 exists so that a restarted peer is
      * distinguishable from the one it replaced. */
     (void)snprintf(epoch, sizeof epoch, "%llu", (unsigned long long)s->epoch);
+    /* A NODE WITH NO SECRET REFUSES TO SEND A CLAIM, and it says so in its own
+     * words rather than letting the claim go out with an empty parameter.
+     *
+     * The reason is the POLICY, and it is now stated on BOTH sides: an inbound
+     * FEDERATE on a node with no configured secret is refused with
+     * FED_NO_SECRET (fed_check_federate() step 2, which says so at length), so
+     * an outbound claim from the same node would be refused by a correctly
+     * configured peer with a reason its operator cannot act on -- "your secret
+     * is wrong" for a node that has no secret. The operator of the
+     * no-secret node is the one who can fix it, and the line that tells them is
+     * the outbound one: this node is the one that cannot authenticate anybody.
+     *
+     * It is a separate reason and not a reuse of UNRENDERABLE because
+     * UNRENDERABLE is a message.c failure -- "this line does not fit or does not
+     * parse" -- and an operator reading it would go looking for a formatting bug
+     * in a module that is behaving exactly as specified. The two are opposites
+     * (a message that cannot be built versus a policy that forbids building it)
+     * and they belong to different files. */
+    if (g_secret_len == 0u) {
+        printf("[observable] link_send_failed: peer=%s reason=NO_SECRET "
+               "configured=0\n",
+               link->name);
+        return -1;
+    }
     memcpy(secret, g_secret, g_secret_len + 1u);
 
     params[0] = s->name;                        /* our own claim        */
@@ -1017,15 +1041,32 @@ static int fed_claim_accepted(server_t *s, server_link_t *link, conn_t *c,
  *      handshake being the only way in: the verb is internal (4.3) and a
  *      client has no business sending it.
  *   2. A line on a link that already exists. The stamp is the liveness signal
- *      and the line is DROPPED. Dropping it is C3's job to stop doing:
- *      fed_dispatch() reads it, checks the 2.4 tags, and applies the hop
- *      ceiling. Until then there is nothing this phase can do with an S-verb
- *      safely, and letting one fall through to the client dispatch would be
- *      worse -- 2.3 says a peer connection is not in the registration state
- *      machine, and commands_dispatch() would answer it 451 and write a
- *      numeric towards a connection that has no client behind it.
+ *      and the line goes to fed_dispatch(), which reads the 2.4 tags, applies
+ *      the hop ceiling and dispatches the verb. It goes through the CLIENT
+ *      dispatch to get there -- commands_dispatch() sees src->kind and calls
+ *      fed_dispatch() -- because 3's diagram says the peer path is the same
+ *      dispatch and that dispatch never asks "is this local or remote?". Two
+ *      doors into the guard chain is one too many, and the chain is the only
+ *      place 2.4 is enforced.
  *   3. Anything else -- an ordinary client line. Untouched, and handed to the
  *      dispatch that was installed before fed_open(). */
+void fed_on_federate(server_t *s, conn_t *c, const message_t *m)
+{
+    server_link_t *self = fed_link_of_conn(s, c);
+    uint64_t peer_epoch = 0;
+    fed_federate_result_t result;
+
+    if (s == NULL || c == NULL || m == NULL) {
+        return;
+    }
+    result = fed_check_federate(s, self, m, g_secret, &peer_epoch);
+    if (result != FED_OK) {
+        fed_reject(s, self, c, result, m->params[0]);
+        return;
+    }
+    (void)fed_claim_accepted(s, self, c, m->params[0], peer_epoch);
+}
+
 static void fed_dispatch_hook(server_t *s, conn_t *c, const message_t *m)
 {
     server_link_t *link;
@@ -1034,16 +1075,15 @@ static void fed_dispatch_hook(server_t *s, conn_t *c, const message_t *m)
         return;
     }
     if (strcmp(m->command, "FEDERATE") == 0) {
-        server_link_t *self = fed_link_of_conn(s, c);
-        uint64_t peer_epoch = 0;
-        fed_federate_result_t result =
-            fed_check_federate(s, self, m, g_secret, &peer_epoch);
-
-        if (result != FED_OK) {
-            fed_reject(s, self, c, result, m->params[0]);
-            return;
-        }
-        (void)fed_claim_accepted(s, self, c, m->params[0], peer_epoch);
+        /* Answered HERE and not by the guard chain's G2, for one reason: at this
+         * point the connection is still a CLIENT connection -- fed_link_established()
+         * is what sets c->kind to CONN_SERVER -- so commands_dispatch()'s peer
+         * branch has not been reached yet and there is nothing to hand the line
+         * to. fed_dispatch()'s G2 calls this same function, so a FEDERATE that
+         * arrives on an ALREADY-established link goes through both paths and is
+         * answered identically: on such a link it is a re-claim, and
+         * fed_check_federate() reports DUPLICATE_LINK or NAME_MISMATCH for it. */
+        fed_on_federate(s, c, m);
         return;
     }
 
@@ -1058,7 +1098,19 @@ static void fed_dispatch_hook(server_t *s, conn_t *c, const message_t *m)
      * core/poll_loop.c so that the loop stays free of any peer concept; see the
      * header. */
     link->last_recv_ms = server_now_ms();
-    /* Dropped. See case 2 above. C3 replaces this line with fed_dispatch(). */
+    /* Handed to the client dispatch, which routes a CONN_SERVER connection to
+     * fed_dispatch(). THAT IS THE WHO OF IT, and it is one path rather than two:
+     * section 3's diagram puts the peer read and the client read through the
+     * same dispatch and says dispatch never asks "is this local or remote?" --
+     * the only difference is src->kind. Routing from here straight into
+     * fed_dispatch() would be a SECOND entry into the peer protocol, and the
+     * guards would then have two doors. A line that reaches the client dispatch
+     * and is not a peer line falls through to the client verb table, where
+     * every S-verb is an unknown command -- which is the correct answer and is
+     * counted, not the reason this routing exists. */
+    if (g_inner != NULL) {
+        g_inner(s, c, m);
+    }
 }
 
 /* ---------------------------------------------------------------------------

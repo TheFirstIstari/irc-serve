@@ -421,6 +421,38 @@ struct server {
     uint64_t  n_fed_hs_timeout; /* links that reached no answer within T2 */
     uint64_t  n_fed_dead;       /* ESTABLISHED links that went silent (T4) */
 
+    /* ------------------------------------------------------------------------
+     * Phase 6 C3: the INBOUND guard chain, one counter per guard that can drop
+     * a line. federation/verbs.c's fed_dispatch() is the only writer.
+     * ------------------------------------------------------------------------
+     *
+     * ONE COUNTER PER GUARD, and that is the property worth having: a single
+     * "dropped" counter over a chain of ten guards says that something was
+     * dropped and nothing about WHICH, and the ten have entirely different
+     * fixes -- a hop ceiling that fires is a mesh problem, an own-origin drop is
+     * loop prevention WORKING, a duplicate is dedup working, and a malformed
+     * line is a peer that does not implement 4.3. An operator reading one
+     * number cannot tell those apart, and the numbers are free.
+     *
+     * They are all ZERO on a node with no peers, so a non-zero value is a real
+     * event and not a derived guess. */
+    uint64_t  n_fed_preauth_drop;  /* a line arrived on a link that is not up */
+    uint64_t  n_fed_hop_drop;      /* hops had reached IRC_MAX_HOPS (2.4)      */
+    uint64_t  n_fed_own_origin;    /* the origin was THIS node (2.4)          */
+    uint64_t  n_fed_untagged_relay;/* untagged line from a peer naming another */
+    uint64_t  n_fed_unknown_verb;  /* not a verb in 4.3's list                */
+    uint64_t  n_fed_verb_deferred; /* a 4.3 verb this build does not do yet   */
+    uint64_t  n_fed_malformed;     /* arity or field validation refused it    */
+    /* The drop the guard chain took at the dedup guard, and the store's own
+     * count of the same event. They are incremented together at G7 and are
+     * equal on any node this build produces; they are two names for one fact
+     * on purpose, because they are read at two different levels -- a loop test
+     * asserts on the guard's drop, and a dedup test asserts on the store's --
+     * and a difference between them would be a real bug in the chain rather
+     * than a number nobody looked at. */
+    uint64_t  n_fed_dup_drop;
+    uint64_t  n_fed_dedup_dup;
+
     int       trace;             /* emit [observable] per-line output */
 };
 

@@ -161,8 +161,26 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
      * other outcome is identical, and the tests run the same scenarios against
      * both.
      */
-    delivered = fanout_deliver(s, &t, prefix, verb, text,
-                               (is_notice != 0) ? c : NULL);
+    /* The parameters AFTER the target: fanout_deliver() prepends t->name, which
+     * is 2.2's canonical spelling rather than whatever the client typed, and
+     * that substitution is the reason this function takes a list rather than a
+     * single trailing string.
+     *
+     * The local copy is because message_t::params is `char *[]` and the
+     * destination is `const char *const *`, and C will not add that
+     * qualification silently to an array of pointers. There is one parameter
+     * after the target in both verbs (RFC 2812 3.3.1: <msgtarget> <text>) and
+     * the arity check at the top of this function has already refused anything
+     * else, so the array cannot overflow. */
+    {
+        const char *sp[1];
+
+        sp[0] = m->params[1];
+        /* `carry` is NULL: a client sent this line, so this node is ORIGINATING
+         * it and fanout_forward_sverb() mints the 2.4 identity at the forward. */
+        delivered = fanout_deliver(s, &t, prefix, verb, sp, 1,
+                                   (is_notice != 0) ? c : NULL, NULL);
+    }
     printf("[observable] msg: verb=%s from=%s target=%s kind=%d members=%zu "
            "delivered=%d echo=%s member=%d\n",
            verb, c->nick, t.name, (int)t.kind,
