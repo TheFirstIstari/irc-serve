@@ -597,6 +597,20 @@ Blunt, because the value of this document is that it can be trusted.
     zero `*out` without freeing what was there (`message.h:40-46`) — a loop that
     reuses one `message_t` leaks, and no test covers that shape.
 
+12. **Nine dead file-local macros, hidden by a suppression whose reason does not
+    cover them** (found while enabling `-Weverything` on Apple clang, #85). The
+    flag set carries `-Wno-unused-macros` for the harness macros in
+    `test_util.h`, which are genuinely used across translation units — but it also
+    hides `T_READY_MS` in nine integration tests
+    (`test_conn_lifecycle.c:40`, `test_registration.c`, `test_ping_pong.c`,
+    `test_quit.c`, `test_pre_register.c`, `test_queries.c`, `test_reaper_close.c`,
+    `test_dup_nick.c`, `test_nick_rule.c`, `test_channels.c`), each defined and
+    never used. Both compilers report them, so this is pre-existing and not
+    something Apple clang found. Left in place deliberately: it is unrelated dead
+    code, not a diagnostic the #85 change surfaces, and the honest options are to
+    delete nine macros across nine test files or to narrow the suppression, which
+    would then need per-file reasoning. Worth a separate cleanup.
+
 ### Known-absent — not started, and correctly reported as such
 
 - **No channels.** `chan_t` does not exist. `struct chan` is forward-declared
