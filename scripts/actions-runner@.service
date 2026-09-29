@@ -17,11 +17,16 @@
 # Instance i uses $INSTALL_ROOT/<name>-%i and registers as <name>-%i, so
 # `systemctl start actions-runner@2` adds a second concurrent runner.
 #
-# Deliberately NOT using Restart=always on its own: if the registration token
-# expires or config.sh is missing, an always-restarting unit becomes a crash
-# loop that hides the real error. Restart=on-failure with a delay, plus
-# StartLimitIntervalSec, makes a genuine failure visible in `systemctl status`
-# instead of silently failing.
+# WHY Restart=always, and not Restart=on-failure:
+# run.sh does NOT propagate a crash. Killing Runner.Listener makes run.sh print
+# "Exiting with unknown error code: 137" and then exit 0, so systemd records
+# status=0/SUCCESS and `Restart=on-failure` never fires. Verified on a live
+# machine: `kill -9` left the runner dead and GitHub showed it offline.
+# A runner's normal state is "always listening for jobs", so always-restart is
+# the correct policy. A genuinely broken config (expired registration, missing
+# config.sh) still surfaces visibly rather than hiding: StartLimitBurst=10 in
+# StartLimitIntervalSec=600 trips and the unit goes to `failed`, which
+# `systemctl status actions-runner@N` and the GitHub UI both show.
 [Unit]
 Description=GitHub Actions runner (irc-serve) instance %i
 Documentation=https://github.com/TheFirstIstari/irc-serve
@@ -41,7 +46,7 @@ ExecStart=__INSTALL_ROOT__/__RUNNER_NAME__-%i/run.sh
 KillSignal=SIGINT
 # The runner needs a moment to finish an in-flight job cleanly.
 TimeoutStopSec=60
-Restart=on-failure
+Restart=always
 RestartSec=15
 # The runner executes untrusted build steps, so it must be able to install
 # packages and start services; it must NOT be able to change its own unit or

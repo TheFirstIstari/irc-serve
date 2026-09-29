@@ -47,7 +47,9 @@ concurrency:
 
 jobs:
   # --- Preferred path: the fast native Linux machine -----------------------
-  # One job, all four compiler x build-type combinations, sequentially.
+  # A real 4-way matrix, executed CONCURRENTLY because the machine runs six
+  # runner instances. A runner process handles one job at a time, so the
+  # instance count is what sets the parallelism.
   ci_linux_cachyos:
     name: ci_linux ${{ matrix.compiler }} ${{ matrix.build_type }}
     runs-on: [self-hosted, Linux, X64, cachyos-x8664]
@@ -56,10 +58,11 @@ jobs:
       name: ${{ github.actor == 'TheFirstIstari' && 'self-hosted-auto' || 'self-hosted' }}
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     continue-on-error: true
-    # Four runners are registered on the machine (cachyos-x8664-1..4), so this
-    # matrix runs CONCURRENTLY rather than queueing behind a single runner. A
-    # runner process handles one job at a time, so the instance count is what
-    # sets the parallelism -- see scripts/setup-self-hosted-runner.sh.
+    # Six runner instances are registered (cachyos-x8664-1..6), so this matrix
+    # runs CONCURRENTLY rather than queueing behind a single runner.
+    # Measured: `gcc Release` and `clang Debug` completed in 19s each, at the
+    # same time, on the same box.
+    # See scripts/setup-self-hosted-runner.sh and scripts/actions-runner@.service.
     strategy:
       fail-fast: false
       matrix:
