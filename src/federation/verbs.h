@@ -430,8 +430,14 @@ const char *fed_prefix_server(const char *prefix, char *out, size_t cap);
  *   G6  The origin is THIS node. 2.4's never-forward-own-origin, inbound half.
  *   G7  fed_dedup_seen() says this (origin, epoch, id) is already known. The
  *       record happens HERE, at the guard, not after the handler.
- *   G8  The verb is not in 4.3's list.
- *   G9  Arity and field validation for that verb.
+ *   G8  The verb is not in 4.3's list. The SBURST family is asked HERE rather
+ *       than in the table, because its five verbs have five different shapes and
+ *       no common channel position; everything above still applies to it, which
+ *       is the point -- a burst is state replacement and is deduplicated like
+ *       anything else.
+ *   G9  Arity and field validation for that verb. The burst verbs validate
+ *       their own arity in federation/burst.c, because the format is stated
+ *       there and five shapes do not fit one range column.
  *   G10 The handler.
  *
  * WHY THE CHAIN IS STRAIGHT-LINE AND INSIDE THIS FUNCTION. A guard chain that
@@ -451,12 +457,21 @@ const char *fed_prefix_server(const char *prefix, char *out, size_t cap);
  *      line. Refused, counted, and the link is NOT torn down: every 2.4 guard is
  *      unavailable on an untagged relay, and a node that accepts them has no
  *      loop prevention at all.
- *   C  SNAMES/SBURST/SQUIT/SHASH and the reply-shaped verbs. Refused untagged for
+ *   C  SNAMES/SQUIT/SHASH and the reply-shaped verbs. Refused untagged for
  *      the same reason as B, and by a different route: they name state the
  *      SENDER holds, so a relayed one is a claim about somebody else's memory.
  *      FEDERATE is exempt by construction (G2).
  *   D  anything else -- an untagged line with a server prefix that is neither
  *      the link's own name nor a legal 2.4 value. Refused as malformed.
+ *   E  SBURST and its four record verbs, untagged from the link's own server.
+ *      This one is NOT a case A, which mints an identity for the line. A burst
+ *      is O(n) lines forming ONE transaction and case A mints per line, which is
+ *      right for dedup and wrong for a state replacement: a peer that could send
+ *      an untagged burst could make this node replace its whole view of that
+ *      origin, repeatedly, on lines whose 2.4 identity this node invented. The
+ *      one family that REPLACES state is therefore the one family required to
+ *      carry its identity. Counted as malformed rather than as a relay -- a peer
+ *      sending this is not relaying somebody else's burst.
  */
 void fed_dispatch(server_t *s, conn_t *c, const message_t *m);
 

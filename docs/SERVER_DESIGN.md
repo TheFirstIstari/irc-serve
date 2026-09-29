@@ -106,11 +106,40 @@ servers hold at least one member. Without `servers[]` the §3.1 row "forward to
 peers holding members" cannot be evaluated, and `353` cannot be answered for a
 channel that is mostly remote.
 
+**The second half of that sentence is now partly untrue, and the correction is
+recorded here rather than left to a reader to derive from the code.** A `chan_t`
+holds only local members *in `members[]`*; remote membership is a `remotes[]`
+roster **plus** the `servers[]` set. What changed is that the *names* are kept
+rather than being derivable: a node cannot name a member it has never heard the
+name of, and `353` is the whole of 4.2's answer for a channel the node is not in.
+The `servers[]` half is still exactly true and is still what §3.1's forward target
+set is built from.
+
+The roster is keyed by `(nick, server)`, and its entry carries a `host` as well as
+a nickname and prefix flags:
+
+```c
+typedef struct chan_remote {      /* one user on another server */
+    char     nick[64];
+    char     server[64];          /* the 2.3 server holding them   */
+    char     host[128];           /* "" until a resync supplies it */
+    unsigned flags;               /* +o / +v, as for a local member */
+} chan_remote_t;
+```
+
+**`host` is filled by §4.3's `SBURST` and by nothing else, and an empty one is the
+normal state rather than a defect.** A live `SJOIN` carries no host, so a member
+learned from one has `host == ""` and only a resync can fill it — and a resync is
+the rarer event. Anything that renders a remote member has to handle the empty case
+rather than printing half a `nick!user@host`. The reason `server` is part of the
+key is 2.1: duplicate nicks across servers are undefined until Phase 9's
+rename-the-loser, so a nickname alone is not an identity here.
+
 The claim "a server never stores remote state" is **false** — `topic` /
 `topic_who` / `topic_when` are already remote-originated. The honest rule:
 **local state is authoritative; a bounded per-channel remote cache holds topic,
-modes, and the member-server set.** That cache is O(servers), not O(users), so
-it does not reintroduce per-join broadcast cost.
+modes, and the member-server set.** That cache is O(servers) plus a bounded roster,
+not O(users), so it does not reintroduce per-join broadcast cost.
 
 **Ownership rules:**
 - First server to see a channel owns it. The creation race is broken by
@@ -275,6 +304,19 @@ owner holding no local member of a channel now spends a forward on a message it
 delivers to nobody. `servers[]` ∪ `ESTABLISHED` links is a broadcast, not a
 unicast (§3.1's topology paragraph below concedes exactly that). This is bought
 with a loop that did not exist before: see the guard note.
+
+**The second half of that cost had no test until C4, and the reason is worth
+recording because it is a property of the table rather than of the code.** The
+amended `owned`/`message` row applies whether or not the owner has a local member,
+and a fault injected at the spot where the forward is emitted — gating it on the
+local write's result — produced **no failure at all**, because in every message
+test the owner did have somebody to write to. Reaching the zero-member owner
+takes a PART, and only a PART: the owner is left owning a channel with
+`nmembers == 0` and `nservers >= 1`, which is precisely the state
+`chan_dispose_if_empty()` exists to keep. `test_fed_relay.c` now asserts that row
+on **both** sides of it — a non-owner with no local member, and an *owner* with no
+local member — because the two are different rows of this table and a forward arm
+serving both is not evidence that either is right.
 
 **Topology.** Full mesh, one bidirectional link per pair of nodes, and a node
 relays onward from peer P to peer Q. Forwarding to each peer holding members
@@ -483,6 +525,94 @@ A resync **replaces** state for that origin; it never merges. There is no
 partial burst and no delta. `SBURST` is **Phase 6**, not Phase 9 — it defines the
 wire format, and a wire format cannot be invented later.
 
+#### 4.3.1 The wire format, frozen in Phase 6
+
+One line per record, and one line per **member** rather than a packed member
+list. Five verbs:
+
+```
+:<origin> SBURST  <epoch> <nnicks>
+:<origin> SBURSTN <nick> <user> <host> <modes> <signon> :<away>
+:<origin> SBURSTC <chan> <origin> <topic_who> <topic_when> <modes> :<topic>
+:<origin> SBURSTM <chan> <nick> <flags>
+:<origin> SBURSTE <epoch> <nnicks> <nchans> <nmembers>
+```
+
+Every line carries §2.4's internal tag block with `hops=0`, and the id is
+**different per line** — a burst is O(n) lines, and one id for the transaction
+would leave every record after the first dropped as a duplicate. The prefix is
+the burst origin. `<epoch>` is how a peer restart is detected, and it is also how
+`server_link_t::epoch` is populated on the far side; a terminator whose epoch
+differs from the link's is a restart, and the link adopts it, because §2.4's dedup
+key pairs the epoch with the id and a mismatched pair aliases. An empty middle
+parameter is the literal `-` (empty middle tokens are unrepresentable — see 3.2);
+`<flags>` is `-`, `o`, `v` or `ov`, **not** the SJOIN token's `+ov`.
+
+**One line per record, and not a packed list, is the load-bearing choice.** `topic`
+is 256 bytes and `away` is 256 bytes and both may contain spaces, `:` and `;`, so
+a packed list needs an escape alphabet — and every escape alphabet is a second
+grammar to get wrong on both sides of a wire that cannot be revised. There is also
+no legal separator: §2.1's `valid_nick()` excludes `@ # & + ! : ;` and every byte
+`<= 0x20` but **accepts `,`, `%` and every byte `>= 0x80`**, so `nick,nick` and
+`nick%nick` are both legal nicknames and neither can be forbidden. One line per
+record sidesteps the whole thing, because 3.2's formatter already refuses a
+parameter containing SP/HTAB/CR/LF, refuses `:` outside the final position, and
+renders the final parameter colonned: **there is no escape function and no
+delimiter.** The price is bytes, and it is charged against a bound rather than a
+line length — see below.
+
+**It is a BEGIN/COMMIT transaction because a receiver cannot know a burst has
+ended unless it is told.** Records accumulate in a shadow and are installed in one
+step at `SBURSTE`, so a burst that stops half way is invisible. `SBURSTE`'s three
+counts are **asserted against what was accumulated, never trusted**: a mismatch is
+a truncated transaction and the whole thing is discarded, leaving the previous
+state untouched. The shadow is discarded on a count mismatch, on a volume overrun,
+on a malformed record, on a link drop, and on a new `SBURST` beginning; a guard
+rejection *mid*-burst needs no separate rule, because every record a burst can
+carry is counted and a dropped one makes the terminator disagree.
+
+**The budget is volume, not line length.** The worst case is 753 bytes for
+`SBURSTC` and 787 for `SBURSTN` against an `IRC_MAX_LINE` of 8192 — 9%, so a
+per-line check would be a formality. The real constraint is that 3.4 **drops** a
+saturated peer link rather than buffering it, and a burst is O(nicks + members), so
+a large node's burst can be megabytes and queueing it all would starve every live
+message behind it. A burst is therefore assembled into a staging buffer of
+`IRC_BURST_MAX_BYTES` = `CONN_WQ_MAX / 2` — half a link's queue, so a resync can
+never crowd out a live message — and a burst that does not fit is **refused in
+full** with one `n_burst_refused`: nothing queued, the link untouched, no
+truncation. The receiver charges every record against the same bound, because the
+shadow is memory made out of what a peer *said*. `fanout_line_fits()` is not used:
+it charges the *client* envelope (a 64-byte channel name and a 64-byte hostmask)
+against `IRC_MAX_RELAY_LINE`, and a `SBURST*` line is neither.
+
+**Both sides burst, which is a deliberate superset of "the initiator sends full
+state".** A node only forwards to peers that already hold the `chan_t`, so if only
+the initiator burst, the responder's channels would never reach the initiator: in a
+two-node fixture a user on the responder would be invisible to the initiator for
+ever, and Phase 6's full-`353` criterion would fail on one of the two nodes. Both
+sides bursting is a superset of the sentence above, costs one extra burst per link,
+and is what makes "on **every** link establishment" mean what a reader expects. The
+two transactions cross on the wire and neither waits for the other: a burst is a
+statement about the sender, and the sender's state does not change because somebody
+received it.
+
+**What Phase 6 deliberately does not do.** The burst is the origin's own state, not
+a relayed one: a burst whose tag block names a third server is refused, and the
+whole family is refused *untagged*, because a node that could replace its entire
+view of an origin with lines whose 2.4 identity the receiver invented has no loop
+prevention at that point. A member record is keyed by the **burst origin**, not by
+the member's own server, because 4.3's frozen `SBURSTM` carries no server field;
+that is exact on a two-node mesh and a cache on a larger one, and a member the
+receiver already knows under any key is left alone rather than installed twice —
+two entries for one person is a `353` that renders the same nickname twice with
+nothing on the node able to explain it. `SBURSTN` carries `user`, `modes`, `signon`
+and `away` and the receiver keeps only `host`; the rest are for 2.1's remote-nick
+registry, which is Phase 9. A channel's creation race is **not** re-keyed from a
+burst: 2.2's tie-break needs the (epoch, name) of the *first* creator and the wire
+carries one epoch. **Driving** the resync — link loss, reconnect, backoff — is
+Phase 9, which is why 8's "link loss and reconnect re-syncs channel state via
+`SBURST`" is still open: Phase 6 owns the verb and the format, not the policy.
+
 ### 4.4 Numerics
 
 Registration `001`–`005`; channel `331` `332` `333` `353` `366` `324` `329`;
@@ -666,6 +796,22 @@ relay nodes for the criterion to be about. A message relayed back to where it
 came from is **expected** under the amended row and is bounded by §2.4 rather
 than forbidden by the routing table: `test_fed_loop.c` requires exactly one such
 bounce and then requires the loop counters to stop moving.
+
+*Accept status after C4 (what is provably met, and what is not).* Criterion 2 is
+met **after a resync** as well as before one, which is the stronger form: three
+resyncs over one established link, and the full `353` contents on both nodes after
+each. The replace-not-merge property behind the word "resync" has four distinct
+tests, and two of the four could **not** be produced by client commands on a
+two-node mesh at all — a member the origin loses is always removed on the far side
+by an `SPART` first, and a channel A no longer has is always removed by its
+forwarded `PART` — so the fixtures create those states deliberately and say so.
+Not met, and deliberately so: **link loss and reconnect driving a resync** is
+Phase 9, so §8's "link loss and reconnect re-syncs channel state via `SBURST`"
+remains open and this phase makes no claim about it. A three-node mesh, the only
+topology in which a resync is a genuine *re*-sync rather than a first exchange, is
+also out of scope here; §4.3.1 records what the format gives up on a larger mesh
+(member records are keyed by the burst origin, and a receiver that already knows a
+nickname leaves the existing attribution alone).
 
 **Phase 7 — Command surface + skip gate empty.** The SHOULD commands; CI fails
 on any skip. *Accept:* zero skipped tests.

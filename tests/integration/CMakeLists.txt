@@ -218,6 +218,16 @@ irc_add_integration_test(test_fed_loop test_fed_loop.c)
 # channel's SPRIVMSG to the owner.
 irc_add_integration_test(test_fed_relay test_fed_relay.c)
 
+# 4.3 / 7/Phase 6 acceptance criterion 2: the FULL 353 CONTENTS on BOTH nodes
+# after a resync, in the Phase 4 order and terminated by a 366 -- and the
+# replace-never-merge property the resync exists for, which needs three bursts
+# over one established link because "replaces" is three different claims. The
+# middle one (an origin de-privileging a member) has teeth with no fixture poke
+# anywhere in it; the third (a member the origin lost) cannot be produced by
+# client commands on a two-node mesh at all, because the SPART would have
+# removed the member first, and the test says so and pokes deliberately.
+irc_add_integration_test(test_fed_burst test_fed_burst.c)
+
 # 2.4: the inbound guard chain, driven by a peer that is trying to get past it.
 # Every guard is a refusal of a line a well-behaved node would never send, so the
 # far end of the link has to be a raw socket rather than a second node.

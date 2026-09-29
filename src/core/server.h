@@ -453,6 +453,33 @@ struct server {
     uint64_t  n_fed_dup_drop;
     uint64_t  n_fed_dedup_dup;
 
+    /* ------------------------------------------------------------------------
+     * Phase 6 C4: the 4.3 resync, which is a TRANSACTION and therefore has two
+     * ways to fail rather than one. federation/burst.c is the only writer.
+     *
+     * n_burst_refused counts an OUTBOUND burst this node declined to send
+     * because it did not fit the staging budget (IRC_BURST_MAX_BYTES, which is
+     * half a link's write queue). It is "declined" rather than "failed": nothing
+     * was queued, the link was not touched, and the node's own view is
+     * untouched. A non-zero value is a node whose state is larger than half a
+     * link's queue, which is a finding rather than a statistic.
+     *
+     * n_burst_abandoned counts an INBOUND burst discarded before its terminator
+     * -- a count mismatch, an over-large transaction, a malformed record, or a
+     * link that went away mid-burst. It is the observable half of 4.3's "a
+     * resync replaces, never merges": the discard is what leaves the PREVIOUS
+     * state in place, so a node whose peer has a broken resync is a node whose
+     * roster is quietly stale, and a counter is the only thing that says so.
+     *
+     * They are NOT the same event and are not incremented together, which is why
+     * the pair above them -- one guard, one event, two counters at two levels of
+     * reading -- is not this pair. A burst that never left is a different problem
+     * from one that arrived and was thrown away, and an operator diagnosing a
+     * stale roster wants the second number and an operator diagnosing a node
+     * that cannot sync wants the first. */
+    uint64_t  n_burst_refused;
+    uint64_t  n_burst_abandoned;
+
     int       trace;             /* emit [observable] per-line output */
 };
 
