@@ -84,7 +84,7 @@ jobs:
           cmake -B build -S . -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=${{ matrix.compiler }}
           cmake --build build --parallel "$(nproc)"
-          ctest --test-dir build --output-on-failure --timeout 60
+          ctest --test-dir build --output-on-failure --timeout 60 -j 2
 
   # --- Independent merge gate: hosted, so it works when the runner is off ---
   # Deliberately small and deliberately hosted. This is the check that keeps a
@@ -103,7 +103,7 @@ jobs:
         run: cmake --build build --parallel $(nproc)
       - name: Unit Tests
         working-directory: build
-        run: ctest --output-on-failure --timeout 60
+        run: ctest --output-on-failure --timeout 60 -j 2
 
   # --- macOS: cannot run on the self-hosted machine -----------------------
   ci_macos:
@@ -123,7 +123,7 @@ jobs:
         run: cmake --build build --parallel $(sysctl -n hw.ncpu)
       - name: Unit Tests
         working-directory: build
-        run: ctest --output-on-failure --timeout 60
+        run: ctest --output-on-failure --timeout 60 -j 2
       - name: Verify Spec References
         shell: bash
         run: |
@@ -253,7 +253,7 @@ jobs:
           # sanitizer nobody acts on.
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: halt_on_error=1
-        run: ctest --output-on-failure --timeout 120
+        run: ctest --output-on-failure --timeout 120 -j 2
 
   # --- Advisory only, hosted ---------------------------------------------
   # Benchmark and compliance run on the hosted runner rather than the
