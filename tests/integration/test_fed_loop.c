@@ -104,6 +104,9 @@
 #include "harness/test_util.h"
 
 #define T_IO_MS 15000
+/* How long settle_relay_counters() waits to see whether the node has anything
+ * new to report. 20 poll ticks. */
+#define T_SETTLE_MS 1000
 
 #define SECRET     "irc-serve-federation-secret-a"
 #define NAME_A     "irc.a"
@@ -363,30 +366,37 @@ static void read_relay_counters(nf_node_t *n, const char *who,
 static void settle_relay_counters(nf_node_t *n, const char *who,
                                   relay_counters_t *out)
 {
-    relay_counters_t prev;
-    int stable_rounds = 0;
+    /* The fixture publishes a stats line ON CHANGE (nf_child_tick), so a node
+     * with nothing to report is SILENT. Waiting for another republication to
+     * prove stability therefore cannot succeed -- under ASan, where everything is
+     * slow enough to have genuinely finished, the wait ran the full 15s and timed
+     * out on a mesh that had settled long before.
+     *
+     * So silence IS the signal: a bounded wait for a republication that does not
+     * come is how we learn nothing moved. T_SETTLE_MS is 20 poll ticks, long
+     * enough that a node which was going to publish would have, short enough to
+     * cost nothing when it did not. It is a deadline wait, not a fixed sleep
+     * (6.3), and the loop below still folds in every republication that DOES
+     * arrive, so a mesh that keeps moving is followed rather than declared
+     * settled.
+     *
+     * A genuinely circulating mesh is caught by the delivery count downstream,
+     * which is a stronger signal than any counter moving. */
+    int moved = 1;
 
     read_relay_counters(n, who, out);
-    prev = *out;
 
-    while (stable_rounds < 2) {
-        size_t before = stats_lines(n);
+    while (moved) {
+        size_t seen = stats_lines(n);
+        relay_counters_t prev = *out;
 
-        if (nf_expect_nth(n, "[fixture] stats", before + 1u, T_IO_MS) != 0) {
-            /* Deadline. Report what we have; the assertions below say whether
-             * that was good enough. A genuinely circulating mesh is caught by the
-             * delivery count rather than by hanging here. */
-            return;
+        if (nf_expect_nth(n, "[fixture] stats", seen + 1u, T_SETTLE_MS) != 0) {
+            return; /* nothing was republished: nothing moved */
         }
         read_relay_counters(n, who, out);
-        if (out->own_origin == prev.own_origin &&
-            out->dup_drop == prev.dup_drop &&
-            out->hop_drop == prev.hop_drop) {
-            stable_rounds++;
-        } else {
-            stable_rounds = 0;
-        }
-        prev = *out;
+        moved = (out->own_origin != prev.own_origin ||
+                 out->dup_drop != prev.dup_drop ||
+                 out->hop_drop != prev.hop_drop);
     }
 }
 
