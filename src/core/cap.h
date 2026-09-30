@@ -135,6 +135,12 @@ int cap_multiprefix_enabled(const conn_t *c);
  * enable, and gets nothing rather than a tag in a protocol it opted out of. */
 int cap_message_tags_enabled(const conn_t *c);
 
+/* draft/message-ids: whether this node writes a `msgid` on a delivered message
+ * to this client. REQUIRES message-tags as well, and the two are not
+ * interchangeable -- see cap.c for why a msgid without tag support is not a
+ * best-effort thing to do. */
+int cap_message_ids_enabled(const conn_t *c);
+
 /* Handle one `CAP` line. Returns 1 if it was handled, 0 if it was not a CAP at
  * all (which cannot happen: the caller has already dispatched on the verb). */
 void cap_handle(server_t *s, conn_t *c, const message_t *m);

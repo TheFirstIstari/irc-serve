@@ -108,6 +108,16 @@ irc_add_integration_test(test_registration test_registration.c)
 # that never implemented CAP.
 irc_add_integration_test(test_cap_negotiation test_cap_negotiation.c)
 
+# 7/Phase 8: the IRCv3 `msgid`. Its own file because it is the only capability
+# whose whole property is a value INVARIANT across a hop, so three of its four
+# cases need clients that negotiated the capability and one of them needs two
+# nodes: the advertised table agrees with what is written, the gate is both
+# capabilities or neither, the value is 2.4's own (origin, epoch, id) rendered
+# rather than a second counter, and the two clients on two processes see the SAME
+# string. The last of those fails with either of the two mints broken and passes
+# with both correct, which is what makes it the case worth having.
+irc_add_integration_test(test_ircv3_msgid test_ircv3_msgid.c)
+
 # test_multi_prefix is here too, and it is STILL A SKIP at the moment of writing:
 # a `353` roster is produced by a server over a socket, which is why it left
 # tests/protocol/, but the multi-prefix capability itself is not implemented yet
