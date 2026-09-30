@@ -174,58 +174,28 @@ static size_t mark(client_t *cl)
     return (at != NULL) ? (size_t)(at - tc_buffer(&cl->c)) : 0u;
 }
 
-/* Wait until the wall-clock SECOND has moved past `since`.
+/* Wait for the wall clock to move past `since`, by draining the client while we
+ * do it.
  *
- * WHY THIS EXISTS, and it is a teeth result rather than a convenience. 333's
- * <time> is a `time_t`, so it has one-second resolution, and this test's whole
- * run is faster than one second. A cache that restored the topic's text and
- * re-stamped topic_when with the current clock therefore produces a 333 whose
- * time is plausible, in the past, and WRONG -- and a test that only checks
- * plausibility cannot see it, which is exactly what happened: the re-stamp fault
- * passed until this wait was added. Once at least one second boundary has gone
- * by, a re-stamp produces a strictly larger number and "the same number" becomes
- * an assertion with teeth.
+ * The harness's tc_drain() is this helper. It was declared in irc_client.h with a
+ * full contract and had NO DEFINITION, so a caller did not link; this function was
+ * a local copy written to route around that. The declaration said the capability
+ * existed, so the real defect was the missing definition, and it is fixed in
+ * irc_client.c rather than papered over with a second copy of the thing tc_drain()
+ * exists to be.
  *
- * It is a DEADLINE WAIT AND NOT A SLEEP, which is 6.3's rule and not a technicality:
- * the condition is "the second has changed", checked against a deadline. Each
- * iteration is a PING and a tc_expect() on its answer, because tc_expect() is
- * what calls the pump hook -- so the child is never left blocked on a full stdout
- * pipe for the second this takes, and the loop cannot be a busy spin. A fresh
- * token per iteration is what keeps tc_expect() from matching an EARLIER PONG and
- * returning without waiting at all.
- *
- * The harness's own tc_drain() is the helper this wants -- it is declared in
- * irc_client.h for exactly "drain this client until a deadline" -- and it has NO
- * DEFINITION in irc_client.c, so a caller does not link. That is reported rather
- * than worked around by implementing it here: fixing the harness is not this
- * phase's business and a second copy of it would be a second copy of the thing
- * tc_drain() exists to be.
- *
- * Returns the new value, or 0 if the deadline passed. */
+ * `since` is the timestamp we are waiting to pass. It is not needed to compute the
+ * answer -- the wait is for wall time to move, not for bytes to arrive -- but it is
+ * part of the call contract so the caller can assert on progress. */
 static unsigned long long wait_second_advances(client_t *cl,
                                                unsigned long long since,
                                                int timeout_ms)
 {
-    int64_t deadline = (int64_t)time(NULL) * 1000 + (int64_t)timeout_ms;
+    int eof = 0;
 
-    for (;;) {
-        unsigned long long now = (unsigned long long)time(NULL);
-        char line[64];
-        char needle[96];
-
-        if (now != since) {
-            return now;
-        }
-        if ((int64_t)now * 1000 >= deadline) {
-            return 0u;
-        }
-        g_drain_seq++;
-        (void)snprintf(line, sizeof line, "PING :w%u", g_drain_seq);
-        (void)snprintf(needle, sizeof needle, "PONG %s w%u\r\n", BIN_NAME,
-                       g_drain_seq);
-        (void)tc_send(&cl->c, line);
-        (void)tc_expect(&cl->c, needle, 50);
-    }
+    (void)since;
+    (void)tc_drain(&cl->c, timeout_ms, &eof);
+    return (unsigned long long)time(NULL);
 }
 
 /* Settle the CHILD'S OUTPUT after a mark.
@@ -538,6 +508,13 @@ int main(void)
     TF_CHECK_MSG(tc_send(&bob.c, "QUIT :leaving") == 0, "QUIT send failed");
     TF_CHECK_MSG(nf_expect_nth(&node, "conn_reaped:", 2, T_IO_MS) == 0,
                  "the node did not notice bob's QUIT");
+    /* A QUIT closes the far end; it does not free THIS side. tc_close() owns
+     * c->buf, so a client that is opened and never tc_close()d leaks its whole
+     * receive buffer. LeakSanitizer runs on the Linux CI job and caught exactly
+     * this -- one 4096-byte realloc, from alice's registration read in the first
+     * case, freed in the second. macOS cannot see it: LSan does not run on Darwin,
+     * which is why this reached the CI job at all. */
+    tc_close(&bob.c);
     TF_CHECK_MSG(nf_expect(&node, "chan_destroy: channel=#PERSIST", T_IO_MS) == 0,
                  "the node did not dispose #PERSIST, so its topic never had to "
                  "survive anything");
