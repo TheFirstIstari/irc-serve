@@ -314,16 +314,28 @@ int message_tag_get(const message_t *m, const char *key, char *out, size_t cap);
 
 /* Escape `value` per IRCv3 into `out` (NUL-terminated), returning the byte
  * count written or 0 if it does not fit -- never truncating. The escape set is
- * the one 3.2 and 5 name: a backslash before ':', ';', ' ', '\', CR or LF, so
- * the escaped forms are "\:", "\;", "\s", "\\", "\r" and "\n". A lone trailing
- * '\' is DROPPED when unescaping, which is what makes a literal backslash have
- * to be SENT as "\\" rather than as a single byte. */
+ * the one IRCv3 message-tags defines: `;` -> `\:` , ' ' -> `\s`, `\` -> `\\`,
+ * CR -> `\r`, LF -> `\n`, and every other byte raw. A COLON IS NOT ESCAPED --
+ * `\:` is how a SEMICOLON is written, which reads backwards and is not a typo.
+ * An earlier version of this header named `:`, `;`, ' ', `\`, CR and LF as the
+ * set and `core/message.c` implemented exactly that, which was the wrong table
+ * in both directions; both are retracted in Phase 8.
+ *
+ * A lone trailing '\' cannot be SENT: it has no two-byte encoding, because on
+ * the wire it would be read as the start of one. That is why a literal
+ * backslash has to be sent as `\\`.
+ *
+ * The implementation is `ircv3_escape_value()` in `ircv3_tags.h`, and this is a
+ * wrapper rather than a second copy. The cost is one call per value on the
+ * serialize path. */
 size_t message_tag_escape(const char *value, char *out, size_t cap);
 
 /* The inverse of message_tag_escape. Returns 0 on success, -1 if `value` does
- * not fit in `out`. A '\' before any character outside the escape set yields
- * that character literally; a lone trailing '\' is dropped, per the rule
- * above. */
+ * not fit in `out`. Per the specification a '\' before any character OUTSIDE the
+ * five-item set has its BACKSLASH DROPPED and yields that character (`\b` is
+ * `b`), and a lone trailing '\' produces no output character at all. Refusing
+ * such a block instead would make this node stricter than the specification and
+ * would drop a peer's message over a byte that costs nothing. */
 int message_tag_unescape(const char *value, char *out, size_t cap);
 
 /* Serialize a whole block from key/value pairs: "k=v;k2=v2", NO leading '@'.
