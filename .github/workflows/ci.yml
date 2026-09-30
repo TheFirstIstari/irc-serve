@@ -83,7 +83,13 @@ jobs:
           set -euo pipefail
           cmake -B build -S . -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=${{ matrix.compiler }}
-          cmake --build build --parallel "$(nproc)"
+          # NOT $(nproc). Four matrix jobs land on this box at once, so asking each
+          # for every core asks for 128 compiler processes on 32 cores. That is
+          # 4x oversubscribed, and it is why ci_linux clang Debug failed in CI
+          # while passing 56/56 in 8.78s when run alone on the same machine
+          # (measured on cachyos-x8664). Divide instead: four jobs, so each gets a
+          # quarter of the cores.
+          cmake --build build --parallel "$(( $(nproc) / 4 ))"
           ctest --test-dir build --output-on-failure --timeout 60 -j 2
 
   # --- Independent merge gate: hosted, so it works when the runner is off ---
