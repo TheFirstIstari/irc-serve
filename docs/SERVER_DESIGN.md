@@ -908,6 +908,77 @@ also out of scope here; §4.3.1 records what the format gives up on a larger mes
 and §4.3.1's open question records the one relay behaviour the design has not
 picked.
 
+*Accept status after C5, part two: what a node does when a peer goes away.* §2.2's
+fail-closed rule and `SQUIT` are the other half of Phase 6, and they are **proved
+on the wire** by `test_fed_resync.c`:
+
+- **Orphaned, fail closed.** With no `ESTABLISHED` link to a channel's origin, a
+  client on a node that does not own that channel gets `437` **naming the origin**,
+  asserted from the client's own bytes and not from a node log line, with the
+  `state=ORPHANED` line beside it to say which refusal it was. `NAMES` still
+  answers in the same state, and the local members still see each other, and the
+  remote roster is still served — a dead **link** is not a departed **server**, and
+  nothing purges it.
+- **No auto-redial.** The latch is `server_link_t::created_ms`; `fed_link_reset()`
+  is the only thing that clears it and the tick does not, so a node whose link
+  fails dials that peer exactly once. Asserted *after* the case's client traffic,
+  not the moment the link died: checked there it passes against a node that
+  re-dials on every tick, because that tick has not run yet. The teeth found that.
+- **Resurrection.** Re-linking a server of the **same name** brings the channel
+  back, and the assertion is a **round trip** — the client is accepted, the
+  `SJOIN` is forwarded, and the far node's own output shows the member arriving —
+  because an absence of `437` is also what a node that silently dropped the
+  request produces. Reaching it required one fix outside the new code: the
+  handshake's uniqueness check treated a link with **no descriptor** as a rival
+  claim on the name, so a peer that re-dialled after a partition was told
+  `NAME_IN_USE` by a link with no socket on it and §2.2's resurrection was
+  unreachable. A link that holds a descriptor is still a claim; one that does not is
+  a name and a destination, and it is reused rather than duplicated.
+- **`SQUIT` fan-out, and the per-origin purge.** A link going down tells every
+  **other** `ESTABLISHED` peer that this node's name is gone, with **one** 2.4
+  identity for the whole fan-out (the dedup store is per node, so two peers
+  carrying one key is what lets a third node drop the second copy). The receiver
+  purges that origin's roster entries and its `servers[]` name and **forwards it
+  onward**, and the purge is **per origin**: a roster belonging to an unrelated
+  origin survives, which is the assertion with teeth. `SQUIT` is **not** in the
+  S-verb table `fed_sverb_for()` reads — that table is §4.3's *forwarded*
+  vocabulary and a departure relays nothing — and it is **refused** on a peer that
+  says *this* node is gone, on its own counter, without costing the link.
+
+**The topology limits of those claims, stated rather than implied.** A link going
+down can only be announced to a peer that is *still up*, so a **two-node** mesh
+produces no announcement at all: the link that died was the only link. The
+smallest fixture that reaches the claim is **four** nodes (an announcer with two
+peers, a receiver with two, and a second origin for the receiver), which
+`test_fed_resync.c` builds and says so. And on a two-node mesh the member's server
+and the burst origin are the same string, so §4.3.1's `SBURSTM` `<server>` field is
+exercised for **shape** but cannot distinguish a receiver that honours it from one
+that ignores it; a **three-node** fixture is the only thing that tests it, and
+there is none. A roster purge is proven per origin **across** channels, not within
+one: only a node that believes it owns a channel emits an `SJOIN` for it (§3.1's
+non-owned row forwards to the owner and nowhere else), so two origins reporting
+one channel means two owners, which is the creation-race gap `fed_in_channel()`
+documents. None of this is coverage that exists.
+
+**What is still open, after all of that.** §8's "link loss and reconnect
+re-syncs channel state via `SBURST`" remains open: C5 proves that a failed link is
+**not** re-dialled and that a *deliberate* retry works, and it drives the retry
+from the test through the `fed_link_reset()` seam. What is missing is the policy —
+backoff, a retry budget, whether a peer that was ever established is dialled more
+eagerly than one that never was — and a `SBURST` **triggered** by a reconnect
+rather than by establishment. §2.2's re-election is not started and must not be:
+§9's risk row says it needs a per-channel epoch in the dedup key, which breaks
+§2.4's `(origin,epoch,id)`.
+
+**One cost of the `SQUIT` trigger, which is a design property and not an
+implementation detail.** The announcement is made when *one link* dies, not when
+the node leaves, so on a mesh where this node is still reachable by somebody else
+the peers told here purge a roster for a server that is still there, and it comes
+back only from a later `SJOIN` or the next burst — which Phase 9 owns. That window
+is the price of telling anybody at all, and it is bounded only by that policy; a
+reader who finds it surprising should read it as the question Phase 9 answers
+rather than as a defect C5 could have avoided.
+
 **Phase 7 — Command surface + skip gate empty.** The SHOULD commands; CI fails
 on any skip. *Accept:* zero skipped tests.
 
@@ -939,7 +1010,23 @@ Single node:
 Federated:
 - [ ] Two-node fixture: cross-server join visibility, cross-server `PRIVMSG`
       delivered exactly once, no message loops
-- [ ] Link loss and reconnect re-syncs channel state via `SBURST`
+- [ ] Link loss and reconnect re-syncs channel state via `SBURST` — **still open,
+      and Phase 6 makes no claim about it.** Phase 6 owns the verb, the wire
+      format, and the *effect* of a resync (tested after a resync, not only
+      before one), and it proves the two halves either side of the gap: a failed
+      link is **not** re-dialled (the latch), and a deliberate retry through
+      `fed_link_reset()` re-establishes and re-bursts. What is missing is the
+      **policy** — backoff, retry budget, and what triggers a resync on reconnect
+      rather than on establishment. Phase 9.
+- [ ] A peer that goes away is announced and forgotten — **met in C5, with the
+      topology limit stated.** A link going down makes the node send `SQUIT` for
+      its own name to every other `ESTABLISHED` peer, the receiver purges **that
+      origin's** roster and `servers[]` entry and forwards the announcement on, and
+      an unrelated origin's roster survives. A claim about **this** node is refused
+      and does not cost the link. Not proven: a two-node mesh produces no
+      announcement (the link that died was the only link), the purge is proven
+      across channels rather than within one, and "the node's own name is gone" is
+      an over-claim when only one of its links died — see §7/Phase 6.
 - [ ] Two nodes cannot both be named `irc.a` — rejected at handshake
 - [ ] Observability: a way to dump peers + their FSM states, channels with
       origin and local/remote server sets, and the dedup table size.
@@ -951,6 +1038,14 @@ Federated:
 - [ ] *Phase 9:* network-visible nick ambiguity resolved by rename-the-loser
       plus a nick-registry broadcast. Until then, duplicate cross-server nicks
       are user-visible and undefined
+- [ ] Origin is immutable and a dead origin is **failed closed**: local members
+      still see each other, origin-requiring actions are `437` naming the origin,
+      and re-linking a server of the same name resurrects the channel — **met in
+      C5, and no code path re-elects an origin.** The only writer of
+      `chan_t::origin` after creation is Phase 4's `chan_rekey()` creation-race
+      tie-break, which is not a re-election; §9's risk row says re-election needs a
+      per-channel epoch in the dedup key and must not begin without re-opening
+      §2.4.
 
 Quality:
 - [ ] ASan/UBSan/LeakSanitizer clean

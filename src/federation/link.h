@@ -12,8 +12,11 @@
  * ---------------------------------------------------------------------------
  * The link LIFECYCLE and the handshake, and nothing else. This file can take a
  * peer from "configured" to "ESTABLISHED", keep it alive, notice that it is not,
- * and say so on stdout. It does not carry messages: the inbound S-verb guard
- * chain and its handlers are federation/verbs.c's fed_dispatch() (C3), and the
+ * say so on stdout, and tell the node's other peers that its own name is going
+ * away (a `SQUIT`, queued from fed_link_down() and emitted straight onto the
+ * wire rather than through the forwarded-verb table, for the reason the function
+ * states). It does not carry messages: the inbound S-verb guard chain and its
+ * handlers are federation/verbs.c's fed_dispatch() (C3), and the
  * resync is federation/burst.c's -- which this file CALLS, at establishment and on
  * link-down, and does not implement. The consequence to be aware of while reading
  * the tick is written out under "WHAT T3 COSTS A TEST" below -- it is the one place
@@ -121,6 +124,12 @@
  * (including this commit's own test) do the same. A C3 or C4 test that
  * configures both directions will see no link at all, and that is the symptom
  * to recognise.
+ *
+ * A FOUR-node fixture (tests/integration/test_fed_resync.c) configures each of
+ * its three pairs in one direction for the same reason, and it needs four nodes
+ * for a reason of its own that comes from the same corner: a link that goes down
+ * announces this node's departure to the peers that are still up, so a two-node
+ * mesh has nobody to announce to and the announcement cannot be observed at all.
  */
 #ifndef IRC_FEDERATION_LINK_H
 #define IRC_FEDERATION_LINK_H
@@ -342,6 +351,16 @@ const char *fed_federate_reason(fed_federate_result_t result);
  *      connection announcing a name the link it is running on does not have,
  *      which is a misconfiguration rather than a second route, and it does not
  *      count as a duplicate.
+ *
+ *      "Rival" MEANS A LINK THAT HOLDS A DESCRIPTOR, and that is a correction
+ *      rather than a restatement. A link in INIT with fd == -1 is a name and a
+ *      pre-resolved destination -- what fed_dead() leaves behind -- and not a
+ *      claim on the name. Counting it as one made 2.2's "re-linking a server of
+ *      the same name resurrects the channel" unreachable, because the peer that
+ *      re-dialled was refused NAME_IN_USE by a link with no socket on it. A link
+ *      that HOLDS a descriptor is still a claim in every state, including
+ *      FAILED and TIMED_OUT: T2 leaves the descriptor alone on purpose, so
+ *      clearing that case is fed_link_reset()'s job and not this check's.
  */
 fed_federate_result_t fed_check_federate(const server_t *s,
                                          const server_link_t *self,
@@ -490,7 +509,17 @@ void fed_on_federate(server_t *s, conn_t *c, const message_t *m);
  * route -- whereas a link that WAS established and has gone away is a link the
  * node must stop believing in. Resetting a never-established link to INIT would
  * make the two cases look identical, which is exactly the distinction T7's
- * latch and the state dump exist to keep visible. */
+ * latch and the state dump exist to keep visible.
+ *
+ * AND BOTH PATHS THROUGH fed_link_down() ANNOUNCE THE DEPARTURE, which is a
+ * deliberate consequence of the announcement living in the shared body rather
+ * than in the dead path alone. A SQUIT for this node's own name goes to every
+ * ESTABLISHED peer before the teardown, and a deliberate reset IS a departure:
+ * the link it is about to re-dial is not up, so a peer holding this node's
+ * roster has a stale one from this moment. The cost is that a Phase 9
+ * reconnect, which calls this once per retry decision, tells the mesh the
+ * server is gone each time it retries -- which is true, and is the reason the
+ * SQUIT is cheap to make idempotent rather than expensive to make quiet. */
 void fed_link_reset(server_t *s, server_link_t *link);
 
 /* Dump every link and the link counters, one [observable] line for the node and

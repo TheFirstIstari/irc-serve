@@ -292,6 +292,44 @@ int fed_queue_line(server_t *s, conn_t *peer, const irc_serve_tags_t *tags,
  * reads topic_when from the origin's own record and a re-burst corrects it.
  *
  * ---------------------------------------------------------------------------
+ * SQUIT, WHICH IS NOT ONE OF THOSE ROWS, AND WHY
+ * ---------------------------------------------------------------------------
+ *   SQUIT     <server> [<reason>]
+ *             `:irc.b S@1 SQUIT irc.b :bye`
+ *
+ * It is frozen here rather than in the table above because it is a DIFFERENT KIND
+ * of line: every row above is about a CHANNEL, at a parameter position the verb
+ * fixes, and this one names a SERVER and no channel at all. The prefix is the
+ * server that is going away, which is also this node's own name on the emission
+ * federation/link.c makes when one of its links dies.
+ *
+ * THE REASON IS OPTIONAL AND NEVER SENT BY THIS NODE, and both halves of that
+ * are the decision rather than an omission. It is optional because 3.2's rule --
+ * a value needing ':' is only representable in the final position -- makes a
+ * trailing free-text parameter the one safe place to put a reason, so an
+ * implementation that has one can send it without a second grammar. It is never
+ * sent because nothing on this node has a reason for a peer to depart: there is
+ * no shutdown notice, no kick threshold and no admin action, and an unused field
+ * on a wire format is a field a second implementation has to guess about. The
+ * receiver reads the first parameter and ignores the rest, so a peer that sends
+ * one is interoperable rather than refused.
+ *
+ * IT IS NOT IN S_VERBS ABOVE, and that is the same conclusion the link keepalive
+ * reaches (see the top of this file). That table maps CLIENT verbs a node
+ * RELAYS, and a node announcing its own departure relays nothing -- and the
+ * column on the left is a client verb, so a row here would claim a client-facing
+ * SQUIT that this node does not have. The line is named directly at its one
+ * emission site and queued through the same fed_queue_line() as every other
+ * outbound peer line, which is the half that genuinely is shared.
+ *
+ * WHAT IT DOES ON RECEIPT: it purges that server's remote roster entries and its
+ * name from every channel's servers[] -- PER ORIGIN, never a global wipe -- and
+ * it is REFUSED, counted on its own counter, and does not touch the link when it
+ * names THIS node. 2.2's fail-closed rule is about a LINK that is down, which is
+ * a different fact from a SERVER that has announced its own departure, and the
+ * two are deliberately not treated alike.
+ *
+ * ---------------------------------------------------------------------------
  * WHY server_queue() AND NOT reply()'s DOOR
  * ---------------------------------------------------------------------------
  * reply.c's emit_to_client() REFUSES a CONN_SERVER destination, and that refusal
@@ -434,7 +472,10 @@ const char *fed_prefix_server(const char *prefix, char *out, size_t cap);
  *       than in the table, because its five verbs have five different shapes and
  *       no common channel position; everything above still applies to it, which
  *       is the point -- a burst is state replacement and is deduplicated like
- *       anything else.
+ *       anything else. SQUIT is asked here too, for the same structural reason
+ *       (it names no channel at all, so there is no position to read) and NOT for
+ *       the burst's reason: it is a state-destroying line, so being deduplicated
+ *       by the chain above is exactly what it needs.
  *   G9  Arity and field validation for that verb. The burst verbs validate
  *       their own arity in federation/burst.c, because the format is stated
  *       there and five shapes do not fit one range column.

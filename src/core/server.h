@@ -454,6 +454,24 @@ struct server {
     uint64_t  n_fed_dedup_dup;
 
     /* ------------------------------------------------------------------------
+     * Phase 6 C5: a peer that says THIS NODE is gone. federation/verbs.c's
+     * fed_in_squit() is the only writer, and the line is REFUSED without the link
+     * being touched.
+     *
+     * IT IS NOT n_fed_malformed, and the reason is that the two say opposite
+     * things. A malformed line is a peer running a build that does not implement
+     * 4.3 -- a version fact, fixed by an upgrade. This is a peer implementing 4.3
+     * and announcing that the node it is talking to no longer exists, which
+     * 2.3's uniqueness rule says is the announcement a re-joining node acts on.
+     * A node whose counter for this climbs is a finding: a peer is out of step
+     * with the network, or is hostile, and neither is visible anywhere else.
+     *
+     * It is not n_fed_unknown_verb either, for the same reason: a peer speaking a
+     * verb this build does not speak is the opposite situation from a peer
+     * speaking one it should not have sent. */
+    uint64_t  n_fed_squit_self;  /* a SQUIT naming THIS node's own name */
+
+    /* ------------------------------------------------------------------------
      * Phase 6 C4: the 4.3 resync, which is a TRANSACTION and therefore has two
      * ways to fail rather than one. federation/burst.c is the only writer.
      *
