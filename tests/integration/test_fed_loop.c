@@ -523,8 +523,15 @@ static void case_message_arrives_once_and_settles(void)
                  "node A never published fed_own_origin=1, so the value this case "
                  "settles on was read before the node had republished it: %s",
                  a.out);
-    read_relay_counters(&a, "node A", &a_first);
-    read_relay_counters(&b, "node B", &b_first);
+    /* Both reads are SETTLED, not just the second one. Settling only the final
+     * read was not enough: on the CI runner b's own-origin counter moved between
+     * the baseline here and the start of the settle, so the comparison was
+     * baseline-versus-after-the-move and read 0 -> 1 every time. A settled
+     * baseline makes the two reads comparable -- both are states the mesh had
+     * actually come to rest in, rather than one rest state and one snapshot of
+     * something still arriving. */
+    settle_relay_counters(&a, "node A", &a_first);
+    settle_relay_counters(&b, "node B", &b_first);
     /* THE EXPECTED OWN-ORIGIN COUNT AFTER THE MESSAGE, and it is derived from
      * the measured baseline rather than written as a literal: the baseline is
      * however many bounces the SJOIN exchange produced on this mesh, and the
