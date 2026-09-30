@@ -57,6 +57,16 @@
  * does not fabricate one. It lands now because retrofitting a nonblocking
  * connect() onto a working loop means touching the hot path; retrofitting a
  * blocking one means stalling every client.
+ *
+ * The one thing Phase 6 added to it without a caller is dial_t::started_ms, and
+ * it is here rather than in the commit that finally dials because the reason it
+ * is needed is a property of poll() that is already true: a connect() to a
+ * firewalled host never becomes writable and never reports an error, so the
+ * DIAL_CONNECTING entry sits in the table forever with nothing in the loop
+ * capable of deciding it failed. A dial is the one thing on this node with no
+ * peer on the other end to generate an event, so the timeout has to be the
+ * tick's to apply -- and the tick can only apply it if the dial recorded when it
+ * started.
  */
 #ifndef IRC_CORE_SERVER_H
 #define IRC_CORE_SERVER_H
@@ -67,6 +77,15 @@
 #include <sys/types.h>
 
 #include "core/connection.h"
+#include "federation_handshake.h"
+
+/* The per-node dedup store (2.4). It is declared here and DEFINED nowhere in
+ * this header on purpose: federation/dedup.h owns the entry layout, and
+ * core/server.h holds only the opaque pointers, so the table's geometry is one
+ * module's business rather than a fourth thing every reader of server_t has to
+ * understand. federation/dedup.h deliberately does NOT include this file -- the
+ * dependency runs the other way, through the four functions in it. */
+struct fed_dedup_entry;
 
 /* The version string this build reports in 002, 004 and PONG.
  *
@@ -118,8 +137,117 @@ typedef struct dial {
     int    fd;
     int    state;
     size_t slot;          /* index into server_t::dials */
+    /* When this dial started, from the one clock the node has (server_now_ms).
+     * Nothing else about a DIAL_CONNECTING entry is observable: poll() reports
+     * nothing at all for a connect() to a host that silently drops the packets,
+     * so without a start stamp the entry is un-timeout-able and stays in the
+     * table for the life of the process. See the file header. */
+    uint64_t started_ms;
     char   peer_name[IRC_MAX_SERVER_NAME + 1];
 } dial_t;
+
+/* ---------------------------------------------------------------------------
+ * The peer link (2.3)
+ * ---------------------------------------------------------------------------
+ * ONE STRUCT PER PEER, held in a VECTOR on server_t and not in a `next`-linked
+ * list. That is a decision, and the reason is that every operation on this set
+ * is a walk anyway: a forward names its destination, so it looks the peer up;
+ * the loop's own link accounting iterates them; and Phase 6's link tick visits
+ * each one per tick. A list would buy nothing over an array here and would cost
+ * the one property the other registries on this struct all share -- a slot
+ * index that survives a removal, so an off-by-one cannot strand a pointer.
+ *
+ * A LINK IS NOT A CONNECTION. `fd` is the descriptor a link currently rides on,
+ * and it is -1 whenever there is none: between the two halves of a dial, after a
+ * peer goes away, and for a link that exists as a name and nothing else. The
+ * connection itself is a conn_t reached through server_t::by_fd, which stays the
+ * single index of live connections, and conn_t::peer_name stays a DISPLAY COPY
+ * of the name rather than the authority on it. Two copies of a peer's name that
+ * can disagree is the failure this arrangement is chosen to make impossible, so
+ * nothing routes by the copy.
+ *
+ * WHY THE HANDSHAKE CONTEXT IS EMBEDDED BY VALUE
+ * ------------------------------------------------
+ * federation_handshake.h is a per-peer FSM with an explicitly caller-owned
+ * context and no module state, and this is that caller. Embedding rather than
+ * pointing at it means a link cannot outlive its FSM or have one replaced under
+ * it: there is no allocation to leak and no second owner to keep alive.
+ *
+ * `state` mirrors handshake_state_t and exists because the routing predicates
+ * (server_find_peer) and the future link tick both want an int comparison in a
+ * hot path, and because -Weverything objects to comparing an enum against
+ * anything but an enumerator in a switch. The mirror is the thing that can go
+ * stale, so it is written in exactly one place -- fed_link_set_state() -- and
+ * never assigned at a call site. hs.state is the truth; `state` is a copy kept
+ * honest by that one writer.
+ */
+typedef struct server_link {
+    /* The peer's server name, validated with irc_serve_server_name_valid()
+     * (the same grammar the irc-serve-origin tag accepts) because 2.3 makes
+     * name uniqueness a handshake-time rejection and a name this node cannot
+     * stamp is a name it cannot be addressed by either. */
+    char     name[IRC_MAX_SERVER_NAME + 1];
+
+    /* -1 when no socket. A link can be named and handshaked with no descriptor
+     * at all, and a link whose descriptor is stale is exactly the case where
+     * by_fd[fd] would hand back some OTHER connection. */
+    int      fd;
+
+    int      state;             /* mirrors handshake_state_t; see the header */
+
+    handshake_ctx_t hs;         /* the FSM context; hs is the truth, state mirrors */
+
+    /* The PRE-RESOLVED target (3.4). It is on the link rather than in a
+     * configuration array so that a link which is re-dialled after a failure
+     * carries the address it failed to reach, and so a future reconnect needs
+     * no lookup: any name resolution inside the event loop stalls every client
+     * on the node, which is why server_dial() takes a struct sockaddr and there
+     * is deliberately no resolution helper anywhere in this file. */
+    struct sockaddr_storage addr;
+    socklen_t               addrlen;
+
+    /* 1 when this node dialled, 0 when it accepted. Needed because the two
+     * directions are not symmetric: the initiator sends the handshake and the
+     * burst (4.3), and only the initiator may decide a link is dead and close
+     * it without first having seen anything wrong from the peer. */
+    int      initiator;
+
+    uint64_t created_ms;
+    uint64_t last_sent_ms;
+    uint64_t last_recv_ms;
+
+    /* The PEER's epoch, which is not this node's and is not derivable from it.
+     * A link that reached ESTABLISHED without learning the peer's epoch cannot
+     * be burst: 4.3's SBURST carries the origin's epoch, and every id stamped
+     * into it has to be attributed to the right boot. It is 0 until the peer
+     * says, and a peer link still at 0 is a link that has not been told. */
+    uint64_t epoch;
+
+    /* Whether this link's SBURST has been APPLIED. It is the flag that makes
+     * a resync replace rather than merge (4.3), so it is on the link and not
+     * on a timer: a link that reconnects needs a fresh burst even if its peer
+     * never went away. */
+    int      burst_done;
+} server_link_t;
+
+/* The initial capacity of server_t::links, and a bound on the PEER DESCRIPTORS
+ * one node will hold, which is the part that actually costs something: a peer
+ * link is a conn_t in the by_fd table and a slot in the loop's poll set.
+ *
+ * Derived rather than picked, from two things that are already fixed in this
+ * codebase:
+ *   - the loop's poll set is FD_SETSIZE-bounded, and SERVER_FD_TABLE is that
+ *     bound. 16 peers is under two percent of it, so a node with a full set of
+ *     peers still has room for the several hundred clients the set allows.
+ *   - 2.2's per-channel member-server set is CHAN_MAX_MEMBER_SERVERS (64). A
+ *     node can therefore hold a member of a channel served by a larger set than
+ *     it has links to, so 16 is a capacity of the link TABLE, not a promise
+ *     about mesh size; the growth below doubles past it rather than refusing.
+ *
+ * It is also a power of two, which is not the reason to pick it but is the
+ * reason it costs nothing: the vector grows geometrically exactly as
+ * server_t::dials does, and no test has to care which multiple it starts at. */
+#define IRC_FED_MAX_PEERS 16
 
 /* The connection registry is a flat array indexed by descriptor, and poll()
  * caps a set at FD_SETSIZE descriptors, so the table holds exactly the
@@ -214,6 +342,33 @@ struct server {
     size_t    ndials;
     size_t    dials_cap;
 
+    /* The peer links (2.3), a VECTOR and not a `next`-linked list -- the reason
+     * is spelled out where server_link_t is defined. Every field here is a
+     * mirror of the by_fd table's world: the vector says WHICH peers this node
+     * knows about, the table says which of them currently has a socket. Keeping
+     * the two separate is what lets a link exist with fd == -1, which is the
+     * state between a dial and its completion and again after a peer is
+     * dropped. */
+    server_link_t *links;
+    size_t    nlinks;
+    size_t    links_cap;
+
+    /* The 2.4 dedup store: an open-addressed table of (origin, epoch, id) with
+     * an intrusive LRU, sized and owned by federation/dedup.c. The pointers are
+     * opaque here on purpose (see the forward declaration at the top), and the
+     * table is NULL until the first relayed message arrives rather than being
+     * allocated by server_init(): the cost is roughly 416 KiB, and a node that
+     * has never been sent a message by a peer has no use for any of it. The
+     * price of that choice is a failed allocation INSIDE the first insert, and
+     * federation/dedup.c answers it by failing closed -- reporting the message
+     * as already seen -- because a dropped message is recoverable and a loop is
+     * not. */
+    struct fed_dedup_entry *dedup_tab;
+    struct fed_dedup_entry *dedup_head;  /* LRU: most recently seen */
+    struct fed_dedup_entry *dedup_tail;  /* LRU: least recently seen */
+    uint64_t  dedup_used;
+    uint64_t  dedup_swept_ms;
+
     /* Observable counters. Every one of these is a claim the loop makes about
      * itself, and each is a real rejection or event rather than a derived
      * guess, so a test can assert on them. */
@@ -249,6 +404,114 @@ struct server {
      * whether or not tracing is on. */
     uint64_t  n_reply_refused;
 
+    /* ------------------------------------------------------------------------
+     * Phase 6 federation claims. All four are events the link module
+     * (federation/link.c) records, and all four are here rather than in that
+     * module because they are properties of the NODE, which is what this
+     * struct is: a counter that lives in the module is a counter a second node
+     * in the same process could not have, and the one-node-per-process
+     * arrangement fed_open() enforces is a constraint rather than a property.
+     *
+     * The per-reason breakdown of n_link_rejected is deliberately NOT here --
+     * eight more fields on this struct for eight rare events, readable from
+     * the link_dump line fed_dump() prints instead. Four headline numbers a
+     * test waits on, plus a breakdown for a human reading a log. */
+    uint64_t  n_link_rejected;  /* FEDERATE claims refused, any reason */
+    uint64_t  n_link_duplicate; /* refused because that name was ESTABLISHED */
+    uint64_t  n_fed_hs_timeout; /* links that reached no answer within T2 */
+    uint64_t  n_fed_dead;       /* ESTABLISHED links that went silent (T4) */
+
+    /* ------------------------------------------------------------------------
+     * Phase 6 C3: the INBOUND guard chain, one counter per guard that can drop
+     * a line. federation/verbs.c's fed_dispatch() is the only writer.
+     * ------------------------------------------------------------------------
+     *
+     * ONE COUNTER PER GUARD, and that is the property worth having: a single
+     * "dropped" counter over a chain of ten guards says that something was
+     * dropped and nothing about WHICH, and the ten have entirely different
+     * fixes -- a hop ceiling that fires is a mesh problem, an own-origin drop is
+     * loop prevention WORKING, a duplicate is dedup working, and a malformed
+     * line is a peer that does not implement 4.3. An operator reading one
+     * number cannot tell those apart, and the numbers are free.
+     *
+     * They are all ZERO on a node with no peers, so a non-zero value is a real
+     * event and not a derived guess. */
+    uint64_t  n_fed_preauth_drop;  /* a line arrived on a link that is not up */
+    uint64_t  n_fed_hop_drop;      /* hops had reached IRC_MAX_HOPS (2.4)      */
+    uint64_t  n_fed_own_origin;    /* the origin was THIS node (2.4)          */
+    uint64_t  n_fed_untagged_relay;/* untagged line from a peer naming another */
+    uint64_t  n_fed_unknown_verb;  /* not a verb in 4.3's list                */
+    uint64_t  n_fed_verb_deferred; /* a 4.3 verb this build does not do yet   */
+    uint64_t  n_fed_malformed;     /* arity or field validation refused it    */
+    /* The drop the guard chain took at the dedup guard, and the store's own
+     * count of the same event. They are incremented together at G7 and are
+     * equal on any node this build produces; they are two names for one fact
+     * on purpose, because they are read at two different levels -- a loop test
+     * asserts on the guard's drop, and a dedup test asserts on the store's --
+     * and a difference between them would be a real bug in the chain rather
+     * than a number nobody looked at. */
+    uint64_t  n_fed_dup_drop;
+    uint64_t  n_fed_dedup_dup;
+
+    /* ------------------------------------------------------------------------
+     * Phase 6 C5: a peer that says THIS NODE is gone. federation/verbs.c's
+     * fed_in_squit() is the only writer, and the line is REFUSED without the link
+     * being touched.
+     *
+     * IT IS NOT n_fed_malformed, and the reason is that the two say opposite
+     * things. A malformed line is a peer running a build that does not implement
+     * 4.3 -- a version fact, fixed by an upgrade. This is a peer implementing 4.3
+     * and announcing that the node it is talking to no longer exists, which
+     * 2.3's uniqueness rule says is the announcement a re-joining node acts on.
+     * A node whose counter for this climbs is a finding: a peer is out of step
+     * with the network, or is hostile, and neither is visible anywhere else.
+     *
+     * It is not n_fed_unknown_verb either, for the same reason: a peer speaking a
+     * verb this build does not speak is the opposite situation from a peer
+     * speaking one it should not have sent. */
+    uint64_t  n_fed_squit_self;  /* a SQUIT naming THIS node's own name */
+
+    /* ------------------------------------------------------------------------
+     * Phase 6 C4: the 4.3 resync, which is a TRANSACTION and therefore has two
+     * ways to fail rather than one. federation/burst.c is the only writer.
+     *
+     * n_burst_refused counts an OUTBOUND burst this node declined to send
+     * because it did not fit the staging budget (IRC_BURST_MAX_BYTES, which is
+     * half a link's write queue). It is "declined" rather than "failed": nothing
+     * was queued, the link was not touched, and the node's own view is
+     * untouched. A non-zero value is a node whose state is larger than half a
+     * link's queue, which is a finding rather than a statistic.
+     *
+     * n_burst_abandoned counts an INBOUND burst discarded before its terminator
+     * -- a count mismatch, an over-large transaction, a malformed record, or a
+     * link that went away mid-burst. It is the observable half of 4.3's "a
+     * resync replaces, never merges": the discard is what leaves the PREVIOUS
+     * state in place, so a node whose peer has a broken resync is a node whose
+     * roster is quietly stale, and a counter is the only thing that says so.
+     *
+     * n_burst_truncated counts the ONE of those discards that is a truncation:
+     * SBURSTE's counts disagreeing with what actually arrived. It is a second
+     * name for a subset of the event above, deliberately, for the same reason
+     * n_fed_dup_drop and n_fed_dedup_dup are two names for one fact -- they are
+     * read at two different levels. n_burst_abandoned says "a transaction was
+     * thrown away" and is the number an operator diagnosing a stale roster
+     * wants; n_burst_truncated says "and the reason was that the peer's
+     * terminator disagreed with its own records", which is a different fault
+     * with a different fix -- a lossy or saturating link rather than a peer that
+     * does not implement 4.3. Before it existed, that fault was visible only as
+     * one log line. Both are incremented on the same branch and are NOT
+     * alternatives to one another.
+     *
+     * They are NOT the same event as n_burst_refused and are not incremented
+     * together, which is why the pair above them -- one guard, one event, two
+     * counters at two levels of reading -- is not these. A burst that never left
+     * is a different problem from one that arrived and was thrown away, and an
+     * operator diagnosing a stale roster wants the second number and an operator
+     * diagnosing a node that cannot sync wants the first. */
+    uint64_t  n_burst_refused;
+    uint64_t  n_burst_abandoned;
+    uint64_t  n_burst_truncated;
+
     int       trace;             /* emit [observable] per-line output */
 };
 
@@ -260,9 +523,24 @@ struct server {
  * server_t without a socket. */
 int server_init(server_t *s, const char *name);
 
-/* Release the registries, the dial table and the by_fd array, close the
- * listener, and close any connection still registered. Safe on a zeroed
- * struct. */
+/* Release the registries, the dial table, the peer-link vector, the dedup table
+ * and the by_fd array, close the listener, and close any connection still
+ * registered. Safe on a zeroed struct.
+ *
+ * The two new arms sit next to the dials arm rather than at the end, and they
+ * are ordered BEFORE the by_fd walk conceptually even though they are not: a
+ * link names a descriptor, and the only reason the free is safe is that every
+ * conn is already gone by the time a link stops being able to name one. That
+ * ordering is the whole invariant, so it is worth saying here where a reader
+ * adding a fourth arm will see it.
+ *
+ * The FOURTH ARM -- fed_burst_close(), which releases 4.3's inbound resync shadow
+ * -- is the one that is not a field on this struct, and it is a CALL rather than a
+ * free for the reason the dedup table's is not: the shadow is a module global in
+ * federation/burst.c, so the owner has to do it. It sits with the dedup free
+ * because both are "a federation module's memory, released here", and both are
+ * ASSERTED NOT VERIFIED on Darwin -- LeakSanitizer does not run on this platform,
+ * so the Linux CI job is what proves either free. */
 void server_shutdown(server_t *s);
 
 /* Bind and listen on `port` (host 0.0.0.0), nonblocking, with SO_REUSEADDR.
@@ -453,22 +731,65 @@ const char *server_chan_lookup(const server_t *s, const char *name);
 /* ---------------------------------------------------------------------------
  * Peer lookup by server name (2.3)
  * ---------------------------------------------------------------------------
- * Find a registered CONN_SERVER connection whose peer_name is `name`,
- * case-insensitively. Returns NULL when there is none.
+ * Find the connection carrying an ESTABLISHED link to the peer called `name`
+ * (ASCII case-insensitively, per 2.1 and 2.4). Returns NULL when there is no
+ * such link, and equally when the link exists and is not ESTABLISHED.
  *
- * This is where "can this node route to the origin?" is answered from, and it
- * exists already because Phase 2's dial FSM is what creates a CONN_SERVER
- * connection and it already sets peer_name. It is a linear scan of by_fd, which
- * is O(FD_SETSIZE) -- the same cost 3.4 already accepts for iterating every
- * connection on the node -- and it is short-circuited by the caller on the
- * overwhelmingly common case, because a channel this node owns never reaches
- * here at all.
+ * The two NULLs are the same answer on purpose. "Can this node route to the
+ * origin?" is what callers ask, and a link that has not finished the handshake
+ * FSM is not yet a route: forwarding onto it would put an S-verb on a socket
+ * whose peer has not authenticated and whose server name is not yet known, and
+ * 2.3 requires the name-uniqueness check to happen before ESTABLISHED. This is
+ * the narrowing Phase 6 promised here, and it is why the question lives in a
+ * function rather than in a flag a caller has to remember to test.
  *
- * Phase 6 narrows it: a link that exists but has not finished the handshake FSM
- * is not yet a route, and the FSM state lives with the link. The signature does
- * not have to change for that, which is the point of keeping the question in a
- * function rather than in a flag. */
+ * THE LOOKUP IS THE LINK, NOT THE NAME
+ * ------------------------------------
+ * Phase 2 answered this by scanning by_fd for a CONN_SERVER whose
+ * conn_t::peer_name matched. That is now the wrong shape: by_fd is the index of
+ * LIVE CONNECTIONS, and a peer is not the same thing as a connection to it. The
+ * link is the answer, the link names the descriptor, and the descriptor is
+ * looked up in by_fd -- so a link with no socket is not a route, a link with a
+ * stale descriptor cannot resolve to a different peer's connection, and
+ * conn_t::peer_name is left as the display copy it was always described as
+ * rather than becoming a second, routing-authoritative name.
+ *
+ * The cost is two array bounds rather than one: the link vector is walked (O(peers),
+ * which is 2.3's own set and is a handful of entries) and the by_fd table is
+ * indexed. The FD_SETSIZE scan Phase 2 paid on every miss is gone, and no
+ * caller pays it on the common path anyway because chan_origin_is_self() --
+ * which fanout_resolve() and the single-writer rule both consult -- answers
+ * before this is ever reached for a channel this node owns. */
 conn_t *server_find_peer(const server_t *s, const char *name);
+
+/* ---------------------------------------------------------------------------
+ * The link registry (2.3), above server_find_peer because it is what that is
+ * built from.
+ * ---------------------------------------------------------------------------
+ * server_find_link() is the name -> link half, with the same ASCII fold, and it
+ * answers for a link that is not ESTABLISHED: "do we know a peer called this,
+ * and what state is it in" is a different question from "can we route to it",
+ * and the link lifecycle needs it. The two are separate functions for the same
+ * reason conn_t::peer_name and server_link_t::name are: a predicate that
+ * answered both would make the caller choose which question it meant.
+ *
+ * server_link_count()/server_link_at() are the enumeration, and they have no
+ * per-peer use yet -- the link tick and the burst do, and neither is in this
+ * commit. They land with the vector rather than with its first reader so the
+ * vector is never walked by hand in a file that should not know its layout,
+ * which is the same reason nick_objs has an enumeration beside its table.
+ */
+server_link_t *server_find_link(const server_t *s, const char *name);
+size_t server_link_count(const server_t *s);
+server_link_t *server_link_at(const server_t *s, size_t i);
+
+/* The connection a link currently rides on: by_fd[link->fd], or NULL when the
+ * link has no socket, when the descriptor is outside the poll() set, or when
+ * that slot is free. The out-of-range test is not defensive noise -- by_fd is
+ * indexed BY the descriptor, so an fd the table cannot hold is a link that
+ * cannot name a connection, and indexing it anyway is a read of whatever slot
+ * happens to be there. */
+conn_t *server_link_conn(const server_t *s, const server_link_t *link);
 
 /* Next id from the per-SERVER monotonic counter (2.4). Never returns 0: id 0
  * is reserved for "unset" so a missing tag is never read as a real id. */

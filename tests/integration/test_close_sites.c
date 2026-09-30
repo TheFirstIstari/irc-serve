@@ -45,6 +45,31 @@
  *                          connections.
  *   everything else         NONE.
  *
+ * ---------------------------------------------------------------------------
+ * src/federation/link.c IS THE EXCEPTION, AND IT IS A NARROW ONE
+ * ---------------------------------------------------------------------------
+ * It closes exactly one thing: the descriptor of a DIAL_CONNECTING entry that
+ * fed_tick()'s T1 has decided will never complete. That is a DIAL and not a
+ * connection -- the descriptor is not in by_fd, it has no conn_t, and the reaper
+ * has nothing to reap -- and server.c already closes precisely these on
+ * precisely this ground, in server_dial_progress()'s DIAL_FAILED arms and in
+ * the shutdown walk. Without it a connect() to a black-holed host would leak a
+ * descriptor on every timeout.
+ *
+ * So link.c is NOT in the `never` list above: putting it there would mean
+ * asserting a falsehood, and a test that asserts a falsehood is a test that
+ * has stopped checking anything. What it gets instead is in the `no_destroy`
+ * list, plus the two targeted assertions at the bottom of this file: that it
+ * has exactly ONE close(), and that the one it has is the dial timeout's. That
+ * is a stronger statement than membership in `never` would have been, because
+ * `never` says "this file never closes" and these say "this file closes one
+ * thing and it is a dial".
+ *
+ * The consequence of the exception is stated rather than glossed: the "no stray
+ * close in a federation file" property is no longer covered by list
+ * membership for link.c. It is covered by the two assertions instead, and that
+ * is why they are there.
+ *
  * Comments and string/char literals are stripped before the search, so prose
  * about closing a descriptor is not mistaken for a call. A trailing comment
  * containing the literal text `close(` would be a false positive; that is the
@@ -75,7 +100,29 @@ static char *load(const char *rel)
 /* Does the byte range [from, to) call `name`? */
 static int calls_between(const char *name, const char *from, const char *to)
 {
-    char body[16384];
+    /* 64 KiB, and the number is measured rather than guessed. This was 16 KiB
+     * until src/federation/link.c needed a WHOLE-FILE range for its own
+     * assertion, and link.c with its comments stripped by tf_read_code() is
+     * 20511 bytes -- over 16 KiB, so at the old size the whole-file count came
+     * back -1 and `n == rc` failed. Both facts were checked by building this
+     * test at 16 KiB and watching it go red, rather than by reading the file
+     * size off a comment.
+     *
+     * The largest file this test measures is src/core/server.c at 24204
+     * stripped, so 64 KiB is about 2.7x the biggest thing in the tree today. The
+     * cap is a backstop against a pointer mistake in a caller's `to`, not a
+     * bound on a source file.
+     *
+     * AND -1 IS A LOUD ANSWER, WHICH IS THE PART THAT MAKES THE CAP HONEST.
+     * Every call site compares against a positive expected count (`rc == 1`) or
+     * against that same rc, so a range too large to measure FAILS the test rather
+     * than passing it quietly: verified by building this at 1 KiB, where
+     * test_close_sites reports `n == rc` with n = -1. An earlier version of this
+     * comment called that "silently stops checking", which was wrong and is
+     * retracted here. The alternative to the cap -- malloc the range and copy it
+     * with no upper bound -- would trade a loud failure for a read past the end
+     * of a heap buffer, which is the worse of the two. */
+    char body[65536];
     size_t n;
 
     if (from == NULL || to == NULL || to <= from) {
@@ -128,7 +175,12 @@ int main(void)
         "src/core/poll_loop.c", "src/core/message.c", "src/core/reply.c",
         "src/core/commands.c", "src/node_main.c",
         "src/protocol_parse.c", "src/ircv3_tags.c",
-        "src/federation_handshake.c", "src/sasl_framework.c"
+        "src/federation_handshake.c", "src/sasl_framework.c",
+        /* The link module. It is in the second list and NOT the first, which is
+         * the whole of the exception documented in the header: it closes a
+         * DIAL that never became a connection, and it must never destroy a
+         * connection. The two assertions below pin the close itself. */
+        "src/federation/link.c"
     };
 
     for (i = 0; i < sizeof never / sizeof never[0]; i++) {
@@ -210,6 +262,58 @@ int main(void)
                  "the FD_SETSIZE rejection does not close the out-of-range "
                  "descriptor (found %d close() calls): it would leak one "
                  "descriptor per refused connection", rc);
+
+    /* federation/link.c: the one file outside server.c that may call close(),
+     * and it may call it for exactly one reason. Two assertions, and both are
+     * needed: the first says there is only the one, the second says which one
+     * it is. Together they are stronger than membership in `never` would have
+     * been, because `never` would have said "this file never closes" -- which
+     * is false -- and a list entry that is false takes the file's real
+     * protection with it. */
+    {
+        char *link_code = load("src/federation/link.c");
+        int n;
+
+        TF_CHECK_MSG(tf_calls(link_code, "close"),
+                     "src/federation/link.c no longer calls close() at all: "
+                     "T1 has to close the descriptor of a dial that will never "
+                     "complete, because a connect() to a black-holed host is "
+                     "not in by_fd and the reaper cannot own it. If the "
+                     "timeout was removed instead, remove the comment in the "
+                     "header with it.");
+        /* And the one it has is the dial timeout's -- which is a stronger claim
+         * than "there is one somewhere in the file", and is checked the same way
+         * server_close_conn() above is: by finding the function and counting the
+         * close() calls inside it. tf_read_code() strips string literals, so
+         * this cannot search for the observable line the function prints; it
+         * searches for the function, which is the better target anyway, because
+         * a close moved into a DIFFERENT function would then fail rather than
+         * pass. */
+        fn = strstr(link_code, "fed_dial_expired(server_t");
+        TF_CHECK_MSG(fn != NULL,
+                     "could not find fed_dial_expired() in link.c; the function "
+                     "that owns the one close() this file is allowed has been "
+                     "renamed, and the comment above it with it");
+        end = strstr(fn, "\n}\n");
+        TF_CHECK_MSG(end != NULL,
+                     "could not find the end of fed_dial_expired() in link.c");
+        rc = calls_between("close", fn, end);
+        TF_CHECK_MSG(rc == 1,
+                     "fed_dial_expired() does not contain exactly one close() "
+                     "(found %d): that is the dial-timeout close, and it is the "
+                     "only close a peer-link file may have", rc);
+        /* And nothing else in link.c does. The whole-file count plus the
+         * in-function count is the pair that says both things; either alone
+         * would leave room for a second close elsewhere. */
+        n = calls_between("close", link_code, link_code + strlen(link_code));
+        TF_CHECK_MSG(n == rc,
+                     "src/federation/link.c has %d close() calls in total but %d "
+                     "inside fed_dial_expired(): a peer link is the one place "
+                     "outside the registry that touches a descriptor, so a "
+                     "close anywhere else is a close path 3.4 does not have", n,
+                     rc);
+        free(link_code);
+    }
 
     free(code);
     tf_done("close_sites");

@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -21,8 +22,14 @@
 #include "core/message.h"
 #include "core/poll_loop.h"
 
-/* The child used by nf_spawn_inline(). Its name must satisfy the 2.4 tag
- * grammar, exactly as the shipped node's does. */
+/* The child used by nf_spawn_inline() and nf_spawn_inline_named(). Its name
+ * must satisfy the 2.4 tag grammar, exactly as the shipped node's does.
+ *
+ * It is a DEFAULT rather than a constant because nf_spawn_inline_named() takes
+ * a name and the two entry points must not be able to disagree about what the
+ * unnamed one uses: the existing tests that call nf_spawn_inline() have to keep
+ * getting a node called exactly what they have always got, or their observable
+ * assertions change for no reason. */
 #define NF_NODE_NAME "irc.fixture"
 
 /* How often a deadline loop checks. Short, so a response is noticed promptly;
@@ -42,6 +49,10 @@
  * misconfigured" branch is exactly the kind that stops being noticed. */
 #error "NF_SERVER_BIN must name the irc-serve executable"
 #endif
+
+static nf_node_t *g_live[8];
+static size_t g_nlive = 0;
+static int nf_pump_all(uint64_t deadline);
 
 static uint64_t nf_now_ms(void)
 {
@@ -77,9 +88,19 @@ static int wait_child(pid_t pid, int ms, int *status)
         if (nf_now_ms() >= deadline) {
             return 1; /* still running */
         }
-        tv.tv_sec = 0;
-        tv.tv_usec = NF_POLL_MS * 1000;
-        (void)select(0, NULL, NULL, NULL, &tv);
+        /* Drain the children's pipes WHILE waiting for the exit, for the reason
+         * this file's other waits drain them: the child is printing its final
+         * stats on the way out, and a child blocked writing to a full pipe cannot
+         * exit, so waiting for it without reading would be waiting for something
+         * that needs the wait to stop. With no live child this is the plain yield
+         * it used to be. */
+        if (g_nlive > 0) {
+            (void)nf_pump_all(nf_now_ms() + (uint64_t)NF_POLL_MS);
+        } else {
+            tv.tv_sec = 0;
+            tv.tv_usec = NF_POLL_MS * 1000;
+            (void)select(0, NULL, NULL, NULL, &tv);
+        }
     }
 }
 
@@ -91,6 +112,58 @@ static int wait_child(pid_t pid, int ms, int *status)
  * accumulate-everything design is also what makes a failure diagnosable: a
  * timeout prints what the child actually said.
  */
+
+/* ---------------------------------------------------------------------------
+ * THE LIVE-NODE REGISTRY, and the one wait every other wait is built on
+ * ---------------------------------------------------------------------------
+ * A child's stdout is a PIPE. A pipe holds a fixed amount -- 65536 bytes on both
+ * Linux and macOS -- and a writer that fills it does not get to run again until
+ * somebody reads. So a child that nobody is reading does not merely have its
+ * diagnostics delayed: it stops.
+ *
+ * WHERE IT STOPS IS THE PART THAT MATTERS. The republication of the counters a
+ * test reads happens in the tick hook, which is step 8 of poll_loop_step(), so a
+ * child blocked writing is blocked INSIDE its event loop. It does not accept, it
+ * does not read, and it does not answer the client that is waiting for it. From
+ * the outside that is indistinguishable from a federation that never worked: the
+ * peer's dial succeeded (the kernel completed the handshake into the listen
+ * backlog), the dialling side reports its link up, the accepting side reports
+ * nothing having happened, and a deadline expires.
+ *
+ * WHICH IS WHY EVERY READER IS DRAINED BY EVERY WAIT. A wait that reads one
+ * child's pipe and selects on that one descriptor is not enough, and a test waiting on a
+ * client socket reads NO child's pipe at all for the whole wait -- and those
+ * waits are 15 seconds long. So the property this file needs is not "the parent
+ * eventually reads every child" but "the parent is always reading every child",
+ * and the second is the only one that holds no matter what the test calls next.
+ * nf_pump_all() is that: one select() over every live child's stdout, draining
+ * every one that is readable, used by every wait in this file and installed as
+ * irc_client.c's pump hook so that a socket wait drains them too.
+ *
+ * The registry is the harness's own and is deliberately not test_util.c's. That
+ * one exists to KILL a node when a TF_CHECK fails, is bounded by a comment that
+ * says it is bounded because it runs on a failing path, and its job is to be
+ * short. This one exists to be drained, and draining wants a different
+ * lifetime: a node is in it from the moment it is forked until nf_free().
+ */
+static void live_add(nf_node_t *n)
+{
+    if (g_nlive < (sizeof g_live / sizeof g_live[0])) {
+        g_live[g_nlive++] = n;
+    }
+}
+
+static void live_del(nf_node_t *n)
+{
+    size_t i;
+
+    for (i = 0; i < g_nlive; i++) {
+        if (g_live[i] == n) {
+            g_live[i] = g_live[--g_nlive];
+            return;
+        }
+    }
+}
 
 static int out_append(nf_node_t *n, const char *bytes, size_t len)
 {
@@ -114,37 +187,96 @@ static int out_append(nf_node_t *n, const char *bytes, size_t len)
     return 0;
 }
 
-/* Read whatever the child has written. Returns 1 if bytes were appended, 0 if
- * nothing was available before the deadline, -1 on a hard read error. */
-static int out_pump(nf_node_t *n, uint64_t deadline)
+/* Read whatever one child has written, without waiting for it to be readable.
+ * Split out of nf_pump_all() so the draining loop reads the same bytes through
+ * the same path whatever called it. Returns 1 if bytes were appended, 0 if
+ * nothing was available, -1 on a hard read error. */
+static int out_read(nf_node_t *n)
 {
     char chunk[4096];
-    struct timeval tv;
-    fd_set rfds;
-    uint64_t left = (deadline > nf_now_ms()) ? (deadline - nf_now_ms()) : 0;
     ssize_t got;
+
+    got = read(n->out_fd, chunk, sizeof chunk);
+    if (got <= 0) {
+        return 0; /* child closed stdout, or nothing yet */
+    }
+    return (out_append(n, chunk, (size_t)got) == 0) ? 1 : -1;
+}
+
+/* ---------------------------------------------------------------------------
+ * nf_pump_all -- the single wait every other wait in this file is built on
+ * ---------------------------------------------------------------------------
+ * Waits up to `deadline` (absolute CLOCK_MONOTONIC ms) for ANY live child to have
+ * something to say, and drains EVERY child that does, not just the one that woke
+ * the wait. Returns 1 if anything was appended, 0 if the slice expired quietly,
+ * -1 on a hard error.
+ *
+ * Draining all of them rather than the one that is readable is the whole point.
+ * The alternative -- one descriptor per wait, the node being waited on -- is what
+ * makes the hazard above real: the child that fills its pipe is precisely the
+ * child nobody is waiting on, so the wait that would have unblocked it is the one
+ * that is not running.
+ *
+ * The slice is capped at NF_POLL_MS so a wait that is polling several nodes
+ * cannot sit in one select() for a whole 15-second deadline with a peer node
+ * 15 seconds behind on its own output. */
+static int nf_pump_all(uint64_t deadline)
+{
+    fd_set rfds;
+    struct timeval tv;
+    uint64_t now = nf_now_ms();
+    uint64_t left = (deadline > now) ? (deadline - now) : 0;
+    int maxfd = -1;
+    int got = 0;
     int rc;
+    size_t i;
 
     if (left == 0) {
         return 0;
     }
+    if (left > NF_POLL_MS) {
+        left = NF_POLL_MS;
+    }
     FD_ZERO(&rfds);
-    FD_SET(n->out_fd, &rfds);
+    for (i = 0; i < g_nlive; i++) {
+        if (g_live[i]->out_fd < 0) {
+            continue;
+        }
+        FD_SET(g_live[i]->out_fd, &rfds);
+        if (g_live[i]->out_fd > maxfd) {
+            maxfd = g_live[i]->out_fd;
+        }
+    }
+
     tv.tv_sec = (time_t)(left / 1000u);
     tv.tv_usec = (suseconds_t)((left % 1000u) * 1000u);
-
-    rc = select(n->out_fd + 1, &rfds, NULL, NULL, &tv);
+    rc = select(maxfd + 1, (maxfd >= 0) ? &rfds : NULL, NULL, NULL, &tv);
     if (rc < 0) {
         return (errno == EINTR) ? 0 : -1;
     }
     if (rc == 0) {
         return 0;
     }
-    got = read(n->out_fd, chunk, sizeof chunk);
-    if (got <= 0) {
-        return 0; /* child closed stdout, or nothing yet */
+    for (i = 0; i < g_nlive; i++) {
+        nf_node_t *n = g_live[i];
+
+        if (n->out_fd < 0 || !FD_ISSET(n->out_fd, &rfds)) {
+            continue;
+        }
+        if (out_read(n) > 0) {
+            got = 1;
+        }
     }
-    return (out_append(n, chunk, (size_t)got) == 0) ? 1 : -1;
+    return got;
+}
+
+/* The irc_client.c hook, and the reason it is a no-argument function: it has to
+ * be callable from a socket wait that knows nothing about nodes. It pumps for one
+ * polling slice and returns; the caller's own deadline loop is what keeps it
+ * going. */
+static void nf_pump_hook(void)
+{
+    (void)nf_pump_all(nf_now_ms() + (uint64_t)NF_POLL_MS);
 }
 
 /* The single wait implementation; nf_expect() is the header-declared entry
@@ -163,7 +295,7 @@ static int nf_expect_with_timeout(nf_node_t *n, const char *needle,
         if (n->out != NULL && strstr(n->out, needle) != NULL) {
             return 0;
         }
-        if (out_pump(n, deadline) < 0) {
+        if (nf_pump_all(deadline) < 0) {
             break;
         }
         if (nf_now_ms() >= deadline) {
@@ -202,7 +334,7 @@ int nf_expect_retry_signal(nf_node_t *n, const char *needle, int sig,
         if (kill(n->pid, sig) != 0 && errno != ESRCH) {
             break;
         }
-        if (out_pump(n, nf_now_ms() + NF_POLL_MS) < 0) {
+        if (nf_pump_all(nf_now_ms() + (uint64_t)NF_POLL_MS) < 0) {
             break;
         }
         if (nf_now_ms() >= deadline) {
@@ -263,6 +395,53 @@ int nf_find_u64(nf_node_t *n, const char *key, uint64_t *out)
  * counter once after seeing an EOF on the wire is racing the child that
  * published it, and that race passes or fails depending on the scheduler.
  * Returns 0 on success, -1 on timeout (printing the last value seen). */
+/* As nf_expect(), but waits until the needle has appeared at least `want` TIMES
+ * rather than once. Returns 0 on success, -1 on timeout, and prints what the
+ * child did say.
+ *
+ * WHY IT EXISTS, and it is not a convenience: nf_expect() searches the whole
+ * accumulated buffer, so a second occurrence of a line the node has ALREADY
+ * printed -- a second `link_established` after a reconnect, a second `link_dial`
+ * after a retry -- is already satisfied before the event happens, and the wait
+ * returns having read nothing. A test that wants the SECOND of something has
+ * either to invent a needle that differs (which couples the test to whichever
+ * field happens to change) or to count, and counting is the honest shape. It is
+ * the same relationship nf_expect_u64_ge() has with nf_expect_u64(): one is a
+ * lower bound on a value the node publishes, this is a lower bound on how many
+ * times the node said something. */
+int nf_expect_nth(nf_node_t *n, const char *needle, size_t want, int timeout_ms)
+{
+    uint64_t deadline = nf_now_ms() + (uint64_t)timeout_ms;
+    size_t seen = 0;
+
+    for (;;) {
+        if (n != NULL && n->out != NULL && needle != NULL) {
+            const char *scan = n->out;
+            size_t len = strlen(needle);
+
+            seen = 0;
+            while ((scan = strstr(scan, needle)) != NULL) {
+                seen++;
+                scan += len;
+            }
+            if (seen >= want) {
+                return 0;
+            }
+        }
+        if (nf_pump_all(deadline) < 0) {
+            break;
+        }
+        if (nf_now_ms() >= deadline) {
+            break;
+        }
+    }
+    fprintf(stderr, "nf_expect_nth: TIMEOUT after %d ms waiting for %zu x \"%s\"; "
+            "%zu seen\n", timeout_ms, want, needle, seen);
+    fprintf(stderr, "nf_expect_nth: child output was:\n%s\n",
+            (n->out != NULL) ? n->out : "(nothing)");
+    return -1;
+}
+
 int nf_expect_u64(nf_node_t *n, const char *key, uint64_t expected,
                   int timeout_ms)
 {
@@ -273,7 +452,7 @@ int nf_expect_u64(nf_node_t *n, const char *key, uint64_t expected,
         if (nf_find_u64(n, key, &seen) == 0 && seen == expected) {
             return 0;
         }
-        if (out_pump(n, nf_now_ms() + NF_POLL_MS) < 0) {
+        if (nf_pump_all(nf_now_ms() + (uint64_t)NF_POLL_MS) < 0) {
             break;
         }
         if (nf_now_ms() >= deadline) {
@@ -299,7 +478,7 @@ int nf_expect_u64_ge(nf_node_t *n, const char *key, uint64_t minimum,
         if (nf_find_u64(n, key, &seen) == 0 && seen >= minimum) {
             return 0;
         }
-        if (out_pump(n, nf_now_ms() + NF_POLL_MS) < 0) {
+        if (nf_pump_all(nf_now_ms() + (uint64_t)NF_POLL_MS) < 0) {
             break;
         }
         if (nf_now_ms() >= deadline) {
@@ -328,10 +507,49 @@ static server_tick_fn g_test_tick = NULL;
 static void nf_child_print_stats(const server_t *s);
 
 /* Last counters republished by the tick, so the republication is change-driven
- * rather than per-tick. */
+ * rather than per-tick. The four fed_* ones are Phase 6's, and they are in
+ * here for the same reason they are in the print: a test that waits for
+ * `fed_hs_timeout=1` has to see the line republished the moment the counter
+ * moves, and a republication driven only by connection counts would not print
+ * it until the next accept. */
 static size_t g_last_nconns = (size_t)-1;
 static uint64_t g_last_closed = 0;
 static uint64_t g_last_accepted = 0;
+static uint64_t g_last_fed_rejected = 0;
+static uint64_t g_last_fed_hs_timeout = 0;
+static uint64_t g_last_fed_dead = 0;
+static uint64_t g_last_dial_failed = 0;
+/* The inbound guard-chain counters (Phase 6 C3). Republished on change for the
+ * same reason as the four above: a two-node test asserts "the loop settles",
+ * which means reading a counter twice, and a republication driven only by
+ * connection counts would not print it until the next accept -- by which time
+ * the second read could not distinguish "settled" from "never republished". */
+static uint64_t g_last_fed_own_origin = 0;
+static uint64_t g_last_fed_dup_drop = 0;
+/* Phase 6 C5's self-SQUIT refusal. It is in the republish list for the same
+ * reason n_fed_dead is: a counter a test can only read if some OTHER counter
+ * happened to move is a counter that is unreadable exactly when a test wants
+ * it -- the line that would report it is only printed when something in the
+ * trigger list changed. */
+static uint64_t g_last_fed_squit_self = 0;
+static uint64_t g_last_fed_lines = 0;
+/* The 4.3 resync's three counters (Phase 6 C4, C5). They are republished for the
+ * same reason the others are -- a test that has to stop the node before it can
+ * read them cannot tell "settled at zero" from "never republished" -- and they
+ * are the counters a burst test needs most, because the difference between a
+ * resync that was applied and a resync that was silently thrown away is the
+ * difference between a passing assertion and a vacuous one.
+ *
+ * n_burst_truncated has its OWN trigger entry rather than riding on
+ * n_burst_abandoned, and that is not tidiness. The two are incremented on the
+ * SAME branch, so riding along would look free -- but a trigger that watches one
+ * of two counters that always move together is a trigger that stops working the
+ * day the two are separated, and a test asserting "this transaction was
+ * truncated" would then read a stale zero. The trigger lists the counters whose
+ * values a test might read, and this is one of them. */
+static uint64_t g_last_burst_refused = 0;
+static uint64_t g_last_burst_abandoned = 0;
+static uint64_t g_last_burst_truncated = 0;
 
 static void nf_on_stop(int sig)
 {
@@ -363,11 +581,38 @@ static void nf_child_tick(server_t *s, uint64_t now_ms)
      * only on the totals at exit. Driven off a change, not off every tick: a
      * line per 50 ms tick would fill the pipe the parent reads and deadlock it
      * against a child that is waiting to write. */
+      /* Republish on CHANGE, deliberately -- see the comment above. This once
+       * carried a TEMPORARY FLOOD PROBE that published on every tick instead, to
+       * force many stat lines fast. It was left here describing behaviour the code
+       * does not have, which is worse than no comment: a reader looking for the
+       * flood lever would change this condition and not learn why. */
     if (s->nconns != g_last_nconns || s->n_closed != g_last_closed ||
-        s->n_accepted != g_last_accepted) {
+        s->n_accepted != g_last_accepted ||
+        s->n_link_rejected != g_last_fed_rejected ||
+        s->n_fed_hs_timeout != g_last_fed_hs_timeout ||
+        s->n_fed_dead != g_last_fed_dead ||
+        s->n_fed_own_origin != g_last_fed_own_origin ||
+        s->n_fed_dup_drop != g_last_fed_dup_drop ||
+        s->n_fed_squit_self != g_last_fed_squit_self ||
+        s->n_burst_refused != g_last_burst_refused ||
+        s->n_burst_abandoned != g_last_burst_abandoned ||
+        s->n_burst_truncated != g_last_burst_truncated ||
+        s->n_lines != g_last_fed_lines ||
+        s->n_dial_failed != g_last_dial_failed) {
         g_last_nconns = s->nconns;
         g_last_closed = s->n_closed;
         g_last_accepted = s->n_accepted;
+        g_last_fed_rejected = s->n_link_rejected;
+        g_last_fed_hs_timeout = s->n_fed_hs_timeout;
+        g_last_fed_dead = s->n_fed_dead;
+        g_last_fed_own_origin = s->n_fed_own_origin;
+        g_last_fed_dup_drop = s->n_fed_dup_drop;
+        g_last_fed_squit_self = s->n_fed_squit_self;
+        g_last_burst_refused = s->n_burst_refused;
+        g_last_burst_abandoned = s->n_burst_abandoned;
+        g_last_burst_truncated = s->n_burst_truncated;
+        g_last_fed_lines = s->n_lines;
+        g_last_dial_failed = s->n_dial_failed;
         nf_child_print_stats(s);
     }
 }
@@ -375,11 +620,22 @@ static void nf_child_tick(server_t *s, uint64_t now_ms)
 static void nf_child_print_stats(const server_t *s)
 {
     /* The same key names as the shipped binary's loop_stats line, so a test can
-     * read a counter with one helper whichever way the node was hosted. */
+     * read a counter with one helper whichever way the node was hosted. The four
+     * fed_* keys are Phase 6's link counters, and they are HERE as well as in
+     * node_main's loop_stats for the same reason the rest of the keys are: a
+     * test that can only read the counters the shipped binary prints can only
+     * run against the shipped binary, and most of the two-node cases need an
+     * inline child to set a per-process timeout. */
     printf("[fixture] stats accepted=%llu closed=%llu lines=%llu "
            "parse_reject=%llu frame_error=%llu writeq_overflow=%llu "
            "write_error=%llu partial_writes=%llu eintr=%llu rejected_fd=%llu "
-           "nconns=%llu dial_connected=%llu dial_failed=%llu\n",
+           "nconns=%llu dial_connected=%llu dial_failed=%llu "
+           "fed_rejected=%llu fed_duplicate=%llu fed_hs_timeout=%llu "
+           "fed_dead=%llu fed_preauth_drop=%llu fed_hop_drop=%llu "
+           "fed_own_origin=%llu fed_untagged_relay=%llu "
+           "fed_unknown_verb=%llu fed_verb_deferred=%llu fed_malformed=%llu "
+           "fed_dup_drop=%llu fed_dedup_dup=%llu fed_squit_self=%llu "
+           "burst_refused=%llu burst_abandoned=%llu burst_truncated=%llu\n",
            (unsigned long long)s->n_accepted, (unsigned long long)s->n_closed,
            (unsigned long long)s->n_lines,
            (unsigned long long)s->n_parse_reject,
@@ -391,9 +647,38 @@ static void nf_child_print_stats(const server_t *s)
            (unsigned long long)s->n_rejected_fd,
            (unsigned long long)s->nconns,
            (unsigned long long)s->n_dial_connected,
-           (unsigned long long)s->n_dial_failed);
+           (unsigned long long)s->n_dial_failed,
+           (unsigned long long)s->n_link_rejected,
+           (unsigned long long)s->n_link_duplicate,
+           (unsigned long long)s->n_fed_hs_timeout,
+           (unsigned long long)s->n_fed_dead,
+           (unsigned long long)s->n_fed_preauth_drop,
+           (unsigned long long)s->n_fed_hop_drop,
+           (unsigned long long)s->n_fed_own_origin,
+           (unsigned long long)s->n_fed_untagged_relay,
+           (unsigned long long)s->n_fed_unknown_verb,
+           (unsigned long long)s->n_fed_verb_deferred,
+           (unsigned long long)s->n_fed_malformed,
+           (unsigned long long)s->n_fed_dup_drop,
+           (unsigned long long)s->n_fed_dedup_dup,
+           (unsigned long long)s->n_fed_squit_self,
+           (unsigned long long)s->n_burst_refused,
+           (unsigned long long)s->n_burst_abandoned,
+           (unsigned long long)s->n_burst_truncated);
     fflush(stdout);
 }
+
+/* The name the CHILD will build its server_t under. Set by the spawn that is
+ * about to happen, which is before the fork, so the child inherits it through
+ * the fork rather than through an argument -- a file-static rather than a
+ * parameter because the name is only known to nf_spawn_inline_named()'s caller
+ * and the only consumer is the child.
+ *
+ * Non-static on purpose: the child is a separate PROCESS after the fork and
+ * cannot see a change the parent makes afterwards, which is exactly the
+ * property a test needs when it spawns two children with two different names
+ * and then changes its mind about the third. */
+static const char *g_child_name = NF_NODE_NAME;
 
 static int nf_child_run(nf_setup_fn setup)
 {
@@ -413,8 +698,8 @@ static int nf_child_run(nf_setup_fn setup)
     if (s == NULL) {
         return 1;
     }
-    if (server_init(s, NF_NODE_NAME) != 0) {
-        fprintf(stderr, "fixture: server_init failed\n");
+    if (server_init(s, g_child_name) != 0) {
+        fprintf(stderr, "fixture: server_init failed for name %s\n", g_child_name);
         return 1;
     }
     if (server_listen(s, 0) != 0) {
@@ -476,7 +761,7 @@ static int nf_finish_spawn(nf_node_t *n, int expect_port_line)
         if (ready) {
             break;
         }
-        if (out_pump(n, deadline) < 0) {
+        if (nf_pump_all(deadline) < 0) {
             break;
         }
         if (nf_now_ms() >= deadline) {
@@ -510,7 +795,8 @@ static int nf_finish_spawn(nf_node_t *n, int expect_port_line)
     return 0;
 }
 
-static int nf_spawn_common(nf_node_t *n, nf_mode_t mode, nf_setup_fn setup)
+static int nf_spawn_common(nf_node_t *n, nf_mode_t mode, nf_setup_fn setup,
+                           const char *name, char *const argv[])
 {
     int pipefd[2];
     pid_t pid;
@@ -538,14 +824,22 @@ static int nf_spawn_common(nf_node_t *n, nf_mode_t mode, nf_setup_fn setup)
         }
         close(pipefd[1]);
         if (mode == NF_BINARY) {
-            char *argv[3];
+            /* argv is either the caller's, or the one-argument default. The
+             * default is built per call rather than shared, because execv()
+             * takes a char *const [] that the child writes to and a shared
+             * static would be a global the harness mutates. */
+            static char *const fallback[] = { (char *)"irc-serve", (char *)"0",
+                                              NULL };
+            char *const *args = (argv != NULL) ? argv : fallback;
 
-            argv[0] = (char *)"irc-serve";
-            argv[1] = (char *)"0";
-            argv[2] = NULL;
-            execv(NF_SERVER_BIN, argv);
+            execv(NF_SERVER_BIN, args);
             _exit(127);
         }
+        /* Set in the parent, before the fork, so the child inherits it. Doing it
+         * here in the child would work equally well and would be worse: it would
+         * make the name a per-mode thing when it is a per-node thing, and the
+         * binary mode has no use for it. */
+        g_child_name = (name != NULL) ? name : NF_NODE_NAME;
         _exit(nf_child_run(setup));
     }
 
@@ -553,6 +847,16 @@ static int nf_spawn_common(nf_node_t *n, nf_mode_t mode, nf_setup_fn setup)
     n->pid = pid;
     n->out_fd = pipefd[0];
     n->mode = mode;
+    /* In the registry BEFORE the readiness wait below, so that wait drains this
+     * child and any already-running one rather than only itself -- nf_finish_spawn()
+     * is a 15-second wait, and a node that is not the one being waited on can
+     * fill its pipe inside it. */
+    live_add(n);
+
+    /* Installed once per process, on the first spawn, and never removed: the hook
+     * belongs to the fixture rather than to any one node, and every wait that can
+     * outlive a spawn has to be able to drain the ones that came before it. */
+    tc_set_pump_hook(nf_pump_hook);
 
     if (nf_finish_spawn(n, (mode == NF_BINARY) ? 1 : 0) != 0) {
         nf_kill(n);
@@ -566,12 +870,55 @@ static int nf_spawn_common(nf_node_t *n, nf_mode_t mode, nf_setup_fn setup)
 
 int nf_spawn_binary(nf_node_t *n)
 {
-    return nf_spawn_common(n, NF_BINARY, NULL);
+    return nf_spawn_common(n, NF_BINARY, NULL, NULL, NULL);
+}
+
+int nf_spawn_binary_argv(nf_node_t *n, char *const argv[])
+{
+    if (argv == NULL) {
+        return -1;
+    }
+    return nf_spawn_common(n, NF_BINARY, NULL, NULL, argv);
 }
 
 int nf_spawn_inline(nf_node_t *n, nf_setup_fn setup)
 {
-    return nf_spawn_common(n, NF_INLINE, setup);
+    return nf_spawn_common(n, NF_INLINE, setup, NULL, NULL);
+}
+
+int nf_spawn_inline_named(nf_node_t *n, const char *name, nf_setup_fn setup)
+{
+    if (name == NULL || name[0] == '\0') {
+        return -1;
+    }
+    return nf_spawn_common(n, NF_INLINE, setup, name, NULL);
+}
+
+/* How much the child has written that the parent has NOT read. FIONREAD on the
+ * READ end of the pipe, which is the direction that matters: it answers "how
+ * much is waiting for me", not "how much have I written".
+ *
+ * Asked of the descriptor rather than of a count the fixture keeps, because the
+ * fixture's own knowledge is exactly what is in doubt when this is called. The
+ * parent's buffer is drained opportunistically by nf_pump_all(), so a node that
+ * stopped writing and a node whose output nobody pumped leave the same
+ * `n->out`, and the kernel's count is the one that separates them.
+ *
+ * FIONREAD is in <sys/ioctl.h> on both platforms this suite builds on: Linux
+ * defines it there, and on macOS that header includes <sys/filio.h>, which is
+ * where it lives. No conditional include is needed for either. */
+int nf_pending_bytes(const nf_node_t *n, int *out)
+{
+    int queued = 0;
+
+    if (n == NULL || out == NULL || n->out_fd < 0) {
+        return -1;
+    }
+    if (ioctl(n->out_fd, FIONREAD, &queued) != 0) {
+        return -1;
+    }
+    *out = queued;
+    return 0;
 }
 
 int nf_stop(nf_node_t *n)
@@ -601,7 +948,7 @@ int nf_stop(nf_node_t *n)
     if (n->out_fd >= 0) {
         uint64_t deadline = nf_now_ms() + 200u;
 
-        while (out_pump(n, deadline) > 0) {
+        while (nf_pump_all(deadline) > 0) {
             deadline = nf_now_ms() + 50u;
         }
     }
@@ -628,6 +975,13 @@ void nf_kill(nf_node_t *n)
         n->reaped = 1;
     }
     n->pid = 0;
+    /* nf_free() would have removed it from the registry and closed the pipe, but
+     * a failed test kills its nodes and often never reaches the free. */
+    live_del(n);
+    if (n->out_fd >= 0) {
+        close(n->out_fd);
+        n->out_fd = -1;
+    }
 }
 
 void nf_free(nf_node_t *n)
@@ -635,6 +989,11 @@ void nf_free(nf_node_t *n)
     if (n == NULL) {
         return;
     }
+    /* Out of the registry before the descriptor below is closed, so that no LATER
+     * pump can be selecting on a descriptor this call is about to close. The wait
+     * loops are single-threaded, so no pump is in flight here; what this prevents
+     * is the next one. */
+    live_del(n);
     if (n->out_fd >= 0) {
         close(n->out_fd);
         n->out_fd = -1;
