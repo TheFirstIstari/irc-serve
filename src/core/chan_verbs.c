@@ -566,6 +566,18 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
             printf("[observable] chan_create: channel=%s origin=%s epoch=%llu "
                    "creator=%s\n", ch->name, ch->origin,
                    (unsigned long long)ch->origin_epoch, c->nick);
+            /* A CHANNEL THAT WAS HERE BEFORE may have left a topic behind, and
+             * this is the one place in the node where a remembered topic can be
+             * put back: the channel did not exist, so nothing here is being
+             * overwritten and 2.2's single-writer rule has nothing to say about
+             * it. It is a restoration of this node's own record about a channel
+             * the node created, not a state change, which is why it is not a peer
+             * message and why nothing is forwarded.
+             *
+             * Order matters: the restore happens BEFORE any 332 is sent below, so
+             * the first thing the joiner sees is the topic the channel actually
+             * has rather than an empty one followed by the real thing later. */
+            (void)server_topic_restore(s, ch);
         }
         /* Authority BEFORE membership and BEFORE the ban check.
          *

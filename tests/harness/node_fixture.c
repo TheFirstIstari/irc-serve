@@ -635,7 +635,8 @@ static void nf_child_print_stats(const server_t *s)
            "fed_own_origin=%llu fed_untagged_relay=%llu "
            "fed_unknown_verb=%llu fed_verb_deferred=%llu fed_malformed=%llu "
            "fed_dup_drop=%llu fed_dedup_dup=%llu fed_squit_self=%llu "
-           "burst_refused=%llu burst_abandoned=%llu burst_truncated=%llu\n",
+           "burst_refused=%llu burst_abandoned=%llu burst_truncated=%llu "
+           "topic_cache_full=%llu\n",
            (unsigned long long)s->n_accepted, (unsigned long long)s->n_closed,
            (unsigned long long)s->n_lines,
            (unsigned long long)s->n_parse_reject,
@@ -664,7 +665,8 @@ static void nf_child_print_stats(const server_t *s)
            (unsigned long long)s->n_fed_squit_self,
            (unsigned long long)s->n_burst_refused,
            (unsigned long long)s->n_burst_abandoned,
-           (unsigned long long)s->n_burst_truncated);
+           (unsigned long long)s->n_burst_truncated,
+           (unsigned long long)s->n_topic_cache_full);
     fflush(stdout);
 }
 

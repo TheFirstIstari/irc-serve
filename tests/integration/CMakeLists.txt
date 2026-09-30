@@ -182,6 +182,16 @@ irc_add_integration_test(test_serverinfo test_serverinfo.c)
 # does NOT say: 381 must never appear, and the password must never reach the log.
 irc_add_integration_test(test_choper test_choper.c)
 
+# Channel topic persistence across a reconnect. This was a CTest skip
+# (return 77) from Phase 1 and Phase 7 implemented the feature it was named for:
+# a channel's topic now survives the channel being DISPOSED, which 2.2 requires
+# once every member has left. Moved here from tests/protocol because the feature
+# is only observable on the wire -- a test that cannot reach a node cannot assert
+# it -- and because the harness that reaches one is built by this file. The CTest
+# name TopicPersistence is unchanged, so nothing that has ever seen the test sees
+# a different thing.
+irc_add_integration_test(test_topic_persist test_topic_persist.c)
+
 # 2.4 / 3.2 / 4.3: the internal tag block the relay path budgets against, from
 # the side that is not Phase 1's. test_message_format.c pins the 179 overhead as
 # a LENGTH; this one pins the block as BYTES (a length cannot tell origin from

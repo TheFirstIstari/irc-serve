@@ -993,7 +993,186 @@ int chan_dispose_if_empty(server_t *s, chan_t *ch)
         return 0;
     }
     printf("[observable] chan_destroy: channel=%s reason=empty\n", ch->name);
+    /* The TOPIC goes out to the cache on the way down, and this is the only
+     * place it happens, which is what makes the cache's lifetime equal to the
+     * channel's: there is no other teardown path for a chan_t, so there is no
+     * other place a topic could be dropped. A loss here -- a full cache -- leaves
+     * the topic lost exactly as it would have been without the cache, and is
+     * counted on s->n_topic_cache_full; the return value is deliberately not
+     * examined, because refusing to dispose a channel over a cache miss would
+     * trade a lost topic for an unbounded store. */
+    (void)server_topic_remember(s, ch);
     server_chan_detach(s, ch->name);
     chan_free(ch);
     return 1;
+}
+
+/* ---------------------------------------------------------------------------
+ * The topic cache
+ * ---------------------------------------------------------------------------
+ * The reasoning for the cache's existence, its bounds and what it deliberately
+ * does NOT carry is in channel.h. What follows is the code, and it is four
+ * functions and one static helper because the whole of the thing is a keyed
+ * array with one writer and one reader.
+ */
+
+/* The entry for `name`, or NULL.
+ *
+ * It folds, and THE FOLD IS CURRENTLY UNREACHABLE, which is worth saying rather
+ * than leaving to be discovered: both callers pass a `chan_t::name`, and 2.2
+ * stores those canonicalised, so the two spellings this comparison is there to
+ * tell apart cannot both arrive. A fault injection that replaced chan_same_name()
+ * here with strcmp() therefore passes the whole suite -- it was tried, and the
+ * only reason it does is that nothing on the wire reaches it.
+ *
+ * It is kept anyway, for the same reason server_link_t::name is a copy rather
+ * than a pointer: "is this the same name" must have ONE answer in this tree, and
+ * a comparison that folds differently from every other one is a comparison that
+ * will differ the day a caller passes something else. The cost is a fold per
+ * entry in a table bounded at SERVER_TOPIC_MAX, on a path that runs once per
+ * channel creation. */
+static chan_topic_t *topic_find(const server_t *s, const char *name)
+{
+    for (size_t i = 0; i < s->ntopics; i++) {
+        if (chan_same_name(s->topics[i].name, name) != 0) {
+            return &s->topics[i];
+        }
+    }
+    return NULL;
+}
+
+/* Drop the entry at `idx`, order-preserving. The order is not used by anything
+ * (there is no LIST over the cache) but preserving it keeps the vector honest for
+ * whoever walks it next, and an order-preserving removal is the same choice
+ * chan_detach_conn() already makes for 2.2's member lists. */
+static void topic_remove_at(server_t *s, size_t idx)
+{
+    for (size_t i = idx; i + 1u < s->ntopics; i++) {
+        s->topics[i] = s->topics[i + 1u];
+    }
+    s->ntopics--;
+}
+
+int server_topic_remember(server_t *s, const chan_t *ch)
+{
+    chan_topic_t *e;
+
+    if (s == NULL || ch == NULL) {
+        return 0;
+    }
+    e = topic_find(s, ch->name);
+    if (ch->topic[0] == '\0') {
+        /* A CLEARED topic removes the entry rather than remembering an empty
+         * one. See channel.h: absence is how "never remembered" is spelled, and
+         * an entry holding "" would be a second way to spell it. */
+        if (e == NULL) {
+            return 0; /* nothing to remember and nothing to forget */
+        }
+        topic_remove_at(s, (size_t)(e - s->topics));
+        printf("[observable] topic_persist: channel=%s state=forgotten entries=%zu\n",
+               ch->name, s->ntopics);
+        return 0;
+    }
+    if (e != NULL) {
+        /* Already known: overwrite in place. The three fields move together, so
+         * an entry is never half old and half new -- the same "every field
+         * changes or none does" rule chan_set_topic() applies to a channel. */
+        (void)copy_bounded(e->topic, sizeof e->topic, ch->topic);
+        (void)copy_bounded(e->who, sizeof e->who, ch->topic_who);
+        e->when = ch->topic_when;
+        printf("[observable] topic_persist: channel=%s state=remembered "
+               "topic_len=%zu entries=%zu updated=1\n",
+               ch->name, strlen(ch->topic), s->ntopics);
+        return 1;
+    }
+    if (s->ntopics >= (size_t)SERVER_TOPIC_MAX) {
+        /* The bound, and the loss is COUNTED rather than hidden. A node whose
+         * counter climbs is a node that has seen more distinct channel names
+         * than it can remember topics for, and that is the number an operator
+         * needs; the topic is then lost exactly as it would have been without
+         * this cache. */
+        s->n_topic_cache_full++;
+        printf("[observable] topic_persist: channel=%s state=REFUSED "
+               "reason=CACHE_FULL entries=%zu\n",
+               ch->name, s->ntopics);
+        return -1;
+    }
+    /* Geometric growth, doubling from the first entry, so a node that remembers
+     * 64 topics has done six reallocs rather than 64. The bound above is what
+     * makes this safe: the loop is not asked to grow without a ceiling, and
+     * `want` is clamped to it so a request past the bound cannot allocate a
+     * bigger array and then fail to use it. */
+    if (s->ntopics == s->topics_cap) {
+        size_t want = (s->topics_cap == 0u) ? 8u : s->topics_cap * 2u;
+        chan_topic_t *grown;
+
+        if (want > (size_t)SERVER_TOPIC_MAX) {
+            want = (size_t)SERVER_TOPIC_MAX;
+        }
+        grown = (chan_topic_t *)realloc(s->topics, want * sizeof *s->topics);
+        if (grown == NULL) {
+            s->n_topic_cache_full++;
+            printf("[observable] topic_persist: channel=%s state=REFUSED "
+                   "reason=NO_MEMORY entries=%zu\n",
+                   ch->name, s->ntopics);
+            return -1;
+        }
+        s->topics = grown;
+        s->topics_cap = want;
+    }
+    e = &s->topics[s->ntopics];
+    (void)copy_bounded(e->name, sizeof e->name, ch->name);
+    (void)copy_bounded(e->topic, sizeof e->topic, ch->topic);
+    (void)copy_bounded(e->who, sizeof e->who, ch->topic_who);
+    e->when = ch->topic_when;
+    s->ntopics++;
+    printf("[observable] topic_persist: channel=%s state=remembered "
+           "topic_len=%zu entries=%zu updated=0\n",
+           ch->name, strlen(ch->topic), s->ntopics);
+    return 1;
+}
+
+int server_topic_restore(server_t *s, chan_t *ch)
+{
+    const chan_topic_t *e;
+
+    if (s == NULL || ch == NULL) {
+        return 0;
+    }
+    e = topic_find(s, ch->name);
+    if (e == NULL) {
+        return 0;
+    }
+    /* The three fields are written by hand rather than through
+     * chan_set_topic(), and the reason is the time. chan_set_topic() STAMPS
+     * topic_when with the current clock, which is right for a topic a client is
+     * setting now and wrong here: 333 would then say the topic was set at the
+     * moment of the rejoin, by the user who rejoined, which is a lie about both
+     * facts and is exactly the failure 333's existence is meant to prevent.
+     *
+     * A refused copy leaves the channel's topic empty, which is the state it was
+     * in anyway, so there is no half-restored state to clean up. A value that
+     * fitted once cannot fail to fit a second time -- both are the same
+     * CHAN_MAX_* fields the channel was filled from -- which is why the result is
+     * reported rather than handled. */
+    (void)copy_bounded(ch->topic, sizeof ch->topic, e->topic);
+    (void)copy_bounded(ch->topic_who, sizeof ch->topic_who, e->who);
+    ch->topic_when = e->when;
+    printf("[observable] topic_persist: channel=%s state=restored topic_len=%zu "
+           "entries=%zu\n",
+           ch->name, strlen(ch->topic), s->ntopics);
+    return 1;
+}
+
+size_t server_topic_count(const server_t *s)
+{
+    return (s != NULL) ? s->ntopics : 0u;
+}
+
+const chan_topic_t *server_topic_at(const server_t *s, size_t i)
+{
+    if (s == NULL || i >= s->ntopics) {
+        return NULL;
+    }
+    return &s->topics[i];
 }
