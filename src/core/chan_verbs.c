@@ -1321,3 +1321,237 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
         return;
     }
 }
+
+/* ---------------------------------------------------------------------------
+ * INVITE
+ * ---------------------------------------------------------------------------
+ * 4.2's INVITE, RFC 2812 3.3.6. Two replies and one line to somebody else:
+ *
+ *   341  RPL_INVITING, to the INVITER: "you have invited them"
+ *   INVITE  to the INVITEE, prefixed with the inviter's hostmask
+ *
+ * THE TWO REPLIES GO TO DIFFERENT CLIENTS, and that is the whole reason the
+ * first one is not redundant. reply() addresses one connection (see reply.h), so
+ * a 341 is by construction only ever seen by the inviter -- the numerics in 3's
+ * reply path are "never written to a peer link and never relayed", and the same
+ * one-enforcement-point discipline is what keeps a 341 off the invitee's socket.
+ * The invitee is not answered with a numeric at all; it gets an INVITE, which is
+ * an ordinary client-to-client line and therefore goes out through 3.1's table
+ * rather than through reply().
+ *
+ * ---------------------------------------------------------------------------
+ * WHY authority_ok() IS ASKED WITH `stateful` = 1 EVEN THOUGH INVITE CHANGES
+ * NOTHING
+ * ---------------------------------------------------------------------------
+ * An INVITE adds no member, sets no topic and no mode, so by 2.2's own words it
+ * is not a channel state change and the single-writer rule does not apply to it
+ * in the way it applies to KICK or MODE. And yet it is asked as though it does,
+ * and the reason is the OTHER thing it reads: the +o it checks.
+ *
+ * member.flags is the origin's record of who is an operator (2.2: the operator
+ * set belongs to the origin, which is why MODE +o is a prefix mode and not an
+ * origin-only one). So on a channel this node does not own, the +o that decides
+ * 482 is a CACHE, and a cache cannot refuse anybody -- a node that let a cached
+ * non-op invite would be the origin's policy being decided by a relay, which is
+ * the exact failure the single-writer rule exists to prevent. Asking with
+ * `stateful` = 1 is what turns that into an explicit 437 rather than a silently
+ * wrong answer.
+ *
+ * And the FORWARD verdict is REFUSED here for the same reason handle_mode()
+ * refuses it: 4.3's frozen S-verb table has no SINVITE, so there is no honest
+ * line to put on a peer link, and the trailing text names the missing verb rather
+ * than pretending the request succeeded somewhere it did not. The cost, stated:
+ * on a federated mesh an invite into a channel this node does not own does not
+ * work until 4.3 grows an SINVITE, and a client gets a 437 saying so rather than
+ * a 341 that may not come true.
+ *
+ * ---------------------------------------------------------------------------
+ * BOTH PARAMETER ORDERS ARE ACCEPTED
+ * ---------------------------------------------------------------------------
+ * RFC 1459 2.4.7 gave INVITE `<channel> <nick>` and RFC 2812 3.3.6 gave it
+ * `<nick> <channel>`. Both are in the field -- the second is what current
+ * clients send, the first is what older ones and a fair number of scripts still
+ * send -- and a node that implements only one of them 401s half the clients that
+ * use it, on a verb whose whole job is to be issued. So the two are told apart by
+ * the NAME rather than by position: 4.4 advertises CHANTYPES=#& and this node
+ * publishes 005's CHANTYPES=#&, so a parameter that is a valid channel name is
+ * the channel. That is the same predicate the channel registry uses, so there is
+ * one definition of "that is a channel name" and not two.
+ *
+ * The cost of accepting both is that `INVITE #a #b` is read as "invite #a to
+ * #b" and 401s on #a, where reading it positionally would have produced the
+ * nonsense invite of one channel to another either way. No legal line is
+ * misread.
+ */
+void handle_invite(server_t *s, conn_t *c, const message_t *m)
+{
+    const char *nick_arg;
+    const char *chan_arg;
+    chan_t *ch;
+    fanout_target_t t;
+    chan_verdict_t verdict;
+    char prefix[CONN_HOSTMASK_MAX];
+    const char *params[1];
+
+    if (m->nparams != 2) {
+        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        return;
+    }
+    if (chan_name_valid(m->params[0])) {
+        /* RFC 1459 2.4.7's <channel> <nick>: the channel comes first. */
+        chan_arg = m->params[0];
+        nick_arg = m->params[1];
+    } else {
+        /* RFC 2812 3.3.6's <nick> <channel>. */
+        nick_arg = m->params[0];
+        chan_arg = m->params[1];
+    }
+
+    /* 442 for a channel the inviter is not on, 403 for a name this node will not
+     * speak about, and -- less obviously -- 442 for a channel this node has
+     * never heard of, because resolve_joined() answers that with 442 too and on
+     * purpose. All three come from that one primitive rather than from three
+     * checks here, so every channel verb in the node answers "you are not on
+     * that channel" in the same words; the reasoning for the missing-channel
+     * case is in resolve_joined()'s own comment. They are all about the
+     * request rather than about the invitee, so they come before anything the
+     * invitee is told. */
+    ch = resolve_joined(s, c, chan_arg);
+    if (ch == NULL) {
+        return;
+    }
+    verdict = authority_ok(s, c, ch, "INVITE", 1);
+    if (verdict == CHAN_VERDICT_REFUSED) {
+        return; /* 437 already sent; nothing has been touched */
+    }
+    if (verdict == CHAN_VERDICT_FORWARD) {
+        printf("[observable] chan_invite_refused: channel=%s nick=%s "
+               "reason=INVITE_NEEDS_ORIGIN\n",
+               ch->name, c->nick);
+        (void)reply(s, c, "437", (const char *const[]){ ch->name }, 1,
+                    "Cannot invite to %s: there is no SINVITE to send its origin "
+                    "(%s)",
+                    ch->name, ch->origin);
+        return;
+    }
+    if (!chan_has_flag(ch, c, CHAN_MEMBER_OP)) {
+        /* 482, for the RFC's reason: "Only channel operators may invite new
+         * users to a channel" (3.3.6). The same numeric KICK and MODE use for
+         * the same situation, and 4.4 has nothing better to say about "you
+         * lack privilege for this action". */
+        (void)reply(s, c, "482", (const char *const[]){ ch->name }, 1,
+                    "You're not a channel operator");
+        printf("[observable] chan_invite_refused: channel=%s nick=%s reason=not_op\n",
+               ch->name, c->nick);
+        return;
+    }
+
+    /* Resolved through 3.1 rather than through a direct registry lookup, so the
+     * target is carried as a resolved target with its class already decided --
+     * the same discipline every other emitter in the tree follows, and the
+     * reason a second write path cannot grow here. A name that resolves to a
+     * CHANNEL is 401: an invite names a person, and "no such nick" is the
+     * honest answer for a name that is not one. */
+    if (fanout_resolve(s, c, nick_arg, FANOUT_MESSAGE, &t) == 0) {
+        return; /* 401 or 403 already sent */
+    }
+    if (t.kind != FANOUT_LOCAL_USER) {
+        (void)reply(s, c, "401", (const char *const[]){ t.name }, 1,
+                    "No such nick/channel");
+        printf("[observable] chan_invite_refused: nick=%s target=%s kind=%d "
+               "reason=not_a_nick\n",
+               c->nick, t.name, (int)t.kind);
+        return;
+    }
+    if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
+        return;
+    }
+
+    /* The channel is the ONLY parameter after the target: 3.1's target is
+     * prepended by the fan-out, and the client's own shape is
+     * `INVITE <target> [:<channel>]`. It is sent whether or not the invitee is
+     * already on the channel -- 3.3.6 says the invitee is invited "regardless of
+     * its modes" and says nothing about suppressing the channel for somebody who
+     * is already there, so the unconditional form is the one that is always
+     * answerable by a client. */
+    params[0] = ch->name;
+    (void)fanout_deliver(s, &t, prefix, "INVITE", params, 1, NULL, NULL);
+
+    /* The inviter is told last, and only the inviter. who->nick is the spelling
+     * the INVITEE chose (2.1: the registry folds the key and the display case is
+     * the user's), so the 341 names them the way every other numeric does. */
+    (void)reply(s, c, "341", (const char *const[]){ ch->name, t.user->nick }, 2,
+                "%s has invited you to channel %s", c->nick, ch->name);
+    printf("[observable] chan_invite: channel=%s by=%s target=%s\n", ch->name,
+           c->nick, t.user->nick);
+}
+
+/* ---------------------------------------------------------------------------
+ * KNOCK
+ * ---------------------------------------------------------------------------
+ * 4.2's KNOCK, and the answer is a refusal. Everything below is why, because a
+ * verb whose entire behaviour is one numeric is exactly the kind of thing that
+ * looks like a stub and is not.
+ *
+ * THE GATE IS AN IRC OPERATOR, NOT A CHANNEL ONE, and this node has no operator
+ * flags at all. KNOCK asks the ORIGIN to extend an invitation to a client that
+ * is not on the channel, so a client has to be able to ask for a favour the
+ * origin will not grant to everybody -- and the only thing the RFC names as that
+ * authority is an IRC operator. There is no IRCop concept anywhere in this tree:
+ * conn_t has no operator field, 004 advertises a user-mode set of "i" that
+ * nothing evaluates, and 5's operator model does not exist. A node that answered
+ * KNOCK with 704 RPL_KNOCK would be telling a client that a request was lodged
+ * with an origin that has never heard of it, which is the 341-without-the-invite
+ * failure this file's INVITE comment describes.
+ *
+ * SO THE ANSWER DOES NOT DEPEND ON THE CHANNEL, and no +k check is performed.
+ * The RFC also allows a server to refuse knocks on a channel with +k set, and
+ * that is the check this handler looks like it should have. It is not here
+ * because it cannot change the answer on this build: nothing in the tree ever
+ * records a 'k' in modes[], so chan_mode_has(ch, 'k') is 0 for every channel
+ * this node holds, and a check whose answer is constant is not a check. The
+ * observable line prints k_mode anyway, so the log says which gate fired and a
+ * reader does not have to guess.
+ *
+ * WHAT WOULD REPLACE IT, and why it is not here: on a federated mesh the honest
+ * implementation is a SKNOCK forwarded to the channel's origin, which then
+ * decides. 4.3's frozen S-verb table has no SKNOCK, and §7/Phase 6's own
+ * statement that a wire format cannot be invented later is the reason it is not
+ * improvised here.
+ *
+ * 482 rather than 480 ERR_KNOCKPROHIBIT, and neither is in 4.4's list. 482 is
+ * the numeric 4.4 does have for "you are not privileged enough for this action"
+ * -- the same one KICK and MODE use -- and the trailing text says what the
+ * privilege is. A client that receives it has been told the truth about why.
+ */
+void handle_knock(server_t *s, conn_t *c, const message_t *m)
+{
+    char canonical[CHAN_MAX_NAME + 1];
+    chan_t *ch;
+
+    if (m->nparams != 1) {
+        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        return;
+    }
+    /* A channel-name check and an existence check, both 403, and both BEFORE the
+     * refusal -- so `KNOCK nosuch` and `KNOCK not-a-channel` are answered about
+     * the thing the client got wrong rather than about the capability it lacks.
+     * That distinction is the only difference a client can act on: one of them
+     * is fixable by typing a different channel. */
+    if (!canonical_channel(s, c, m->params[0], canonical, sizeof canonical)) {
+        return;
+    }
+    ch = server_chan_get(s, canonical);
+    if (ch == NULL) {
+        (void)reply(s, c, "403", (const char *const[]){ canonical }, 1,
+                    "No such channel");
+        return;
+    }
+
+    (void)reply(s, c, "482", (const char *const[]){ ch->name }, 1,
+                "You're not an IRC operator");
+    printf("[observable] knock_refused: channel=%s nick=%s reason=NO_OPER_FLAGS "
+           "k_mode=%d local=%zu\n",
+           ch->name, c->nick, chan_mode_has(ch, 'k'), ch->nmembers);
+}
+
