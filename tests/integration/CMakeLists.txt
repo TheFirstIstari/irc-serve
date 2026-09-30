@@ -153,3 +153,96 @@ irc_add_integration_test(test_messaging test_messaging.c)
 # WHOIS report on, so the three cannot be separated by a file boundary without
 # the file testing itself.
 irc_add_integration_test(test_queries test_queries.c)
+
+# 2.4 / 3.2 / 4.3: the internal tag block the relay path budgets against, from
+# the side that is not Phase 1's. test_message_format.c pins the 179 overhead as
+# a LENGTH; this one pins the block as BYTES (a length cannot tell origin from
+# epoch, so a serialiser emitting the four tags in the wrong order has exactly
+# the right length) and then measures the overhead from two real renders, and
+# asserts that the largest body the node will relay, stamped with the largest
+# legal stamp, still fits IRC_MAX_LINE while one byte more is refused.
+irc_add_integration_test(test_fed_tags test_fed_tags.c)
+
+# 4.3 / 2.4: the S-verb wire, byte for byte, toward a listener THIS test owns.
+# Every client verb with an S-verb is compared against a written-out literal --
+# the four tag names in the frozen order, hops=0, the S-verb, the target, the
+# text -- and the whole peer buffer is then asserted equal to exactly those
+# lines, so a line that was not asked for fails as surely as one that was
+# missing. The end-to-end half of test_reply_guard.c is here: real numerics
+# driven through a real peer link, with each one checked to have reached the
+# CLIENT first so that "the peer link is empty" is not satisfied by a link that
+# never worked. No sleep anywhere; waiting is a deadline loop over the node's
+# own poll step, and the negatives close their window with a PING/PONG.
+irc_add_integration_test(test_fed_wire test_fed_wire.c)
+
+# 2.4: the (origin, epoch, id) duplicate store and the loop guard that reads it.
+# The store is asserted on RETURN VALUES -- first arrival new, second seen, the
+# three key fields independent, the origin folded ASCII, an illegal key not new
+# -- plus the TTL on BOTH sides of its boundary, the sweep throttle, and the
+# capacity eviction (the store must not grow, must take the least recently seen
+# entry, and must still answer correctly afterwards, which is what catches a
+# back-shift repair that broke a probe chain). The guard is asserted on the WIRE:
+# a link that is not ESTABLISHED is not a route, a relay carries its
+# origin/epoch/id through untouched with only hops incremented (the id counter is
+# pinned and required not to move), hops one short of the ceiling is refused,
+# and a message whose origin is this node is refused in either case spelling --
+# each beside a positive control, and each with a different-case name so the
+# fold is load-bearing.
+irc_add_integration_test(test_fed_dedup test_fed_dedup.c)
+
+# 2.3 / 4.3 / 8: the FEDERATE exchange, end to end, over real TCP between real
+# child processes. Every case is a REJECTION or the happy path, and each is
+# asserted on the child's own observable output rather than on a struct field:
+# two nodes claiming one name (SELF_NAME, and neither reaches ESTABLISHED), a
+# wrong secret (BAD_SECRET, with the two secrets differing only in their LAST
+# byte so a prefix compare would pass), a second claim on a name that is
+# already ESTABLISHED (DUPLICATE_LINK), a handshake nobody answers, a link that
+# goes silent, and the happy path -- which runs the SHIPPED BINARY on a command
+# line, so --name/--secret/--peer and main()'s getaddrinfo are covered by
+# something that can fail rather than by code nothing reaches. The handshake
+# timeout and the liveness threshold are set per process in the child, so no
+# case waits the shipped five or ninety seconds, and there is no sleep anywhere:
+# every wait is a deadline over select() (6.3).
+irc_add_integration_test(test_fed_handshake test_fed_handshake.c)
+
+# 7/Phase 6: a user on A JOINs a channel and a user on B JOINs the same one, and
+# the FULL 353 contents on each node are asserted in the Phase 4 order. Two child
+# processes over real TCP, per 6.2.
+irc_add_integration_test(test_fed_roster test_fed_roster.c)
+
+# 7/Phase 6: a PRIVMSG from A reaches B exactly once, the two-node ping-pong
+# settles, and 2.4's own-origin rule is the counter that proves it.
+irc_add_integration_test(test_fed_loop test_fed_loop.c)
+
+# 7/Phase 6: a node with ZERO local members in the channel still relays that
+# channel's SPRIVMSG to the owner.
+irc_add_integration_test(test_fed_relay test_fed_relay.c)
+
+# 4.3 / 7/Phase 6 acceptance criterion 2: the FULL 353 CONTENTS on BOTH nodes
+# after a resync, in the Phase 4 order and terminated by a 366 -- and the
+# replace-never-merge property the resync exists for, which needs three bursts
+# over one established link because "replaces" is three different claims. The
+# middle one (an origin de-privileging a member) has teeth with no fixture poke
+# anywhere in it; the third (a member the origin lost) cannot be produced by
+# client commands on a two-node mesh at all, because the SPART would have
+# removed the member first, and the test says so and pokes deliberately.
+irc_add_integration_test(test_fed_burst test_fed_burst.c)
+
+# 2.4: the inbound guard chain, driven by a peer that is trying to get past it.
+# Every guard is a refusal of a line a well-behaved node would never send, so the
+# far end of the link has to be a raw socket rather than a second node.
+irc_add_integration_test(test_fed_guards test_fed_guards.c)
+
+# 2.2 / 4.3: what a node does when a peer goes away and when one comes back.
+# 437 naming the origin on a channel this node cannot route to, NAMES still
+# answered after the drop, NO auto-redial, re-linking a server of the SAME name
+# resurrecting the channel (asserted as a round trip on the far side, not as an
+# absence of 437), the SQUIT a dying node sends its remaining peers and the
+# PER-ORIGIN purge that follows -- including an unrelated origin's roster
+# surviving, which is the assertion with teeth -- and a peer claiming THIS node
+# is gone being refused without costing the link. Three of the four cases need a
+# node with more than one peer, so the fixture is four nodes: a two-node mesh
+# cannot produce a link-down announcement at all, because the link that died was
+# the only link. The last case owns one end of a link, like test_fed_guards.c,
+# because no second node built from this code will send the line.
+irc_add_integration_test(test_fed_resync test_fed_resync.c)

@@ -170,6 +170,7 @@ void chan_free(chan_t *ch)
     free(ch->members);
     free(ch->servers);
     free(ch->bans);
+    free(ch->remotes);
     free(ch);
 }
 
@@ -313,6 +314,11 @@ void chan_member_leave(server_t *s, chan_t *ch, conn_t *who, int echo_to_who,
 int chan_has_flag(const chan_t *ch, const conn_t *c, unsigned flag)
 {
     return chan_member_is(chan_find_member(ch, c), flag);
+}
+
+int chan_same_name(const char *a, const char *b)
+{
+    return same_name(a, b);
 }
 
 struct member *chan_find_nick(const chan_t *ch, const char *nick)
@@ -501,6 +507,196 @@ int chan_server_has(const chan_t *ch, const char *name)
         }
     }
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * The remote roster
+ * ------------------------------------------------------------------------- */
+
+chan_remote_t *chan_remote_find(const chan_t *ch, const char *server,
+                                const char *nick)
+{
+    if (ch == NULL || server == NULL || nick == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < ch->nremotes; i++) {
+        if (same_name(ch->remotes[i].server, server) &&
+            same_name(ch->remotes[i].nick, nick)) {
+            return &ch->remotes[i];
+        }
+    }
+    return NULL;
+}
+
+int chan_remote_add(chan_t *ch, const char *server, const char *member_server,
+                    const char *nick, unsigned flags)
+{
+    chan_remote_t *seen;
+
+    if (ch == NULL || server == NULL || nick == NULL) {
+        return -1;
+    }
+    /* Validated HERE, and not left to the caller, because the caller is a peer
+     * protocol handler and the three rules it would have to remember are 2.1's
+     * nickname charset and 2.4's server-name grammar (twice, because the entry
+     * now names two different servers). All of them exist because later phases
+     * build on them -- 2.1's split at the last '@' is unsound without the
+     * charset -- and a roster entry that skipped any of them would be a name the
+     * node could not qualify, compare or render. This is the first place in the
+     * tree a nickname arrives from a network rather than from a client.
+     *
+     * member_server is validated when it is GIVEN and accepted as absent when it
+     * is not: "" and NULL both mean "this node has not been told", which is the
+     * ordinary state of an entry learned from a live SJOIN rather than a
+     * corruption. Refusing an empty one would mean a live SJOIN could not record
+     * a member at all.
+     *
+     * THE VALIDATION ALSO BOUNDS THE LENGTH, which is why the copy further down
+     * cannot fail: irc_serve_server_name_valid() refuses a name longer than
+     * IRC_MAX_SERVER_NAME, and CHAN_MAX_SERVER is that same bound, so a name
+     * that passed is a name that fits. The copy's result is still checked for the
+     * KEY, which is what the existing code did, and deliberately not for the
+     * holder -- a refusal there would drop a whole member over a field the
+     * member itself is fine without. */
+    if (!irc_serve_server_name_valid(server) || !valid_nick(nick)) {
+        return -1;
+    }
+    if (member_server != NULL && member_server[0] != '\0' &&
+        !irc_serve_server_name_valid(member_server)) {
+        return -1;
+    }
+    seen = chan_remote_find(ch, server, nick);
+    if (seen != NULL) {
+        /* A repeated SJOIN is a re-assertion, not a second member. The flags
+         * are overwritten rather than OR'd because a peer that says `alice` is
+         * no longer an op has told us something, and a roster where nobody can
+         * ever lose +o is a roster that converges on the wrong answer.
+         *
+         * The holder is overwritten on a repeat even when the repeat is a live
+         * SJOIN carrying no server, because a caller that knows nothing says so
+         * and must not silently clear what a burst established -- a stale holder
+         * is a fact this node can still act on, a cleared one is not. */
+        seen->flags = flags;
+        if (member_server != NULL && member_server[0] != '\0') {
+            (void)copy_bounded(seen->member_server, sizeof seen->member_server,
+                               member_server);
+        }
+        return 0;
+    }
+    if (ch->nremotes == ch->rcap) {
+        size_t want = (ch->rcap == 0) ? 4u : ch->rcap * 2u;
+        chan_remote_t *grown;
+
+        if (ch->nremotes >= (size_t)CHAN_MAX_REMOTE_MEMBERS) {
+            return -1;
+        }
+        grown = (chan_remote_t *)realloc(ch->remotes, want * sizeof *grown);
+        if (grown == NULL) {
+            return -1;
+        }
+        ch->remotes = grown;
+        ch->rcap = want;
+    }
+    if (!copy_bounded(ch->remotes[ch->nremotes].nick,
+                      sizeof ch->remotes[0].nick, nick) ||
+        !copy_bounded(ch->remotes[ch->nremotes].server,
+                      sizeof ch->remotes[0].server, server)) {
+        return -1;
+    }
+    /* A new entry has no host: 4.3's SJOIN does not carry one, and a burst is
+     * the only thing that can supply it. Written explicitly rather than left to
+     * the allocator, because realloc does NOT zero the slot it hands back -- this
+     * struct grew the field in C4, so an initialiser that existed only in
+     * chan_new()'s memset would leave a RECYCLED element carrying the previous
+     * member's host, which is a member impersonation bug wearing a memory bug's
+     * clothes. `member_server` is written the same way and for the same reason:
+     * it grew in C5, and a recycled element must not inherit the previous
+     * member's server either -- that is the same impersonation with a
+     * different field. */
+    ch->remotes[ch->nremotes].host[0] = '\0';
+    ch->remotes[ch->nremotes].member_server[0] = '\0';
+    if (member_server != NULL) {
+        (void)copy_bounded(ch->remotes[ch->nremotes].member_server,
+                           sizeof ch->remotes[0].member_server, member_server);
+    }
+    ch->remotes[ch->nremotes].flags = flags;
+    ch->nremotes++;
+    return 0;
+}
+
+size_t chan_remote_purge(chan_t *ch, const char *server)
+{
+    size_t i = 0;
+    size_t gone = 0;
+
+    if (ch == NULL || server == NULL) {
+        return 0;
+    }
+    /* Walking FORWARD under a shrinking array rather than backward from the end
+     * under a growing one: the only other shape is an index that has to be
+     * decremented on every removal, and the off-by-one that produces is silent
+     * -- it skips a member rather than crashing. Entries are ordered, and 7/Phase
+     * 4 fixes 353's rendering order across this array, so a forward walk is
+     * also the one that does not reorder what is kept. */
+    while (i < ch->nremotes) {
+        if (same_name(ch->remotes[i].server, server)) {
+            (void)memmove(&ch->remotes[i], &ch->remotes[i + 1u],
+                          (ch->nremotes - i - 1u) * sizeof ch->remotes[0]);
+            ch->nremotes--;
+            gone++;
+            continue; /* the element now at i is unexamined; look at it again */
+        }
+        i++;
+    }
+    return gone;
+}
+
+int chan_remote_set_host(chan_t *ch, const char *server, const char *nick,
+                         const char *host)
+{
+    chan_remote_t *seen;
+
+    if (ch == NULL || server == NULL || nick == NULL || host == NULL) {
+        return -1;
+    }
+    /* An EMPTY host is a real answer, not a bad argument: it is what a burst
+     * that carried none leaves behind, and refusing it would mean a peer could
+     * not say "this member has no host" once a host had been learned. */
+    seen = chan_remote_find(ch, server, nick);
+    if (seen == NULL) {
+        return -1;
+    }
+    return copy_bounded(seen->host, sizeof seen->host, host) ? 0 : -1;
+}
+
+int chan_remote_remove(chan_t *ch, const char *server, const char *nick)
+{
+    if (ch == NULL || server == NULL || nick == NULL) {
+        return 0;
+    }
+    for (size_t i = 0; i < ch->nremotes; i++) {
+        if (same_name(ch->remotes[i].server, server) &&
+            same_name(ch->remotes[i].nick, nick)) {
+            (void)memmove(&ch->remotes[i], &ch->remotes[i + 1u],
+                          (ch->nremotes - i - 1u) * sizeof ch->remotes[0]);
+            ch->nremotes--;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+size_t chan_remote_count(const chan_t *ch)
+{
+    return (ch != NULL) ? ch->nremotes : 0u;
+}
+
+chan_remote_t *chan_remote_at(const chan_t *ch, size_t i)
+{
+    if (ch == NULL || i >= ch->nremotes) {
+        return NULL;
+    }
+    return &ch->remotes[i];
 }
 
 /* ---------------------------------------------------------------------------

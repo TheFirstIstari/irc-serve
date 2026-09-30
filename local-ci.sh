@@ -34,4 +34,9 @@ BUILD_TYPE=${BUILD_TYPE:-Release}
 
 cmake -B build -S . -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" -DBUILD_TESTING=ON
 cmake --build build --parallel "${NPROC}"
-ctest --test-dir build --output-on-failure --timeout "${CTEST_TIMEOUT}"
+# -j matters: the suite is 56 independent processes and ctest defaults to one
+# at a time, so serial execution spends most of the wall clock waiting. Override
+# with CTEST_JOBS=1 when bisecting a failure, where interleaved output is worse
+# than slow.
+CTEST_JOBS="${CTEST_JOBS:-$( (command -v nproc >/dev/null && nproc) || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+ctest --test-dir build --output-on-failure --timeout "${CTEST_TIMEOUT}" -j "${CTEST_JOBS}"
