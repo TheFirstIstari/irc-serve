@@ -309,7 +309,10 @@ int main(void)
     message_free(&m);
 
     /* --- tag lookup: unescaped values, case-insensitive keys --- */
-    assert(message_parse("@note=a\\sb\\;c\\:d\\\\e;flag;other=v PING", &m) == 0);
+    /* The wire form is IRCv3's: ';' is written \:, a colon is RAW, ' ' is
+     * \\s and \\ is \\. The previous spelling here read \; as ';' and \: as
+     * ':', which is a plausible guess and is not the table. */
+    assert(message_parse("@note=a\\sb\\:c:d\\\\e;flag;other=v PING", &m) == 0);
     {
         char value[64];
         assert(message_tag_get(&m, "note", value, sizeof value) == 0);

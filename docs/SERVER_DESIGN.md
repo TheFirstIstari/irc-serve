@@ -775,12 +775,32 @@ mandatory — many clients misbehave without it.
 
 | Item | Problem | Action |
 |---|---|---|
-| `ircv3_tags.c` | `tags_parse` and `tags_serialize` are the same function; roundtrip is vacuous; no escaping | Real parse → tag list, real serialize, and IRCv3 escaping (`\:` `\;` `\s` `\\` `\r` `\n` + lone-`\` rule) **both ways**. Doubles as the internal `@irc-serve-*` transport tags (§2.4) |
+| `ircv3_tags.c` | `tags_parse` and `tags_serialize` are the same function; roundtrip is vacuous; no escaping | Real parse → tag list, real serialize, and IRCv3 escaping **both ways**. Doubles as the internal `@irc-serve-*` transport tags (§2.4) |
 | `sasl_framework.c` | not in `irc_core`; `sasl_step` discards input, auto-completes after 2 calls; self-test harness lives in `src/` | Move the harness to `tests/`; implement real SASL PLAIN (base64 → `authzid\0authcid\0passwd` → credential store). Credentials are per-server, so a federated deployment shares via link auth |
 | `message_id.c` | orphan, not compiled, not tested, global counter, not IRCv3-shaped | Fold into §2.4: per-SERVER monotonic counter + boot `epoch`, dedup key `(origin,epoch,id)` scoped per node — unique without a global lock |
 | `lockfree_contract.c` | `volatile int`, one writer, no atomics | **Delete.** The single-threaded loop needs no lock-free structure. The claim comes out of the docs |
 | `server.c` | `printf` theatre; parses literal `"PING"` | Rewrite as the real `server_t` |
 | `node_main.c` | closes every client immediately (line 115) | Keeps its real `socket`/`bind`/`listen` and signals; loop becomes §3.4; port configurable, not hardcoded 6667 |
+
+**The escape set named above was wrong, and is corrected here rather than left
+for a reader to disprove.** Phase 8 checked it against the IRCv3 message-tags
+specification and this row listed `` `\:` `\;` `\s` `\\` `\r` `\n` ``, which is
+a plausible reading and is the wrong table in both directions: a semicolon is
+written `` `\:` `` and a **colon is not escaped at all**. `core/message.c` carried
+that table in its own `switch` and had asserted it in `test_message_format.c`
+for several phases, which is the usual way one survives — the test looked like the
+thing protecting the value while it was the thing keeping it wrong. Both were
+corrected in Phase 8: the escape table now lives in exactly one place
+(`src/ircv3_tags.c`) and `message_tag_escape()`/`message_tag_unescape()` delegate
+to it, because two copies are a tree that disagrees with itself about what a tag
+value means. Unescaping was wrong in a second, less visible way — a `\` before a
+character outside the set kept the backslash, so `\x` decoded to `\x` where the
+specification says `x`; it now drops it, which is also what makes a block written
+with the wrong table by a peer decode to the value its author meant.
+
+A tag value's escape set is **not** a parameter's, and the two are not
+interchangeable: RFC 1459 has no parameter escaping at all, and 3.2's formatter
+refuses or colons a parameter rather than escaping it.
 
 **Preserved as-is:** `federation_handshake.c` (real FSM, becomes the peer-link
 driver).

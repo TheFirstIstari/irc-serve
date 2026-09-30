@@ -8,6 +8,11 @@
 #include <string.h>
 #include <strings.h>
 
+/* The ONE escape table in this tree. message_tag_escape()/message_tag_unescape()
+ * below delegate here rather than carrying their own switch; see the comments on
+ * those two wrappers for why, and ircv3_tags.h for the table itself. */
+#include "ircv3_tags.h"
+
 /* Longest decimal we read or write for a uint64_t: UINT64_MAX is 20 digits.
  * Bounds the numeric tag parse and the size computations below. */
 #define NUM_DIGITS_U64 20
@@ -155,41 +160,29 @@ static int tag_block_find(const char *block, const char *key,
     return 0;
 }
 
-/* Escape `value` per IRCv3. Returns 0 on success and writes the byte count to
- * *written, or -1 if it does not fit. Never truncates. */
+/* Escape `value` per IRCv3 into `out` and write the byte count to *written.
+ * Returns 0 on success, -1 if it does not fit. Never truncates.
+ *
+ * A THIN WRAPPER, and deliberately so. ircv3_tags.c owns the escape table --
+ * there is exactly one in this tree, because two copies are a tree that
+ * disagrees with itself about what a value means. This function used to carry
+ * its own switch, and it carried the WRONG one: it escaped ':' as '\:' and ';'
+ * as '\;', which is a plausible reading of the table and is not the
+ * specification's. IRCv3 maps ';' to '\:' and leaves a colon raw. The mistake is
+ * retracted here rather than preserved for a test that asserted it.
+ *
+ * The cost of the delegation is one call per value on the serialize path, which
+ * is one per relayed message, and it is not measurable next to the render that
+ * follows it. */
 static int tag_escape_into(const char *value, char *out, size_t cap,
                            size_t *written)
 {
-    size_t n = 0;
-    for (size_t i = 0; value[i] != '\0'; i++) {
-        char c = value[i];
-        const char *rep = NULL;
-        switch (c) {
-        case ':':  rep = "\\:"; break;
-        case ';':  rep = "\\;"; break;
-        case ' ':  rep = "\\s"; break;
-        case '\\': rep = "\\\\"; break;
-        case '\r': rep = "\\r"; break;
-        case '\n': rep = "\\n"; break;
-        default:   break;
-        }
-        const size_t add = (rep != NULL) ? 2u : 1u;
-        if (n + add + 1 > cap) {
-            return -1;
-        }
-        if (rep != NULL) {
-            out[n] = '\\';
-            out[n + 1] = rep[1];
-            n += 2;
-        } else {
-            out[n] = c;
-            n++;
-        }
-    }
-    if (n + 1 > cap) {
+    const size_t n = ircv3_escape_value(value, out, cap);
+
+    if (n == 0u && value != NULL && value[0] != '\0') {
+        out[0] = '\0';
         return -1;
     }
-    out[n] = '\0';
     *written = n;
     return 0;
 }
@@ -211,35 +204,20 @@ size_t message_tag_escape(const char *value, char *out, size_t cap)
 /* Unescape exactly `len` bytes of `value` into `out`. Split out so that
  * message_tag_get, which knows a value's span inside a block and not just its
  * length, does not have to copy the value out of the block first. Returns 0 on
- * success, -1 if it does not fit. Never grows the value. */
+ * success, -1 if it does not fit. Never grows the value.
+ *
+ * Also a thin wrapper, for the reason tag_escape_into() gives. The rule it now
+ * inherits is the specification's: a '\' before a character outside the escape
+ * set has its BACKSLASH DROPPED and yields the character, and a lone trailing
+ * '\' produces nothing. It used to keep the backslash as a literal character,
+ * which meant a peer sending `\x` produced a value no peer would agree with --
+ * the same value, spelled two ways, on two nodes. */
 static int tag_unescape_span(const char *value, size_t len, char *out, size_t cap)
 {
-    if (len + 1 > cap) {
+    if (out == NULL || cap == 0) {
         return -1;
     }
-    size_t n = 0;
-    for (size_t i = 0; i < len; i++) {
-        char c = value[i];
-        if (c == '\\') {
-            if (i + 1 >= len) {
-                break; /* a lone trailing '\' is dropped */
-            }
-            c = value[++i];
-            switch (c) {
-            case ':':  c = ':';  break;
-            case ';':  c = ';';  break;
-            case 's':  c = ' ';  break;
-            case '\\': c = '\\'; break;
-            case 'r':  c = '\r'; break;
-            case 'n':  c = '\n'; break;
-            default:   break;   /* an unknown escape yields the character */
-            }
-        }
-        out[n] = c;
-        n++;
-    }
-    out[n] = '\0';
-    return 0;
+    return ircv3_unescape_value(value, len, out, cap);
 }
 
 int message_tag_unescape(const char *value, char *out, size_t cap)
