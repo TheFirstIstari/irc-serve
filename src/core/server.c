@@ -276,16 +276,119 @@ static void *strtab_get(const struct strtab *t, const char *key)
     return t->buckets[at].val;
 }
 
-/* Empty the bucket at `at` and count it out of the table. The one place a slot
- * is cleared, so strtab_del() below and strtab_del_owner() further down cannot
- * disagree about what "removed" leaves behind. */
+/* Empty the bucket at `at` and count it out of the table, then SHIFT the rest of
+ * the probe chain back over the gap. The one place a slot is cleared, so
+ * strtab_del() below and strtab_del_owner() further down cannot disagree about
+ * what "removed" leaves behind.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY DELETION HAS TO SHIFT (issue #107)
+ * ---------------------------------------------------------------------------
+ * This used to stop at the assignment below, and that made every key that probed
+ * PAST `at` unreachable. strtab_probe() walks forward from the key's home
+ * bucket and stops at the first slot with used == 0, so an empty slot is not
+ * merely an absence -- it is a WALL, and anything behind it is invisible.
+ *
+ * The consequence was user-visible rather than theoretical. `u4x` and `u79x` both
+ * hash to bucket 14; claim both, release `u4x`, and lookup("u79x") returns NULL
+ * while the name is still held. PRIVMSG and WHOIS then answer 401 for a
+ * connected, registered user, and a second client can claim the same name while
+ * the first is still listed in 353 -- because WHO walks the ENUMERATION and never
+ * consults the table for the name. Roughly 1 in 1024 per colliding pair, and
+ * every release adds another hole rather than closing one, so a node running for a
+ * day accumulates a great many.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY SHIFTING IS CORRECT FOR THIS PROBE, AND NOT BY LUCK
+ * ---------------------------------------------------------------------------
+ * Backward-shift deletion is only sound if the probe sequence for a key does not
+ * depend on the table's HISTORY. Here it does not, and the reason is structural:
+ *
+ *   strtab_probe() derives everything from the key and the table size alone --
+ *   idx = hash(k) % STRTAB_BUCKETS, then at = (idx + probe) % STRTAB_BUCKETS for
+ *   probe = 0, 1, 2, ... The one thing that varies with history is where the walk
+ *   STOPS, and "stop at the first empty slot" is precisely the thing a deletion
+ *   perturbs. So the obligation after a deletion is exactly one: put every entry
+ *   back where its own probe sequence will find it again.
+ *
+ * An entry in slot p is findable iff every slot in the cyclic range [home, p) is
+ * occupied. After this function returns, the ONLY slot that is newly empty is
+ * the final gap, so re-establishing that invariant for every entry is the whole
+ * requirement -- and the rule below is what re-establishes it.
+ *
+ * The FOLDED flag is irrelevant to this and the reasoning must not be read as
+ * depending on it. strtab_put() STORES the folded key (see the note there), so
+ * strtab_hash(e->key) on a stored key is the same value strtab_probe() computed
+ * for it, folded or not, and the shift therefore computes the same home for a
+ * stored entry that a later probe of that key will.
+ *
+ * ---------------------------------------------------------------------------
+ * THE MOVE RULE
+ * ---------------------------------------------------------------------------
+ * Walking forward from the gap, an entry sitting at `from` gets moved into the
+ * gap `hole` when its own probe distance from its home is AT LEAST its distance
+ * from the gap:
+ *
+ *   k  = (from - home) % STRTAB_BUCKETS   -- how far the entry sits from home
+ *   pd = (from - hole) % STRTAB_BUCKETS   -- how far the gap sits behind it
+ *
+ * That single comparison is both directions at once, because the entry's cluster
+ * [home, from) is occupied and the gap is empty, so the gap CANNOT be inside that
+ * cluster -- which is exactly what `k >= pd` says. Note it admits the equal case:
+ * an entry homed exactly on the gap belongs in the gap, and since pd >= 1 always
+ * the k == 0 case (the entry sitting in its own home slot, which must not move
+ * anywhere) falls out as "stay" with no special case to get backwards.
+ *
+ *   k >= pd   the gap is at or behind the entry's home, so the entry moves into
+ *             it and the gap advances to where the entry was.
+ *   k <  pd   the gap is strictly inside the entry's own cluster, so the entry
+ *             stays exactly where it is and the walk continues past it.
+ *
+ * Two things the loop must therefore do, and both are load-bearing:
+ *
+ *   - CONTINUE past an entry that does not move. Only the gap advances on a move,
+ *     so an entry further along can still need the gap even though the one just
+ *     examined could not take it.
+ *   - STOP at the first EMPTY slot. Nothing beyond a second empty slot can be
+ *     probing through this one, so the rest of the table cannot have been
+ *     affected.
+ *
+ * The bound is STRTAB_BUCKETS-1 steps, which visits every other slot exactly once
+ * and wraps without ever coming back to `at` -- so an entry can never be moved
+ * into the slot the walk started from and read again. */
 static void strtab_remove_at(struct strtab *t, size_t at)
 {
+    size_t hole = at;
+    size_t from = (at + 1u) % STRTAB_BUCKETS;
+    size_t probe;
+
     free(t->buckets[at].key);
     t->buckets[at].key = NULL;
     t->buckets[at].val = NULL;
     t->buckets[at].used = 0;
     t->nentries--;
+
+    for (probe = 0; probe + 1u < STRTAB_BUCKETS; probe++) {
+        struct strtab_entry *e = &t->buckets[from];
+        size_t home;
+        size_t k;
+        size_t pd;
+
+        if (!e->used) {
+            break; /* the rest of the chain is not reachable through here */
+        }
+        home = (size_t)(strtab_hash(e->key) % STRTAB_BUCKETS);
+        k = (from + STRTAB_BUCKETS - home) % STRTAB_BUCKETS;
+        pd = (from + STRTAB_BUCKETS - hole) % STRTAB_BUCKETS;
+        if (k >= pd) {
+            t->buckets[hole] = *e; /* the key pointer moves with the entry */
+            e->key = NULL;
+            e->val = NULL;
+            e->used = 0;
+            hole = from;
+        }
+        from = (from + 1u) % STRTAB_BUCKETS;
+    }
 }
 
 static int strtab_del(struct strtab *t, const char *key)
@@ -343,19 +446,40 @@ static size_t strtab_count_owner(const struct strtab *t, const void *owner)
 /* Remove EVERY key mapped to `owner`, and return how many went. Used by the
  * teardown, which must not leave any reference to a conn_t it is about to free
  * -- and cannot be written as a single strtab_del() because a connection is not
- * guaranteed to hold exactly one name (see server_nick_claim). */
+ * guaranteed to hold exactly one name (see server_nick_claim).
+ *
+ * A single pass is NOT enough now that deletion shifts, and this is the one place
+ * the shift changes what a caller has to do rather than being invisible inside
+ * the table. strtab_remove_at() can move an entry from the slot AFTER the one
+ * being cleared back into that slot -- which is the first thing it examines, and
+ * the overwhelmingly common case in a chain of names that share a home bucket. A
+ * forward scan has already gone past that slot, so an entry shifted into it
+ * belongs to `owner` and is missed: a connection holding two colliding names
+ * would have one of them survive its own teardown, pointing at freed memory.
+ *
+ * So the pass repeats until a whole pass finds nothing left to remove. It is
+ * bounded and cheap in the right way: every extra pass removes at least one
+ * entry, and a connection holds a handful of names at most, so this is
+ * O(STRTAB_BUCKETS) for the ordinary one-name teardown. That is the same linear
+ * scan the operation already was. */
 static size_t strtab_del_owner(struct strtab *t, const void *owner)
 {
-    size_t i;
     size_t n = 0;
+    int again = 1;
 
     if (t == NULL) {
         return 0u;
     }
-    for (i = 0; i < STRTAB_BUCKETS; i++) {
-        if (t->buckets[i].used && t->buckets[i].val == owner) {
-            strtab_remove_at(t, i);
-            n++;
+    while (again) {
+        size_t i;
+
+        again = 0;
+        for (i = 0; i < STRTAB_BUCKETS; i++) {
+            if (t->buckets[i].used && t->buckets[i].val == owner) {
+                strtab_remove_at(t, i);
+                n++;
+                again = 1;
+            }
         }
     }
     return n;
