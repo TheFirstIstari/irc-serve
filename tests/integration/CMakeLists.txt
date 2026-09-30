@@ -177,6 +177,11 @@ irc_add_integration_test(test_knock test_knock.c)
 # sending what INFO says this node answers and reading the numerics back.
 irc_add_integration_test(test_serverinfo test_serverinfo.c)
 
+# 7/Phase 7, 4.2's CHOPER, and with it the refusal policy for operator commands.
+# Its own file because the property most of the test is about is what the node
+# does NOT say: 381 must never appear, and the password must never reach the log.
+irc_add_integration_test(test_choper test_choper.c)
+
 # 2.4 / 3.2 / 4.3: the internal tag block the relay path budgets against, from
 # the side that is not Phase 1's. test_message_format.c pins the 179 overhead as
 # a LENGTH; this one pins the block as BYTES (a length cannot tell origin from
