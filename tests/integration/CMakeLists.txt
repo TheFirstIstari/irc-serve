@@ -118,14 +118,15 @@ irc_add_integration_test(test_cap_negotiation test_cap_negotiation.c)
 # with both correct, which is what makes it the case worth having.
 irc_add_integration_test(test_ircv3_msgid test_ircv3_msgid.c)
 
-# test_multi_prefix is here too, and it is STILL A SKIP at the moment of writing:
-# a `353` roster is produced by a server over a socket, which is why it left
-# tests/protocol/, but the multi-prefix capability itself is not implemented yet
-# and the test says so with an honest `return 77` rather than asserting a
-# behaviour nothing has. Its line in tests/known_skips.txt is unchanged, because
-# the CTest NAME is unchanged.
+# test_multi_prefix, here because a `353` roster and a `352` flags field are
+# produced by a server over a socket -- which is why it left tests/protocol/ -- and
+# no longer a skip: Phase 8 implemented `multi-prefix`, so the test asserts the
+# capability rather than the absence of it. The CTest NAME is unchanged, which is
+# why the SKIP_RETURN_CODE line that used to follow this one is GONE rather than
+# edited: leaving it would make ctest treat a failure as a skip. Its line in
+# tests/known_skips.txt went in the same change, which is the other half of what
+# the ratchet asks.
 irc_add_integration_test(test_multi_prefix test_multi_prefix.c)
-set_tests_properties(MultiPrefix PROPERTIES SKIP_RETURN_CODE 77)
 
 # 2.1 / 5: valid_nick() enforced at runtime. Phase 1 shipped the predicate with
 # no caller in src/, so this is the test that makes it load-bearing. Asserts the

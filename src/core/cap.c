@@ -34,16 +34,17 @@ enum {
     CAPBIT_SASL = 1u << 3
 };
 
-/* THE BIT ORDER IS FIXED AND THE TABLE BELOW IS THE CLAIM. CAPBIT_MESSAGE_IDS
- * held a bit and no entry while the msgid stamp did not exist; it was reserved
- * then so that adding the capability later would not renumber the others, and
- * the entry is here now because core/message.c renders `msgid` and core/fanout.c
- * puts it on a delivered line. That reservation-and-retirement is the shape of
- * this file's one rule: a bit is claimed before its capability exists so no
- * stored value is ever read with the wrong meaning, and the capability enters
- * the table in the same change that makes the feature real -- never earlier,
- * because a capability advertised before the feature exists is precisely the
- * failure this file was written to prevent. */
+/* THE BIT ORDER IS FIXED AND THE TABLE BELOW IS THE CLAIM.
+ *
+ * Two of these four bits were reserved for months before their capability
+ * existed -- CAPBIT_MULTIPREFIX and CAPBIT_MESSAGE_IDS -- and each was added to
+ * the table in the same change that made the feature real. Reserving first means
+ * a bit that moves is never a bit some already-stored conn_t value is read with
+ * the wrong meaning; adding the NAME second means a capability is never
+ * advertised before the feature exists, which is precisely the failure this file
+ * was written to prevent. A reader who finds a bit here with no name below it is
+ * looking at a capability whose implementation has not landed, and the correct
+ * response is to finish it -- not to advertise it. */
 
 typedef struct {
     const char *name;
@@ -53,6 +54,7 @@ typedef struct {
 /* THE LIST OF THINGS THIS NODE DOES. Adding a name here is a claim that the
  * feature exists; do not add one to make a client stop complaining. */
 static const cap_def_t k_caps[] = {
+    { CAP_MULTIPREFIX, CAPBIT_MULTIPREFIX },
     { CAP_MESSAGE_TAGS, CAPBIT_MESSAGE_TAGS },
     { CAP_MESSAGE_IDS, CAPBIT_MESSAGE_IDS },
     { CAP_SASL, CAPBIT_SASL }

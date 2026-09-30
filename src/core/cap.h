@@ -44,10 +44,17 @@
  * true regardless of whether `multi-prefix` is enabled. `multi-prefix` is a
  * separate thing and says only whether a `353` may render MORE THAN ONE sigil
  * per member -- it changes how much is drawn, not what the sigils mean. The two
- * therefore do not have to agree, and they do not contradict each other: a node
- * that renders one sigil per member is still a node whose sigils are '@' and
- * '+'. See cap_multiprefix_enabled() and the comment in chan_verbs.c's
- * send_names_list().
+ * therefore do not contradict each other, and a node that renders one sigil per
+ * member is still a node whose sigils are '@' and '+'.
+ *
+ * What multi-prefix DOES commit this node to, and the part that is easy to get
+ * half right, is the ORDER of the drawn run. `chan_verbs.c`'s names_signs()
+ * draws in PREFIX order -- '@' before '+' -- because a client reads the run left
+ * to right and looks it up in PREFIX, and a run in any other order gives it an
+ * answer the node does not hold. The same capability also governs `352`
+ * RPL_WHOREPLY (`msg_verbs.c`'s who_flags()), because IRCv3's multi-prefix names
+ * both numerics and a node that honoured it in 353 alone would be a node whose
+ * 353 is authoritative and whose 352 is a summary.
  *
  * The consistency that DOES have to hold is between `CAP LS` and the code: every
  * name in cap_available() must be a name something here implements. That is why
