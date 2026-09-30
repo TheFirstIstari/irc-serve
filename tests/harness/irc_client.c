@@ -27,6 +27,23 @@
  * this is far longer than a loopback handshake needs. */
 #define TC_CONNECT_TIMEOUT_MS 10000
 
+/* The pump hook: see irc_client.h for why a socket wait needs one. Installed by
+ * node_fixture.c and NULL until something installs it, so a test that spawns no
+ * children pays one predictable NULL branch per iteration and nothing else. */
+static tc_pump_fn g_pump_hook = NULL;
+
+void tc_set_pump_hook(tc_pump_fn fn)
+{
+    g_pump_hook = fn;
+}
+
+static void pump_hook(void)
+{
+    if (g_pump_hook != NULL) {
+        g_pump_hook();
+    }
+}
+
 static uint64_t now_ms(void)
 {
     struct timespec ts;
@@ -95,9 +112,17 @@ static int read_once(test_client_t *c, uint64_t deadline, int *eof)
         return (errno == EINTR) ? 0 : -1;
     }
     if (rc == 0) {
+        /* The socket had nothing, but the wait is not over: the deadline may
+         * have room left and the OTHER readers this test owns -- the child
+         * nodes' stdout pipes -- may not. Calling the hook on the timeout branch
+         * as well as the readable one is what keeps them drained for the whole
+         * of a wait that spends most of its time with an idle socket, which is
+         * the normal shape of a cross-node test waiting for a peer to catch up. */
+        pump_hook();
         return 0;
     }
 
+    pump_hook();
     n = recv(c->fd, chunk, sizeof chunk, 0);
     if (n == 0) {
         if (eof != NULL) {
@@ -385,8 +410,13 @@ int tc_read_exact(test_client_t *c, char *dst, size_t n, int timeout_ms)
             return -1;
         }
         if (rc == 0) {
+            /* Same reason as read_once(): the timeout branch is where a socket
+             * wait spends most of its life, so it is where the other readers
+             * have to be kept moving. */
+            pump_hook();
             continue;
         }
+        pump_hook();
         got = recv(c->fd, chunk, want, 0);
         if (got == 0) {
             fprintf(stderr, "tc_read_exact: EOF with %zu of %zu bytes read\n",

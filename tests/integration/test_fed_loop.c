@@ -245,12 +245,71 @@ static size_t times_seen(const test_client_t *c, const char *needle)
  * function is used for the settle check as well as for the baseline, and a wait
  * for a value would be a wait for MOVEMENT -- which is exactly what the settle
  * check is asserting does not happen. A caller that needs to wait for a value
- * asks for it itself, with nf_expect_u64_ge(). */
+ * asks for it itself, with nf_expect_u64_ge().
+ *
+ * ---------------------------------------------------------------------------
+ * AND THIS FUNCTION IS NOT ENOUGH ON ITS OWN, WHICH IS THE BUG IT USED TO BE
+ * ---------------------------------------------------------------------------
+ * Waiting for the KEY proves the node has published these counters at least
+ * once. It does not prove the node has published the value the CALLER is asking
+ * about, and for the baseline read that difference is the whole flake.
+ *
+ * The fixture publishes its stats line from the tick, which is step 8 of the poll
+ * iteration -- AFTER the dispatch that handled the line. So the `[observable]`
+ * line a test waits for and the stats line carrying the counter that line moved
+ * are two different writes, in that order, and a wait that stops at the first
+ * one leaves the second one unwritten. A caller then reads a counter value from
+ * before the event it just waited for.
+ *
+ * On node B that is not hypothetical and it is not subtle. B owns #T, so A
+ * relays alice's SJOIN to B with the CHANNEL's origin on it -- irc.b -- and B's
+ * own-origin guard fires and declines to forward it. That is a legitimate event
+ * and it moves B's fed_own_origin from 0 to 1. A baseline read taken at the
+ * `fed_sjoin:` line rather than at the republication after it sees 0; the second
+ * read, taken later, sees 1; and the settle check reports "something is still
+ * circulating" about a mesh that had stopped circulating one poll tick before it
+ * started looking. That is the Phase 6 CI failure in this case, and it arrived as
+ * `own_origin 0 -> 1` in every run.
+ *
+ * So a caller that wants a value it can settle on must FIRST wait for the
+ * republication that follows the event it waited for, and only then call this.
+ * `await_republication()` below is that wait, and it is why it exists rather
+ * than a comment.
+ */
 typedef struct {
     uint64_t own_origin;
     uint64_t dup_drop;
     uint64_t hop_drop;
 } relay_counters_t;
+
+/* How many `[fixture] stats` lines this node has published. Counted rather than
+ * assumed, so the caller can say "one more than it had when I looked" without
+ * knowing how many that is. */
+static size_t stats_lines(const nf_node_t *n)
+{
+    return tf_count(n->out, "[fixture] stats");
+}
+
+/* Wait until `n` has published at least one more stats line than it had at
+ * `before`, which is what "the node has caught up with the event you just waited
+ * for" means on this fixture.
+ *
+ * A republication rather than a value, because a value wait is a movement wait
+ * and the settle check's whole subject is movement that must NOT happen. The
+ * node always republishes when a counter moves (nf_child_tick), so one more
+ * stats line after the event is exactly the node having finished counting it.
+ *
+ * No fixed sleep: this is nf_expect_nth()'s deadline loop like every other wait
+ * in the file (6.3). */
+static void await_republication(nf_node_t *n, const char *who, size_t before)
+{
+    TF_CHECK_MSG(nf_expect_nth(n, "[fixture] stats", before + 1u, T_IO_MS) == 0,
+                 "%s handled the line this read was waiting for but never "
+                 "republished its counters afterwards, so the value read here "
+                 "would be the one from BEFORE the event rather than the one it "
+                 "caused: %s",
+                 who, (n->out != NULL) ? n->out : "(nothing)");
+}
 
 static void read_relay_counters(nf_node_t *n, const char *who,
                                 relay_counters_t *out)
@@ -284,6 +343,7 @@ static void case_message_arrives_once_and_settles(void)
     relay_counters_t b_second;
     uint64_t a_bounce;
     size_t b_deliveries;
+    size_t b_stats_before_sjoin;
 
     g_peer_port = 0;
     g_trace = 0;
@@ -348,12 +408,32 @@ static void case_message_arrives_once_and_settles(void)
      * A second count here would be a defect and is asserted not to happen: the
      * only line that can move fed_own_origin is a relayed state change, and the
      * only ones in flight are the two SJOINs, so more than one means a duplicate
-     * forward that the dedup store is standing in for. */
+     * forward that the dedup store is standing in for.
+     *
+     * AND B's republication IS WAITED FOR, WHICH IS THE POINT OF THIS WHOLE
+     * BLOCK. The `fed_sjoin:` line above is printed by the dispatch; the counter
+     * it moved is published by the tick after it, in a second write. So waiting
+     * for the line and reading the counter is reading across that gap, and on B
+     * there is a counter in the gap: B owns #T, so A's relayed SJOIN carries the
+     * channel's own origin (irc.b) back to B, B's own-origin guard fires, and
+     * fed_own_origin goes 0 -> 1. A baseline read taken before that republication
+     * is 0. The second read, taken after the message, is 1. The settle check then
+     * reports that something is still circulating on a mesh that had stopped one
+     * poll tick before it started looking -- which is exactly what it did, in
+     * every CI run, as `own_origin 0 -> 1`.
+     *
+     * The snapshot is taken BEFORE the wait rather than after it, and that is
+     * what makes `before + 1` correct rather than lucky: taken after, it would
+     * already include the republication when the two writes landed in one read,
+     * and the wait would then sit there until some unrelated counter moved. */
+    b_stats_before_sjoin = stats_lines(&b);
     TF_CHECK_MSG(nf_expect(&b, "fed_sjoin: channel=" CHAN " member=" NICK_A, T_IO_MS) ==
                      0,
                  "node B never put alice in its roster, so the cross-node exchange "
                  "this case rests on did not happen: %s",
                  b.out);
+    await_republication(&b, "node B after applying alice's SJOIN",
+                        b_stats_before_sjoin);
     TF_CHECK_MSG(nf_expect(&a, "fed_own_origin_drop: ", T_IO_MS) == 0,
                  "node A never dropped a message of its own origin, so the "
                  "two-node ping-pong never happened: %s",

@@ -294,6 +294,28 @@ static void expect_roster(test_client_t *client, const char *who,
  * ownership of the same channel -- a split 2.2's tie-break exists to prevent and
  * one that cannot be resolved from an SJOIN, because the epoch of the FIRST
  * creator only arrives in 4.3's SBURST vocabulary.
+ *
+ * ---------------------------------------------------------------------------
+ * AND A SECOND ORDERING, BETWEEN THE TWO NODES RATHER THAN BETWEEN THE TWO JOINs
+ * ---------------------------------------------------------------------------
+ * The section above settles WHICH node creates the channel. It does not settle
+ * WHEN node A hears about it, and that is a separate race in a separate process:
+ * B forwards bob's SJOIN from its own poll tick, A applies it on one of its own,
+ * and everything this test does between the two JOINs happens on B's socket, so
+ * it gives A no reason to be further along.
+ *
+ * If A is still behind when alice's JOIN lands then A has never seen #T, creates
+ * it (2.2 again), and makes alice its creator and therefore its operator -- so
+ * alice's roster comes back ops-only and the ` 353 alice = #T alice` line this
+ * case asserts is never sent by anyone, ever. Nothing is broken at that point;
+ * the case asked a node about the world before the world had arrived, and then
+ * waited out its whole deadline against a line that was not coming. This is what
+ * the Phase 6 CI failures in this case were: a 15 s timeout with the node's
+ * counters entirely consistent with a node that had done nothing wrong.
+ *
+ * So A's `fed_sjoin:` line is waited for BEFORE alice's JOIN, where it is a
+ * precondition on the assertion, and the same line is still asserted at the end
+ * of the case for what it says rather than for when it arrived.
  */
 static void case_cross_node_roster(void)
 {
@@ -354,6 +376,46 @@ static void case_cross_node_roster(void)
 
         expect_roster(&bob, "bob before alice joined", NICK_B, own, 1u);
     }
+
+    /* THE PRECONDITION ALICE'S ROSTER DEPENDS ON, AND IT IS WAITED FOR HERE
+     * BECAUSE IT IS A PRECONDITION, NOT BELOW WHERE IT USED TO BE.
+     *
+     * alice's JOIN makes A render a roster, and what that roster can contain is
+     * fixed by what A already knows about #T at that instant. If A has already
+     * applied bob's SJOIN then A knows #T came from %s, does NOT own it, and
+     * renders `alice` in the plain group and `@bob` in the ops group -- the two
+     * lines this case asserts. If A has NOT applied it yet then #T does not
+     * exist on A at all, alice's JOIN CREATES it there (2.2: first server to see
+     * a channel owns it), alice becomes the creator and therefore an operator
+     * (RFC 1459 2.3.1), and the roster comes back ops-only: `@alice`. The needle
+     * ` 353 alice = #T alice` then cannot match anything this node will ever
+     * send, and the case waits out its whole deadline against a line that is not
+     * coming. That is the failure, and it is a failure of the WAIT rather than of
+     * the roster: the node rendered correctly for the state it was in.
+     *
+     * THE ORDERING IS THE WHOLE POINT, and it is a real ordering rather than a
+     * stylistic one. B's forward of bob's SJOIN and A's processing of it are
+     * events in two different processes, separated by two poll ticks at worst,
+     * and between them this test does a client round trip on B. Nothing in the
+     * round trip makes A wait. So the question "does A know bob yet?" is a race,
+     * and on a loaded runner A can lose it -- and then the test reports a
+     * federation defect that is not there.
+     *
+     * `chan_remote_add()` runs BEFORE the `fed_sjoin:` line is printed
+     * (federation/verbs.c, fed_in_sjoin), so this line is not merely "B tried to
+     * send it": it is A having applied it. That is what makes it a usable
+     * precondition rather than just another observable.
+     *
+     * The assertion at the end of this case checks the same line and is KEPT.
+     * It is the one that carries the origin/owned/remote detail, and this wait is
+     * about ordering rather than about what the line says. */
+    TF_CHECK_MSG(nf_expect(&a, "fed_sjoin: channel=" CHAN " member=" NICK_B,
+                           T_IO_MS) == 0,
+                 "node A never applied bob's SJOIN, so alice's JOIN would reach a "
+                 "node that has never heard of %s and would create it there with "
+                 "alice as its operator. The roster this case asserts would be a "
+                 "different roster, so the case cannot proceed: %s",
+                 CHAN, a.out);
 
     /* alice joins on A. A does not own the channel, so this is the JOIN
      * exception: the local membership happens and the SJOIN is forwarded. */

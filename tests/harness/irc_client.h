@@ -117,4 +117,40 @@ size_t tc_received(const test_client_t *c);
 /* Close and release. Safe on a zeroed or already-closed client. */
 void tc_close(test_client_t *c);
 
+/* ---------------------------------------------------------------------------
+ * THE PUMP HOOK, and why a socket wait needs one
+ * ---------------------------------------------------------------------------
+ * Every deadline loop in this file blocks on ONE descriptor: the client socket.
+ * A two-node test also has child processes whose stdout the parent has to keep
+ * reading, and a loop that only ever selects on the socket reads nobody else's
+ * output for as long as it waits.
+ *
+ * That is not a tidiness issue. A child writes its `[observable]` and
+ * `[fixture] stats` lines to a PIPE, and a pipe holds a fixed amount (65536
+ * bytes on both Linux and macOS). A child that fills it blocks inside its own
+ * event loop -- in node_fixture.c the stats republication happens in the tick
+ * hook, so the block is inside `poll_loop_step()` -- and a node that is blocked
+ * there serves nothing: no accept, no read, no reply to the very client this
+ * loop is waiting on. The wait then runs out its deadline against a node that is
+ * not slow but wedged, and reports it as a protocol failure.
+ *
+ * So this file calls a hook once per iteration of every deadline loop, and
+ * node_fixture.c installs one that drains every live child. The hook is what
+ * makes "the parent is always reading" true no matter which wait is running;
+ * without it the property holds only by accident of what the test happened to
+ * call next.
+ */
+typedef void (*tc_pump_fn)(void);
+
+/* Install the callback every deadline loop calls to keep unrelated readers
+ * moving. NULL removes it. tc_init()/tc_connect() do NOT clear it: it belongs to
+ * the process, not to a connection. */
+void tc_set_pump_hook(tc_pump_fn fn);
+
+/* Drain this client's socket until the deadline passes, waiting on the socket
+ * and on the installed pump hook at the same time. Returns 0 if nothing was
+ * read before the deadline, 1 if bytes were appended, -1 on a hard error, and
+ * sets `*eof` when the peer closed. */
+int tc_drain(test_client_t *c, int timeout_ms, int *eof);
+
 #endif /* TEST_HARNESS_IRC_CLIENT_H */
