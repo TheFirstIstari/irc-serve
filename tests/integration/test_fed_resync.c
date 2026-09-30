@@ -170,10 +170,22 @@
  * is why the counter is a lower bound for a test that does, per link.h's
  * "WHAT T3 COSTS A TEST"), and a case that wanted a PING it did not ask for
  * would be testing the timer rather than the behaviour. */
+/* TEST_KEEPALIVE_MS and TEST_DEAD_MS are the pair this test EXISTS to exercise --
+ * 250ms keepalive so a 750ms dead-link expiry is observable inside the test's own
+ * deadline. They must stay small.
+ *
+ * TEST_DIAL_MS and TEST_HS_MS are the opposite: they bound the happy path and
+ * nothing in this file waits on them. They were 1000 and 2000, which on a loaded
+ * runner is 20 and 40 poll ticks -- not enough when a tick slips behind 30
+ * competing suites. The product then does the right thing (times out, retries the
+ * dial) and the test's deadline expires first, which reads as a federation bug.
+ * The shipped defaults are IRC_FED_DIAL_TIMEOUT_MS (10s) and
+ * IRC_FED_HS_TIMEOUT_MS (5s); these now match the handshake one and nothing in the
+ * happy path waits either way. */
 #define TEST_KEEPALIVE_MS 250
 #define TEST_DEAD_MS (3 * TEST_KEEPALIVE_MS)
-#define TEST_DIAL_MS 1000
-#define TEST_HS_MS 2000
+#define TEST_DIAL_MS 5000
+#define TEST_HS_MS 5000
 
 /* ---------------------------------------------------------------------------
  * PRE-FORK STATE
