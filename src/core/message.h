@@ -302,6 +302,26 @@ int message_build(message_t *out,
  */
 size_t message_format(const message_t *m, char *out, size_t cap);
 
+/* As message_format(), but `force_colon` non-zero puts the ':' marker on the
+ * FINAL parameter whether or not it needs one to survive a re-parse.
+ *
+ * WHY IT EXISTS, and it is one caller rather than a general facility: IRCv3's
+ * CAP carries its capability list as a trailing parameter, and every example in
+ * the specification and every working server writes it as `CAP * LS :a b`. A
+ * capability list has no space and does not start with ':', so RFC 1459's rule
+ * -- colonned "only when it has to be" -- would render it bare, and the two
+ * forms are IDENTICAL to a parser that indexes parameters (which is how the
+ * clients read it) but differ in bytes from what the specification shows.
+ *
+ * The choice here is the specification's bytes over RFC 1459's minimality,
+ * because the cost of being wrong is a client that mis-parses a capability
+ * negotiation and a connection that hangs, and the cost of being right is two
+ * bytes per CAP reply. Nothing else in the tree uses this: a numeric's trailing
+ * text is prose and gets colonned by the existing rule, and a relayed message's
+ * last parameter is a message body that gets colonned for the same reason. */
+size_t message_format_ex(const message_t *m, char *out, size_t cap,
+                         int force_colon);
+
 /*
  * Tag lookup and serialization. The tag list is queryable because Phase 6
  * has to read irc-serve-origin / -epoch / -id / -hops off an inbound line
