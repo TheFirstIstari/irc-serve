@@ -182,10 +182,28 @@
  * The shipped defaults are IRC_FED_DIAL_TIMEOUT_MS (10s) and
  * IRC_FED_HS_TIMEOUT_MS (5s); these now match the handshake one and nothing in the
  * happy path waits either way. */
+/* This file's dial and handshake budgets are 15000, not the 5000 the two-node
+ * federation tests use, and the reason is the node count.
+ *
+ * The four-node case runs four poll loops plus four parent pumps plus CTest on a
+ * GitHub runner that has TWO cores. A dial and a FEDERATE exchange that settle in
+ * two ticks on an idle box can miss even a 5s budget there, and the product does
+ * the right thing when it does -- it times out and retries -- while this test's
+ * 15s assertion deadline expires first. The failure it produces reads as
+ * "federation does not work", which is the most expensive kind of wrong.
+ *
+ * Node A also dials TWO peers in one tick here, which is the only place the
+ * multi-dial path is exercised at all; the three other federation tests are all
+ * one dial per node. T7 latches created_ms before calling server_dial() and the
+ * dial table reallocs, but neither touches s->links, so the iteration the tick
+ * holds is safe -- the budget is the exposure, not a defect.
+ *
+ * 15000 is well inside this test's own T_IO_MS, so a genuinely dead link still
+ * fails the assertion rather than running to the harness deadline. */
 #define TEST_KEEPALIVE_MS 250
 #define TEST_DEAD_MS (3 * TEST_KEEPALIVE_MS)
-#define TEST_DIAL_MS 5000
-#define TEST_HS_MS 5000
+#define TEST_DIAL_MS 15000
+#define TEST_HS_MS 15000
 
 /* ---------------------------------------------------------------------------
  * PRE-FORK STATE
