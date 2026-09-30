@@ -232,3 +232,17 @@ irc_add_integration_test(test_fed_burst test_fed_burst.c)
 # Every guard is a refusal of a line a well-behaved node would never send, so the
 # far end of the link has to be a raw socket rather than a second node.
 irc_add_integration_test(test_fed_guards test_fed_guards.c)
+
+# 2.2 / 4.3: what a node does when a peer goes away and when one comes back.
+# 437 naming the origin on a channel this node cannot route to, NAMES still
+# answered after the drop, NO auto-redial, re-linking a server of the SAME name
+# resurrecting the channel (asserted as a round trip on the far side, not as an
+# absence of 437), the SQUIT a dying node sends its remaining peers and the
+# PER-ORIGIN purge that follows -- including an unrelated origin's roster
+# surviving, which is the assertion with teeth -- and a peer claiming THIS node
+# is gone being refused without costing the link. Three of the four cases need a
+# node with more than one peer, so the fixture is four nodes: a two-node mesh
+# cannot produce a link-down announcement at all, because the link that died was
+# the only link. The last case owns one end of a link, like test_fed_guards.c,
+# because no second node built from this code will send the line.
+irc_add_integration_test(test_fed_resync test_fed_resync.c)

@@ -175,6 +175,18 @@ int nf_expect_u64(nf_node_t *n, const char *key, uint64_t expected,
 int nf_expect_u64_ge(nf_node_t *n, const char *key, uint64_t minimum,
                      int timeout_ms);
 
+/* As nf_expect(), but waits until `needle` has appeared at least `want` TIMES
+ * rather than once.
+ *
+ * This is not a convenience: nf_expect() searches the accumulated buffer, so a
+ * needle the node has ALREADY printed is satisfied before the event it is meant
+ * to be waiting for has happened. A test that wants the second of something --
+ * the second `link_established` after a reconnect, the second `link_dial` after
+ * a retry -- has otherwise to invent a needle that differs, which couples it to
+ * whichever field happens to change between the two. Same relationship to
+ * nf_expect() that nf_expect_u64_ge() has to nf_expect_u64(). */
+int nf_expect_nth(nf_node_t *n, const char *needle, size_t want, int timeout_ms);
+
 /* Signal the child to stop (SIGTERM), wait for it to exit, and return its exit
  * status -- or -1 if it had to be killed, -2 on a wait failure. A clean stop
  * must be status 0; anything else is a finding. */

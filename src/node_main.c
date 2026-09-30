@@ -583,7 +583,7 @@ int main(int argc, char **argv)
            "fed_dead=%llu fed_preauth_drop=%llu fed_hop_drop=%llu "
            "fed_own_origin=%llu fed_untagged_relay=%llu "
            "fed_unknown_verb=%llu fed_verb_deferred=%llu fed_malformed=%llu "
-           "fed_dup_drop=%llu fed_dedup_dup=%llu "
+           "fed_dup_drop=%llu fed_dedup_dup=%llu fed_squit_self=%llu "
            "burst_refused=%llu burst_abandoned=%llu burst_truncated=%llu\n",
            (unsigned long long)srv.n_ticks, (unsigned long long)srv.n_eintr,
            (unsigned long long)srv.n_accepted, (unsigned long long)srv.n_closed,
@@ -609,6 +609,7 @@ int main(int argc, char **argv)
            (unsigned long long)srv.n_fed_malformed,
            (unsigned long long)srv.n_fed_dup_drop,
            (unsigned long long)srv.n_fed_dedup_dup,
+           (unsigned long long)srv.n_fed_squit_self,
            (unsigned long long)srv.n_burst_refused,
            (unsigned long long)srv.n_burst_abandoned,
            (unsigned long long)srv.n_burst_truncated);

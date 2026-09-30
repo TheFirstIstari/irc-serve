@@ -783,6 +783,175 @@ static void fed_in_skick(server_t *s, server_link_t *link, chan_t *ch,
 }
 
 /* ---------------------------------------------------------------------------
+ * SQUIT: <server> [<reason>]
+ * ---------------------------------------------------------------------------
+ * "That server is gone; forget everything you learned through it."
+ *
+ * WHY IT IS NOT A ROW IN INBOUND, and the answer is the same one the burst family
+ * gets at G8 with one difference in the reasoning. Every INBOUND row describes a
+ * line ABOUT A CHANNEL, at a parameter position the verb fixes, and the
+ * dispatch reads the channel out of that position -- position 0 for SJOIN, 1 for
+ * the rest. A SQUIT names no channel at all, and a row for it would have to lie
+ * about that. The burst family is the other shape the table cannot hold, and it
+ * is asked separately for the same structural reason.
+ *
+ * IT IS NOT THE BURST CASE EITHER, and that is the part worth stating because a
+ * reader who has just read case E will assume the resemblance is deliberate. Case
+ * E refuses an UNTAGGED burst because case A would mint a fresh identity PER
+ * LINE for it, and a burst is O(n) lines forming one transaction -- so a peer
+ * could replace this node's entire view of an origin, as often as it liked, on
+ * lines whose 2.4 identity this node invented. A SQUIT is ONE line destroying
+ * ONE origin's state, and the authority to do that is the authority the peer
+ * already has: any peer may report a roster, and may report a smaller one. So a
+ * SQUIT is allowed the same untagged-originated treatment as any other state
+ * change, and it is a RELAYED one that is refused (case B), because a claim that
+ * somebody ELSE is gone is a claim about a third party's memory. No case of its
+ * own, and the chain is unchanged above this point -- which is the point: a
+ * SQUIT is deduplicated, hop-checked and own-origin-checked like every other
+ * state-destroying line, and a REPLAYED SQUIT is refused by G7 rather than
+ * purging twice.
+ *
+ * 3.1: it is a state change, so it is applied to this node's cache and FORWARDED
+ * onward, exactly as the table's rows are. See the forwarding note at the end of
+ * the function for what "onward" means when the subject of the change is a server
+ * rather than a channel.
+ */
+static void fed_in_squit(server_t *s, server_link_t *link,
+                         const irc_serve_tags_t *tags, const char *const *params,
+                         int nparams)
+{
+    const char *gone;
+    size_t purged = 0;
+    size_t chans = 0;
+    size_t i = 0;
+
+    if (s == NULL || params == NULL) {
+        return;
+    }
+    /* Arity here rather than in G9's table, for the reason the burst verbs give:
+     * this shape is not a table row, so there is no row to hold its bounds. One
+     * or two -- the reason is the OPTIONAL trailing parameter SPART and SKICK
+     * also carry, and it is never acted on. A line with any other count is a peer
+     * running a different format and is refused rather than guessed at. */
+    if (nparams < 1 || nparams > 2) {
+        s->n_fed_malformed++;
+        printf("[observable] fed_malformed: command=SQUIT field=arity nparams=%d "
+               "want=1..2\n",
+               nparams);
+        return;
+    }
+    gone = params[0];
+
+    /* A SQUIT NAMES THIS NODE, and it is REFUSED, and the link is NOT torn down.
+     *
+     * This is the one line a peer can send that, taken literally, would have a
+     * listening node delete itself from the mesh, and 2.3's uniqueness rule is
+     * what makes it worse than a nuisance: 2.3 calls two nodes with one name
+     * "catastrophic and undetectable later", and a peer announcing that name is
+     * the announcement a re-joining node would act on. So the claim is refused on
+     * the only evidence available -- this node is here, and it is answering --
+     * and the LINK SURVIVES, because a peer sending this is either broken or
+     * hostile and neither of those is a reason to hang up on a peer that is
+     * otherwise the only route to half the network.
+     *
+     * It is counted separately from n_fed_malformed because the two say opposite
+     * things to an operator: a malformed line is a peer that does not implement
+     * 4.3, and this is a peer that implements 4.3 and is telling this node it no
+     * longer exists. The first is a version fact and the second is a finding. */
+    if (chan_same_name(gone, s->name)) {
+        s->n_fed_squit_self++;
+        printf("[observable] fed_squit_refused: fd=%d peer=%s server=%s self=%s "
+               "reason=SELF_NOT_GONE\n",
+               (link != NULL) ? link->fd : -1, (link != NULL) ? link->name : "?",
+               gone, s->name);
+        return;
+    }
+
+    /* THE PURGE, AND IT IS PER ORIGIN. Everything this node learned THROUGH the
+     * departed server goes, and nothing else does: chan_remote_purge() is keyed
+     * by the reporting origin -- the same key SBURSTM's records are installed
+     * under, which federation/burst.c's install step states -- so a member that
+     * arrived from some other server is untouched.
+     *
+     * THE GLOBAL WIPE IS THE BUG THIS SHAPE IS SHAPED AGAINST, and it is worth
+     * naming because it is the obvious shortcut: "a server is gone, drop the
+     * rosters" reads as one loop with no key, and it destroys every other
+     * origin's members on this node in the same pass. On a two-node mesh the two
+     * are indistinguishable, which is exactly why tests/integration/
+     * test_fed_resync.c gives the receiving node two origins over two different
+     * links.
+     *
+     * servers[] LOSES THE NAME, unlike a link that merely went down (2.2's
+     * fail-closed note, and fed_link_down()'s neighbours): a SQUIT is positive
+     * evidence that the server is gone rather than a socket this node cannot
+     * reach, so keeping the name would keep a channel alive for the rest of the
+     * process for a server that has said it is finished. The two cases are
+     * different facts and are treated differently on purpose.
+     *
+     * THE WALK DOES NOT ADVANCE PAST A DISPOSED CHANNEL, and the reason is
+     * server_chan_detach()'s: it shifts the array down, so an index that is
+     * incremented after a removal skips the channel that moved into the hole --
+     * silently, and a channel that silently survives a purge is a roster the
+     * operator is told is gone. chan_remote_purge() walks the same way for the
+     * same reason. */
+    while (i < server_chan_count(s)) {
+        chan_t *ch = server_chan_at(s, i);
+        int disposed;
+
+        if (ch == NULL) {
+            i++;
+            continue;
+        }
+        purged += chan_remote_purge(ch, gone);
+        if (chan_server_remove(ch, gone) > 0) {
+            chans++;
+        }
+        /* The same disposition the burst's replace arm does: a channel left with
+         * no local member and no member-server has nothing left to remember, and
+         * holding it for the life of the process is a channel LIST reports and
+         * NAMES answers for, forever. One this node still holds members in is
+         * kept, which is 2.2's locally-orphaned case: the members still see each
+         * other and origin-requiring actions are refused with 437. */
+        disposed = chan_dispose_if_empty(s, ch);
+        if (disposed == 0) {
+            i++;
+        }
+    }
+    printf("[observable] fed_squit: server=%s chans=%zu purged=%zu remote=%zu\n", gone,
+           chans, purged, (size_t)server_chan_count(s));
+
+    /* 3.1's non-owner row: apply here, forward onward. "Onward" for a
+     * server-scoped state change is the OTHER ESTABLISHED LINKS, and the two
+     * exclusions are the whole of the rule:
+     *
+     *   - the link it arrived on, because it came from there. Forwarding it back
+     *     is 2.4's never-forward-own-origin rule in the only shape that applies
+     *     here: the sender already has it.
+     *   - a link whose name IS the departed server, because that node is by
+     *     definition not gone and the line would arrive there as a SQUIT naming
+     *     itself, which the arm above refuses. Skipping it saves a line and does
+     *     not change any outcome.
+     *
+     * THE COST, because a reader deserves it: this is a broadcast, and it is
+     * bounded by 2.4 rather than by the hop ceiling alone. A node two hops away
+     * receives the same (origin, epoch, id) by two paths, and the per-node dedup
+     * store drops the second; a node three hops away never receives it at all,
+     * because the ceiling is ten hops and a full mesh is two. So on a large mesh
+     * the announcement reaches a bounded neighbourhood rather than the whole
+     * network, and what it does not reach is corrected by the next burst -- which
+     * is Phase 9's to drive, and is stated rather than relied on here. */
+    for (size_t k = 0; k < server_link_count(s); k++) {
+        server_link_t *lk = server_link_at(s, k);
+
+        if (lk == NULL || lk == link || lk->state != (int)ESTABLISHED ||
+            chan_same_name(lk->name, gone)) {
+            continue;
+        }
+        (void)fanout_forward_sverb(s, lk->name, "SQUIT", NULL, params, nparams, tags);
+    }
+}
+
+/* ---------------------------------------------------------------------------
  * The inbound table, and the verbs it does not have
  * ---------------------------------------------------------------------------
  *
@@ -833,25 +1002,24 @@ static int inbound_index(const char *verb)
 
 /* The 4.3 words this build does not speak yet, and WHY THAT IS NOT "unknown".
  *
- * SQUIT and SHASH are in 4.3's list and are not in INBOUND, because they are
- * later commits of this phase (C5). They are listed here so that a peer sending
- * one is told this node has not implemented it rather than that it is not a
- * verb -- a distinction an operator needs, because the first means "a peer is
- * running a build I do not have" and the second means "a peer is talking
- * nonsense". Reporting them through n_fed_unknown_verb would make the counter
- * mean two incompatible things and stop being evidence of anything.
+ * SNAMES and SHASH are in 4.3's list and are not in INBOUND, because they are
+ * later commits of this phase. They are listed here so that a peer sending one
+ * is told this node has not implemented it rather than that it is not a verb -- a
+ * distinction an operator needs, because the first means "a peer is running a
+ * build I do not have" and the second means "a peer is talking nonsense".
+ * Reporting them through n_fed_unknown_verb would make the counter mean two
+ * incompatible things and stop being evidence of anything.
  *
- * SBURST IS NOT HERE ANY MORE, and its removal is the change C4 made: the resync
- * landed, so a peer sending one gets the transaction rather than a version fact.
- * The list used to read `SNAMES SBURST SQUIT SHASH` and every entry in it was
- * "not yet", which is what a list like this is for -- a verb that arrives and is
- * handled must not leave its name in a table that says it is not handled, or the
- * table becomes a place where a reader learns which half of the phase is
- * finished.
+ * SQUIT IS NOT HERE ANY MORE, and its removal is the change C5 made: the
+ * departure announcement landed, so a peer sending one gets the purge rather than
+ * a version fact. A verb that arrives and is handled must not leave its name in a
+ * table that says it is not handled, or the table becomes a place where a reader
+ * learns which half of the phase is finished -- which is what the list said about
+ * SBURST before C4 removed it, and is why this paragraph exists.
  *
  * FEDERATE is NOT here: it never reaches G8, because G2 consumes it, and it is
  * the verb that ESTABLISHES the epoch every other tag rule is stated against. */
-static const char *const DEFERRED[] = { "SNAMES", "SQUIT", "SHASH" };
+static const char *const DEFERRED[] = { "SNAMES", "SHASH" };
 
 static int is_deferred(const char *verb)
 {
@@ -1165,6 +1333,25 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
      * format is. */
     if (fed_burst_verb(m->command) != 0) {
         (void)fed_burst_apply(s, link, m);
+        return;
+    }
+
+    /* SQUIT, and the same placement argument one paragraph up: it names no
+     * channel, so INBOUND's position-indexed read cannot reach it, and it is
+     * asked HERE -- after the burst family and before the table -- so that
+     * everything above still applies to it. That is the load-bearing part. A
+     * SQUIT is the most state-destroying line in 4.3, and it is deduplicated
+     * (G7), hop-checked (G5) and own-origin-checked (G6) by the same chain as an
+     * SJOIN, which is why it is here and not in a second entry point. */
+    if (strcmp(m->command, "SQUIT") == 0) {
+        /* The same local array the table arms below use, and for the same reason
+         * (message_t::params is `char *[]` and the handler takes a qualified
+         * one). It is filled here rather than handed over as `m->params` because
+         * the handler reads up to two entries and the wire can carry fifteen. */
+        for (int i = 0; i < m->nparams && i < IRC_MAX_PARAMS; i++) {
+            sp[i] = m->params[i];
+        }
+        fed_in_squit(s, link, &tags, sp, m->nparams);
         return;
     }
 

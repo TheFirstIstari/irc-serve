@@ -269,6 +269,53 @@ int nf_find_u64(nf_node_t *n, const char *key, uint64_t *out)
  * counter once after seeing an EOF on the wire is racing the child that
  * published it, and that race passes or fails depending on the scheduler.
  * Returns 0 on success, -1 on timeout (printing the last value seen). */
+/* As nf_expect(), but waits until the needle has appeared at least `want` TIMES
+ * rather than once. Returns 0 on success, -1 on timeout, and prints what the
+ * child did say.
+ *
+ * WHY IT EXISTS, and it is not a convenience: nf_expect() searches the whole
+ * accumulated buffer, so a second occurrence of a line the node has ALREADY
+ * printed -- a second `link_established` after a reconnect, a second `link_dial`
+ * after a retry -- is already satisfied before the event happens, and the wait
+ * returns having read nothing. A test that wants the SECOND of something has
+ * either to invent a needle that differs (which couples the test to whichever
+ * field happens to change) or to count, and counting is the honest shape. It is
+ * the same relationship nf_expect_u64_ge() has with nf_expect_u64(): one is a
+ * lower bound on a value the node publishes, this is a lower bound on how many
+ * times the node said something. */
+int nf_expect_nth(nf_node_t *n, const char *needle, size_t want, int timeout_ms)
+{
+    uint64_t deadline = nf_now_ms() + (uint64_t)timeout_ms;
+    size_t seen = 0;
+
+    for (;;) {
+        if (n != NULL && n->out != NULL && needle != NULL) {
+            const char *scan = n->out;
+            size_t len = strlen(needle);
+
+            seen = 0;
+            while ((scan = strstr(scan, needle)) != NULL) {
+                seen++;
+                scan += len;
+            }
+            if (seen >= want) {
+                return 0;
+            }
+        }
+        if (out_pump(n, deadline) < 0) {
+            break;
+        }
+        if (nf_now_ms() >= deadline) {
+            break;
+        }
+    }
+    fprintf(stderr, "nf_expect_nth: TIMEOUT after %d ms waiting for %zu x \"%s\"; "
+            "%zu seen\n", timeout_ms, want, needle, seen);
+    fprintf(stderr, "nf_expect_nth: child output was:\n%s\n",
+            (n->out != NULL) ? n->out : "(nothing)");
+    return -1;
+}
+
 int nf_expect_u64(nf_node_t *n, const char *key, uint64_t expected,
                   int timeout_ms)
 {
@@ -353,6 +400,12 @@ static uint64_t g_last_dial_failed = 0;
  * the second read could not distinguish "settled" from "never republished". */
 static uint64_t g_last_fed_own_origin = 0;
 static uint64_t g_last_fed_dup_drop = 0;
+/* Phase 6 C5's self-SQUIT refusal. It is in the republish list for the same
+ * reason n_fed_dead is: a counter a test can only read if some OTHER counter
+ * happened to move is a counter that is unreadable exactly when a test wants
+ * it -- the line that would report it is only printed when something in the
+ * trigger list changed. */
+static uint64_t g_last_fed_squit_self = 0;
 static uint64_t g_last_fed_lines = 0;
 /* The 4.3 resync's three counters (Phase 6 C4, C5). They are republished for the
  * same reason the others are -- a test that has to stop the node before it can
@@ -409,6 +462,7 @@ static void nf_child_tick(server_t *s, uint64_t now_ms)
         s->n_fed_dead != g_last_fed_dead ||
         s->n_fed_own_origin != g_last_fed_own_origin ||
         s->n_fed_dup_drop != g_last_fed_dup_drop ||
+        s->n_fed_squit_self != g_last_fed_squit_self ||
         s->n_burst_refused != g_last_burst_refused ||
         s->n_burst_abandoned != g_last_burst_abandoned ||
         s->n_burst_truncated != g_last_burst_truncated ||
@@ -422,6 +476,7 @@ static void nf_child_tick(server_t *s, uint64_t now_ms)
         g_last_fed_dead = s->n_fed_dead;
         g_last_fed_own_origin = s->n_fed_own_origin;
         g_last_fed_dup_drop = s->n_fed_dup_drop;
+        g_last_fed_squit_self = s->n_fed_squit_self;
         g_last_burst_refused = s->n_burst_refused;
         g_last_burst_abandoned = s->n_burst_abandoned;
         g_last_burst_truncated = s->n_burst_truncated;
@@ -448,7 +503,7 @@ static void nf_child_print_stats(const server_t *s)
            "fed_dead=%llu fed_preauth_drop=%llu fed_hop_drop=%llu "
            "fed_own_origin=%llu fed_untagged_relay=%llu "
            "fed_unknown_verb=%llu fed_verb_deferred=%llu fed_malformed=%llu "
-           "fed_dup_drop=%llu fed_dedup_dup=%llu "
+           "fed_dup_drop=%llu fed_dedup_dup=%llu fed_squit_self=%llu "
            "burst_refused=%llu burst_abandoned=%llu burst_truncated=%llu\n",
            (unsigned long long)s->n_accepted, (unsigned long long)s->n_closed,
            (unsigned long long)s->n_lines,
@@ -475,6 +530,7 @@ static void nf_child_print_stats(const server_t *s)
            (unsigned long long)s->n_fed_malformed,
            (unsigned long long)s->n_fed_dup_drop,
            (unsigned long long)s->n_fed_dedup_dup,
+           (unsigned long long)s->n_fed_squit_self,
            (unsigned long long)s->n_burst_refused,
            (unsigned long long)s->n_burst_abandoned,
            (unsigned long long)s->n_burst_truncated);
