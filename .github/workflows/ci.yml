@@ -125,8 +125,8 @@ jobs:
       # It is NOT "fail if any test skips". A test that skips without a line in
       # tests/known_skips.txt is a FAILURE, and so is a listed skip that is no
       # longer skipping -- the second direction is what makes the list a ratchet
-      # rather than an allowlist that rots. Seven skips are permitted today, all
-      # of them allocated by 7/Phase 8 and 7/Phase 9 to phases that have not run;
+      # rather than an allowlist that rots. Five skips are permitted today, all
+      # of them allocated by 7/Phase 9 to a phase that has not run;
       # docs/SERVER_DESIGN.md 6.4 explains why "zero" is not reachable before then
       # and what the list is instead.
       - name: Skip gate (ratchet)
