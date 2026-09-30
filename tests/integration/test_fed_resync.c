@@ -198,12 +198,20 @@
  * dial table reallocs, but neither touches s->links, so the iteration the tick
  * holds is safe -- the budget is the exposure, not a defect.
  *
- * 15000 is well inside this test's own T_IO_MS, so a genuinely dead link still
- * fails the assertion rather than running to the harness deadline. */
+ * The budget MUST sit well inside this test's own T_IO_MS (15000) or the fix is
+ * worse than no fix: set the two to the same value and a dial that times out
+ * consumes the entire assertion deadline, so the link can never establish in time
+ * and the test fails on a load spike it should have waited out. 6000 leaves 9s of
+ * margin -- a genuinely dead link still fails the assertion rather than running
+ * to the harness deadline.
+ *
+ * Getting this wrong is not hypothetical: it is exactly what a first attempt at
+ * this fix did, and CI caught it by failing on node A's link to B where it had
+ * previously failed on node C's link to A. */
 #define TEST_KEEPALIVE_MS 250
 #define TEST_DEAD_MS (3 * TEST_KEEPALIVE_MS)
-#define TEST_DIAL_MS 15000
-#define TEST_HS_MS 15000
+#define TEST_DIAL_MS 6000
+#define TEST_HS_MS 6000
 
 /* ---------------------------------------------------------------------------
  * PRE-FORK STATE
