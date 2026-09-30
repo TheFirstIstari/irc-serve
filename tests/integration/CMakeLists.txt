@@ -171,6 +171,12 @@ irc_add_integration_test(test_userhost test_userhost.c)
 # stub is which of the other numerics does NOT come back for each input.
 irc_add_integration_test(test_knock test_knock.c)
 
+# 7/Phase 7, 4.2's LUSERS, ADMIN and INFO. One file rather than three because
+# they are one family with one fixture, and because the file's central assertion
+# is that INFO's list of claims about the node is TRUE -- which is checked by
+# sending what INFO says this node answers and reading the numerics back.
+irc_add_integration_test(test_serverinfo test_serverinfo.c)
+
 # 2.4 / 3.2 / 4.3: the internal tag block the relay path budgets against, from
 # the side that is not Phase 1's. test_message_format.c pins the 179 overhead as
 # a LENGTH; this one pins the block as BYTES (a length cannot tell origin from
