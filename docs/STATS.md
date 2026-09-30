@@ -2,30 +2,33 @@
 
 # Project status
 
-Generated `2026-09-30T17:22:40Z` from commit `e3beb3d` by
+Generated `2026-09-30T18:39:25Z` from commit `498c032` by
 [stats.yml](../../blob/main/.github/workflows/stats.yml).
 
 ## Test suite
 
 | | count |
 |---|---|
-| Total | 56 |
-| Passing | 48 |
-| **Skipped** | **8** |
+| Total | 61 |
+| Passing | 54 |
+| **Skipped** | **7** |
 | Failed | 0 |
 
 > **The skipped count is shown because it is the number that matters.**
 > Each skipped test is a CTest skip (`return 77`) naming a feature that
-> is not implemented. CI does not currently fail on skips, so
-> "100% tests passed" can coexist with unimplemented features.
-> Closing that gap is Phase 7, issue #81.
+> is not implemented, and every one of them has a line in
+> `tests/known_skips.txt` naming the phase that owns it and the issue
+> that closes it. CI fails if a test skips without such a line, and also
+> if a listed skip no longer skips -- the count may only go down.
+> The list is `tests/known_skips.txt`; the gate is
+> `scripts/check-skips.sh`.
 
 ## Code size
 
 | | lines |
 |---|---|
-| `src/` | 19322 |
-| `tests/` | 24410 |
+| `src/` | 20452 |
+| `tests/` | 27360 |
 
 ## Build phases
 
