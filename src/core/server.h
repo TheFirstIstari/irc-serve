@@ -87,6 +87,13 @@
  * dependency runs the other way, through the four functions in it. */
 struct fed_dedup_entry;
 
+/* Phase 7's topic cache: one entry per channel whose topic outlived the
+ * channel. The layout is channel.h's, for the same reason the dedup entry's is
+ * federation/dedup.h's -- this header holds opaque pointers so the geometry of
+ * a table is one module's business rather than a fourth thing every reader of
+ * server_t has to understand. */
+struct chan_topic;
+
 /* The version string this build reports in 002, 004 and PONG.
  *
  * It lives here, and not in the node's own banner, so that there is exactly
@@ -511,6 +518,40 @@ struct server {
     uint64_t  n_burst_refused;
     uint64_t  n_burst_abandoned;
     uint64_t  n_burst_truncated;
+
+    /* ------------------------------------------------------------------------
+     * Phase 7: the topic cache, and the one event it can have.
+     * ------------------------------------------------------------------------
+     *
+     * WHY A CACHE EXISTS AT ALL, since 2.2 disposes a channel with no members.
+     * chan_dispose_if_empty() frees a channel that has no local members and no
+     * member-server, and it must: a channel nobody is on has nothing to be
+     * authoritative about, and holding one per channel name a client ever typed
+     * would be an unbounded store reachable from the wire. The topic is the one
+     * field whose loss is visible -- a client that rejoins a channel everybody
+     * has left finds a topicless channel, which is indistinguishable from a
+     * channel that never had one -- so the topic is copied out on the way down
+     * and copied back in when the channel is created again. See
+     * server_topic_remember() and server_topic_restore() in channel.h.
+     *
+     * The alternative designs were considered and rejected rather than
+     * overlooked. Keeping the chan_t (a leak per channel name, unbounded from the
+     * wire). Persisting to disk (a write inside the event loop, and 3.4's rule
+     * that nothing in the loop may block; also a new deployment artifact and a
+     * new failure mode for a topic). This is the only one of the three that is
+     * bounded, allocation-free on the hot path, and honest about its own scope:
+     * it does NOT survive a node restart, and nothing claims that it does.
+     *
+     * `n_topic_cache_full` counts a channel whose topic could NOT be copied out
+     * because the cache was at its bound. It is a real loss -- that channel's
+     * topic is gone -- and it is a finding rather than a statistic: a node whose
+     * counter climbs is a node that has seen more distinct channel names than it
+     * can remember topics for, which is the number an operator needs.
+     */
+    struct chan_topic *topics;
+    size_t    ntopics;
+    size_t    topics_cap;
+    uint64_t  n_topic_cache_full;
 
     int       trace;             /* emit [observable] per-line output */
 };

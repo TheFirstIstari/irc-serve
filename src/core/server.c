@@ -692,6 +692,19 @@ void server_shutdown(server_t *s)
      * ASSERTED here too: a test can prove the arm ran without a leak checker,
      * and Linux CI can read the same line next to its LSan run. */
     fed_burst_close(s);
+    /* Phase 7's topic cache: a plain free of a plain vector, which is the
+     * simplest arm on this function and the newest. It sits HERE rather than at
+     * the end because the ordering that matters on this struct is "the peer links
+     * and the dedup table are federation state, and this is not" -- a reader
+     * looking for where the federation allocations go will not pass it by, and
+     * a reader looking for the topic cache will not go looking through the
+     * federation arms for it. The cache holds three topic fields and a name per
+     * entry and no conn_t*, no chan_t* and no server_link_t*, so it is safe at
+     * any point in the walk above. */
+    free(s->topics);
+    s->topics = NULL;
+    s->ntopics = 0;
+    s->topics_cap = 0;
     strtab_free(s->nicks);
     s->nicks = NULL;
     strtab_free(s->chans);
