@@ -340,6 +340,56 @@ static void read_relay_counters(nf_node_t *n, const char *who,
     TF_CHECK_MSG(nf_find_u64(n, "fed_hop_drop=", &out->hop_drop) == 0,
                  "%s published fed_hop_drop but it does not parse", who);
 }
+/* Read the counters, then WAIT UNTIL THEY STOP MOVING, and read them once they
+ * have.
+ *
+ * The previous shape read twice with a client-visible line in between and
+ * required equality. That is a movement test, but it bounds the in-flight work by
+ * ONE line going past -- and in a two-node mesh one line is not all of it.
+ *
+ * What actually moved the counters on the 2-core CI runner was a late SJOIN: bob
+ * owns the channel, so an SJOIN that A relays to B carries the channel's own
+ * origin and B's never-forward-own-origin guard legitimately counts it. That is
+ * correct behaviour arriving late, not a ping-pong, and the old check could not
+ * tell the two apart -- it reported "something is still circulating" for a mesh
+ * that had stopped circulating a message long before.
+ *
+ * So: settle first, then assert. Stability is two consecutive republications with
+ * identical values, which is the actual property ("no longer moving"), and a
+ * genuinely circulating mesh never reaches it because its counters move on every
+ * pass. The deadline still bounds the wait, so a real loop fails rather than hangs.
+ *
+ * No fixed sleep -- nf_expect_nth()'s deadline loop, like every wait here (6.3). */
+static void settle_relay_counters(nf_node_t *n, const char *who,
+                                  relay_counters_t *out)
+{
+    relay_counters_t prev;
+    int stable_rounds = 0;
+
+    read_relay_counters(n, who, out);
+    prev = *out;
+
+    while (stable_rounds < 2) {
+        size_t before = stats_lines(n);
+
+        if (nf_expect_nth(n, "[fixture] stats", before + 1u, T_IO_MS) != 0) {
+            /* Deadline. Report what we have; the assertions below say whether
+             * that was good enough. A genuinely circulating mesh is caught by the
+             * delivery count rather than by hanging here. */
+            return;
+        }
+        read_relay_counters(n, who, out);
+        if (out->own_origin == prev.own_origin &&
+            out->dup_drop == prev.dup_drop &&
+            out->hop_drop == prev.hop_drop) {
+            stable_rounds++;
+        } else {
+            stable_rounds = 0;
+        }
+        prev = *out;
+    }
+}
+
 
 /* ---------------------------------------------------------------------------
  * THE CASE
@@ -579,8 +629,8 @@ static void case_message_arrives_once_and_settles(void)
     TF_CHECK_MSG(tc_expect(&bob, " 366 ", T_IO_MS) == 0,
                  "bob's second NAMES was never answered, so the settle check has "
                  "no client-visible line to put between its two reads");
-    read_relay_counters(&a, "node A", &a_second);
-    read_relay_counters(&b, "node B", &b_second);
+    settle_relay_counters(&a, "node A", &a_second);
+    settle_relay_counters(&b, "node B", &b_second);
     TF_CHECK_MSG(tf_count(b.out, "fed_message: channel=" CHAN) == b_deliveries,
                  "node B delivered the relayed PRIVMSG %lu times and then again "
                  "while a client-visible line went past: the mesh is still "
