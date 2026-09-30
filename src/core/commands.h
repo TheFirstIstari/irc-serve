@@ -49,4 +49,16 @@ void commands_dispatch(server_t *s, conn_t *c, const message_t *m);
  * that cannot ask the question cannot check it. */
 int commands_registered(const conn_t *c);
 
+/* Recompute this connection's registration state from its two facts and emit the
+ * welcome burst if the transition into CONN_REG_READY happened.
+ *
+ * EXPOSED, and it is one function rather than the static it was, because Phase 8
+ * has a second caller: `CAP END` releases the negotiation hold, and a client that
+ * sent NICK, USER, CAP LS and then CAP END must register from THAT call. Exposing
+ * it keeps one promotion to CONN_REG_READY in the tree rather than two, and the
+ * two gates it enforces -- the CAP hold and the SASL failure hold -- stay in one
+ * place for the same reason. Idempotent: a repeated NICK or USER leaves both
+ * facts true, the projection is unchanged, and nothing is re-sent. */
+void commands_state_update(server_t *s, conn_t *c);
+
 #endif /* IRC_CORE_COMMANDS_H */

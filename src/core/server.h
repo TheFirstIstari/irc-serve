@@ -87,6 +87,18 @@
  * dependency runs the other way, through the four functions in it. */
 struct fed_dedup_entry;
 
+/* The credential store SASL PLAIN verifies against (Phase 8). It is an OPAQUE
+ * pointer for the same reason the dedup entry's and the topic cache's are:
+ * sasl_framework.h owns the layout, and this header holds only the pointer, so a
+ * reader of server_t does not also have to understand a file format and four
+ * size bounds.
+ *
+ * It is NULL until sasl_store_load() succeeds, which is the honest state of a node
+ * started without --sasl-store -- and it is the thing cap.c asks before
+ * advertising `sasl`. NULL therefore means "this node can authenticate nobody",
+ * and the SASL path treats it that way rather than treating it as "no opinion". */
+struct sasl_store;
+
 /* Phase 7's topic cache: one entry per channel whose topic outlived the
  * channel. The layout is channel.h's, for the same reason the dedup entry's is
  * federation/dedup.h's -- this header holds opaque pointers so the geometry of
@@ -552,6 +564,26 @@ struct server {
     size_t    ntopics;
     size_t    topics_cap;
     uint64_t  n_topic_cache_full;
+
+    /* ------------------------------------------------------------------------
+     * Phase 8: authentication. Both counters are events, not derived guesses.
+     * ------------------------------------------------------------------------
+     *
+     * n_sasl_ok counts exchanges that verified against the store. n_sasl_fail
+     * counts exchanges that DID NOT -- a bad credential, an unknown authcid, a
+     * malformed payload, a refused proxying authzid. Both are zero on a node with
+     * no --sasl-store, because a node that cannot authenticate anybody never
+     * completes an exchange, and that is what makes the two numbers
+     * distinguishable from a node whose store failed to load.
+     *
+     * A FAILURE IS NOT LOGGED WITH ITS INPUT. There is no password, no base64
+     * payload and no authcid on any [observable] line anywhere in the SASL path:
+     * the observable facts an operator needs are how many exchanges failed and
+     * why (the sasl_state_t), and every one of those is countable without
+     * touching a secret. */
+    struct sasl_store *sasl_store;
+    uint64_t  n_sasl_ok;
+    uint64_t  n_sasl_fail;
 
     int       trace;             /* emit [observable] per-line output */
 };

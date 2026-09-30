@@ -77,9 +77,10 @@ static int emit_to_client(server_t *s, conn_t *c, const char *code,
  * and the trailing text; `code` is the command word. `prefix` NULL means the
  * node's own name, which is the rule for every numeric and for a PONG; a
  * client-originated broadcast passes the acting user's hostmask. */
-static int emit_built(server_t *s, conn_t *c, const char *code,
-                      const char *prefix,
-                      const char *const *params, int nparams)
+static int emit_built_ex(server_t *s, conn_t *c, const char *code,
+                         const char *prefix,
+                         const char *const *params, int nparams,
+                         int force_colon)
 {
     message_t m;
     /* IRC_MAX_LINE counts a legal line INCLUDING its terminator, and
@@ -92,7 +93,7 @@ static int emit_built(server_t *s, conn_t *c, const char *code,
                       params, nparams) != 0) {
         return refuse(s, c, code, "unbuildable");
     }
-    len = message_format(&m, line, sizeof line - 2u);
+    len = message_format_ex(&m, line, sizeof line - 2u, force_colon);
     message_free(&m);
     if (len == 0) {
         /* A representable message that did not fit, or one holding a value
@@ -105,6 +106,13 @@ static int emit_built(server_t *s, conn_t *c, const char *code,
     line[len] = '\r';
     line[len + 1u] = '\n';
     return emit_to_client(s, c, code, line, len + 2u);
+}
+
+static int emit_built(server_t *s, conn_t *c, const char *code,
+                      const char *prefix,
+                      const char *const *params, int nparams)
+{
+    return emit_built_ex(s, c, code, prefix, params, nparams, 0);
 }
 
 /* <target> per RFC 2812 3.3: the client's nickname, or "*" when it does not
@@ -185,6 +193,21 @@ int send_line(server_t *s, conn_t *dst, const char *prefix,
 /* ---------------------------------------------------------------------------
  * send_pong
  * ------------------------------------------------------------------------ */
+
+int send_line_colon(server_t *s, conn_t *dst, const char *prefix,
+                    const char *command, const char *const *params, int nparams)
+{
+    if (s == NULL || command == NULL || command[0] == '\0') {
+        return refuse(s, dst, command, "bad_args");
+    }
+    if (params == NULL && nparams != 0) {
+        return refuse(s, dst, command, "bad_args");
+    }
+    if (nparams < 0 || nparams > IRC_MAX_PARAMS) {
+        return refuse(s, dst, command, "too_many_params");
+    }
+    return emit_built_ex(s, dst, command, prefix, params, nparams, 1);
+}
 
 int send_pong(server_t *s, conn_t *src, const char *token)
 {
