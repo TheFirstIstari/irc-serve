@@ -195,7 +195,64 @@ at 2am.
 ./local-ci.sh      # or: make local-ci
 ```
 
-Mirrors CI: strict C11, `-Wall -Wextra -Werror -Wpedantic -O2`, full suite.
-Green locally is necessary but not sufficient — two of the three build breaks
-fixed in this project were invisible on the machine they were written on, so let
-CI have the final word.
+Mirrors CI: strict C11, `-Wall -Wextra -Werror -Wpedantic -O2`, full suite, and
+the skip gate below. Green locally is necessary but not sufficient — two of the
+three build breaks fixed in this project were invisible on the machine they were
+written on, so let CI have the final word.
+
+## The skip gate is a ratchet
+
+`tests/known_skips.txt` is the single authoritative list of tests that are allowed
+to skip. One line per skip, naming the CTest test, the phase that owns it and the
+issue that closes it. `scripts/check-skips.sh` compares that list with the set
+CTest actually reports as skipped and **fails in both directions**:
+
+| | |
+|---|---|
+| a test skips and is not on the list | **FAIL** — a new skip |
+| a test on the list no longer skips | **FAIL** — a retired skip whose line was not retired |
+| a listed name is not a registered test | **FAIL** — a typo, or a deleted test |
+| the output has no skip block to read | **FAIL** — "could not tell" is not "there are none" |
+
+The second row is the one that makes it a ratchet rather than an allowlist. An
+allowlist that only fails on a *new* skip is a permanent permission: a test
+implemented in 2026 and left on the list goes on authorising a skip for ever and
+the count stops meaning anything.
+
+It runs in `ci_test` (the required merge gate), in `local-ci.sh`, and in
+`make test`. CTest's own exit code cannot express "a test skipped" — it excludes
+skips from the pass rate and from the status — which is why the gate is a
+separate step reading a saved log rather than part of the `ctest` invocation.
+
+### Why it is a ratchet and not "zero skips"
+
+`docs/SERVER_DESIGN.md` §6.4 used to say the list *"must reach empty by Phase 7"*
+and claimed a `KNOWN_SKIPS` list existed. Neither was true: no list existed, and
+zero is unreachable before Phase 9. The phase allocation is the reason — CAP and
+multi-prefix are §7/Phase 8, and peer discovery, auto-scale, reconnect and
+failover are §7/Phase 9, with §2.3 saying "Peer discovery and auto-scale stay
+Phase 9" in as many words. Those skips are not unfinished Phase 7 work. A gate
+demanding zero would demand a feature Phase 7 must not build, and the only ways
+out would be to delete the tests — the exact failure the gate prevents — or to
+build two phases inside one.
+
+Seven skips are permitted today, and the list is the account of all seven.
+
+### Adding a skip
+
+`CONTRIBUTING.md` already requires a test for an absent feature to return CTest's
+skip code with a message naming what is missing. That rule is unchanged. On top of
+it, **a skip is only permitted with a line in `tests/known_skips.txt`** — a new
+skip without one is red in CI, which is the point.
+
+Before you add one, check that the feature is not already allocated to this phase.
+Most of what was skipped when this gate landed belonged to a later one; the list
+exists so that a skip in the wrong phase is visible rather than plausible.
+
+### Closing a skip
+
+Implement the feature, remove the `return 77` and the `SKIP_RETURN_CODE` from the
+test's CMakeLists, and **delete the line from `tests/known_skips.txt` in the same
+change**. Leaving the line is a CI failure by design. `test_topic_persist` is the
+worked example: it skipped from Phase 1, Phase 7 implemented topic persistence
+across a reconnect, and the line is gone.

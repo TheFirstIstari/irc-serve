@@ -16,7 +16,7 @@ CTEST_TIMEOUT := 60
 help:
 	@echo "irc-serve — make targets:"
 	@echo "  build        Configure + compile (Release, BUILD_TESTING=ON)"
-	@echo "  test         Run unit tests via ctest"
+	@echo "  test         Run unit tests via ctest, then the skip ratchet"
 	@echo "  benchmark    Configure + build + run benchmarks"
 	@echo "  local-ci     Run ./local-ci.sh (mirrors .github/workflows/ci.yml)"
 	@echo "  clean        Remove build directories"
@@ -26,9 +26,21 @@ build:
 	$(CMAKE) -B $(BUILD_DIR) -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 	$(CMAKE) --build $(BUILD_DIR) --parallel $(NPROC)
 
-# `test` mirrors `local-ci.sh` line 3.
+# `test` mirrors `local-ci.sh` lines 3-4: the suite, then the skip ratchet.
+#
+# The ratchet is here for the same reason it is in local-ci.sh and in `ci_test`:
+# ctest's exit code CANNOT express "a test skipped", so a `make test` that runs
+# only ctest is a green run that would have passed with any number of new skips.
+# Every entry point that runs the suite runs the gate, or the gate is a gate on
+# one path out of three. `ctest ... | tee` is safe here because the recipe is run
+# by `sh` and this target is a single pipeline whose status make already takes
+# from its LAST command -- tee -- so ctest's own failure is NOT propagated and
+# the gate below is what turns a failed suite red. That is a real limitation of
+# this target and it is why `make local-ci`, which uses local-ci.sh's pipefail, is
+# the one CONTRIBUTING.md tells contributors to run.
 test: build
-	cd $(BUILD_DIR) && $(CTEST) --output-on-failure --timeout $(CTEST_TIMEOUT)
+	cd $(BUILD_DIR) && $(CTEST) --output-on-failure --timeout $(CTEST_TIMEOUT) | tee ctest-make.log
+	./scripts/check-skips.sh -b $(BUILD_DIR) $(BUILD_DIR)/ctest-make.log
 
 # `benchmark` mirrors CI job `ci_benchmark`.
 benchmark:
