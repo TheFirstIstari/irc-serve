@@ -514,3 +514,125 @@ void handle_away(server_t *s, conn_t *c, const message_t *m)
     (void)reply(s, c, "306", NULL, 0, "You have been marked as being away");
     printf("[observable] away: nick=%s state=set len=%zu\n", c->nick, len);
 }
+
+/* ---------------------------------------------------------------------------
+ * USERHOST
+ * ---------------------------------------------------------------------------
+ * 4.2's USERHOST, RFC 2812 3.3.4: "used to return a list of matches between the
+ * given <nickname> parameters and the nicknames of users on the server. Users
+ * are listed in the following format: <nickname> [+|*] [<user>@]<host>."
+ *
+ * ONE 302 PER NICKNAME, and each is a single-parameter answer to a
+ * single-parameter question. The alternative -- one 302 carrying every answer,
+ * which is how a batching client would want it -- is not the RFC's shape and
+ * 4.4 does not have a numeric for it.
+ *
+ * ---------------------------------------------------------------------------
+ * 302 IS THE FOURTH HOLE IN 4.4's LIST, and the same gap as 301, 303 and 417
+ * ---------------------------------------------------------------------------
+ * 4.4 enumerates "query `311`-`319`" and 302 is below that range, so the list
+ * has a hole where the protocol does not. RFC 2812 3.3.4 defines 302
+ * RPL_USERHOST as the reply to USERHOST and nothing else is a reply to it, so
+ * 302 is used and the discrepancy is flagged here and in the report, exactly as
+ * Phase 5 flagged 301, 303 and 417 rather than inventing a numeric.
+ *
+ * The trailing text is a SECOND COPY of the same value the middle parameter
+ * carries, which is the RFC's wire form and the reason both are filled: real
+ * clients read a 302 by position and the two positions are documented to be
+ * equal. A one-parameter 302 would be a line whose meaning depends on which end
+ * a reader happened to look at.
+ *
+ * WHAT THE WIRE ACTUALLY LOOKS LIKE, because it is not what the RFC's notation
+ * suggests. RFC 1459 2.3.2 writes `:<parameter>` for the trailing one, and every
+ * RFC in the family writes 302 as `302 <client> <reply> :<reply>` -- but 2.3.1's
+ * actual rule is that the LAST parameter is the trailing one whether or not it
+ * was colonned, and 3.2's formatter colons a value only when it has to (empty,
+ * leading ':', or holding a separator). A `<nick>+<user>@<host>` value needs
+ * none of those, so the line on the wire is
+ *
+ *     :<server> 302 <client> <nick>+<user>@<host> <nick>+<user>@<host>
+ *
+ * with NO colon before the second copy. Both parameters are the value; a client
+ * reading it positionally -- which is every client -- is unaffected, and a test
+ * that writes the colon into its needle will wait for a byte this node
+ * deliberately does not send. test_queries.c records the same thing about 301 and
+ * the AWAY message.
+ *
+ * ---------------------------------------------------------------------------
+ * THE `*` PREFIX, AND WHY IT CANNOT CHANGE THE ANSWER ON THIS BUILD
+ * ---------------------------------------------------------------------------
+ * RFC 2812 3.3.4: "If the <nickname> parameter begins with a '*' then only those
+ * users who have set a user mode to be invisible will be returned."
+ *
+ * This node has no user modes. 004 advertises a user-mode set of "i" and MODE
+ * evaluates none of it -- `MODE <nick> +i` reaches handle_mode() and is refused
+ * with 472, because a user is not a channel -- so the set of invisible users is
+ * EMPTY and the honest answer to `USERHOST *bob` is that bob is not in it.
+ *
+ * That is answered with the '*' branch, not with a special case, and the reason
+ * is that '*' is the RFC's own marker for "not on this server in the sense you
+ * asked about". Using the marker rather than inventing a third outcome is what
+ * keeps this ONE code path instead of two, and a client cannot tell the two
+ * apart anyway: both say "not here". What it CAN tell apart is the case this
+ * refuses to fake -- a node that answered `USERHOST *bob` with the '+' form
+ * would be claiming a user is invisible, and this node has no way to know.
+ *
+ * THE ABSENCE OF A USER IS ALSO REPORTED, as `<nick>*` rather than by staying
+ * silent. There is no numeric for "that nickname is not connected" in USERHOST's
+ * reply set, the same reason 303 omits an offline nickname rather than erroring
+ * on it, and a client that asked about a specific name needs the name back to
+ * know the question was answered. Every parameter therefore produces exactly one
+ * 302 and no parameter produces a 401.
+ *
+ * The host is the OBSERVED one, for the reason it is in 311 and 352 and in the
+ * message prefix: c->host is what accept() saw, and nothing a client asserted in
+ * USER moves it (see commands.c's handle_user()).
+ */
+void handle_userhost(server_t *s, conn_t *c, const message_t *m)
+{
+    size_t online = 0;
+
+    if (m->nparams < 1) {
+        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        return;
+    }
+
+    for (int i = 0; i < m->nparams; i++) {
+        const char *arg = m->params[i];
+        /* A bare '*' is not the invisibility prefix: there has to be something
+         * after it for the prefix to mean anything, and `USERHOST *` asks about
+         * a nickname called "*", which no client can hold. */
+        int want_invisible = (arg[0] == '*' && arg[1] != '\0');
+        const char *want = want_invisible ? arg + 1 : arg;
+        conn_t *who = fanout_find_nick(s, want);
+        /* nick + '+' + user + '@' + host + NUL, which is CONN_HOSTMASK_MAX with
+         * '!' replaced by '@' -- the two bounds are the same expression of the
+         * three struct widths, so raising conn_t::nick, ::user or ::host cannot
+         * leave this buffer one byte short. */
+        char nuh[CONN_HOSTMASK_MAX];
+
+        if (who == NULL || want_invisible) {
+            /* See the header comment: the `*` branch covers BOTH "no such user"
+             * and "asked about a user that is not invisible", and they are the
+             * same answer because this node has no invisibility.
+             *
+             * An empty name has nothing to repeat, so it gets the bare marker.
+             * The alternative -- "%s*" with an empty name -- renders "**", and
+             * while that is technically "the name you asked about, marked
+             * absent" for a name that does not exist, it reads as a two
+             * character answer to a question about a zero character one. */
+            if (want[0] == '\0') {
+                (void)snprintf(nuh, sizeof nuh, "*");
+            } else {
+                (void)snprintf(nuh, sizeof nuh, "%s*", want);
+            }
+        } else {
+            (void)snprintf(nuh, sizeof nuh, "%s+%s@%s", who->nick, who->user,
+                           who->host);
+            online++;
+        }
+        (void)reply(s, c, "302", (const char *const[]){ nuh }, 1, "%s", nuh);
+    }
+    printf("[observable] userhost: by=%s asked=%d online=%zu umodes=0\n", c->nick,
+           m->nparams, online);
+}

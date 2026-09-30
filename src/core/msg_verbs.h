@@ -1,10 +1,12 @@
-/* msg_verbs.h -- the Phase 5 verb surface: messaging, query and status.
+/* msg_verbs.h -- messaging, query and status: the Phase 5 surface plus 4.2's
+ * USERHOST.
  *
  * Authority: docs/SERVER_DESIGN.md 7/Phase 5 ("PRIVMSG/NOTICE with fan-out
  * through 3.1, WHO/WHOIS/ISON, AWAY"), 4.1 (PRIVMSG, NOTICE), 4.2 (WHO, WHOIS,
  * ISON, AWAY -- listed as SHOULD/Phase 6 and pulled forward here, which is what
- * 4.2's own table says 4.4 expects), 3.1 (the routing), 3.2 (the line cap), 4.4
- * (the numerics) and 4.3 (the away field SBURST will have to send).
+ * 4.2's own table says 4.4 expects; and USERHOST, which arrives in Phase 7),
+ * 3.1 (the routing), 3.2 (the line cap), 4.4 (the numerics) and 4.3 (the away
+ * field SBURST will have to send).
  *
  * ---------------------------------------------------------------------------
  * WHY THE VERBS ARE NOT IN commands.c
@@ -24,8 +26,13 @@
  * through reply() or through fanout_deliver(), which is 3's single
  * enforcement point.
  *
+ * USERHOST is here and not in chan_verbs.c for the one reason that decides it:
+ * it has no channel in it. It answers a question about people, exactly as
+ * WHO/WHOIS/ISON do, and the file it belongs in is the one whose other handlers
+ * also take no channel argument.
+ *
  * ---------------------------------------------------------------------------
- * THE FOUR DECISIONS 7/LEAVES TO THE PHASE, MADE HERE
+ * THE DECISIONS 7/LEAVES TO THE PHASE, MADE HERE
  * ---------------------------------------------------------------------------
  * They are decided here rather than in the design because a client cannot tell
  * the difference between a choice and an oversight. Each is argued at the
@@ -38,8 +45,8 @@
  *      send_message().
  *   3. conn_t::away is bounded at 255 bytes and an over-long message is
  *      REFUSED, never truncated. See handle_away() and CONN_MAX_AWAY.
- *   4. 4.4's numeric list has three holes this phase walks through -- 301,
- *      303 and 417. Each is used because the protocol needs it and the list
+ *   4. 4.4's numeric list has FOUR holes this file walks through -- 301, 303,
+ *      417 and 302. Each is used because the protocol needs it and the list
  *      does not have it, and each is flagged where it is emitted, exactly as
  *      Phase 3 flagged 432. They are collected in the report.
  */
@@ -60,5 +67,6 @@ void handle_who(server_t *s, conn_t *c, const message_t *m);
 void handle_whois(server_t *s, conn_t *c, const message_t *m);
 void handle_ison(server_t *s, conn_t *c, const message_t *m);
 void handle_away(server_t *s, conn_t *c, const message_t *m);
+void handle_userhost(server_t *s, conn_t *c, const message_t *m);
 
 #endif /* IRC_CORE_MSG_VERBS_H */

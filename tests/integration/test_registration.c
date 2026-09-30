@@ -177,10 +177,10 @@ int main(void)
                  ":%s 005 alice NETWORK=irc-serve CHANTYPES=#& PREFIX=(ov)@+ "
                  "CASEMAPPING=ascii NICKLEN=%d :are supported by this server\r\n"
                  ":%s 372 alice :- irc-serve: a federation-native IRC node.\r\n"
-                 ":%s 372 alice :- this build answers PASS, NICK, USER, MOTD, "
-                 "PING, PONG and QUIT.\r\n"
-                 ":%s 372 alice :- channels, messaging and federation are not "
-                 "implemented.\r\n"
+                   ":%s 372 alice :- registration, channels, messaging and peer "
+                   "federation are implemented.\r\n"
+                   ":%s 372 alice :- INFO lists what this node actually does; "
+                   "try it.\r\n"
                  ":%s 375 alice :- Message of the day -\r\n"
                  ":%s 376 alice :End of /MOTD command.\r\n",
                  NODE_NAME, NODE_NAME, IRC_SERVE_VERSION,

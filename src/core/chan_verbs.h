@@ -1,12 +1,24 @@
-/* chan_verbs.h -- the seven channel commands.
+/* chan_verbs.h -- the channel commands: the seven of 4.1, plus 4.2's INVITE and
+ * KNOCK.
  *
- * Authority: docs/SERVER_DESIGN.md 4.1 (JOIN PART TOPIC NAMES MODE KICK), 2.2
- * (the single-writer rule, mode authority, and the local/remote member split)
- * and 3.1 (which decides, for each verb, whether the action is a local write, a
- * forward, or both). The data model and the ownership predicates are in
- * core/channel.h; the reply-path rules are in core/reply.h. This header is the
- * seam between the two: it takes a parsed message and a connection and answers
- * it, and it has no state of its own.
+ * Authority: docs/SERVER_DESIGN.md 4.1 (JOIN PART TOPIC NAMES MODE KICK), 4.2
+ * (INVITE, KNOCK), 2.2 (the single-writer rule, mode authority, and the
+ * local/remote member split) and 3.1 (which decides, for each verb, whether the
+ * action is a local write, a forward, or both). The data model and the
+ * ownership predicates are in core/channel.h; the reply-path rules are in
+ * core/reply.h. This header is the seam between the two: it takes a parsed
+ * message and a connection and answers it, and it has no state of its own.
+ *
+ * WHY INVITE AND KNOCK LIVE HERE RATHER THAN NEXT TO THEIR SIBLINGS
+ * ---------------------------------------------------------------
+ * Both are 4.2 SHOULD commands, and both are about a CHANNEL rather than about
+ * the network or about a person, so they are answered with the same channel
+ * primitives the seven use: a canonical name, a membership check, and
+ * authority_ok(). Splitting them into a file of their own would mean either two
+ * copies of resolve_joined() or a wider shared header, and both are worse than
+ * two more handlers in a file that already owns the vocabulary. USERHOST is
+ * NOT here for the opposite reason: it has no channel in it at all, so it
+ * belongs with the other person-shaped queries in core/msg_verbs.c.
  *
  * ---------------------------------------------------------------------------
  * WHY THE HANDLERS ARE NOT IN THE COMMAND TABLE'S OWN FILE
@@ -105,7 +117,12 @@ typedef enum {
  * validate arity, resolve the channel, ask the authority question, and only then
  * touch state. The authority question is asked in chan_verbs.c's own
  * authority_ok(), which every one of these calls -- there is no verb that
- * decides it for itself. */
+ * decides it for itself.
+ *
+ * INVITE is the one that does not fit that sentence exactly, and the exception
+ * is deliberate: it changes no channel state, so it asks authority_ok() the way
+ * a query does, and then refuses the FORWARD case explicitly. Read its own
+ * comment before changing the `stateful` argument. */
 void handle_join(server_t *s, conn_t *c, const message_t *m);
 void handle_part(server_t *s, conn_t *c, const message_t *m);
 void handle_topic(server_t *s, conn_t *c, const message_t *m);
@@ -113,5 +130,12 @@ void handle_names(server_t *s, conn_t *c, const message_t *m);
 void handle_list(server_t *s, conn_t *c, const message_t *m);
 void handle_kick(server_t *s, conn_t *c, const message_t *m);
 void handle_mode(server_t *s, conn_t *c, const message_t *m);
+
+/* 4.2: INVITE and KNOCK. Both resolve a channel by name; INVITE additionally
+ * requires the client to be a member, and KNOCK does not -- see chan_verbs.c
+ * for why a knock on a channel you are not on is still answered with a numeric
+ * about the channel rather than a complaint about your membership. */
+void handle_invite(server_t *s, conn_t *c, const message_t *m);
+void handle_knock(server_t *s, conn_t *c, const message_t *m);
 
 #endif /* IRC_CORE_CHAN_VERBS_H */
