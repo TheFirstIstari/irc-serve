@@ -1115,6 +1115,32 @@ static void case_resync_replaces(void)
                  "node A's second resync did not carry the four member records its "
                  "own state has (alice and bob and carol on %s, dave on %s): %s",
                  CHAN_T, CHAN_U, a.out);
+    /* THE RECEIVER IS WAITED FOR BEFORE THE RECEIVER IS ASKED, and that ordering is
+     * the whole fix for this step. The two waits above are about node A: it drove
+     * the resync and it put the records on the wire. Neither says node B has read
+     * them. B applying a burst is its own poll iteration, in its own process, and
+     * the whole of what this test does in between happens on A's stdout -- so
+     * there is nothing in it that moves B forward.
+     *
+     * ask B for a roster in that state and B answers from the roster it has: alice
+     * still an operator, because B has not run the purge yet. So the answer is a
+     * SECOND 353 group carrying `@alice`, ` 353 bob = #T bob carol alice` -- the
+     * one plain line this step asserts -- is missing, and the LINE COUNT check
+     * below reports a merge that did not happen. That is the Phase 6 CI failure in
+     * this case, and expect_names() cannot save it: its PING drain orders bob's
+     * NAMES behind bob's own PING on B's socket, which proves B processed bob's
+     * question, not that B had processed A's answer to the previous one.
+     *
+     * `fed_burst_applied` is printed after the installs and the purge (federation/
+     * burst.c, at the end of fed_burst_apply), and this is the wait that already
+     * said so -- it was simply running one step too late to be a precondition. */
+    TF_CHECK_MSG(nf_expect(&b, "nicks=2 chans=2 members=4 installed=1 purged=1 "
+                                  "dropped=0 bytes=",
+                           T_IO_MS) == 0,
+                 "node B did not apply A's second resync with the expected shape: "
+                 "alice reinstalled once, her irc.a entry purged once, nothing "
+                 "dropped.\n  node said: %s",
+                 b.out);
     /* THE TEETH, and this is the one that needs no poke at all. A MERGE leaves
      * B's (irc.a, alice) entry standing with +o on it, recognises the new record
      * as a name this node already knows, and skips it -- so the client is shown
@@ -1128,13 +1154,6 @@ static void case_resync_replaces(void)
      * it is one plain line naming all three, and it was one line naming bob and an
      * op before. If A's own 353 were wrong, B's being right would prove nothing. */
     expect_names(&alice, "alice after the de-op", NICK_A, CHAN_T, a_deop, 1u, NULL);
-    TF_CHECK_MSG(nf_expect(&b, "nicks=2 chans=2 members=4 installed=1 purged=1 "
-                                  "dropped=0 bytes=",
-                           T_IO_MS) == 0,
-                 "node B did not apply A's second resync with the expected shape: "
-                 "alice reinstalled once, her irc.a entry purged once, nothing "
-                 "dropped.\n  node said: %s",
-                 b.out);
 
     /* --- resync #3: a member the origin LOST must be forgotten ------------- */
     /* Registering eve is the trigger. The tick hook removes alice from A's #T
@@ -1150,12 +1169,18 @@ static void case_resync_replaces(void)
                  "node A's third resync did not carry three clients and three member "
                  "records, so the fixture's silent removal did not happen: %s",
                  a.out);
-    /* THE SECOND SET OF TEETH, and this is the one the pass's "a departed member
-     * must appear in 353" describes. A MERGE keeps B's (irc.a, alice) entry, so
-     * the answer is two names on the first line plus alice; a replace is the two
-     * names B hosts and nothing else. */
-    expect_names(&bob, "bob after alice was dropped at the origin", NICK_B, CHAN_T,
-                 t_gone, 1u, NICK_A);
+    /* SAME ORDERING RULE AS THE DE-OP STEP ABOVE, AND IT MATTERS MORE HERE. The two
+     * waits are about node A driving the resync; neither says node B has applied
+     * it. B applying it is its own poll iteration, and everything between here
+     * and the roster question happens on A's stdout.
+     *
+     * Asked before it has, B still holds the (irc.a, alice) record the resync is
+     * about to purge, so it answers with alice in the roster -- which is the
+     * `absent` check below failing on a node that had simply not got to the purge
+     * yet, and the ONE line check failing too, since the un-purged record puts
+     * alice in a second 353 group. So the receiver is waited for first, exactly as
+     * in the de-op step, and the wait below is kept where it was for what it
+     * asserts rather than for when it runs. */
     TF_CHECK_MSG(nf_expect(&b, "nicks=3 chans=2 members=3 installed=0 purged=1 "
                                   "dropped=0 bytes=",
                            T_IO_MS) == 0,
@@ -1163,6 +1188,12 @@ static void case_resync_replaces(void)
                  "one irc.a entry purged and nothing installed, because the origin "
                  "no longer reports that member.\n  node said: %s",
                  b.out);
+    /* THE SECOND SET OF TEETH, and this is the one the pass's "a departed member
+     * must appear in 353" describes. A MERGE keeps B's (irc.a, alice) entry, so
+     * the answer is two names on the first line plus alice; a replace is the two
+     * names B hosts and nothing else. */
+    expect_names(&bob, "bob after alice was dropped at the origin", NICK_B, CHAN_T,
+                 t_gone, 1u, NICK_A);
     /* AND #U, one last time, after a burst that named it. dave is still there, and
      * the 366 is there: the channel survived and its roster was not disturbed by a
      * resync about a different origin. */
