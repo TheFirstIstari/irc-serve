@@ -521,6 +521,130 @@ server_link_t *fed_link_configure(server_t *s, const char *name,
     return link;
 }
 
+/* ---------------------------------------------------------------------------
+ * THE DEPARTURE ANNOUNCEMENT, AND WHY IT IS NOT A ROW IN THE S-VERB TABLE
+ * ---------------------------------------------------------------------------
+ * Tell this node's remaining peers that THIS NODE'S OWN NAME is going away,
+ * because a link just went down. It is a SQUIT -- 4.3's word for exactly this --
+ * and it is emitted from the link LIFECYCLE rather than from any of the five
+ * fan-out arms, because there is no client emission to fan out: nothing on this
+ * node asked for anything, a socket did.
+ *
+ * IT IS NOT IN S_VERBS, and that is the same conclusion the T3 keepalive reaches
+ * from the other side, for the same reason and with the same citation:
+ * tests/integration/test_fed_wire.c asserts the contents of that table, and 4.3's
+ * list is the FORWARDED vocabulary -- verbs a node relays. A node announcing its
+ * own departure relays nothing. Putting `{"SQUIT", "SQUIT"}` in that table would
+ * also be meaningless, because the column on the left is a CLIENT verb and no
+ * client sends one; a row there would claim that a client's SQUIT is forwarded,
+ * which is a claim about the client surface that this node does not implement
+ * and would not implement. So the verb is named here and the shared
+ * render-and-queue step (fed_queue_line(), stamp the 2.4 block, build, render,
+ * bound-check, terminate, queue) is the same one T3 and fed_send_sverb() use.
+ *
+ * ONE ID FOR THE WHOLE FAN-OUT, which is a deliberate difference from
+ * fanout_forward_sverb()'s per-target minting, and the reason is 2.4's dedup
+ * scope. The store is PER NODE, not per peer, so a node reachable by two of this
+ * node's peers sees the same (origin, epoch, id) twice and MUST drop the second:
+ * that is what the per-node rule is for. Minting per peer would make the two
+ * copies two different keys, so the third node would apply the purge twice and
+ * store two entries for one message. This is one message with several targets.
+ *
+ * THE COST, stated because it is a real one: the fan-out is a broadcast to every
+ * ESTABLISHED link, which is 3.1's amended owned/`state-change` row rather than
+ * a unicast, so on a large mesh one link failure costs one line per peer. It is
+ * paid on a link event, which is rare, and the alternative -- telling nobody --
+ * leaves every peer holding a roster for a server that is not there until the
+ * next burst, and driving bursts is Phase 9.
+ *
+ * AND THE SENTENCE THIS SENDS IS WIDER THAN THE EVENT, which is a property of
+ * the TRIGGER rather than of this function: the event is ONE link going down,
+ * and the sentence is "this node's name is gone". On a mesh where this node is
+ * still reachable by somebody else, a peer told here purges a roster for a
+ * server that is still there, and the roster comes back from a later SJOIN or
+ * the next burst -- which Phase 9 owns. That is the price of telling anybody at
+ * all, and it is bounded only by that policy, so it is written down here rather
+ * than left for a reader to discover as a stale roster on a live server. A reader
+ * who thinks it should be "my link to you is down" instead should read
+ * 7/Phase 9, which is where the answer belongs.
+ */
+static int fed_send_squit(server_t *s, const server_link_t *dying)
+{
+    irc_serve_tags_t tags;
+    const char *params[1];
+    fed_queue_why_t why = FED_QUEUE_OK;
+    size_t targets = 0;
+    int sent = 0;
+
+    if (s == NULL) {
+        return 0;
+    }
+    /* COUNTED FIRST, AND THE COUNT IS WHAT MAKES THE "NO ID SPENT" DECISION.
+     * core/fanout.c says the same about a forward that is refused before it is
+     * stamped: the ids come from a per-SERVER counter and a hole in that sequence
+     * is a hole in the sequence, and nothing requires it to be contiguous. It is
+     * still not free, so a node whose only ESTABLISHED link is the one that just
+     * went -- the ordinary TWO-NODE mesh, where this announcement has nobody to
+     * go to -- spends no id and prints nothing. */
+    for (size_t i = 0; i < s->nlinks; i++) {
+        if (&s->links[i] == dying) {
+            /* The link that died is NOT a peer this is told through, and the
+             * reason is the wire rather than taste: its caller is about to mark
+             * that connection CLOSING, so a line queued onto it is a line nobody
+             * will read, and counting it as a peer told would be a claim the wire
+             * does not support. The far side of a dead link learns this node is
+             * gone from the link, which is the channel the event arrived on. */
+            continue;
+        }
+        if (s->links[i].state == (int)ESTABLISHED &&
+            server_link_conn(s, &s->links[i]) != NULL) {
+            targets++;
+        }
+    }
+    if (targets == 0u) {
+        return 0;
+    }
+
+    memset(&tags, 0, sizeof tags);
+    memcpy(tags.origin, s->name, strlen(s->name) + 1u);
+    tags.epoch = s->epoch;
+    tags.id = server_next_msg_id(s);
+    tags.hops = 0; /* originated here, so it leaves at zero (2.4) */
+
+    /* SQUIT <server>: the name of the server that is going away, which is THIS
+     * one. verbs.h freezes the shape; the [optional reason] is not sent because
+     * nothing on this node has one to give, and an unused field on a wire format
+     * is a field a second implementation has to guess about. */
+    params[0] = s->name;
+
+    for (size_t i = 0; i < s->nlinks; i++) {
+        conn_t *c;
+
+        if (&s->links[i] == dying || s->links[i].state != (int)ESTABLISHED) {
+            continue;
+        }
+        c = server_link_conn(s, &s->links[i]);
+        if (c == NULL) {
+            continue;
+        }
+        if (fed_queue_line(s, c, &tags, s->name, "SQUIT", params, 1, &why) != 0) {
+            /* Reported, not swallowed, for the reason every other refusal in
+             * this module is: a node that failed to announce its departure and
+             * says nothing looks exactly like a node whose peers are all silent,
+             * and the two have opposite fixes. server_queue() has already
+             * counted a saturated link and marked it CLOSING (3.4), so this is
+             * the report and not a second count. */
+            printf("[observable] fed_squit_send_failed: self=%s peer=%s reason=%s\n",
+                   s->name, s->links[i].name, fed_queue_why_name(why));
+            continue;
+        }
+        sent++;
+    }
+    printf("[observable] fed_squit_sent: self=%s peers=%d id=%llu\n", s->name, sent,
+           (unsigned long long)tags.id);
+    return sent;
+}
+
 /* The link back to INIT, keeping `initiator`, the address and the dial latch.
  * The reasoning is on fed_link_reset() in the header; this is the shared body
  * so that the dead path and the reconnect seam cannot drift apart. */
@@ -529,6 +653,12 @@ static void fed_link_down(server_t *s, server_link_t *link)
     if (link == NULL) {
         return;
     }
+    /* THE DEPARTURE GOES OUT FIRST, while the other links are still up, and the
+     * order is the whole point: this announcement is queued onto peers' write
+     * queues, and every step below either closes a descriptor or forgets that a
+     * peer existed. A SQUIT emitted afterwards would be a line on a link the node
+     * has already stopped believing in. */
+    (void)fed_send_squit(s, link);
     handshake_init(&link->hs);
     fed_link_set_state(link);
     link->fd = -1;
@@ -908,9 +1038,31 @@ fed_federate_result_t fed_check_federate(const server_t *s,
      * moment the peer was configured. Every OTHER link with this name is a
      * rival, and the difference between the two verdicts is the whole of 2.3's
      * rule: a link that is ESTABLISHED is a live route to that name, and
-     * admitting a second one is the split brain; a link that is not is a
-     * half-open exchange for the same name, and admitting a second one would
-     * put two descriptors on one identity. */
+     * admitting a second one is the split brain; a link that HOLDS A DESCRIPTOR
+     * but is not established is a half-open exchange for the same name, and
+     * admitting a second one would put two descriptors on one identity.
+     *
+     * AND A LINK WITH NO DESCRIPTOR IS NEITHER. That clause is the correction,
+     * and it was missing until a re-link was tested: a link in INIT with fd == -1
+     * is a NAME and a DESTINATION, not a claim on the name. It is what fed_dead()
+     * leaves behind -- the peer went away, the descriptor is closed, the name is
+     * kept so that T7 can dial it again and so that 2.2's fail-closed rule has an
+     * origin to be unreachable FROM. Refusing a peer's re-claim because such a
+     * link exists made 2.2's "re-linking a server of the same name resurrects the
+     * channel" UNREACHABLE: the peer re-dialled, was told the name was in use by
+     * a link that had no socket on it, and the mesh could never recover from a
+     * partition without an operator deleting configuration.
+     *
+     * THE COST, and it is the reason this is about the DESCRIPTOR and not about
+     * the state: a node can now hold at most one link per name whose fd is >= 0
+     * and any number whose fd is -1, and only the first kind is a claim. A link
+     * that is FAILED or TIMED_OUT WITH A DESCRIPTOR still holds one -- T2 leaves
+     * the descriptor alone on purpose -- so a peer re-dialling into that state is
+     * still refused with NAME_IN_USE, and clearing it is fed_link_reset()'s job.
+     * That asymmetry is left as it is rather than papered over: it is the same
+     * asymmetry link.h draws between a link that was established and went away
+     * (resettable, because there is something to stop believing in) and one that
+     * never completed (terminal, because there was never anything to believe). */
     for (i = 0; i < server_link_count(s); i++) {
         const server_link_t *other = server_link_at(s, i);
 
@@ -920,7 +1072,9 @@ fed_federate_result_t fed_check_federate(const server_t *s,
         if (other->state == (int)ESTABLISHED) {
             return FED_DUPLICATE_LINK;
         }
-        return FED_NAME_IN_USE;
+        if (other->fd >= 0) {
+            return FED_NAME_IN_USE;
+        }
     }
     /* And the same answer reached through the function every router uses. It
      * is redundant with the scan above by construction, and it is here anyway:
@@ -1006,6 +1160,25 @@ static void fed_refuse(server_t *s, server_link_t *link, conn_t *c,
 static int fed_claim_accepted(server_t *s, server_link_t *link, conn_t *c,
                               const char *claim, uint64_t peer_epoch)
 {
+    if (link == NULL) {
+        /* A RE-CLAIM FROM A PEER WHOSE LINK WENT AWAY REUSES THE LINK, and this
+         * is the second half of the correction in fed_check_federate() step 4.
+         * That check now admits a claim for a name this node still holds a link
+         * for, and the link is a NAME and a DESTINATION rather than a rival
+         * claim -- so the claim has to be applied to IT. Creating a second link
+         * for the same name instead would leave two entries in the table for
+         * one server, and the second one is a duplicate every uniqueness check
+         * from then on has to think about.
+         *
+         * WHY IT IS SAFE, which is the part that has to be argued rather than
+         * assumed: fed_check_federate() has already returned FED_OK, and that
+         * now means no ESTABLISHED link and no link holding a descriptor claims
+         * this name. So whatever is found here holds no socket, and taking it
+         * over cannot displace a live route. It also cannot disturb the
+         * dialling side, which finds its link by descriptor in
+         * fed_link_of_conn() and never reaches this branch. */
+        link = server_find_link(s, claim);
+    }
     if (link == NULL) {
         link = fed_link_new(s, claim, 0);
         if (link == NULL) {
