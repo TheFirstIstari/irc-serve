@@ -471,3 +471,64 @@ void tc_close(test_client_t *c)
     c->len = 0;
     c->cap = 0;
 }
+
+/* Drain this client's socket until the deadline passes, waiting on the socket and
+ * on the installed pump hook at the same time.
+ *
+ * This has been DECLARED in irc_client.h, with a full contract, since the pump
+ * hook was added -- and had no definition. A caller does not link, which is the
+ * worst kind of harness defect: the header says the capability exists, so a test
+ * reads it, writes against it, and finds out at link time.
+ *
+ * It existed because "wait on this client until a deadline, while unrelated
+ * readers keep moving" is the operation every deadline loop in this harness wants
+ * and each one had grown its own version. test_topic_persist grew a local copy
+ * rather than link against this.
+ *
+ * Returns 0 if nothing was read before the deadline, 1 if bytes were appended,
+ * -1 on a hard error, and sets `*eof` when the peer closed. */
+int tc_drain(test_client_t *c, int timeout_ms, int *eof)
+{
+    uint64_t deadline;
+    int got = 0;
+
+    if (c == NULL) {
+        return -1;
+    }
+    if (eof != NULL) {
+        *eof = 0;
+    }
+    deadline = now_ms() + (uint64_t)timeout_ms;
+
+    for (;;) {
+        int e = 0;
+        int rc;
+
+        /* Consume what is already buffered before waiting: read_once() appends,
+         * and a buffer that is never emptied grows without bound and makes the
+         * next strstr() match something from an earlier exchange. */
+        if (c->buf != NULL && c->len > 0) {
+            memmove(c->buf, c->buf + c->len, c->cap - c->len);
+            c->cap -= c->len;
+            c->len = 0;
+            got = 1;
+        }
+
+        rc = read_once(c, deadline, &e);
+        if (rc < 0) {
+            return got;
+        }
+        if (e) {
+            if (eof != NULL) {
+                *eof = 1;
+            }
+            return got;
+        }
+        if (rc > 0) {
+            got = 1;
+            continue;
+        }
+        /* Deadline reached: read_once() returns 0 with nothing read. */
+        return got;
+    }
+}

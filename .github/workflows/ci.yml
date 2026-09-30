@@ -107,9 +107,30 @@ jobs:
         run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
       - name: Build
         run: cmake --build build --parallel $(nproc)
+      # shell: bash, and not the default, for ONE reason: the default is
+      # `bash -e {0}`, which has no pipefail, so `ctest | tee` would return tee's
+      # status and a FAILED suite would sail through this job. `shell: bash` is
+      # `bash --noprofile --norc -eo pipefail`, which is what makes the tee below
+      # safe.
       - name: Unit Tests
         working-directory: build
-        run: ctest --output-on-failure --timeout 60 -j 2
+        shell: bash
+        run: ctest --output-on-failure --timeout 60 -j 2 | tee ctest.log
+      # THE SKIP RATCHET. It is a step of its own rather than part of the ctest
+      # invocation because it is a different KIND of check: ctest's exit code
+      # cannot express "a test skipped", and that blind spot is what let 8 dead
+      # tests pass unnoticed. It reads the log the step above wrote, so the suite
+      # is not run twice.
+      #
+      # It is NOT "fail if any test skips". A test that skips without a line in
+      # tests/known_skips.txt is a FAILURE, and so is a listed skip that is no
+      # longer skipping -- the second direction is what makes the list a ratchet
+      # rather than an allowlist that rots. Seven skips are permitted today, all
+      # of them allocated by 7/Phase 8 and 7/Phase 9 to phases that have not run;
+      # docs/SERVER_DESIGN.md 6.4 explains why "zero" is not reachable before then
+      # and what the list is instead.
+      - name: Skip gate (ratchet)
+        run: ./scripts/check-skips.sh -b build build/ctest.log
 
   # --- macOS: cannot run on the self-hosted machine -----------------------
   ci_macos:

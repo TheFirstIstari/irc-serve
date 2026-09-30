@@ -1,0 +1,72 @@
+# tests/known_skips.txt -- THE SINGLE AUTHORISITIVE LIST OF PERMITTED SKIPS.
+#
+# One line per test that CTest reports as Skipped. The first whitespace-separated
+# field is the CTest test NAME; everything after it is prose and is not parsed.
+# Blank lines and lines beginning with '#' are ignored.
+#
+# WHAT THIS IS FOR. 6.4 of docs/SERVER_DESIGN.md used to describe a KNOWN_SKIPS
+# list that did not exist, and Phase 7 implements the gate it described -- as a
+# RATCHET rather than as "zero skips", because "zero" is unreachable before Phase
+# 9 and the reasons are in 6.4. The ratchet enforces the real intent: the count
+# only goes DOWN, and every skip is accounted for by name, by the phase that owns
+# it, and by the issue that closes it.
+#
+# THE GATE FAILS IN BOTH DIRECTIONS, and the second direction is the one that
+# makes this a ratchet rather than an allowlist that can rot:
+#
+#   a test that skips and is not on this list        -> FAIL (a new skip)
+#   a test on this list that no longer skips         -> FAIL (a retired skip
+#                                                          that was not retired
+#                                                          from the list)
+#   a name here that is not a registered CTest test   -> FAIL (a typo, or a test
+#                                                          that was deleted)
+#
+# Enforced by scripts/check-skips.sh, which CI runs and local-ci.sh runs. The
+# other half of the rule -- "the list is the only place a skip is permitted" -- is
+# CONTRIBUTING.md's, and it is what the first direction enforces: a new skip
+# without a line here is red.
+#
+# CLOSING A SKIP. Implement the feature, delete the `return 77` and the
+# SKIP_RETURN_CODE in the test's CMakeLists.txt, and DELETE THE LINE HERE IN THE
+# SAME CHANGE. Leaving it is a CI failure, which is the point: the list is meant
+# to be hard to leave stale.
+#
+# Zero skips is still the goal. Phase 8 retires the two IRCv3 lines below and
+# Phase 9 retires the other five, and when the last line goes this file is empty
+# and the gate is a plain "no test may skip".
+#
+# --- the list -----------------------------------------------------------------
+
+# Phase 8 (issue #82): IRCv3 CAP negotiation -- LS/REQ/ACK/NAK. 7/Phase 8 names
+# CAP explicitly, and 4.2's 4.4 has no numeric for any of it.
+CapNegotiation  Phase 8  #82  IRCv3 CAP negotiation (LS/REQ/ACK/NAK)
+
+# Phase 8 (issue #82): the IRCv3 `multi-prefix` capability, which renders more
+# than one prefix per member in 353. chan_verbs.c's send_names_list() renders
+# EXACTLY one of @/+ per member by design, so this is a capability question and
+# not a bug in the render.
+MultiPrefix  Phase 8  #82  IRCv3 multi-prefix in 353
+
+# Phase 9 (issue #83): the §4.3 resync DRIVEN BY a reconnect -- backoff, a retry
+# budget, and a SBURST triggered by a reconnect rather than by establishment.
+# Phase 6 owns the verb and its wire format and proves both halves either side of
+# this gap; the policy is what is missing.
+SyncState  Phase 9  #83  link-loss reconnect policy driving the §4.3 SBURST resync
+
+# Phase 9 (issue #83): peer failover and reconnect. C5 proves a failed link is not
+# re-dialled (the latch) and that a deliberate retry through fed_link_reset()
+# re-establishes and re-bursts; the automatic policy is not started.
+FailoverReconnect  Phase 9  #83  automatic peer failover: backoff and retry budget
+
+# Phase 9 (issue #83): peer discovery. 2.3 says "Peer discovery and auto-scale stay
+# Phase 9", verbatim.
+PeerDiscovery  Phase 9  #83  §2.3 peer discovery (advertise / graceful leave)
+
+# Phase 9 (issue #83): client reconnect preserving session state. Distinct from
+# the load-balancer Reconnect below: this one is about what a client keeps across
+# a reconnect, which is about services this node does not have.
+Reconnect  Phase 9  #83  client reconnect preserving session state
+
+# Phase 9 (issue #83): auto-scaling. 2.3 names it in the same sentence as peer
+# discovery.
+AutoScale  Phase 9  #83  §2.3 auto-scale (spawn / shutdown / propagation)

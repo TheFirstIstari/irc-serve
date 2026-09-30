@@ -161,6 +161,36 @@ local members still see each other, but origin-requiring actions are refused
 with `437`. Re-linking a server of the same name resurrects the channel.
 Re-election instead is out of scope — see §9.
 
+**A channel's TOPIC outlives the channel; nothing else does, and a bounded
+cache on `server_t` is why.** The disposal rule below frees a channel with no
+local members and no member-server, and it is right to — holding one per
+channel *name* a client ever typed would be an unbounded store reachable from the
+wire. The topic is the one field whose loss a **client** can see, because a
+channel everybody has left comes back topicless and that is indistinguishable
+from a channel that never had one. So `topic`/`topic_who`/`topic_when` are
+copied into a bounded cache on `server_t` when the channel is disposed and copied
+back when a channel is **created**; the only two call sites are the disposer and
+`JOIN`'s creation branch, so the cache's lifetime is exactly the channel's.
+
+Four limits are stated here rather than left to `core/channel.h`, because a
+reader deciding whether a topic survives needs them and should not have to go
+looking:
+
+- **It does not survive a node restart.** The cache is heap memory; 3.4 forbids a
+  write inside the event loop and an on-disk topic store is a new deployment
+  surface. It is a bounded cache, not persistence in the usual sense.
+- **Only the topic is carried.** Not the modes, not the bans, not the members.
+  2.2 says the origin owns those, and a cache restoring them would be a *second
+  authority for channel state* — the exact thing the single-writer rule exists to
+  prevent.
+- **`topic_who` and `topic_when` travel with it**, because 333 reports both. A
+  cache holding only the text would make 333 name whoever rejoined and the moment
+  they rejoined, which is a lie about two facts at once.
+- **It is bounded, and a loss is counted rather than refused.** Past the bound
+  the topic is lost exactly as it would have been without the cache, and
+  `server_t::n_topic_cache_full` records it. The cache can therefore only fail to
+  help; it never refuses a client command.
+
 ### 2.3 Servers and peers
 
 ```c
@@ -715,6 +745,21 @@ message, so without it "WHOIS reflects AWAY" is unimplementable); `303`
 **refused**, not truncated — truncating would store a message the user did
 not write and then report it in `301` as theirs).
 
+Phase 7 walked through four more of the same kind, and the argument is identical
+each time: the list has a gap and the protocol does not, the RFC numeric is the
+one a client understands, and the discrepancy is flagged at the emission.
+
+- `302` `RPL_USERHOST` — the reply to `USERHOST` and nothing else. Below the
+  `311`-`319` range this section lists for queries.
+- `371` `RPL_INFO` and `374` `RPL_ENDOFINFO` — `INFO`'s body and its terminator.
+  They sit in the gap between this section's `251`-`266` and `372`-`376` ranges.
+  `375` and `376` are **not** reused for them: those are
+  `RPL_MOTDSTARTING`/`RPL_MOTDEND`, and an INFO terminated with them would make
+  the MOTD's terminator lie.
+- `402` `ERR_NOSUMSERVER` — a `LUSERS` or `ADMIN` `<server>` mask naming a node
+  this one cannot reach. On a single node there is nowhere to forward the
+  question, which is precisely what 402 says.
+
 `432` `ERR_ERRONEUSNICKNAME` is for a nickname that is **malformed** — illegal
 under §2.1. It is distinct from `433` `ERR_NICKNAMEINUSE`, which is for a legal
 nickname already claimed. The two must not be conflated: answering an illegal
@@ -800,11 +845,53 @@ fixed sleep is the leading cause of CI flake.
 
 ### 6.4 Skip gate
 
-`KNOWN_SKIPS` in `tests/CMakeLists.txt` lists every legitimately-skipped test.
-CI fails if a test reports `Skipped` and is not listed, and `KNOWN_SKIPS` must
-reach empty by Phase 7 (Phase 6 is the federation link; the gate lands with
-the command surface it protects). This closes the `return 77` blind spot that let 8 dead
-tests pass unnoticed.
+**The gate is a RATCHET, and "zero skipped tests" is not reachable in Phase 7.
+Both of the claims this section used to make were false, and they are retracted
+here rather than left for a reader to disprove.**
+
+The first was that *"`KNOWN_SKIPS` in `tests/CMakeLists.txt` lists every
+legitimately-skipped test"*. **No such list existed at any point.** The
+`return 77` blind spot this section describes was real — `ctest` excludes a skip
+from its pass rate and from its exit code, so a green run coexisted with eight
+unimplemented features — and nothing in the tree enforced anything about it. The
+second was that the list *"must reach empty by Phase 7"*.
+
+**It cannot, and the reason is this document's own phase allocation rather than an
+oversight.** §7 gives CAP negotiation and multi-prefix to **Phase 8**; §2.3 says
+"Peer discovery and auto-scale stay Phase 9" in as many words, and §7/Phase 9
+owns reconnect and failover as well. Those skips are not unfinished Phase 7 work.
+They are work Phase 7 has explicitly been given no time to do. A gate demanding
+zero would be demanding a feature Phase 7 must not build, and the only two ways
+to satisfy it would be to delete the tests — which is exactly what the blind spot
+looks like — or to build Phase 8 and Phase 9 inside Phase 7.
+
+**What is enforced instead is the real intent: the count only goes down, and every
+skip is accounted for by name.** `tests/known_skips.txt` is the single
+authoritative list: one line per skip, naming the CTest test, the phase that owns
+it, and the issue that closes it. `scripts/check-skips.sh` compares that list with
+the set CTest actually reports as skipped, in **both** directions:
+
+- a test that skips and is not on the list **fails** — the blind spot above;
+- a test on the list that no longer skips **also fails**, so the list cannot rot
+  into a permanent allowlist still naming tests that were implemented years ago.
+  *This second direction is what makes it a ratchet rather than an allowlist, and
+  it is the half a "fail on any skip" rule gets for free while an allowlist does
+  not.*
+- a listed name that is not a registered CTest test **fails** — a typo, or a
+  deleted test.
+- output the script cannot read the skip block from is a **failure**, not a pass:
+  "we could not tell" is not "there are none".
+
+The gate runs in `ci_test` (the required merge gate), in `local-ci.sh`, and in
+`make test`. `CONTRIBUTING.md`'s rule — *if a feature is absent, return CTest's
+skip code with a message naming it* — is unchanged, and the first direction is
+what enforces it: **a new skip without a line in `tests/known_skips.txt` is red.**
+
+Seven skips are permitted today, and `tests/known_skips.txt` is the
+phase-by-phase account of all seven. Zero remains the correct goal; closing a
+skip is implementing the feature and deleting its line **in the same change**.
+§7/Phase 8 retires two of them and §7/Phase 9 retires the other five, and when
+the last line goes the file is empty and the gate is a plain "no test may skip".
 
 ---
 
@@ -979,12 +1066,47 @@ is the price of telling anybody at all, and it is bounded only by that policy; a
 reader who finds it surprising should read it as the question Phase 9 answers
 rather than as a defect C5 could have avoided.
 
-**Phase 7 — Command surface + skip gate empty.** The SHOULD commands; CI fails
-on any skip. *Accept:* zero skipped tests.
+**Phase 7 — Command surface, and the skip gate becomes a ratchet.** The remaining
+§4.2 SHOULD commands; CI gains the skip gate. *Accept:* the seven remaining verbs
+answer on the wire, `test_topic_persist` is a real test of real topic
+persistence, and the gate fails in **both** directions. **"Zero skipped tests", as
+this phase once read, is not met and was never reachable here** — §6.4 gives the
+argument and `tests/known_skips.txt` is the phase-by-phase account of the seven
+that remain.
+
+*What is in, and what the honest refusals are.* `INVITE` `LUSERS` `ADMIN` `INFO`
+`USERHOST` `KNOCK` `CHOPER` are implemented, and two of them are refusals rather
+than features, because the RFC wants something this tree cannot honestly supply:
+`KNOCK` is gated on an **IRC operator**, and there is no operator concept here at
+all, so it answers `482` for every request and says so in its text; `CHOPER`
+implies operator flags and a credential store, and this node has neither — `PASS`
+is *recorded, not checked* — so it answers `464` and never `381`. The alternative
+in both cases was a numeric claiming a success that nothing would act on.
+`LUSERS` reports a real `<max clients>` (the connection table's bound) and says
+that is what it is, because there is no configured maximum to report.
+
+*Four new numerics that are not in §4.4's list, added the way 301, 303 and 417
+already were:* `302` (RPL_USERHOST, for `USERHOST`), `371`/`374` (RPL_INFO and its
+terminator, for `INFO`), and `402` (ERR_NOSUMSERVER, for a `LUSERS`/`ADMIN` mask
+naming a node this one cannot reach). In each case the list has a gap and the
+protocol does not, the RFC numeric is the one a client understands, and the
+discrepancy is flagged at the emission. `375`/`376` are **not** reused for INFO's
+terminator: they are `RPL_MOTDSTARTING`/`RPL_MOTDEND`, and reusing them would make
+the MOTD's terminator lie.
+
+*Topic persistence is a Phase 7 feature, and it is a bounded cache and not a disk
+write.* §2.2 requires a channel with no members to be disposed, and the topic is
+the one field whose loss a client can see, so `chan_t::topic`/`topic_who`/
+`topic_when` are copied into a bounded cache on `server_t` when the channel is
+disposed and copied back when a channel is created again. A topic does **not**
+survive a node restart, because 3.4 forbids a write inside the event loop; the
+cache's bounds, its three alternatives that were considered and rejected, and what
+it deliberately does **not** carry are in `core/channel.h`.
 
 **Phase 8 — IRCv3.** Real tag escaping + roundtrip, CAP negotiation
-(LS/REQ/ACK/NAK), real SASL PLAIN, message-ids. Turns the 5 skipped IRCv3
-tests green.
+(LS/REQ/ACK/NAK), real SASL PLAIN, message-ids. Turns the 2 skipped IRCv3
+tests green, and the ratchet then refuses the run until their lines come out of
+`tests/known_skips.txt`.
 
 **Phase 9 — Federation hardening.** Link failure and reconnect handling, driving
 the §4.3 `SBURST` resync (Phase 6 owns the verb and its wire format, not this
@@ -1001,7 +1123,16 @@ should not be split across people.
 ## 8. Definition of done
 
 Single node:
-- [ ] Zero skipped tests; CI fails if any test is skipped
+- [ ] Zero skipped tests; CI fails if any test is skipped — **met in Phase 7 as
+      a RATCHET, which is not what this item read.** It read as an outcome, and
+      the outcome is not reachable before Phase 9: §7 allocates CAP and
+      multi-prefix to Phase 8 and peer discovery, auto-scale, reconnect and
+      failover to Phase 9, so demanding zero in Phase 7 would demand a feature
+      Phase 7 must not build. What is enforced instead is the intent behind the
+      item — the count only goes down and every skip is accounted for — by a list
+      in `tests/known_skips.txt` and a gate that fails in **both** directions. See
+      §6.4, which is where the original wording is retracted, and
+      `docs/DEVELOPMENT.md` for how to close a skip.
 - [ ] Two clients connect, register, `#JOIN` a channel, exchange a `PRIVMSG`,
       `#QUIT` cleanly
 - [ ] All MUST commands and numerics in §4 implemented

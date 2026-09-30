@@ -804,6 +804,120 @@ int chan_origin_wins(uint64_t a_epoch, const char *a_name,
 int chan_rekey(chan_t *ch, const char *origin, uint64_t origin_epoch);
 
 /* ---------------------------------------------------------------------------
+ * THE TOPIC CACHE -- a topic that outlives its channel
+ * ---------------------------------------------------------------------------
+ * One entry per channel whose topic was set and whose channel has since been
+ * disposed. It exists because of a collision between two things 2.2 wants:
+ *
+ *   chan_dispose_if_empty() frees a channel with no local members and no
+ *   member-server, and it is right to -- a channel nobody is on has nothing to
+ *   be authoritative about, and holding one per channel NAME a client ever typed
+ *   would be an unbounded store reachable from the wire. 2.2's own statement is
+ *   that a channel "outlives a connection", which is a statement about OWNERSHIP
+ *   and not about never being freed.
+ *
+ *   And the topic is the one field whose loss a CLIENT can see. A user who
+ *   rejoins a channel everybody has left finds it topicless, and that is
+ *   indistinguishable from a channel that never had a topic -- so the topic is
+ *   copied out on the way down and copied back in when the channel is created
+ *   again.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT IT IS NOT, and each of these is a decision rather than a gap
+ * ---------------------------------------------------------------------------
+ *   NOT A PERSISTENT STORE. The cache is heap memory on server_t and it is gone
+ *   when the node exits. A topic does not survive a node restart, nothing here
+ *   claims it does, and a test that asserted it would be asserting a disk write
+ *   this phase does not have. 3.4 is the reason: a write inside the event loop
+ *   blocks every client on the node, and a new on-disk artifact is a new
+ *   deployment surface and a new way for a topic to be wrong.
+ *
+ *   NOT A CHANNEL. It holds three topic fields and a name. It is authoritative
+ *   for nothing, it is consulted on exactly one code path (a channel being
+ *   CREATED), and nothing routes through it -- 3.1's table has no row for it,
+ *   because a line is never delivered to a topic.
+ *
+ *   NOT A MEMBER LIST, A MODE SET OR A BAN LIST. Only the topic is carried, and
+ *   that is the whole of what a re-created channel needs in order not to look
+ *   blank. A channel whose bans and modes were dropped when everybody left is a
+ *   channel whose moderation state was reset, and 2.2 says the ORIGIN owns
+ *   those: a cache that restored them would be a second authority for channel
+ *   state, which is the exact thing the single-writer rule exists to prevent. If
+ *   they are wanted later, that is a decision for the phase that owns mode
+ *   authority, not a side effect of this one.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY IT IS BOUNDED, AND WHAT HAPPENS AT THE BOUND
+ * ---------------------------------------------------------------------------
+ * SERVER_TOPIC_MAX is a bound, not a hint, and unlike 2.2's per-channel caches
+ * this one is reached by ordinary client input: a client can join a channel, set
+ * a topic, leave, and repeat, naming as many distinct channels as it likes --
+ * one at a time, with no single line asking for a lot of work. That is the same
+ * reason CHAN_MAX_BANS is a real limit rather than a formality.
+ *
+ * At the bound a topic is NOT remembered, s->n_topic_cache_full counts the loss,
+ * and the topic is then lost exactly as it would have been without this cache.
+ * The cache therefore never refuses a client command and never makes the node
+ * slower; it can only fail to help. That is the right direction for a cache whose
+ * bound is reached by traffic rather than by a bug.
+ *
+ * 64 is not derived from anything: it is a judgement, and it is a judgement about
+ * NAMES rather than about topics, because the entry is keyed by channel name. 64
+ * names is well under the 1024 descriptors the node can hold and far above the
+ * number of channels one client is typically on. The cost when full is the cost
+ * when full: one topic, reported.
+ */
+
+/* ONE REMEMBERED TOPIC. The name is the key and it is stored canonicalised
+ * (2.2), so "#t" and "#T" are one entry -- the same reason the channel registry
+ * stores names that way and the nick registry folds its keys instead.
+ *
+ * `who` and `when` are here because 333 reports BOTH. A cache that restored only
+ * the text would make 333 name whoever rejoined and the moment they rejoined,
+ * which is a lie about who set the topic -- and the observable difference is that
+ * a user reading 333 would believe they had set a topic they did not set. */
+typedef struct chan_topic {
+    char   name[CHAN_MAX_NAME + 1];
+    char   topic[CHAN_MAX_TOPIC + 1];
+    char   who[CHAN_MAX_TOPIC_WHO + 1];
+    time_t when;
+} chan_topic_t;
+
+/* How many channels this node will remember a topic for. See the note above:
+ * reached by client input, and a loss at the bound is reported rather than
+ * refused. */
+#define SERVER_TOPIC_MAX 64
+
+/* Copy `ch`'s topic, setter and time into the cache, replacing any entry for the
+ * same channel. Called immediately before the channel is disposed, so the topic
+ * outlives the channel.
+ *
+ * AN EMPTY TOPIC REMOVES the entry rather than remembering an empty one, and that
+ * is load-bearing: a user who CLEARS a topic (`TOPIC #chan :`) and then everybody
+ * leaves must not find the old topic back when they rejoin. Remembering "" as a
+ * value would need a "remembered but empty" state to be told apart from "never
+ * remembered", and the ABSENCE of an entry is already that state.
+ *
+ * A no-op when the channel has no topic and nothing is remembered for it: a
+ * channel that never had a topic is not a cache write. Returns 1 when an entry
+ * was stored, 0 when there was nothing to do or when an entry was removed, and
+ * -1 when the cache was full or an allocation failed -- the case
+ * s->n_topic_cache_full counts, and which leaves everything else untouched. */
+int server_topic_remember(server_t *s, const chan_t *ch);
+
+/* Copy a remembered topic into a channel that has just been CREATED. A no-op
+ * when nothing is remembered for that name, and 1 when a topic was restored.
+ * Never called for a channel that already existed: a live channel's topic is
+ * authoritative and the cache has nothing to add to it. */
+int server_topic_restore(server_t *s, chan_t *ch);
+
+/* How many topics the node is remembering, and the entry at index `i`. For the
+ * observable output; the wire assertions in test_topic_persist.c are what
+ * actually pin the behaviour. */
+size_t server_topic_count(const server_t *s);
+const chan_topic_t *server_topic_at(const server_t *s, size_t i);
+
+/* ---------------------------------------------------------------------------
  * The node's channel set
  * ------------------------------------------------------------------------- */
 

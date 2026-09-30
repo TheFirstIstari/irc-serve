@@ -25,6 +25,15 @@ command in this document was run on 2026-09-28.**
 CI run was observed in this pass. The only execution evidence given here is the
 local Release run above, on macOS/darwin with the system compiler.
 
+**A Phase 7 addendum, and what it supersedes.** This document is a dated audit
+against a named commit and most of it is left exactly as written, because
+rewriting a snapshot would destroy the evidence it exists to provide. Three
+claims below were superseded by Phase 7 and are corrected **in place** rather than
+left to be disproved, because they are statements about the tree and the tree has
+changed: **§2** (the skip list, and the claim that CI does not count skips),
+**§5.1** (which phase owns the skip gate), and the `TopicPersistence` row of
+§2's table. Everything else here is as of 2026-09-28.
+
 ### Commit under verification
 
 `HEAD` = `e958ea9` ("Phase 2: server core - poll loop, conn_t framing,
@@ -151,7 +160,7 @@ All rows verified in `src/core/commands.c` (566 lines), `src/core/reply.c`
 :irc.test 005 good NETWORK=irc-serve CHANTYPES=#& PREFIX=(ov)@+ CASEMAPPING=ascii NICKLEN=63 :are supported by this server
 :irc.test 372 good :- irc-serve: a federation-native IRC node.
 :irc.test 372 good :- this build answers PASS, NICK, USER, MOTD, PING, PONG and QUIT.
-:irc.test 372 good :- channels, messaging and federation are not implemented.
+:irc.test 372 good :- registration, channels, messaging and peer federation are implemented.
 :irc.test 375 good :- Message of the day -
 :irc.test 376 good :End of /MOTD command.
 :irc.test PONG irc.test abc123
@@ -346,50 +355,86 @@ contradict each other; see §5.
 
 ---
 
-## 2. The eight skipped tests
+## 2. The seven skipped tests
 
-All eight are CTest skips: the test binary prints a `SKIP:` line and returns
-`77`, and the CMakeLists registers `SKIP_RETURN_CODE 77` so CTest reports
-`***Skipped`. This is the honest choice — a fabricated passing assertion would
-be worse — but it has a consequence that must be stated plainly.
+**Phase 7 corrected this section; it previously said eight.** All seven are
+CTest skips: the test binary prints a `SKIP:` line and returns `77`, and the
+CMakeLists registers `SKIP_RETURN_CODE 77` so CTest reports `***Skipped`. This is
+the honest choice — a fabricated passing assertion would be worse — and it has a
+consequence that must be stated plainly.
 
-| # | CTest name | File | Feature it is waiting on | Lands in |
+`TopicPersistence` is **no longer here.** Phase 7 implemented the feature it was
+named for: a channel's topic survives the channel being disposed, through a
+bounded cache on `server_t` (`server_topic_remember` / `server_topic_restore` in
+`src/core/channel.c`). The test is now `tests/integration/test_topic_persist.c`
+and asserts it on the wire, on both sides of a dispose and both sides of a
+dropped connection, including that 333 still names the original setter and the
+original time. The row's "Phase 4 / 9 (no `chan_t` exists yet)" was wrong on both
+counts by then: a `chan_t` had existed since Phase 4, and the feature needed
+neither Phase 4 nor Phase 9.
+
+| CTest name | File | Feature it is waiting on | Lands in | Issue |
 |---|---|---|---|---|
-| 4 | `MultiPrefix` | `tests/protocol/test_multi_prefix.c` | IRCv3 `multi-prefix` capability (multi-`prefix` in `353`) | Phase 8 |
-| 5 | `TopicPersistence` | `tests/protocol/test_topic_persist.c` | Channel topic persistence across reconnects | Phase 4 / 9 (no `chan_t` exists yet) |
-| 11 | `SyncState` | `tests/federation/test_sync_state.c` | Federation state sync / failover | Phase 6 (`SBURST` resync) |
-| 13 | `FailoverReconnect` | `tests/federation/test_failover_reconnect.c` | Peer failover / reconnect | Phase 9 |
-| 17 | `CapNegotiation` | `tests/compliance/test_cap_negotiation.c` | IRCv3 CAP negotiation (`LS`/`REQ`/`ACK`/`NAK`) | Phase 8 |
-| 18 | `PeerDiscovery` | `tests/loadbal/test_peer_discovery.c` | Load-balancer peer discovery (advertise / graceful leave) | Phase 9 |
-| 19 | `Reconnect` | `tests/loadbal/test_reconnect.c` | Client reconnect preserving session state | Phase 9 |
-| 20 | `AutoScale` | `tests/loadbal/test_autoscale.c` | Auto-scaling (spawn / shutdown / propagation) | Phase 9 |
+| `MultiPrefix` | `tests/protocol/test_multi_prefix.c` | IRCv3 `multi-prefix` capability (multi-`prefix` in `353`) | Phase 8 | #82 |
+| `SyncState` | `tests/federation/test_sync_state.c` | the §4.3 resync **driven by a reconnect** — backoff, retry budget | Phase 9 | #83 |
+| `FailoverReconnect` | `tests/federation/test_failover_reconnect.c` | Peer failover / reconnect | Phase 9 | #83 |
+| `CapNegotiation` | `tests/compliance/test_cap_negotiation.c` | IRCv3 CAP negotiation (`LS`/`REQ`/`ACK`/`NAK`) | Phase 8 | #82 |
+| `PeerDiscovery` | `tests/loadbal/test_peer_discovery.c` | Load-balancer peer discovery (advertise / graceful leave) | Phase 9 | #83 |
+| `Reconnect` | `tests/loadbal/test_reconnect.c` | Client reconnect preserving session state | Phase 9 | #83 |
+| `AutoScale` | `tests/loadbal/test_autoscale.c` | Auto-scaling (spawn / shutdown / propagation) | Phase 9 | #83 |
 
-### CI does not count skips
+**This table and `tests/known_skips.txt` must agree, and CI checks that they
+do.** The list is the single authoritative copy — one line per skip, naming the
+test, the phase that owns it and the issue that closes it — and
+`scripts/check-skips.sh` fails if the two disagree in **either** direction. The
+`#` column above (4, 11, 13, 17…) is gone for that reason: CTest's test NUMBERS
+shift whenever a test is added, so a table keyed on them is a table that rots,
+and this one is now keyed on the test NAME, which is what the gate compares.
 
-The full `ctest` run prints this:
+### CI did not count skips. It does now.
+
+**Everything in this subsection up to the last paragraph was true on 2026-09-28 and
+is retracted here.** The finding was correct: `ctest` excludes a skipped test from
+the percentage and from the pass/fail exit code, so
 
 ```
 100% tests passed out of 39
 ```
 
-…while 8 of those 39 were skipped. `ctest` excludes skipped tests from the
-percentage and from the pass/fail exit code. Every CI entry point inherits this:
+…while 8 of those 39 were skipped. **"100% tests passed" coexisted with 8
+unimplemented features**, and a green CI run proved nothing about any of them.
 
-| Entry point | Line | Counts skips? |
+Design §6.4 specified the fix as a `KNOWN_SKIPS` list in `tests/CMakeLists.txt`
+that CI fails against, and the finding below this paragraph was also correct:
+**`KNOWN_SKIPS` did not exist**, `grep -rn 'KNOWN_SKIPS'` matched only
+`docs/SERVER_DESIGN.md:532-533`, and the gate was entirely unbuilt.
+
+**Phase 7 built it, and built it differently from the design's wording.** The
+finding named the defect accurately and the remedy wrongly, in one respect: §6.4
+also said the list "must reach empty by Phase 7", and that is not reachable —
+§7/Phase 8 owns CAP and multi-prefix, §2.3 says "Peer discovery and auto-scale stay
+Phase 9" in as many words, and §7/Phase 9 owns reconnect and failover. So the
+gate is a **ratchet**, not a zero:
+
+- `tests/known_skips.txt` is the single authoritative list, one line per skip with
+  the phase and the issue.
+- `scripts/check-skips.sh` fails if a test **skips without** a line (the original
+  blind spot) **and** if a listed test **no longer skips** (which is what stops
+  the list rotting into a permanent allowlist), **and** if a listed name is not a
+  registered CTest test, **and** if it cannot read the skip set from the output at
+  all — "we could not tell" is not "there are none".
+- It runs in `ci_test`, in `local-ci.sh` and in `make test`, reading the log the
+  suite run just wrote so the suite is not run twice.
+
+| Entry point | Counts skips? | Where |
 |---|---|---|
-| `.github/workflows/ci.yml` `ci_test` | `:28` `ctest --output-on-failure --timeout 60` | No |
-| `.github/workflows/ci.yml` `ci_compliance` | `:54` `ctest -L Compliance --output-on-failure --timeout 60` | No |
-| `local-ci.sh` | `:37` `ctest --test-dir build --output-on-failure --timeout "${CTEST_TIMEOUT}"` | No |
-| `Makefile` `test` | `:31` `cd $(BUILD_DIR) && $(CTEST) --output-on-failure --timeout $(CTEST_TIMEOUT)` | No |
+| `.github/workflows/ci.yml` `ci_test` | **Yes** | the `Skip gate (ratchet)` step, after `Unit Tests` |
+| `local-ci.sh` | **Yes** | `./scripts/check-skips.sh -b build "${CTEST_LOG}"` |
+| `Makefile` `test` | **Yes** | `./scripts/check-skips.sh -b $(BUILD_DIR) …` |
+| `.github/workflows/ci.yml` `ci_compliance` | No, deliberately | it runs `-L Compliance` only, so a skip outside that label is not its business; `ci_test` covers the whole suite |
 
-So **"100% tests passed" currently coexists with 8 unimplemented features**, and
-a green CI run would prove nothing about any of them.
-
-Design §6.4 specifies the fix: a `KNOWN_SKIPS` list in `tests/CMakeLists.txt`
-that CI fails against. **`KNOWN_SKIPS` does not exist** — `grep -rn 'KNOWN_SKIPS'`
-matches only `docs/SERVER_DESIGN.md:532-533`. The skip gate is entirely unbuilt.
-Issue **#81 (Phase 7)** is where it belongs; see §6 for the one place the design
-contradicts itself about which phase owns it.
+Design §6.4 and §7/Phase 7 have been corrected in place to say the same thing, and
+`docs/DEVELOPMENT.md` has a section on how to add and how to close a skip.
 
 ---
 
@@ -454,12 +499,19 @@ is no default threshold.
 Reported, not silently resolved. `docs/SERVER_DESIGN.md` is the plan;
 where the two conflict the code is what runs.
 
-1. **Which phase owns the skip gate.** Design **§6.4** says `KNOWN_SKIPS` "must
-   reach empty by **Phase 6**". Design **Phase 7** says "Command surface + skip
-   gate empty… *Accept:* zero skipped tests". The two are different phases. GitHub
-   issue **#81** is Phase 7 and is titled "Remaining command surface and empty
-   skip gate", so issue #81 and design Phase 7 agree with each other and §6.4 is
-   the outlier. Phase 6 is already scoped to federation (issue #80).
+1. **Which phase owns the skip gate — RESOLVED in Phase 7, and not the way the
+   design said.** Design **§6.4** said `KNOWN_SKIPS` "must reach empty by
+   **Phase 6**" (the copy this audit was run against said Phase 7 in §6.4 and
+   Phase 7 in §7, which is itself the contradiction). GitHub issue **#81** is
+   Phase 7 and is titled "Remaining command surface and empty skip gate", so §6.4
+   was the outlier and Phase 7 is where the gate belonged. **Phase 7 built it
+   there — and then retracted the "reach empty" half, because it is not
+   reachable**: §7/Phase 8 owns CAP and multi-prefix, and §2.3 says "Peer
+   discovery and auto-scale stay Phase 9" verbatim. The gate is a **ratchet**:
+   `tests/known_skips.txt` plus `scripts/check-skips.sh`, failing in both
+   directions. Both design sections now say so, and this entry is closed rather
+   than removed — the contradiction was real and the correction is the useful
+   part of it.
 
 2. **The lock-free claim is still published.** Design §5 orders
    `lockfree_contract.c` **deleted** and the claim removed from the docs.

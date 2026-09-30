@@ -57,7 +57,12 @@ opposite is what it was built out of.
   teeth result.
 - **If a feature is absent, say so.** Return CTest's skip code (`77`) with a
   message naming what is missing. Do not write a test that asserts behaviour
-  nothing implements. CI does not yet fail on skips; that gate is Phase 7.
+  nothing implements. A skip is only permitted with a line in
+  [`tests/known_skips.txt`](tests/known_skips.txt) naming the phase that owns it
+  and the issue that closes it — CI fails on a skip that is not on that list, and
+  also on a line that is no longer a skip. See
+  [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#the-skip-gate-is-a-ratchet) and
+  design §6.4.
 - **No `sleep()` in tests.** Use a `select()`-driven deadline loop. A fixed
   sleep is the leading cause of CI flake, and `tc_expect()` is there so you do
   not need one.
