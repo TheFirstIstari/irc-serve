@@ -100,13 +100,20 @@ static const char *const k_005[] = {
 };
 
 /* The MOTD body, sent as one 372 per line. It describes what the node IS
- * rather than what it pretends to be: a client reading it should not be led to
- * expect channels or federation, because neither exists yet. */
-static const char *const k_motd[] = {
-    "- irc-serve: a federation-native IRC node.",
-    "- this build answers PASS, NICK, USER, MOTD, PING, PONG and QUIT.",
-    "- channels, messaging and federation are not implemented."
-};
+   * rather than what it pretends to be.
+   *
+   * This said "channels, messaging and federation are not implemented", false
+   * from Phase 4 onward and a claim shipped to every client that connected. It
+   * stayed false because a test asserted those exact bytes, and a test asserting
+   * a falsehood is the usual way one survives: it looks like the thing
+   * protecting the value while it is the thing keeping it wrong. The test was
+   * updated with the text. INFO (371-374) is now the truthful, checkable
+   * surface; the MOTD only had to stop lying. */
+  static const char *const k_motd[] = {
+      "- irc-serve: a federation-native IRC node.",
+      "- registration, channels, messaging and peer federation are implemented.",
+      "- INFO lists what this node actually does; try it."
+  };
 
 /* ---------------------------------------------------------------------------
  * 372-376: the MOTD

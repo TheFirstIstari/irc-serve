@@ -160,7 +160,7 @@ All rows verified in `src/core/commands.c` (566 lines), `src/core/reply.c`
 :irc.test 005 good NETWORK=irc-serve CHANTYPES=#& PREFIX=(ov)@+ CASEMAPPING=ascii NICKLEN=63 :are supported by this server
 :irc.test 372 good :- irc-serve: a federation-native IRC node.
 :irc.test 372 good :- this build answers PASS, NICK, USER, MOTD, PING, PONG and QUIT.
-:irc.test 372 good :- channels, messaging and federation are not implemented.
+:irc.test 372 good :- registration, channels, messaging and peer federation are implemented.
 :irc.test 375 good :- Message of the day -
 :irc.test 376 good :End of /MOTD command.
 :irc.test PONG irc.test abc123
