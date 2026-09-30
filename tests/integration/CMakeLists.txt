@@ -154,6 +154,23 @@ irc_add_integration_test(test_messaging test_messaging.c)
 # the file testing itself.
 irc_add_integration_test(test_queries test_queries.c)
 
+# 7/Phase 7, 4.2's INVITE. Its own file because the command's shape is "two
+# replies to two DIFFERENT clients", which is the property most of the test is
+# about: a 341 on the invitee's socket, or an INVITE on a third party's, would
+# pass any check that only looked at the inviter.
+irc_add_integration_test(test_invite test_invite.c)
+
+# 7/Phase 7, 4.2's USERHOST. Its own file because the numeric is a per-name
+# answer rather than a single reply, and the count of replies is the property
+# most of the test is about -- a node that answered a four-name query with one
+# 302 carrying everybody would satisfy every individual line assertion.
+irc_add_integration_test(test_userhost test_userhost.c)
+
+# 7/Phase 7, 4.2's KNOCK. Its own file because the command's ENTIRE behaviour is
+# one numeric, and the only thing that distinguishes an honest refusal from a
+# stub is which of the other numerics does NOT come back for each input.
+irc_add_integration_test(test_knock test_knock.c)
+
 # 2.4 / 3.2 / 4.3: the internal tag block the relay path budgets against, from
 # the side that is not Phase 1's. test_message_format.c pins the 179 overhead as
 # a LENGTH; this one pins the block as BYTES (a length cannot tell origin from

@@ -524,7 +524,18 @@ static const command_t k_commands[] = {
     { "WHO",     handle_who,     0 },
     { "WHOIS",   handle_whois,   0 },
     { "ISON",    handle_ison,    0 },
-    { "AWAY",    handle_away,    0 }
+    { "AWAY",    handle_away,    0 },
+    /* 7/Phase 7: the rest of 4.2, in 4.2's own order. INVITE and KNOCK are in
+     * chan_verbs.c because both are about a channel; USERHOST is in
+     * msg_verbs.c because it has no channel in it; the server-info family is
+     * below, next to the MOTD it belongs with. The order in the table is
+     * 4.2's and not the order of the files, for the same reason the table is
+     * ordered by the RFC's rather than by the history: a reader comparing the
+     * surface against the specification should be able to do it down this list
+     * without a map. */
+    { "INVITE",  handle_invite,  0 },
+    { "USERHOST", handle_userhost, 0 },
+    { "KNOCK",   handle_knock,   0 }
 };
 
 static const command_t *lookup(const char *verb)
