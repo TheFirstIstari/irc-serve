@@ -672,6 +672,12 @@ static int needs_colon(const char *s)
 
 size_t message_format(const message_t *m, char *out, size_t cap)
 {
+    return message_format_ex(m, out, cap, 0);
+}
+
+size_t message_format_ex(const message_t *m, char *out, size_t cap,
+                         int force_colon)
+{
     if (m == NULL || out == NULL || cap == 0) {
         return 0;
     }
@@ -730,8 +736,14 @@ size_t message_format(const message_t *m, char *out, size_t cap)
     }
     sink_puts(&s, m->command);
     for (int i = 0; i < m->nparams; i++) {
+        /* force_colon applies to the LAST parameter only, and only when there is
+         * one. Applying it to every parameter would put a ':' in a target field,
+         * which is not a marker at all. */
+        const int last = (i == m->nparams - 1);
+
         sink_putc(&s, ' ');
-        if (needs_colon(m->params[i]) != 0) {
+        if (needs_colon(m->params[i]) != 0 ||
+            (force_colon != 0 && last)) {
             sink_putc(&s, ':');
         }
         sink_puts(&s, m->params[i]);
