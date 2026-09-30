@@ -141,7 +141,22 @@ static void child_setup(server_t *s)
                  "federation module cannot reach any assertion in this test");
     s->trace = g_trace;
     s->on_tick = child_tick;
-    fed_set_timeouts(1000, 2000, 30000, 90000);
+    /* The SHIPPED defaults are IRC_FED_DIAL_TIMEOUT_MS (10s) and
+     * IRC_FED_HS_TIMEOUT_MS (5s) in federation/link.h, and fed_set_timeouts() is a
+     * per-process seam used only by tests -- so raising these here does not change
+     * the product.
+     *
+     * They were 1000 and 2000. On a loaded runner -- a 2-core CI box, or 30+ copies
+     * of this suite on one machine -- a poll tick slips far enough that a FEDERATE
+     * exchange which completes in two ticks on an idle box misses its budget. The
+     * product then does the correct thing (times out, and retries the dial) while
+     * the test's 15s deadline expires first, and the failure reads as 'federation
+     * is broken' rather than 'the fixture was too impatient'.
+     *
+     * 5000 is 100 poll ticks of POLL_TICK_MS, which is the shipped handshake
+     * default. The happy path still completes in two ticks, so nothing waits
+     * longer -- these budgets only bound the failure case. */
+    fed_set_timeouts(5000, 5000, 30000, 90000);
 
     if (g_peer_port <= 0) {
         /* The accepting side. No peer is configured, and that IS the
@@ -450,6 +465,34 @@ static void case_cross_node_roster(void)
          * echo (federation/verbs.c says why: an inbound SJOIN carries a server
          * prefix and a client cannot be shown a JOIN from one), so the origin's
          * own member learns about alice the next time it asks. */
+        /* WHICH IS A PRECONDITION, NOT A DETAIL, AND IT IS THE MIRROR OF THE WAIT
+         * ABOVE. A's roster came out of alice's JOIN, on a node that had provably
+         * applied bob's SJOIN, so the two names in it were both already there. B's
+         * roster is a QUESTION, and the answer is whatever B knows when it is
+         * asked: alice's name reaches B only in the SJOIN that A puts on the link,
+         * and A having QUEUED that line says nothing about B having read it. A
+         * NAMES sent in between is answered with `@bob` alone -- a complete,
+         * correctly terminated, one-name list, which is precisely the truncated
+         * roster 7/Phase 6 says does not pass, and it fails the ` 353 bob = #T
+         * alice` line below for 15 s against a node that did nothing wrong.
+         *
+         * So the wait is on B's OWN record of the arrival, and it is here because
+         * it is a precondition on the assertion rather than an observation of it.
+         * This is the same defect class as the one the A-side wait above closes,
+         * on the other node, and the two waits are the whole of the fix. It is not
+         * currently observed to fire -- the fixture happens to give B's link a
+         * lower descriptor than bob's client connection, and poll_loop_step()
+         * scans its connection set in ascending descriptor order, so B reads its
+         * peer before its own client -- and that is a property of descriptor
+         * allocation rather than of the protocol, which is not something a test
+         * should be resting on. */
+        TF_CHECK_MSG(nf_expect(&b, "fed_sjoin: channel=" CHAN " member=" NICK_A,
+                               T_IO_MS) == 0,
+                     "node B never applied alice's SJOIN, so bob's roster cannot have "
+                     "got her name from a peer and would be the local member alone -- "
+                     "a terminated one-name list, which is the truncation this case "
+                     "exists to rule out: %s",
+                     b.out);
         TF_CHECK_MSG(tc_send(&bob, "NAMES " CHAN) == 0, "bob's NAMES send failed");
         expect_roster(&bob, "bob on the owning node", NICK_B, both, 2u);
     }

@@ -166,7 +166,22 @@ static void child_setup(server_t *s)
                  "federation module cannot reach any assertion in this test");
     s->trace = g_trace;
     s->on_tick = child_tick;
-    fed_set_timeouts(1000, 2000, 30000, 90000);
+    /* The SHIPPED defaults are IRC_FED_DIAL_TIMEOUT_MS (10s) and
+     * IRC_FED_HS_TIMEOUT_MS (5s) in federation/link.h, and fed_set_timeouts() is a
+     * per-process seam used only by tests -- so raising these here does not change
+     * the product.
+     *
+     * They were 1000 and 2000. On a loaded runner -- a 2-core CI box, or 30+ copies
+     * of this suite on one machine -- a poll tick slips far enough that a FEDERATE
+     * exchange which completes in two ticks on an idle box misses its budget. The
+     * product then does the correct thing (times out, and retries the dial) while
+     * the test's 15s deadline expires first, and the failure reads as 'federation
+     * is broken' rather than 'the fixture was too impatient'.
+     *
+     * 5000 is 100 poll ticks of POLL_TICK_MS, which is the shipped handshake
+     * default. The happy path still completes in two ticks, so nothing waits
+     * longer -- these budgets only bound the failure case. */
+    fed_set_timeouts(5000, 5000, 30000, 90000);
 
     if (g_peer_port <= 0) {
         /* The accepting side. No peer is configured, and that IS the
