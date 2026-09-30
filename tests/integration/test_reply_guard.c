@@ -64,7 +64,25 @@
 #include "core/server.h"
 #include "harness/test_util.h"
 
-#define T_POLL_MS 2000
+/* Two timeouts, because "these bytes arrived" and "these bytes did not" are
+ * different questions with different answers.
+ *
+ * T_POLL_MS is for a POSITIVE check: the bytes should be there and we wait for
+ * them generously.
+ *
+ * T_ABSENT_MS is for a NEGATIVE check, and it is small on purpose. Every path
+ * under test is SYNCHRONOUS: reply() renders, conn_queue() buffers, conn_pump()
+ * calls send() -- all on loopback, all before has_bytes() is entered. So a
+ * broken write is in the socket buffer before the first select() starts. There
+ * is no delayed delivery for a longer wait to catch, and this file spent ten of
+ * its seconds on five absence checks that a tenth of a second settles.
+ *
+ * The floor argument: 150ms is three whole poll ticks (POLL_TICK_MS is 50), so a
+ * node that deferred a write rather than making it synchronously would still be
+ * caught, which is the only way this assertion could ever have needed the wait
+ * to be long. */
+#define T_POLL_MS   2000
+#define T_ABSENT_MS 150
 
 /* Is there anything readable on `fd` within a short deadline? Used to turn "no
  * bytes were written" into an observation rather than an assumption. A select()
@@ -75,7 +93,7 @@
  * one integer, because tv_usec must stay below 1000000 and a value above it
  * makes select() fail with EINVAL -- which looks exactly like "nothing
  * arrived", silently turning every negative assertion here into a vacuous one. */
-static int has_bytes(int fd)
+static int has_bytes(int fd, int timeout_ms)
 {
     fd_set rfds;
     struct timeval tv;
@@ -83,8 +101,8 @@ static int has_bytes(int fd)
 
     FD_ZERO(&rfds);
     FD_SET(fd, &rfds);
-    tv.tv_sec = T_POLL_MS / 1000;
-    tv.tv_usec = (T_POLL_MS % 1000) * 1000;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
     rc = select(fd + 1, &rfds, NULL, NULL, &tv);
     if (rc <= 0) {
         return 0; /* timed out with nothing, or an error: either way, no bytes */
@@ -126,7 +144,7 @@ int main(void)
                  "counted, or a node that refused a peer numeric for a week "
                  "would look identical to one that never had the chance",
                  (unsigned long long)s.n_reply_refused);
-    TF_CHECK_MSG(!has_bytes(sv[1]),
+    TF_CHECK_MSG(!has_bytes(sv[1], T_ABSENT_MS),
                  "bytes arrived at the far end of the socket behind a "
                  "CONN_SERVER conn. The refusal is supposed to mean no byte is "
                  "written, not that the bytes are ignored afterwards.");
@@ -137,7 +155,7 @@ int main(void)
                  "send_pong() accepted a peer conn: a PONG reaching a peer is "
                  "wrong in exactly the same way a numeric is, and it travels "
                  "through a different function");
-    TF_CHECK_MSG(!has_bytes(sv[1]),
+    TF_CHECK_MSG(!has_bytes(sv[1], T_ABSENT_MS),
                  "send_pong() wrote to a peer socket");
     TF_CHECK_MSG(s.n_reply_refused == 2,
                  "n_reply_refused is %llu, expected 2 after the PONG",
@@ -172,7 +190,7 @@ int main(void)
         TF_CHECK_MSG(conn_pump(ok) == 0, "conn_pump failed");
 
         want = ":irc.test 433 alice shared :Nickname is already in use\r\n";
-        TF_CHECK_MSG(has_bytes(sv[0]),
+        TF_CHECK_MSG(has_bytes(sv[0], T_POLL_MS),
                      "nothing arrived at the far end of the control "
                      "socketpair: the positive control did not run, so the "
                      "negative assertions above prove nothing");
@@ -210,7 +228,7 @@ int main(void)
                  "reply() accepted a NULL src. 3 allows src to be NULL for a "
                  "server-originated MESSAGE; it does not allow it to invent an "
                  "addressee for a numeric.");
-    TF_CHECK_MSG(!has_bytes(sv[1]),
+    TF_CHECK_MSG(!has_bytes(sv[1], T_ABSENT_MS),
                  "a numeric with no addressee was written somewhere");
 
     /* ------------------------------------------------------------------------
@@ -229,7 +247,7 @@ int main(void)
                          REPLY_REFUSED,
                      "reply() queued a message for a connection that is already "
                      "CLOSING");
-        TF_CHECK_MSG(!has_bytes(sv[1]),
+        TF_CHECK_MSG(!has_bytes(sv[1], T_ABSENT_MS),
                      "reply() wrote to a CLOSING connection");
         conn_free(closing);
     }
@@ -262,7 +280,7 @@ int main(void)
                      peer->state);
         TF_CHECK_MSG(server_nick_lookup(&s, "intruder") == NULL,
                      "a peer conn put a nickname into the user registry");
-        TF_CHECK_MSG(!has_bytes(sv[1]), "a peer conn was answered");
+        TF_CHECK_MSG(!has_bytes(sv[1], T_ABSENT_MS), "a peer conn was answered");
 
         TF_CHECK_MSG(message_parse("USER intruder 0 * :Intruder", &m) == 0,
                      "parse failed");
