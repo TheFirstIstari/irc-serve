@@ -177,6 +177,15 @@ int reply(server_t *s, conn_t *src, const char *code,
 int send_line(server_t *s, conn_t *dst, const char *prefix,
               const char *command, const char *const *params, int nparams);
 
+/* As send_line(), with the final parameter colonned whether or not RFC 1459
+ * requires it. Exists for IRCv3's CAP, whose capability list every server writes
+ * as `CAP * LS :a b` and which RFC 1459's "colonned only when it has to be"
+ * rule would render bare; see message_format_ex() for why the specification's
+ * bytes win there. Everything else about the destination rules, the refusals and
+ * the counters is send_line()'s, because it is the same door. */
+int send_line_colon(server_t *s, conn_t *dst, const char *prefix,
+                    const char *command, const char *const *params, int nparams);
+
 /* As many middle parameters as the 15-parameter cap leaves room for once
  * <target> and the trailing text have taken two slots. */
 #define REPLY_MAX_MID (IRC_MAX_PARAMS - 2)

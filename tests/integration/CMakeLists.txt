@@ -28,14 +28,38 @@ target_compile_definitions(test_harness PUBLIC
   NF_SERVER_BIN="$<TARGET_FILE:irc-serve>"
   IRCSERVE_SRC_DIR="${PROJECT_SOURCE_DIR}")
 
+# `ctest_name` is optional and defaults to `name`. It exists for exactly one
+# caller: a test that MOVED out of tests/compliance/ or tests/protocol/ and whose
+# CTest name must not change, because tests/known_skips.txt names it and
+# scripts/check-skips.sh checks every listed name against the registered set.
+# Renaming a test to satisfy a build system is how a skip line goes stale without
+# anybody noticing; renaming the TARGET and keeping the CTest name is the move
+# that keeps the ratchet honest.
+# A map from target name to CTest name, for the tests that MOVED here with a CTest
+# name they are not allowed to change. tests/known_skips.txt names the moved
+# tests, and scripts/check-skips.sh cross-checks every listed name against the
+# registered set -- so renaming a test to suit a build system is how a skip line
+# goes stale without anybody noticing. Renaming the TARGET and keeping the CTest
+# name is the move that keeps the ratchet honest.
+function(irc_ctest_name name out)
+  if(${name} STREQUAL "test_cap_negotiation")
+    set(${out} "CapNegotiation" PARENT_SCOPE)
+  elseif(${name} STREQUAL "test_multi_prefix")
+    set(${out} "MultiPrefix" PARENT_SCOPE)
+  else()
+    set(${out} "${name}" PARENT_SCOPE)
+  endif()
+endfunction()
+
 function(irc_add_integration_test name source)
   add_executable(${name} ${source})
   target_link_libraries(${name} PRIVATE test_harness)
   # Spelled out rather than relying on the generator expression's side effect:
   # an ordering guarantee worth having should not be implicit.
   add_dependencies(${name} irc-serve)
-  add_test(NAME ${name} COMMAND ${name})
-  set_tests_properties(${name} PROPERTIES LABELS Integration)
+  irc_ctest_name(${name} _ctest_name)
+  add_test(NAME ${_ctest_name} COMMAND ${name})
+  set_tests_properties(${_ctest_name} PROPERTIES LABELS Integration)
 endfunction()
 
 # 7/Phase 2: "a client connects and is closed cleanly (assert accept -> EOF)".
@@ -75,6 +99,23 @@ irc_add_integration_test(test_dial_fsm test_dial_fsm.c)
 # 7/Phase 3: "integration test registers and receives 001 and 005; duplicate
 # nick -> 433". The first phase in which the node answers a client at all.
 irc_add_integration_test(test_registration test_registration.c)
+
+# 7/Phase 8: IRCv3 CAP negotiation and SASL PLAIN. The CTest name is unchanged
+# (CapNegotiation) and only the TARGET is spelled differently -- see the
+# ctest_name shim in irc_add_integration_test below. It moved here from
+# tests/compliance/ because CAP is answered by a server over a socket, and a test
+# that cannot reach a server cannot tell a working CAP END gate from a server
+# that never implemented CAP.
+irc_add_integration_test(test_cap_negotiation test_cap_negotiation.c)
+
+# test_multi_prefix is here too, and it is STILL A SKIP at the moment of writing:
+# a `353` roster is produced by a server over a socket, which is why it left
+# tests/protocol/, but the multi-prefix capability itself is not implemented yet
+# and the test says so with an honest `return 77` rather than asserting a
+# behaviour nothing has. Its line in tests/known_skips.txt is unchanged, because
+# the CTest NAME is unchanged.
+irc_add_integration_test(test_multi_prefix test_multi_prefix.c)
+set_tests_properties(MultiPrefix PROPERTIES SKIP_RETURN_CODE 77)
 
 # 2.1 / 5: valid_nick() enforced at runtime. Phase 1 shipped the predicate with
 # no caller in src/, so this is the test that makes it load-bearing. Asserts the

@@ -23,6 +23,7 @@
  * core/commands.c already include federation/ headers for the same class of
  * reason, so this is a direction this tree already has. */
 #include "federation/burst.h"
+#include "sasl_framework.h"
 
 /* ---------------------------------------------------------------------------
  * A small open-addressed string -> pointer map
@@ -705,6 +706,19 @@ void server_shutdown(server_t *s)
     s->topics = NULL;
     s->ntopics = 0;
     s->topics_cap = 0;
+    /* Phase 8's credential store: a CALL rather than a free, for the same reason
+     * fed_burst_close() is a call -- the layout and the passwords are
+     * sasl_framework.c's, and the owner also overwrites the passwords before
+     * releasing them. It sits with the other "a module's memory, released here"
+     * arms for the same reason, and it is ASSERTED NOT VERIFIED on Darwin for the
+     * same reason: LeakSanitizer runs only on the Linux CI job, so a missing
+     * arm here is invisible locally and real there.
+     *
+     * Every connection is already closed by the walk above, so no sasl_ctx_t --
+     * and no connection that borrowed this store -- can still be holding a
+     * pointer into it. */
+    sasl_store_free(s->sasl_store);
+    s->sasl_store = NULL;
     strtab_free(s->nicks);
     s->nicks = NULL;
     strtab_free(s->chans);
