@@ -35,7 +35,7 @@
  * readback, a readiness line, and a way to inject a test-provided dispatch and
  * tick hook into a child so the parent can drive the scenario.
  *
- * What is NOT here yet, and would be added rather than replaced:
+ * What is NOT here, and would be added rather than replaced:
  *   - a second node dialing the first. That needs the pre-resolved-address
  *     entry point (6.1's peer list) to be configurable, and the dial FSM is
  *     already in place and tested.
@@ -44,6 +44,29 @@
  *     output would be ambiguous. 6.2 explicitly allows "one line to stdout (or
  *     to fd 3)", and the read is already per-child, so interleaved output from
  *     two children is not actually a problem.
+ *
+ * ---------------------------------------------------------------------------
+ * ONE THING A TEST WITH CLIENTS HAS TO DO ITSELF, AND IT IS WORTH NAMING
+ * ---------------------------------------------------------------------------
+ * The child installs NO command dispatch. s->dispatch is NULL on a fresh
+ * server_t, which is the honest Phase 2 state and is exactly right for a
+ * peer-only test: the federation handshake is answered by the link module's own
+ * wrapper, which fed_open() installs over whatever was there.
+ *
+ * A test that attaches a CLIENT has to install core/commands.c's
+ * commands_dispatch itself, and it has to do so BEFORE fed_open() -- fed_open()
+ * saves the dispatch that is already there and replaces it, so a
+ * commands_dispatch installed afterwards would become the node's whole dispatch
+ * and a peer line would never reach the guard chain at all. The symptom is
+ * silent and total: the client connects, registers nothing and receives no
+ * numerics, and no [observable] line says why. test_fed_roster.c's child_setup
+ * is the worked example.
+ *
+ * THAT IS ALSO THE ORDERING 3's "one dispatch" claim needs. The node's dispatch
+ * is the federation wrapper, its inner is commands_dispatch, and a peer line
+ * reaches fed_dispatch() THROUGH the client dispatch on the strength of
+ * src->kind. If they were two dispatch functions, nothing in a test would notice
+ * -- which is why the claim is made where both live.
  */
 #ifndef TEST_HARNESS_NODE_FIXTURE_H
 #define TEST_HARNESS_NODE_FIXTURE_H
@@ -79,6 +102,20 @@ typedef void (*nf_setup_fn)(server_t *s);
  * child reports readiness. Returns 0 on success, -1 on failure. */
 int nf_spawn_binary(nf_node_t *n);
 
+/* As nf_spawn_binary(), but with the binary's OWN argument vector, for a test
+ * that needs to drive the shipped command line (--name, --secret, --peer).
+ *
+ * `argv` is the FULL vector INCLUDING argv[0] and MUST be NULL-terminated;
+ * passing NULL is an error rather than a default, because a caller that
+ * reached for this and passed NULL wanted arguments and would silently get the
+ * bare one. The strings are only read in the child, before execv(), so the
+ * caller may free them as soon as the spawn returns.
+ *
+ * The readiness and port lines are read exactly as they are for
+ * nf_spawn_binary() (6.1: servers bind port 0 and report the chosen port), so
+ * a test can mix the two forms in one run. */
+int nf_spawn_binary_argv(nf_node_t *n, char *const argv[]);
+
 /* Fork a child that builds its own server_t, binds port 0, calls `setup` (may
  * be NULL), then runs the real loop until it is signalled to stop. Blocks
  * until the child reports readiness. Returns 0 on success, -1 on failure.
@@ -88,6 +125,21 @@ int nf_spawn_binary(nf_node_t *n);
  * it. What it does not do is exercise the shipped executable -- use
  * nf_spawn_binary() for that. */
 int nf_spawn_inline(nf_node_t *n, nf_setup_fn setup);
+
+/* As nf_spawn_inline(), with the child naming ITSELF `name` rather than the
+ * harness default.
+ *
+ * This exists because 2.3's name uniqueness is a property of the NODE's name
+ * and cannot be exercised any other way: a test that wants two nodes which
+ * both claim to be `irc.a` has to be able to name them, and the harness's own
+ * default name is exactly what it could not override before. The same-named
+ * handshake case in test_fed_handshake.c is the caller that needed it.
+ *
+ * `name` must satisfy 2.4's tag grammar (server_init() refuses anything else
+ * and the child exits), must be non-NULL and non-empty, and is copied by the
+ * fork rather than retained: the child is a separate process, so nothing the
+ * caller does to the string afterwards can be seen. */
+int nf_spawn_inline_named(nf_node_t *n, const char *name, nf_setup_fn setup);
 
 /* Wait until `needle` appears in the child's output, or the deadline passes.
  * Returns 0 on success, -1 on timeout, and prints what the child did say. */
@@ -122,6 +174,38 @@ int nf_expect_u64(nf_node_t *n, const char *key, uint64_t expected,
 /* As nf_expect_u64(), for a lower bound. */
 int nf_expect_u64_ge(nf_node_t *n, const char *key, uint64_t minimum,
                      int timeout_ms);
+
+/* As nf_expect(), but waits until `needle` has appeared at least `want` TIMES
+ * rather than once.
+ *
+ * This is not a convenience: nf_expect() searches the accumulated buffer, so a
+ * needle the node has ALREADY printed is satisfied before the event it is meant
+ * to be waiting for has happened. A test that wants the second of something --
+ * the second `link_established` after a reconnect, the second `link_dial` after
+ * a retry -- has otherwise to invent a needle that differs, which couples it to
+ * whichever field happens to change between the two. Same relationship to
+ * nf_expect() that nf_expect_u64_ge() has to nf_expect_u64(). */
+int nf_expect_nth(nf_node_t *n, const char *needle, size_t want, int timeout_ms);
+
+/* How many bytes are sitting in the child's stdout PIPE right now, unread.
+ * Returns 0 on success with the count in `out`, or -1 if the pipe is closed or
+ * the descriptor is not one this can ask (a node that has been freed).
+ *
+ * WHY IT IS WORTH ASKING, and it is a diagnostic rather than a convenience. A
+ * child's stdout is a pipe, a pipe holds a bounded amount (65536 bytes on both
+ * Linux and macOS), and a writer that fills it does not get to run again until
+ * somebody reads. The republication of the counters a test reads happens in the
+ * tick hook -- step 8 of poll_loop_step() -- so a child blocked writing is
+ * blocked INSIDE its event loop: it does not accept, it does not read, and it
+ * does not answer the client that is waiting for it. From outside that is
+ * indistinguishable from a node that had nothing to say.
+ *
+ * `n->out` CANNOT ANSWER IT, which is the whole reason this exists. `n->out` is
+ * only what the parent HAPPENED to pump, so a node wedged mid-write and a node
+ * that said nothing at all print an indistinguishable pair of buffers. This is
+ * the number that tells them apart: a value in the tens of thousands is a child
+ * stopped inside write(), and 0 with an empty buffer is a node that is quiet. */
+int nf_pending_bytes(const nf_node_t *n, int *out);
 
 /* Signal the child to stop (SIGTERM), wait for it to exit, and return its exit
  * status -- or -1 if it had to be killed, -2 on a wait failure. A clean stop

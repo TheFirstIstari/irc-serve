@@ -333,6 +333,32 @@ int message_tag_unescape(const char *value, char *out, size_t cap);
 size_t message_tags_format(const message_tag_t *tags, size_t ntags,
                            char *out, size_t cap);
 
+/* The hop ceiling (2.4: "irc-serve-hops increments per forward and the message
+ * is dropped at 10").
+ *
+ * The number is 2.4's, not a value derived here, and the DERIVATION is the
+ * reason it is written as a named constant rather than left as a 10 inside two
+ * comparison sites: a forward test and a receipt test that each wrote their own
+ * 10 would agree today and could drift apart, and a message that crossed a
+ * disagreeing pair would loop -- which is the one failure 2.4 exists to
+ * prevent.
+ *
+ * IT WAS ABSENT UNTIL THIS PHASE, and that is recorded rather than papered
+ * over: the 2.4 tag FORMAT was frozen in Phase 1 and the hop LIMIT was not, so
+ * there was a place to put the block and no place to put the bound that
+ * governs whether the block is honoured. The `hops` value grammar above already
+ * allows up to UINT32_MAX, which is the tell that the ceiling lived somewhere
+ * else and had not been written down.
+ *
+ * The cost of the bound is stated rather than assumed: a message is refused when
+ * the value it WOULD carry reaches this ceiling, so a message is delivered to at
+ * most IRC_MAX_HOPS - 1 peers. On the full mesh 3.1 specifies, that is a
+ * diameter of nine, which is far more than a deployment of the size this design
+ * targets will ever have, and it is the price of never bouncing a message
+ * forever.
+ */
+#define IRC_MAX_HOPS 10
+
 /* ---------------------------------------------------------------------------
  * The 2.4 internal tag set -- FROZEN by Phase 1, not a placeholder
  * ---------------------------------------------------------------------------

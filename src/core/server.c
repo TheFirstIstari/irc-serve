@@ -16,6 +16,13 @@
 
 #include "core/channel.h"
 #include "core/message.h"
+/* The one include that points the other way. 4.3's inbound resync shadow is a
+ * module global rather than a field on server_t, so the shutdown has to reach
+ * into its owner to release it -- the same reason the dedup table below is freed
+ * here rather than left to federation/dedup.c. core/fanout.c and
+ * core/commands.c already include federation/ headers for the same class of
+ * reason, so this is a direction this tree already has. */
+#include "federation/burst.h"
 
 /* ---------------------------------------------------------------------------
  * A small open-addressed string -> pointer map
@@ -487,13 +494,14 @@ static size_t strtab_del_owner(struct strtab *t, const void *owner)
 
 /* Case-insensitive server-name comparison, ASCII-folded.
  *
- * The same fold is required in three places: 2.1's nick@server split, 2.4
+ * The same fold is required in four places now: 2.1's nick@server split, 2.4
  * ("server names are case-insensitive in IRC, so a comparison against our OWN
- * name MUST be case-insensitive") and channel.c's own server-name fold. It is
- * written out here rather than exported because it is six lines and a public
- * helper one of the two callers would never use again is a wider API than the
- * duplication is worth. The two copies are asserted to agree by
- * test_channels.c, which looks a peer up by a name differing only in case. */
+ * name MUST be case-insensitive"), channel.c's own server-name fold, and
+ * fanout.c's own-origin check on the forward path. It is written out here
+ * rather than exported because it is six lines and a public helper two of the
+ * three callers would never use again is a wider API than the duplication is
+ * worth. The copies are asserted to agree by test_channels.c, which looks a
+ * peer up by a name differing only in case. */
 static int same_server_name(const char *a, const char *b)
 {
     if (a == NULL || b == NULL) {
@@ -636,6 +644,54 @@ void server_shutdown(server_t *s)
     }
     s->ndials = 0;
     s->dials_cap = 0;
+    /* The peer links. Nothing here closes a descriptor: a link only NAMES one,
+     * and the conn the loop registered for that descriptor has already been
+     * closed by the walk above, so dropping the name is the whole teardown. The
+     * vector is a flat array of POD with no allocations of its own, which is
+     * why it needs one free and no per-element destructor. */
+    free(s->links);
+    s->links = NULL;
+    s->nlinks = 0;
+    s->links_cap = 0;
+    /* The dedup table, owned by federation/dedup.c but freed here. The two
+     * modules are the same library, and a teardown arm that called into the
+     * owner would mean a second entry point whose only job is to be called from
+     * one place -- while the alternative, leaving it to the owner, means the
+     * table's lifetime is not visible in the function that ends every other
+     * allocation on this struct. It is NULL on a node that never received a
+     * relayed message, which is the common case today.
+     *
+     * ASSERTED, NOT VERIFIED, ON THIS PLATFORM: LeakSanitizer does not exist on
+     * Darwin, so a missing free here is invisible to the local sanitizer run
+     * and is caught only by the Linux CI job. */
+    free(s->dedup_tab);
+    s->dedup_tab = NULL;
+    s->dedup_head = NULL;
+    s->dedup_tail = NULL;
+    s->dedup_used = 0;
+    s->dedup_swept_ms = 0;
+    /* 4.3's resync shadow, the second federation allocation this function
+     * releases and the only one it has to CALL rather than free. C4 declined to
+     * add this arm because it could not be checked on Darwin; that reasoning was
+     * backwards, and the correction is the reason this arm exists: an arm that
+     * is unverifiable LOCALLY is exactly the one worth adding when LeakSanitizer
+     * DOES run on the CachyOS Linux CI runner. A node stopped mid-transaction --
+     * a SIGTERM while a peer is bursting -- was leaking up to
+     * IRC_BURST_MAX_BYTES to the kernel, and the only evidence was a build nobody
+     * ran locally.
+     *
+     * IT IS SAFE HERE AND AT ANY POINT in the walk above: the shadow is records
+     * this node copied out of what a peer said. It holds no conn_t*, no chan_t*
+     * and no server_link_t*, so nothing it can be holding has been freed yet.
+     * And it is safe on a node that never called fed_open(), which is every
+     * test that links this library without the federation fixture -- the shadow
+     * is a file-scope static and therefore already zero.
+     *
+     * ASSERTED, NOT VERIFIED, ON THIS PLATFORM -- and the arm prints an
+     * `[observable] fed_burst_close: shadow=OPEN|NONE` line precisely so it is
+     * ASSERTED here too: a test can prove the arm ran without a leak checker,
+     * and Linux CI can read the same line next to its LSan run. */
+    fed_burst_close(s);
     strtab_free(s->nicks);
     s->nicks = NULL;
     strtab_free(s->chans);
@@ -1347,30 +1403,81 @@ chan_t *server_chan_at(const server_t *s, size_t i)
 }
 
 /* ---------------------------------------------------------------------------
- * Peer lookup by server name (2.3)
+ * The peer link registry (2.3)
  * ---------------------------------------------------------------------------
- * A CONN_SERVER conn's identity is conn_t::peer_name, which Phase 2's dial FSM
- * already sets, so this is a real lookup over real state rather than a
- * placeholder for state Phase 6 will create. O(FD_SETSIZE), which is the cost
- * 3.4 already accepts for enumerating connections, and which no caller pays on
- * the common path: chan_origin_state() short-circuits on origin == self before
- * it ever gets here. */
-conn_t *server_find_peer(const server_t *s, const char *name)
+ * A vector, and the reason is at server_link_t. These three are the only ways
+ * into it, so the layout never has to be known outside this file -- which is the
+ * same bargain server_t::nick_objs makes with server_nick_at().
+ */
+server_link_t *server_find_link(const server_t *s, const char *name)
 {
-    if (s == NULL || s->by_fd == NULL || name == NULL || name[0] == '\0') {
+    size_t i;
+
+    if (s == NULL || name == NULL || name[0] == '\0') {
         return NULL;
     }
-    for (size_t i = 0; i < SERVER_FD_TABLE; i++) {
-        const conn_t *c = s->by_fd[i];
-
-        if (c == NULL || c->kind != CONN_SERVER || c->peer_name == NULL) {
-            continue;
-        }
-        if (same_server_name(c->peer_name, name)) {
-            return s->by_fd[i];
+    for (i = 0; i < s->nlinks; i++) {
+        if (same_server_name(s->links[i].name, name)) {
+            return &s->links[i];
         }
     }
     return NULL;
+}
+
+size_t server_link_count(const server_t *s)
+{
+    return (s == NULL) ? 0u : s->nlinks;
+}
+
+server_link_t *server_link_at(const server_t *s, size_t i)
+{
+    if (s == NULL || i >= s->nlinks) {
+        return NULL;
+    }
+    return &s->links[i];
+}
+
+conn_t *server_link_conn(const server_t *s, const server_link_t *link)
+{
+    /* Every one of these is a real case and not defensive padding:
+     *   link == NULL   the caller had no link, so there is nothing to name
+     *   fd < 0          a link with no socket: between dial halves, or after a
+     *                   peer was dropped. Common, not degenerate.
+     *   fd out of range by_fd is indexed BY the descriptor, so an fd the table
+     *                   cannot hold names no slot at all. */
+    if (s == NULL || link == NULL || link->fd < 0 ||
+        link->fd >= SERVER_FD_TABLE) {
+        return NULL;
+    }
+    return s->by_fd[link->fd];
+}
+
+/* ---------------------------------------------------------------------------
+ * Peer lookup by server name (2.3)
+ * ---------------------------------------------------------------------------
+ * A link, a state test and a by_fd index. The reasoning for all three -- and for
+ * why this is no longer a scan of by_fd for a conn_t::peer_name -- is at
+ * server_find_peer() in the header, which is where a caller of this function
+ * will be reading.
+ *
+ * The ESTABLISHED comparison is an int against a mirror field rather than a
+ * switch on handshake_state_t, deliberately: hs.state is an enum, and
+ * -Weverything's -Wswitch-default and -Wcovered-switch-default cannot both be
+ * satisfied by a switch over it, and a two-way test does not need one. The
+ * mirror is written in exactly one place, so the comparison cannot be reading a
+ * field nothing has updated. */
+conn_t *server_find_peer(const server_t *s, const char *name)
+{
+    const server_link_t *link;
+
+    if (s == NULL || s->by_fd == NULL) {
+        return NULL;
+    }
+    link = server_find_link(s, name);
+    if (link == NULL || link->state != (int)ESTABLISHED) {
+        return NULL;
+    }
+    return server_link_conn(s, link);
 }
 
 size_t server_dial_count(const server_t *s)
@@ -1465,6 +1572,12 @@ int server_dial(server_t *s, const struct sockaddr *sa, socklen_t salen,
     slot->fd = fd;
     slot->state = DIAL_CONNECTING;
     slot->slot = s->ndials - 1u;
+    /* The one clock the node has, taken HERE rather than by the tick later: a
+     * tick that supplied the stamp would stamp every DIAL_CONNECTING entry on
+     * the same tick, so a dial that had already been waiting would be handed
+     * the timeout it had already used up. Taking it at the start makes the
+     * deadline a property of the connect() rather than of the loop's cadence. */
+    slot->started_ms = server_now_ms();
     memcpy(slot->peer_name, peer_name, strlen(peer_name) + 1u);
     return 0;
 }

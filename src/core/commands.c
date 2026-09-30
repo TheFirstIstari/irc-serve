@@ -1,5 +1,6 @@
-/* commands.c -- see commands.h. Registration, the welcome burst, and the four
- * commands that need no channel, no other user and no peer.
+/* commands.c -- see commands.h. Registration, the welcome burst, the four
+ * commands that need no channel and no other user, and THE DISPATCH SEAM that
+ * both a client line and a peer line arrive at.
  */
 #include "core/commands.h"
 
@@ -10,6 +11,7 @@
 #include "core/chan_verbs.h"
 #include "core/msg_verbs.h"
 #include "core/reply.h"
+#include "federation/verbs.h"
 
 /* ---------------------------------------------------------------------------
  * THE STATE ENUM IS A PROJECTION OF TWO FACTS
@@ -546,20 +548,29 @@ void commands_dispatch(server_t *s, conn_t *c, const message_t *m)
         return;
     }
 
-    /* 2.3: a peer link is EXEMPT from the client registration state machine --
-     * no PASS/NICK/USER, no 001-005, no MOTD -- and is authenticated by the
-     * federation handshake secret instead. So this handler, which is the client
-     * surface, does not answer a peer at all.
+    /* 3: the peer path is the SAME dispatch, and dispatch "never asks 'is this
+     * local or remote?' -- src->kind is the only difference". So a peer line is
+     * not routed around this function; it arrives here and is handed to the
+     * guard chain on the strength of src->kind and nothing else. That is the
+     * whole of the difference between the two paths, and putting it here rather
+     * than in poll_loop.c's read step is what keeps there ONE door into a
+     * command: a second entry point into fed_dispatch() would be a second way
+     * for a future line to arrive without passing 2.4's guards.
      *
-     * reply() would refuse every numeric for a CONN_SERVER conn anyway (see
-     * reply.h), so this is belt to that braces: a peer must not be able to
-     * REGISTER, and registration mutates the nick registry. Nothing creates a
-     * CONN_SERVER conn until Phase 6, so this path is unreachable in the
-     * shipped binary today, and the check exists so that the day one appears it
-     * cannot register itself as a user. */
+     * ABOVE THE CONN_CLOSING CHECK, deliberately and specifically. A peer link
+     * is a TCP connection like any other, so one segment can carry a peer's last
+     * line AND its close; the close marks the conn CLOSING, and the check below
+     * would then drop the line that arrived in the same read. Losing a peer's
+     * final state change because it happened to share a segment with a FIN is
+     * exactly the kind of loss 2.2's cache is supposed to self-heal from and
+     * usually does not: there is no later burst to correct it until Phase 9.
+     * The check itself still applies to CLIENTS, where a dropped line after a
+     * QUIT is correct behaviour.
+     *
+     * The `c == NULL` guard above means a peer line cannot reach here without a
+     * connection, and fed_dispatch() repeats it. */
     if (c->kind == CONN_SERVER) {
-        printf("[observable] cmd_skipped: kind=CONN_SERVER command=%s\n",
-               m->command);
+        fed_dispatch(s, c, m);
         return;
     }
 
