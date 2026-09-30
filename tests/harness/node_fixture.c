@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -580,8 +581,11 @@ static void nf_child_tick(server_t *s, uint64_t now_ms)
      * only on the totals at exit. Driven off a change, not off every tick: a
      * line per 50 ms tick would fill the pipe the parent reads and deadlock it
      * against a child that is waiting to write. */
-    /* TEMPORARY FLOOD PROBE: publish on EVERY tick instead of on change, which
-     * is the "force many stat lines fast" lever. ~700 bytes per 50 ms tick. */
+      /* Republish on CHANGE, deliberately -- see the comment above. This once
+       * carried a TEMPORARY FLOOD PROBE that published on every tick instead, to
+       * force many stat lines fast. It was left here describing behaviour the code
+       * does not have, which is worse than no comment: a reader looking for the
+       * flood lever would change this condition and not learn why. */
     if (s->nconns != g_last_nconns || s->n_closed != g_last_closed ||
         s->n_accepted != g_last_accepted ||
         s->n_link_rejected != g_last_fed_rejected ||
@@ -888,6 +892,33 @@ int nf_spawn_inline_named(nf_node_t *n, const char *name, nf_setup_fn setup)
         return -1;
     }
     return nf_spawn_common(n, NF_INLINE, setup, name, NULL);
+}
+
+/* How much the child has written that the parent has NOT read. FIONREAD on the
+ * READ end of the pipe, which is the direction that matters: it answers "how
+ * much is waiting for me", not "how much have I written".
+ *
+ * Asked of the descriptor rather than of a count the fixture keeps, because the
+ * fixture's own knowledge is exactly what is in doubt when this is called. The
+ * parent's buffer is drained opportunistically by nf_pump_all(), so a node that
+ * stopped writing and a node whose output nobody pumped leave the same
+ * `n->out`, and the kernel's count is the one that separates them.
+ *
+ * FIONREAD is in <sys/ioctl.h> on both platforms this suite builds on: Linux
+ * defines it there, and on macOS that header includes <sys/filio.h>, which is
+ * where it lives. No conditional include is needed for either. */
+int nf_pending_bytes(const nf_node_t *n, int *out)
+{
+    int queued = 0;
+
+    if (n == NULL || out == NULL || n->out_fd < 0) {
+        return -1;
+    }
+    if (ioctl(n->out_fd, FIONREAD, &queued) != 0) {
+        return -1;
+    }
+    *out = queued;
+    return 0;
 }
 
 int nf_stop(nf_node_t *n)

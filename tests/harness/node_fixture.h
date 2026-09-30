@@ -187,6 +187,26 @@ int nf_expect_u64_ge(nf_node_t *n, const char *key, uint64_t minimum,
  * nf_expect() that nf_expect_u64_ge() has to nf_expect_u64(). */
 int nf_expect_nth(nf_node_t *n, const char *needle, size_t want, int timeout_ms);
 
+/* How many bytes are sitting in the child's stdout PIPE right now, unread.
+ * Returns 0 on success with the count in `out`, or -1 if the pipe is closed or
+ * the descriptor is not one this can ask (a node that has been freed).
+ *
+ * WHY IT IS WORTH ASKING, and it is a diagnostic rather than a convenience. A
+ * child's stdout is a pipe, a pipe holds a bounded amount (65536 bytes on both
+ * Linux and macOS), and a writer that fills it does not get to run again until
+ * somebody reads. The republication of the counters a test reads happens in the
+ * tick hook -- step 8 of poll_loop_step() -- so a child blocked writing is
+ * blocked INSIDE its event loop: it does not accept, it does not read, and it
+ * does not answer the client that is waiting for it. From outside that is
+ * indistinguishable from a node that had nothing to say.
+ *
+ * `n->out` CANNOT ANSWER IT, which is the whole reason this exists. `n->out` is
+ * only what the parent HAPPENED to pump, so a node wedged mid-write and a node
+ * that said nothing at all print an indistinguishable pair of buffers. This is
+ * the number that tells them apart: a value in the tens of thousands is a child
+ * stopped inside write(), and 0 with an empty buffer is a node that is quiet. */
+int nf_pending_bytes(const nf_node_t *n, int *out);
+
 /* Signal the child to stop (SIGTERM), wait for it to exit, and return its exit
  * status -- or -1 if it had to be killed, -2 on a wait failure. A clean stop
  * must be status 0; anything else is a finding. */

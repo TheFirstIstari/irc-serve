@@ -39,14 +39,58 @@ void tf_unregister(nf_node_t *n)
     }
 }
 
+/* The pipe capacity quoted below. It is a CONSTANT rather than a query because
+ * the point of printing the queued count is the comparison against the ceiling:
+ * "0 of 65536" says the child has nothing to say, and "65330 of 65536" says the
+ * child is stopped inside write() and every wait that was waiting on it was
+ * waiting for a node that had stopped running. 65536 is the capacity of a
+ * pipe(2) buffer on both Linux and macOS, which is why it can be named here
+ * instead of measured -- the measurement that matters is the queued half, and
+ * that one is read from the kernel every time. */
+#define TF_PIPE_CAPACITY 65536
+
+/* Dump what every live node said, and -- the part this exists for -- how much
+ * each of them still has UNREAD in its stdout pipe.
+ *
+ * WHY THE SECOND NUMBER. `n->out` is only what the parent happened to pump, so
+ * on a failure it cannot distinguish the two states a reader actually has to
+ * separate: a node that had nothing to say, and a node that said a great deal
+ * and then stopped being able to say any more because its 64 KiB pipe filled
+ * and it is now blocked inside write(), in the middle of its own event loop.
+ * Both print the same buffer, and on a loaded runner guessing between them from
+ * a truncated dump is how a real defect gets diagnosed as a scheduler.
+ *
+ * So the number is read from the kernel (ioctl FIONREAD on the pipe's read end)
+ * and printed beside the buffer it explains. A large value is a node that is
+ * WEDGED, and it says so here rather than leaving it to be inferred. */
 void tf_report(const char *expr, const char *file, int line)
 {
     int i;
 
     fprintf(stderr, "\nFAILED: %s\n  at %s:%d\n", expr, file, line);
     for (i = 0; i < g_nnodes; i++) {
-        fprintf(stderr, "--- node %d (pid %ld, port %d) output ---\n%s\n",
-                i, (long)g_nodes[i]->pid, g_nodes[i]->port,
+        int queued = 0;
+
+        if (nf_pending_bytes(g_nodes[i], &queued) != 0) {
+            fprintf(stderr,
+                    "--- node %d (pid %ld, port %d): stdout pipe is closed or "
+                    "unreadable, so its queued-byte count is unknown ---\n",
+                    i, (long)g_nodes[i]->pid, g_nodes[i]->port);
+        } else if (queued > 0) {
+            fprintf(stderr,
+                    "--- node %d (pid %ld, port %d): %d of %d bytes still QUEUED "
+                    "in its stdout pipe. A child fills that pipe and stops running "
+                    "until somebody reads, so this node may have stopped inside "
+                    "write() rather than having nothing to say: ---\n",
+                    i, (long)g_nodes[i]->pid, g_nodes[i]->port, queued,
+                    TF_PIPE_CAPACITY);
+        } else {
+            fprintf(stderr,
+                    "--- node %d (pid %ld, port %d): 0 of %d bytes queued in its "
+                    "stdout pipe, so this node has said everything it had to say ---\n",
+                    i, (long)g_nodes[i]->pid, g_nodes[i]->port, TF_PIPE_CAPACITY);
+        }
+        fprintf(stderr, "%s\n",
                 (g_nodes[i]->out != NULL) ? g_nodes[i]->out : "(nothing)");
     }
     /* Kill rather than stop: this path is already a failure, and there is no

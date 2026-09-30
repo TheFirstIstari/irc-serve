@@ -597,7 +597,22 @@ static void child_setup(server_t *s)
                  "federation module cannot reach any assertion in this test");
     s->trace = g_trace;
     s->on_tick = child_tick;
-    fed_set_timeouts(1000, 2000, 30000, 90000);
+    /* The SHIPPED defaults are IRC_FED_DIAL_TIMEOUT_MS (10s) and
+     * IRC_FED_HS_TIMEOUT_MS (5s) in federation/link.h, and fed_set_timeouts() is a
+     * per-process seam used only by tests -- so raising these here does not change
+     * the product.
+     *
+     * They were 1000 and 2000. On a loaded runner -- a 2-core CI box, or 30+ copies
+     * of this suite on one machine -- a poll tick slips far enough that a FEDERATE
+     * exchange which completes in two ticks on an idle box misses its budget. The
+     * product then does the correct thing (times out, and retries the dial) while
+     * the test's 15s deadline expires first, and the failure reads as 'federation
+     * is broken' rather than 'the fixture was too impatient'.
+     *
+     * 5000 is 100 poll ticks of POLL_TICK_MS, which is the shipped handshake
+     * default. The happy path still completes in two ticks, so nothing waits
+     * longer -- these budgets only bound the failure case. */
+    fed_set_timeouts(5000, 5000, 30000, 90000);
     if (g_tiny_send != 0 && g_is_b == 0) {
         /* NODE A ONLY, and the distinction is the case's whole point. The bound is
          * symmetric in the code -- the receiver charges every record against the
@@ -948,26 +963,51 @@ static void case_resync_replaces(void)
     TF_CHECK_MSG(tc_send(&alice, "JOIN " CHAN_T) == 0, "alice's JOIN send failed");
     TF_CHECK_MSG(tc_expect(&alice, " 366 ", T_IO_MS) == 0,
                  "alice's JOIN never completed on the node that owns the channel");
+    /* THE PRECONDITION BOB'S JOIN DEPENDS ON, WAITED FOR BEFORE THE JOIN RATHER
+     * THAN AFTER IT. The comment this replaces said the right thing -- "asserting
+     * the pre-state without waiting for it is a race" -- and then waited for the
+     * wrong thing too late. A node B that has not applied alice's SJOIN has never
+     * heard of the channel, so bob's JOIN CREATES it there (2.2: first server to
+     * see a channel owns it) and makes bob its creator and therefore its operator
+     * (RFC 1459 2.3.1). The mesh then has BOTH nodes claiming the origin, and
+     * `unchanged` below -- plain "bob ann", then the op group -- is rendered
+     * against a world where bob is an op and alice is only one of two, so the
+     * first 353 comes back as "ann" and the second as "@bob @alice". That is not
+     * a weakened roster: it is a roster of a DIFFERENT network, and the wait below
+     * is what keeps the case from measuring it.
+     *
+     * It has to be B's own record of the arrival, for the reason this file's other
+     * waits are B's own record rather than A's: A writes the SJOIN into its link
+     * socket, and the fact that A has QUEUED it says nothing about whether B has
+     * read it. Only the `fed_sjoin:` line on B is the arrival. */
+    TF_CHECK_MSG(nf_expect(&b, "fed_sjoin: channel=" CHAN_T " member=" NICK_A, T_IO_MS)
+                     == 0,
+                 "node B never learned about alice, so bob's JOIN would reach a node "
+                 "that has never heard of the channel and would create it there with "
+                 "bob as its operator, which is a split in 2.2's origin that the "
+                 "roster below would then be rendered against: %s",
+                 b.out);
     TF_CHECK_MSG(tc_send(&bob, "JOIN " CHAN_T) == 0, "bob's JOIN send failed");
     TF_CHECK_MSG(tc_expect(&bob, " 366 ", T_IO_MS) == 0,
                  "bob's JOIN never completed on the node that does not own the "
-                 "channel");
-    /* BOB'S 366 IS NOT A'S KNOWLEDGE OF HIM, and asserting the pre-state without
-     * waiting for it is a race: B answers bob from its own loop the moment it has
-     * applied the local membership, and A learns of bob from the SJOIN on a
-     * different socket a moment later. A 353 asked in between renders the local
-     * member and nothing else, which is a correct answer to a question asked too
-     * early. Both directions are therefore waited for, and each is the node's own
-     * record of the arrival rather than the far side's opinion of it. */
+     "channel");
+    /* AND THE OTHER DIRECTION, which is a wait rather than a claim about bob's
+     * 366: B answers bob from its own loop the moment it has applied the local
+     * membership, and A learns of bob from the SJOIN on a different socket a
+     * moment later. A 353 asked in between renders the local member and nothing
+     * else, which is a correct answer to a question asked too early. */
     TF_CHECK_MSG(nf_expect(&a, "fed_sjoin: channel=" CHAN_T " member=" NICK_B, T_IO_MS)
                      == 0,
                  "node A never learned about bob, so its pre-state roster cannot "
                  "have the remote name the criterion is about: %s",
                  a.out);
+    /* B's copy of the arrival is asserted here as well as waited for above, for
+     * what it says rather than for when it came: it is the line that carries
+     * alice's flags, and the pre-state roster's op group is that flag. */
     TF_CHECK_MSG(nf_expect(&b, "fed_sjoin: channel=" CHAN_T " member=" NICK_A, T_IO_MS)
                      == 0,
-                 "node B never learned about alice, so its pre-state roster cannot "
-                 "have the remote name the criterion is about: %s",
+                 "node B never reported accepting an SJOIN for alice, so its "
+                 "pre-state roster cannot have her remote name: %s",
                  b.out);
 
     /* dave CREATES #U on B, so B owns it and dave is its operator. The channel
@@ -1527,6 +1567,21 @@ static void case_over_budget_changes_nothing(void)
     TF_CHECK_MSG(tc_send(&ann, "JOIN " CHAN_T) == 0, "ann's JOIN send failed");
     TF_CHECK_MSG(tc_expect(&ann, " 366 ", T_IO_MS) == 0,
                  "ann's JOIN never completed on the node that owns the channel");
+    /* THE PRECONDITION BOB'S JOIN DEPENDS ON, WAITED FOR BEFORE THE JOIN. Without
+     * it, a B that has not applied alice's SJOIN has never heard of the channel,
+     * so bob's JOIN creates it there (2.2), makes bob its creator and therefore an
+     * operator, and puts BOTH nodes in the running as origin -- a split 2.2's
+     * tie-break exists to prevent. `unchanged` below is then rendered against a
+     * different network than the case is about. The wait is on B's own record of
+     * the arrival: A having QUEUED the SJOIN says nothing about B having read it.
+     * See the first case in this file for the full statement. */
+    TF_CHECK_MSG(nf_expect(&b, "fed_sjoin: channel=" CHAN_T " member=" NICK_A, T_IO_MS)
+                     == 0,
+                 "node B never learned about alice, so bob's JOIN would reach a node "
+                 "that has never heard of the channel and would create it there with "
+                 "bob as its operator, which is a split in 2.2's origin that the "
+                 "roster below would then be rendered against: %s",
+                 b.out);
     TF_CHECK_MSG(tc_send(&bob, "JOIN " CHAN_T) == 0, "bob's JOIN send failed");
     TF_CHECK_MSG(tc_expect(&bob, " 366 ", T_IO_MS) == 0,
                  "bob's JOIN never completed on the node that does not own the "
@@ -1694,10 +1749,27 @@ static void case_truncated_burst_changes_nothing(void)
     TF_CHECK_MSG(tc_send(&ann, "JOIN " CHAN_T) == 0, "ann's JOIN send failed");
     TF_CHECK_MSG(tc_expect(&ann, " 366 ", T_IO_MS) == 0,
                  "ann's JOIN never completed on the node that owns the channel");
+    /* THE PRECONDITION BOB'S JOIN DEPENDS ON, WAITED FOR BEFORE THE JOIN. This is
+     * the case that produced the roster failure this wait fixes: without it a B
+     * that has not applied alice's SJOIN has never heard of the channel, so bob's
+     * JOIN creates it there (2.2), makes bob its creator and therefore an operator,
+     * and puts BOTH nodes in the running as origin. `unchanged` is then rendered
+     * against a different network than the case is about, and the first 353 comes
+     * back as "ann" with the ops reading "@bob @alice" -- which is a complete,
+     * correctly ordered roster of the WRONG world. The wait is on B's own record
+     * of the arrival: A having QUEUED the SJOIN says nothing about B having read
+     * it. See the first case in this file for the full statement. */
+    TF_CHECK_MSG(nf_expect(&b, "fed_sjoin: channel=" CHAN_T " member=" NICK_A, T_IO_MS)
+                     == 0,
+                 "node B never learned about alice, so bob's JOIN would reach a node "
+                 "that has never heard of the channel and would create it there with "
+                 "bob as its operator, which is a split in 2.2's origin that the "
+                 "roster below would then be rendered against: %s",
+                 b.out);
     TF_CHECK_MSG(tc_send(&bob, "JOIN " CHAN_T) == 0, "bob's JOIN send failed");
     TF_CHECK_MSG(tc_expect(&bob, " 366 ", T_IO_MS) == 0,
                  "bob's JOIN never completed on the node that does not own the "
-                 "channel");
+                  "channel");
     TF_CHECK_MSG(nf_expect(&a, "fed_sjoin: channel=" CHAN_T " member=" NICK_B, T_IO_MS)
                      == 0,
                  "node A never learned about bob: %s", a.out);
