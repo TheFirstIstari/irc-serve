@@ -186,6 +186,28 @@ int send_line(server_t *s, conn_t *dst, const char *prefix,
 int send_line_colon(server_t *s, conn_t *dst, const char *prefix,
                     const char *command, const char *const *params, int nparams);
 
+/* As send_line(), with a tag block on the outbound line. This is the ONLY way a
+ * tag reaches a client, and it exists as a separate function rather than as a
+ * NULL-tags sentinel inside send_line() because a tag block on a line is a
+ * per-destination decision (one client negotiated `message-tags` and the next
+ * did not) while the other six arguments are the same message: the callers that
+ * write to a LIST of members each ask the question once per member, and a flag
+ * would have to be threaded through the same walk either way.
+ *
+ * `tags` is a block WITHOUT the leading '@' and NUL-terminated -- the contract
+ * irc_serve_tags_format() and irc_serve_msgid_tag() both produce. NULL means no
+ * tag block, and is exactly send_line().
+ *
+ * 3.2's rule that the internal `irc-serve-*` tags are STRIPPED before delivery
+ * to a client is enforced by what is passed in here, not by this function: the
+ * caller decides, and the only caller that has a client-visible tag to pass is
+ * the one that negotiated for it. That is deliberate -- a filter here would be a
+ * second place that decides what a client may see about this node's internals,
+ * and 2.4's rule is one sentence a reader can check at the call site. */
+int send_line_tagged(server_t *s, conn_t *dst, const char *prefix,
+                     const char *command, const char *const *params, int nparams,
+                     const char *tags);
+
 /* As many middle parameters as the 15-parameter cap leaves room for once
  * <target> and the trailing text have taken two slots. */
 #define REPLY_MAX_MID (IRC_MAX_PARAMS - 2)

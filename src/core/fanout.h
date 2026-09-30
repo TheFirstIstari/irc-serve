@@ -229,11 +229,19 @@ int fanout_is_member(const fanout_target_t *t, const conn_t *c);
  * delivered by, and there is no second decision in between to disagree.
  *
  * `carry` is 2.4's identity for the emission, or NULL for a line this node is
- * ORIGINATING, and it reaches only the forward arm. Every handler passes NULL,
- * because a handler is handed a line from a client and a client has no 2.4
- * identity; federation/verbs.c passes the tags the line arrived with, and that
- * is the whole reason this is an argument here rather than a private detail of
- * the relay path.
+ * ORIGINATING. Every handler passes NULL, because a handler is handed a line from
+ * a client and a client has no 2.4 identity; federation/verbs.c passes the tags
+ * the line arrived with, and that is the whole reason this is an argument here
+ * rather than a private detail of the relay path.
+ *
+ * IT NOW REACHES MORE THAN THE FORWARD ARM, and that is the second reason it is
+ * an argument. This function computes the emission's 2.4 identity ONCE -- minting
+ * it for an originating emission, carrying a received one and adding the hop
+ * otherwise -- and hands the SAME stamp to the local write and to every forward
+ * target. The local write renders it as the IRCv3 `msgid` a client sees; the
+ * forward puts it on the wire. Before, only the forward saw it, which meant an
+ * emission forwarded to two peers was stamped with two different ids and a client
+ * on this node had no id to show at all.
  *
  * IT IS AN ARGUMENT FOR THE SAME REASON IT IS NOT A FIELD ON THE TARGET, one
  * level up: an identity is a property of ONE emission, and a resolved target is
@@ -385,15 +393,37 @@ int fanout_forward_sverb(server_t *s, const char *peer_name, const char *sverb,
  * verb here rather than taken pre-shaped, so a caller that has a client
  * emission does not have to know the S-verb's shape. Returns how many peers the
  * line was queued to; zero is a normal answer -- a channel with no member-server
- * and no ESTABLISHED link has nowhere to forward to. */
+ * and no ESTABLISHED link has nowhere to forward to.
+ *
+ * `stamp` IS THE EMISSION'S IDENTITY AND IS PUT ON THE WIRE AS IT STANDS -- no
+ * mint here, no hop added here -- which is a different contract from every other
+ * entry point on this leg and is said so because getting it wrong is silent. The
+ * caller has already computed it, because it needs the same value for the
+ * client-facing `msgid` it is writing to its own members, and an identity that
+ * differed between those two would tell a client on this node and a client on the
+ * peer two different things about one message.
+ *
+ * `relayed` says whether `stamp` came from a peer, and it is a parameter rather
+ * than a comparison against `s->name` because the two are indistinguishable by
+ * value: a stamp this node minted has origin == s->name, and so does a stamp a
+ * peer sent naming this node. Only where the value came from tells them apart,
+ * and it decides whether 2.4's hop ceiling and never-forward-own-origin guards
+ * apply -- they do not to an identity this node just created, which is the whole
+ * of a forward this node originates. */
 int fanout_forward_channel(server_t *s, const chan_t *ch, fanout_class_t vclass,
                            const char *client_verb, const char *prefix,
                            const char *const *params, int nparams,
-                           const irc_serve_tags_t *carry);
+                           const irc_serve_tags_t *stamp, int relayed);
 
 /* As fanout_forward_channel(), for a line that is ALREADY an S-verb in the
  * shape 4.3 freezes -- which is what a RELAY of a received state change is.
- * Same target set, same refusals, reached through the same static walk. */
+ * Same target set, same refusals, reached through the same static walk.
+ *
+ * `carry` here has the OTHER contract, and the difference is deliberate rather
+ * than an inconsistency: this one is reached from federation/verbs.c with a stamp
+ * a PEER sent, so its job is to add this node's hop and change nothing else, and
+ * it computes that once for the whole walk. The two forms cannot be merged
+ * because one of them has already had the hop added by the time it arrives. */
 int fanout_forward_channel_sverb(server_t *s, const chan_t *ch,
                                  fanout_class_t vclass, const char *sverb,
                                  const char *prefix, const char *const *params,

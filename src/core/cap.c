@@ -34,13 +34,16 @@ enum {
     CAPBIT_SASL = 1u << 3
 };
 
-/* CAPBIT_MESSAGE_IDS has a bit and no entry in the table above yet, and that is
- * deliberate rather than unfinished bookkeeping: the capability is added to the
- * table in the same commit that makes the server stamp a msgid, because a
- * capability advertised before the feature exists is precisely the failure this
- * file was written to prevent. The bit position is reserved now so that adding it
- * later does not renumber the others -- a bit that moves is a bit some future
- * field's stored value would be read with the wrong meaning. */
+/* THE BIT ORDER IS FIXED AND THE TABLE BELOW IS THE CLAIM. CAPBIT_MESSAGE_IDS
+ * held a bit and no entry while the msgid stamp did not exist; it was reserved
+ * then so that adding the capability later would not renumber the others, and
+ * the entry is here now because core/message.c renders `msgid` and core/fanout.c
+ * puts it on a delivered line. That reservation-and-retirement is the shape of
+ * this file's one rule: a bit is claimed before its capability exists so no
+ * stored value is ever read with the wrong meaning, and the capability enters
+ * the table in the same change that makes the feature real -- never earlier,
+ * because a capability advertised before the feature exists is precisely the
+ * failure this file was written to prevent. */
 
 typedef struct {
     const char *name;
@@ -51,6 +54,7 @@ typedef struct {
  * feature exists; do not add one to make a client stop complaining. */
 static const cap_def_t k_caps[] = {
     { CAP_MESSAGE_TAGS, CAPBIT_MESSAGE_TAGS },
+    { CAP_MESSAGE_IDS, CAPBIT_MESSAGE_IDS },
     { CAP_SASL, CAPBIT_SASL }
 };
 
@@ -175,6 +179,26 @@ int cap_multiprefix_enabled(const conn_t *c)
 int cap_message_tags_enabled(const conn_t *c)
 {
     return cap_enabled(c, CAP_MESSAGE_TAGS);
+}
+
+int cap_message_ids_enabled(const conn_t *c)
+{
+    /* BOTH GATES, and the second is not a convenience. `msgid` is a TAG, so a
+     * client that enabled `draft/message-ids` and not `message-tags` has asked
+     * for a tag inside a tag support it declined, and a node that wrote one
+     * anyway would be putting a tag block on a line the client has said it does
+     * not want to parse -- which is the whole of what the capability-negotiation
+     * specification is for. 3.2's parser reads a block or it does not, so this
+     * is not a "best effort" gate: the value is either on the line or it is not.
+     *
+     * The cost, stated: a client whose REQ lists `draft/message-ids` alone gets
+     * no msgid while believing it asked for one. That is the honest answer --
+     * the client opted out of tags -- and the alternative (stamping anyway) is a
+     * node that lies about a negotiated protocol. */
+    return (cap_enabled(c, CAP_MESSAGE_IDS) != 0 &&
+            cap_enabled(c, CAP_MESSAGE_TAGS) != 0)
+               ? 1
+               : 0;
 }
 
 /* --------------------------------------------------------------------------

@@ -447,6 +447,85 @@ size_t irc_serve_tags_format(const irc_serve_tags_t *t, char *out, size_t cap);
 int irc_serve_tags_valid(const irc_serve_tags_t *t);
 
 /* ---------------------------------------------------------------------------
+ * THE IRCv3 `msgid` -- 2.4's dedup key, rendered for a CLIENT
+ * ---------------------------------------------------------------------------
+ * A client cannot read an `irc-serve-*` tag: 2.4 says they are all stripped
+ * before delivery, and they are stripped because they are internal machinery
+ * whose shape is this project's, not a protocol a client has agreed to. The
+ * IRCv3 `draft/message-ids` capability is the client-visible half of the same
+ * fact, and its whole purpose is the sentence 2.4 already needs: two clients
+ * on two different nodes who were both sent one message must be able to tell
+ * it was one message.
+ *
+ * THE VALUE IS THE DEDUP KEY, NOT A SECOND COUNTER, and that is the load-bearing
+ * decision rather than a formatting one. The obvious alternative -- a counter
+ * for msgids, incremented on every outbound line -- would be a value that means
+ * one thing to this node and a *different* thing to the peer's dedup store, so a
+ * relay would be unable to carry it (it has no way to mint a value in the
+ * sender's space) and every hop would have to renumber. Deriving it means:
+ *
+ *   - a client-visible value and a peer-internal key are THE SAME THREE NUMBERS,
+ *     so a node that relays this line changes nothing about the identity and a
+ *     client sees one msgid at every hop;
+ *   - no second monotonic counter exists to keep unique, and 2.4's argument
+ *     about a PER-CONNECTION counter -- two connections on one server both
+ *     emitting (a,1) -- applies to it for free;
+ *   - the server name is in the value, so uniqueness is a NETWORK property
+ *     without this node having to know anything about the mesh.
+ *
+ * FORMAT: `<origin>_<epoch>_<id>`, and the delimiter is '_' for a reason worth
+ * naming. 2.4's origin grammar is ASCII letters, digits, '-' and '.', so '_'
+ * cannot appear inside a server name and the three fields are separable by a
+ * reader -- a peer, a log scraper or a test can recover the dedup key from the
+ * client-visible tag with no extra state. Using '-' would have been shorter and
+ * ambiguous: `irc-serve-1_1756464000123_41` and `irc_1_1756464000123_41` would
+ * be the same string, which is exactly the aliasing 2.4's epoch pairing exists
+ * to prevent.
+ *
+ * NEED NO ESCAPING, and that is checked rather than assumed: every byte here is
+ * a letter, a digit, '_' or '.', none of which is in the five-character escape
+ * set ircv3_tags.h documents. So the value goes out exactly as built, and the
+ * renderer does not call the escaper -- a tag value that needed escaping would
+ * be a bug report, not a value to encode.
+ */
+
+/* Worst-case bytes of the rendered `msgid=` TAG, derived from the same bounds
+ * the overhead table above uses and not from a guess:
+ *
+ *     6   "msgid="                 5 name + '='
+ *     1   '_'                      origin/epoch separator
+ *     1   '_'                      epoch/id separator
+ *    63   origin                   <= IRC_MAX_SERVER_NAME (2.3)
+ *    20   epoch                    <= UINT64_MAX, 20 digits
+ *    20   id                       <= UINT64_MAX, 20 digits
+ *    ---
+ *   111   worst case, excluding the NUL
+ *
+ * The cost of naming it rather than letting each caller size its own buffer is
+ * that a value bound raised in 2.4's grammar fails the suite at this constant
+ * instead of quietly overrunning a stack buffer somewhere a caller sized by
+ * eye. IRC_MAX_TAG_VALUE_MAX (128) is NOT used as the bound and must not be:
+ * that is the ircv3_tags.h bound for a DECODED value, and 111 < 128 here only by
+ * luck of the current grammar. */
+#define IRC_MAX_MSGTAG 111u
+
+/* Render the `msgid=<origin>_<epoch>_<id>` tag into `out` as a block WITHOUT
+ * the leading '@' -- the same contract irc_serve_tags_format() has, so a caller
+ * concatenates blocks the same way in both directions.
+ *
+ * Returns the byte count written, or 0 if `t` is not itself legal or the value
+ * does not fit. 0 is unambiguous for the same reason it is for
+ * irc_serve_tags_format(): a legal msgid is never empty. `hops` is
+ * deliberately NOT rendered: it counts forwards, which is 2.4's business and
+ * tells a client nothing. */
+size_t irc_serve_msgid_tag(const irc_serve_tags_t *t, char *out, size_t cap);
+
+/* As irc_serve_msgid_tag(), but the VALUE alone with no `msgid=` key -- for a
+ * caller that already has a tag block and wants the value in it. The value needs
+ * IRC_MAX_MSGTAG bytes; the tag needs IRC_MAX_MSGTAG + 1 for the terminator. */
+size_t irc_serve_msgid_value(const irc_serve_tags_t *t, char *out, size_t cap);
+
+/* ---------------------------------------------------------------------------
  * The nick rule 2.1 depends on and 5 says is missing
  * ---------------------------------------------------------------------------
  * The whole identity scheme is `nick@server`. 2.1 splits a qualified name at

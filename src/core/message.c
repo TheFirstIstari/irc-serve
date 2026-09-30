@@ -4,6 +4,7 @@
  * by the compiler. */
 #include "message.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -927,6 +928,94 @@ int irc_serve_tags_parse(const message_t *m, irc_serve_tags_t *out)
     out->id = i_id;
     out->hops = (uint32_t)h;
     return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * The IRCv3 `msgid` -- see the block comment on irc_serve_msgid_tag() in
+ * message.h, which is where the format and the argument for it live. What is
+ * here is the renderer and the one check that keeps the promise in that comment
+ * true.
+ * ------------------------------------------------------------------------ */
+
+static const char TAG_MSGID[] = "msgid";
+
+/* The '_' that separates the three fields. Spelled as a constant rather than
+ * written into the format string because it is the load-bearing byte of the
+ * whole format: message.h's argument is that 2.4's origin grammar excludes it,
+ * so the three fields stay separable. A reader changing the separator to '-'
+ * should have to find this line. */
+#define MSGID_SEP '_'
+
+size_t irc_serve_msgid_value(const irc_serve_tags_t *t, char *out, size_t cap)
+{
+    if (out == NULL || cap == 0) {
+        return 0;
+    }
+    out[0] = '\0';
+    /* The same legality gate irc_serve_tags_format() uses, for the same reason:
+     * a stamp the 2.4 grammar would refuse must not be able to become a
+     * client-visible identity, because a client cannot check it and a peer
+     * cannot re-derive the dedup key from a value that was never legal. */
+    if (irc_serve_tags_valid(t) != 1) {
+        return 0;
+    }
+    char epoch[NUM_DIGITS_U64 + 1];
+    char id[NUM_DIGITS_U64 + 1];
+    if (format_decimal(t->epoch, epoch, sizeof epoch) == 0 ||
+        format_decimal(t->id, id, sizeof id) == 0) {
+        return 0;
+    }
+    /* snprintf rather than concatenation, because the bound is three variable
+     * lengths and a hand-rolled sum is the kind of arithmetic that is wrong
+     * once and then forever. The cap is checked by snprintf and 0 is returned,
+     * so a caller that sized its buffer from the derivation in message.h is
+     * right and one that did not is refused rather than overrunning. */
+    const int n = snprintf(out, cap, "%s%c%s%c%s", t->origin, MSGID_SEP, epoch,
+                           MSGID_SEP, id);
+    if (n < 0 || (size_t)n >= cap) {
+        out[0] = '\0';
+        return 0;
+    }
+    /* THE ESCAPE CLAIM, CHECKED. message.h says this value needs no escaping
+     * because every byte is a letter, a digit, '_' or '.'; that is a claim about
+     * the grammar above, and a grammar that later widens -- an origin rule that
+     * admitted ';' or a space -- would turn it into a value that corrupts the
+     * block it is written into. Refusing here is a bug report, not a fallback:
+     * there is no second spelling of this tag and silently emitting an
+     * unescaped one is the failure ircv3_tags.h exists to prevent. */
+    for (const char *p = out; *p != '\0'; p++) {
+        const unsigned char ch = (unsigned char)*p;
+
+        const int alnum = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                          (ch >= '0' && ch <= '9');
+        if (alnum == 0 && ch != (unsigned char)MSGID_SEP && ch != (unsigned char)'.') {
+            out[0] = '\0';
+            return 0;
+        }
+    }
+    return (size_t)n;
+}
+
+size_t irc_serve_msgid_tag(const irc_serve_tags_t *t, char *out, size_t cap)
+{
+    if (out == NULL || cap == 0) {
+        return 0;
+    }
+    out[0] = '\0';
+    /* The one tag rather than the four, so message_tags_format() does the
+     * assembling -- including the `key=value` join and the block's own contract
+     * -- instead of a second copy of it here. A hand-written "msgid=" prefix
+     * would be a place where the key spelling and the separator could drift from
+     * the one message.h documents. */
+    char value[IRC_MAX_MSGTAG + 1];
+    const size_t vlen = irc_serve_msgid_value(t, value, sizeof value);
+
+    if (vlen == 0u) {
+        return 0;
+    }
+    const message_tag_t one[1] = { { TAG_MSGID, value } };
+
+    return message_tags_format(one, 1, out, cap);
 }
 
 /* --------------------------------------------------------------------------
