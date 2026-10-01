@@ -843,7 +843,7 @@ int fed_send_advertise(server_t *s);
  * this node measures no load: the honest thing to put on the wire from a node
  * that cannot measure itself is a value an operator set, and a fabricated 0% would
  * be a number this node does not believe. Clamped to 0..100 on the way out. */
-void fed_set_load(unsigned pct);
+void fed_set_load(server_t *s, unsigned pct);
 
 /* What one peer ADVERTISED, for a log or a counter. `name` and `host` are bounded
  * buffers and `port_out`/`load_out` may be NULL; each is zeroed or emptied on

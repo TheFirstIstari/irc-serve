@@ -753,6 +753,14 @@ void server_shutdown(server_t *s)
      * this library without the federation fixture -- the table is a field on
      * server_t, so it is already NULL. */
     fed_nickreg_close(s);
+    /* The advertise table is the same shape of obligation as the nick registry
+     * above and for the same reason: server_t::advs is a lazily calloc()ed table
+     * with no conn_t* in it, so it survives every per-connection teardown and only
+     * server_shutdown() can reach it. Leaving it unfreed is a real LSan failure on
+     * the Linux CI job -- and one no macOS run can see, which is why this arm
+     * exists rather than being left to the next reader. Safe on a node that never
+     * advertised: the field is NULL until the first calloc. */
+    fed_advert_close(s);
     strtab_free(s->nicks);
     s->nicks = NULL;
     strtab_free(s->chans);
