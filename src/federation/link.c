@@ -934,6 +934,16 @@ int fed_send_advertise(server_t *s)
         int nparams = 1;
         char pct[4];
         char portbuf[8];
+        /* HOISTED to the loop body on purpose. It is declared inside the `if` that
+         * fills it in the obvious way, and that is a stack-use-after-scope: the
+         * block closes, and fed_queue_line() below then renders params[2] from a
+         * buffer whose lifetime is already over. ASan catches it as
+         * stack-use-after-scope and it is silent without it -- the advertised host
+         * is whatever the stack happens to hold, which is how this node ended up
+         * publishing its own name as its peer's address. It lives here, beside pct
+         * and portbuf, because every buffer this loop renders from has to outlive
+         * the arm that fills it. */
+        char host[CONN_HOST_MAX + 1];
 
         if (s->links[i].state != (int)ESTABLISHED) {
             continue;
@@ -963,7 +973,6 @@ int fed_send_advertise(server_t *s)
          * anything a peer told this node, and the comment above says why that
          * matters even setting the SSRF argument aside. */
         if (s->links[i].initiator != 0 && s->links[i].addrlen != 0) {
-            char host[CONN_HOST_MAX + 1];
             unsigned port = 0u;
 
             if (advert_peer_hint(s, &s->links[i], host, sizeof host, &port) == 0) {
@@ -992,6 +1001,39 @@ int fed_send_advertise(server_t *s)
                s->name, sent, s->load_pct);
     }
     return sent;
+}
+
+/* The operator's load figure. A KNOB and not a metric: this node measures no load,
+ * so the honest thing to put on the wire is a value an operator set. A fabricated
+ * 0% would be a number this node does not believe -- the same rule k_ncaps follows
+ * in "advertise only what is real".
+ *
+ * Takes server_t because load_pct is a field of the NODE, not a process global:
+ * two nodes in one address space must not overwrite each other's figures. This was
+ * DECLARED in link.h with no definition anywhere, so the first caller would have hit
+ * a link failure rather than a missing feature. */
+void fed_set_load(server_t *s, unsigned pct)
+{
+    if (s == NULL) {
+        return;
+    }
+    /* Clamped here as well as on the way out. Both halves exist deliberately: the
+     * clamp is what keeps the wire honest, and fed_advertise_apply()'s validation is
+     * what keeps a peer from being believed. */
+    s->load_pct = (pct > 100u) ? 100u : pct;
+}
+
+/* The advertisement period, overridable per process.
+ *
+ * The shipped default is IRC_FED_ADVERTISE_MS, which is derived equal to
+ * IRC_FED_KEEPALIVE_MS and for the same reason: an advertisement is a liveness
+ * signal as well as a load figure, so a peer must never see a longer silence than
+ * T4's dead threshold and conclude the node has stopped. A test needs the figure
+ * inside its own deadline, so this exists -- and it was declared without a
+ * definition, which would have made every caller a link failure. */
+void fed_set_advertise_interval(uint64_t ms)
+{
+    g_advertise_ms = ms;
 }
 
 
