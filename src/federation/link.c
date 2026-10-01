@@ -17,6 +17,7 @@
  */
 #include "federation/link.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -769,6 +770,23 @@ static void fed_link_down(server_t *s, server_link_t *link, int announce)
     fed_burst_abandon(link);
     link->last_sent_ms = 0;
     link->last_recv_ms = 0;
+    /* AND THE PEER'S LAST ADVERTISED FIGURE GOES WITH IT. A link that has gone down
+     * has learned nothing about its peer's CURRENT load, and leaving the number here
+     * would make T8 report a busy peer from a link that is no longer up -- the same
+     * category of error as leaving the old epoch behind a few lines above, where the
+     * comment gives the reason. `load_seen_ok` goes with it so a re-established link
+     * is a link that has heard nothing, rather than one whose silence is inherited
+     * from the previous connection.
+     *
+     * The shed LATCH is not cleared here, and that asymmetry is deliberate: it is
+     * cleared by fed_link_reset() (the operator's door) and by an advertisement that
+     * arrives BELOW the threshold, and not by the link going down. A link that dies
+     * while its peer is busy has not been contradicted -- T4 is about to declare the
+     * peer dead and report that far more loudly -- so re-arming the latch here would
+     * buy one extra line per link cycle on a mesh that is already printing a dead
+     * peer, which is noise rather than information. */
+    link->load_seen = 0u;
+    link->load_seen_ok = 0;
     fed_dump(s, "link_down");
 }
 
@@ -811,6 +829,18 @@ int fed_mark_clean_leave(server_t *s, server_link_t *link, int set)
     }
     return (was != link->clean_leave) ? 1 : 0;
 }
+
+/* How many bytes this node is willing to absorb from a peer, per link, on its way
+ * out. See the drain inside fed_send_shutdown(): the bound exists so a teardown
+ * cannot be made to spin by a peer that is streaming at it.
+ *
+ * 8 KiB is chosen for what it has to cover rather than for tidiness: it is above
+ * what a receive queue holds in every realistic case, so the close that follows is a
+ * FIN in every realistic case, and it is small enough that the whole drain is a
+ * handful of recv() calls. It is NOT a limit on what a peer may have sent -- nothing
+ * here refuses data, the bytes are read and discarded either way -- it is a limit on
+ * how long this node will spend reading them. */
+#define FED_SHUTDOWN_DRAIN_MAX 8192u
 
 /* Send `SHUTDOWN [:reason]` to every ESTABLISHED link. Returns how many carried
  * it.
@@ -875,6 +905,74 @@ int fed_send_shutdown(server_t *s, const char *reason)
         if (ok == 0) {
             sent++;
             (void)conn_pump(c);
+            /* THE DRAIN, AND IT IS WHAT MAKES THE GOODBYE SURVIVE ITS OWN CLOSE.
+             *
+             * server_shutdown() closes this socket a few lines of C later, and a
+             * close() on a socket whose RECEIVE queue still holds unread data makes
+             * the kernel send RST instead of FIN. An RST discards whatever the peer
+             * has not yet read -- which here is the SHUTDOWN just pumped above, in
+             * flight, not yet delivered. The departing node then announces its
+             * departure and the peer never hears it, marks nothing clean, and arms
+             * the whole retry ladder: the exact outcome this function exists to
+             * prevent, arriving through the goodbye itself.
+             *
+             * It IS NOT HYPOTHETICAL, and it was found by this phase's own test
+             * rather than reasoned about: with the peer sending keepalives every
+             * 60 ms, a peer link closed with a PING still unread reproduced it in
+             * roughly one run in fifteen, and the symptom was a receiver reporting
+             * `conn_close: reason=read_error` and a link declared DEAD rather than
+             * cleanly departed. One in fifteen is a flaky test, and behind it is a
+             * goodbye that fails one time in fifteen in the field.
+             *
+             * WHAT IS DISCARDED, and why that is safe: whatever the peer sent in the
+             * last few milliseconds, on a link this node is about to stop having. It
+             * cannot be acted on -- there is no loop left to act in it -- and reading
+             * it into the conn's own buffer would be worse, because the conn is freed
+             * a few lines later and the bytes would go with it unframed. Draining to a
+             * scratch and forgetting them is the honest description of what happens to
+             * a peer's last words during a shutdown.
+             *
+             * IT IS BOUNDED, because this runs on the teardown path and must not be
+             * able to spin: the loop stops on EAGAIN, on EOF, on a read error, or on
+             * DRAIN_MAX bytes. A peer that is streaming at us gets its queue emptied up
+             * to that bound and the close is still a FIN rather than an RST in every
+             * realistic case, because a receive queue holds kilobytes rather than
+             * megabytes. The cost is a recv() per pending chunk on the way out, on a
+             * path that runs once per process.
+             *
+             * MSG_DONTWAIT rather than relying on the socket's flags: the drain must
+             * not be able to block a teardown even if some other code path made this
+             * descriptor blocking, and a blocking recv() in server_shutdown() would be
+             * a hang rather than a missed goodbye. */
+            {
+                char sink[512];
+                size_t drained = 0u;
+
+                for (;;) {
+                    ssize_t got = recv(c->fd, sink, sizeof sink, MSG_DONTWAIT);
+
+                    if (got > 0) {
+                        drained += (size_t)got;
+                        if (drained >= (size_t)FED_SHUTDOWN_DRAIN_MAX) {
+                            break;
+                        }
+                        continue;
+                    }
+                    if (got < 0 && errno == EINTR) {
+                        continue;
+                    }
+                    break;
+                }
+                if (drained > 0u) {
+                    /* PRINTED, because "the goodbye was discarded by the close" is
+                     * otherwise indistinguishable from "the peer was deaf", and the
+                     * two have completely different fixes. A non-zero figure here
+                     * means this node's departure nearly went unannounced. */
+                    printf("[observable] fed_shutdown_drained: self=%s peer=%s "
+                           "bytes=%zu before=RST_avoided\n",
+                           s->name, s->links[i].name, drained);
+                }
+            }
         } else {
             printf("[observable] fed_shutdown_send_failed: self=%s peer=%s reason=%s\n",
                    s->name, s->links[i].name, fed_queue_why_name(why));
@@ -1001,6 +1099,30 @@ int fed_send_advertise(server_t *s)
                s->name, sent, s->load_pct);
     }
     return sent;
+}
+
+/* The SHEDDING THRESHOLD, which is how far the propagation half goes and no
+ * further. See server_t::shed_pct for the whole argument; the short version is that
+ * REPORTING a busy peer is something this node can honestly do, and anything past
+ * that is not: 2.2's origin is immutable, a client's session belongs to the node
+ * its socket is on, and there is no verb here that could move either. So the arm
+ * prints a line and counts it, and the line says action=REPORT_ONLY so a reader is
+ * never left wondering whether something further happened.
+ *
+ * 0 IS THE SHIPPED VALUE and it means "no opinion", not "report at zero". A node
+ * that ships with a threshold would be inventing a figure it cannot justify: the
+ * percentage is the OPERATOR's number about the PEER's load (see fed_set_load), so
+ * the level at which it matters is a deployment's judgement and this codebase has
+ * no standing to make it. An operator who wants the report sets one. */
+void fed_set_shed_pct(server_t *s, unsigned pct)
+{
+    if (s == NULL) {
+        return;
+    }
+    /* Clamped for the same reason fed_set_load() clamps: the wire and the policy
+     * both have a range, and a value outside it is a configuration error that
+     * should not become a comparison this node can never satisfy. */
+    s->shed_pct = (pct > 100u) ? 100u : pct;
 }
 
 /* The operator's load figure. A KNOB and not a metric: this node measures no load,
@@ -1138,6 +1260,16 @@ void fed_link_reset(server_t *s, server_link_t *link)
      * handshake timeout on the tick after it dials, because the stamp would
      * already be older than IRC_FED_HS_TIMEOUT_MS. */
     link->created_ms = 0;
+    /* AND THE SHED LATCH IS CLEARED, and it is here because this is the operator's
+     * door and nothing else clears it. An operator who resets a link after seeing a
+     * busy peer wants to hear about it again if it happens again, and a latch that
+     * outlived the operator's reset would report a crossing once per PROCESS rather
+     * than once per event. The stored figure itself is deliberately KEPT: what that
+     * peer advertised is still true and T8 re-evaluates it against the live
+     * threshold, so a peer that is still above the line is reported again on the
+     * next tick -- which is the correct reading of "reset this link and tell me
+     * again", as opposed to forgetting what the peer said. */
+    link->shed_reported = 0;
     /* AND THE CLEAN LEAVE IS UNDONE, which is the ONLY thing that undoes it, and
      * the reason is the OPERATOR. A peer that said goodbye is not dialled again,
      * so an operator who resets the link is the only way back -- and that is the
@@ -2481,6 +2613,45 @@ void fed_tick(server_t *s, uint64_t now_ms)
              * owns, and this file's whole claim about the FSM is that it does
              * not have one. */
             break;
+        }
+
+        /* --- T8: this peer says it is shedding, so SAY SO ---------------- */
+        /* ONE COMPARISON PER ESTABLISHED LINK PER TICK, and it is gated on the
+         * operator having set a threshold at all (server.h's shed_pct), which is
+         * 0 in the shipped state. So the cost on a node with no threshold is two
+         * integer comparisons per link, on a mesh whose busiest node is nowhere near
+         * this. On a node that HAS set one it is three, and the line it may print is
+         * one per crossing rather than one per tick.
+         *
+         * IT IS OUTSIDE THE SWITCH ON PURPOSE, because the figure belongs to the
+         * PEER rather than to the link's state: a peer that is shedding is a fact
+         * this node learned over an ESTABLISHED link and it stays true through T4's
+         * transition to INIT, so gating the report on ESTABLISHED would drop the
+         * report of a peer that crossed the threshold and died in the same tick --
+         * which is precisely the moment an operator most wants to hear about it.
+         * The latch makes that harmless: the crossing is reported once, from
+         * whichever state the link happens to be in when the tick runs.
+         *
+         * `load_seen_ok` IS CHECKED AND NOT ASSUMED, because an unset figure is not
+         * a zero figure: without it a peer that has never advertised would be
+         * reported as an idle 0% peer the moment the operator set a threshold above
+         * zero, and this node would be making a claim about a peer it has never
+         * heard from. */
+        if (s->shed_pct != 0u && link->load_seen_ok != 0 &&
+            link->load_seen >= s->shed_pct && link->shed_reported == 0) {
+            link->shed_reported = 1;
+            s->n_fed_shed++;
+            /* THE LINE, and action=REPORT_ONLY is load-bearing rather than
+             * documentation: it is on the wire, so an operator grepping a mesh for
+             * "who is busy" gets an unambiguous answer about what this node did
+             * about it, and a reader cannot mistake a report for a routing change
+             * that this codebase does not make. The refusal reason is spelled out
+             * because "and then what?" is the question a reader of a mesh-load
+             * feature always asks, and the answer being "nothing, and here is why"
+             * is the honest one. */
+            printf("[observable] fed_shed: peer=%s load=%u%% threshold=%u%% "
+                   "action=REPORT_ONLY rebalance=NO reason=NO_MOVE_MECHANISM\n",
+                   link->name, link->load_seen, s->shed_pct);
         }
     }
 }

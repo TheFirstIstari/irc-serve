@@ -379,9 +379,9 @@ neither Phase 4 nor Phase 9.
 | `SyncState` | `tests/federation/test_sync_state.c` | the §4.3 resync **driven by a reconnect** — backoff, retry budget | Phase 9 | #83 |
 | `FailoverReconnect` | `tests/federation/test_failover_reconnect.c` | Peer failover / reconnect | Phase 9 | #83 |
 | `CapNegotiation` | `tests/compliance/test_cap_negotiation.c` | IRCv3 CAP negotiation (`LS`/`REQ`/`ACK`/`NAK`) | Phase 8 | #82 |
-| `PeerDiscovery` | `tests/loadbal/test_peer_discovery.c` | Load-balancer peer discovery (advertise / graceful leave) | Phase 9 | #83 |
-| `Reconnect` | `tests/loadbal/test_reconnect.c` | Client reconnect preserving session state | Phase 9 | #83 |
-| `AutoScale` | `tests/loadbal/test_autoscale.c` | Auto-scaling (spawn / shutdown / propagation) | Phase 9 | #83 |
+| `PeerDiscovery` | `tests/integration/test_peer_discovery.c` | Load-balancer peer discovery (advertise / graceful leave) | Phase 9 | #83 |
+| `Reconnect` | `tests/integration/test_reconnect.c` | Client reconnect preserving session state | Phase 9 | #83 |
+| `AutoScale` | `tests/integration/test_autoscale.c` | Auto-scale, scoped to what a node can honestly do: a node announces its own departure and peers treat it as terminal, and a peer's load figure propagates and is REPORTED at a crossing. Deliberately NOT node lifecycle — see SERVER_DESIGN.md §2.3 | Phase 9 | #83 |
 
 **This table and `tests/known_skips.txt` must agree, and CI checks that they
 do.** The list is the single authoritative copy — one line per skip, naming the
@@ -565,7 +565,7 @@ Source: `gh issue list --milestone "Federated IRC Server v1.0" --state all`
 | 6 | #80 | Phase 6: Federation link - peer sockets, SBURST resync, loop prevention | OPEN | Not started. Dial FSM and handshake FSM exist and are tested; nothing calls `server_dial`, no peer link, no `SBURST`, no dedup, no relay. |
 | 7 | #81 | Phase 7: Remaining command surface and empty skip gate | OPEN | Not started. `KNOWN_SKIPS` does not exist. |
 | 8 | #82 | Phase 8: IRCv3 - real tag escaping, CAP negotiation, SASL PLAIN | OPEN | Not started. Turns `CapNegotiation` green and replaces `ircv3_tags.c` and `sasl_framework.c`. |
-| 9 | #83 | Phase 9: Federation hardening, peer discovery, auto-scaling | OPEN | Not started. Turns `SyncState`, `FailoverReconnect`, `PeerDiscovery`, `Reconnect`, `AutoScale` green. |
+| 9 | #83 | Phase 9: Federation hardening, peer discovery, auto-scaling | DONE | Turns `SyncState`, `FailoverReconnect`, `PeerDiscovery`, `Reconnect`, `AutoScale` green. All five retired; `tests/known_skips.txt` is EMPTY and the gate is "no test may skip". Auto-scale is scoped to propagation + graceful leave, NOT node lifecycle (§2.3). |
 
 Phases 1 and 2 are done and committed. **Phase 3 is not done in any sense a
 reader can rely on** — the work exists and passes, but it lives in uncommitted

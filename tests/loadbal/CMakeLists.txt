@@ -1,34 +1,46 @@
-add_executable(test_autoscale test_autoscale.c)
-
-target_link_libraries(test_autoscale PRIVATE irc_core)
-
-add_test(NAME AutoScale COMMAND test_autoscale)
-
-set_tests_properties(AutoScale PROPERTIES LABELS LoadBal)
-set_tests_properties(AutoScale PROPERTIES SKIP_RETURN_CODE 77)
-
-# Absent features register an honest skip (return 77) rather than fabricated
-# passing assertions.
+# THIS DIRECTORY IS EMPTY OF TESTS, and that is the state rather than a leftover.
 #
-# ONE IS LEFT, and which one is the point of this file being worth reading.
-# `Reconnect` and `PeerDiscovery` were both here because the phase table put them
-# here, alongside auto-scale -- three of the five skips 7/Phase 9 owned. None of
-# the three is a property of a SINGLE node: a client whose TCP session drops and
-# comes back is observable only over a socket, by a client that really connects
-# and really disconnects; and a peer that advertises a dial hint, or says it is
-# leaving, is observable only across a mesh. A target in this directory links
-# irc_core and nothing else, so it has no way to spawn a node, no way to own one
-# end of a link, no way to drop a socket and no way to read a 366 -- which is why
-# both files were placeholders and why implementing the features in place was not
-# possible.
+# It held five of the skips 7/Phase 9 owned, and all five have now been retired. The
+# classification those five were filed under was a classification BY THE SKIP'S NAME
+# rather than by the feature, and it was wrong in the same way for all of them:
 #
-# THEY ARE NOW tests/integration/test_reconnect.c and
-# tests/integration/test_peer_discovery.c, and the CTest NAMES are unchanged
-# (`Reconnect` and `PeerDiscovery`) because tests/known_skips.txt names the tests
-# and scripts/check-skips.sh checks those names against the registered set in
-# BOTH directions. `set_tests_properties(PeerDiscovery PROPERTIES
-# SKIP_RETURN_CODE 77)` is gone rather than edited: leaving it would make CTest
-# treat a FAILURE as a skip, and each name is retired from the list in the same
-# change -- which is the ratchet's other direction, the one that catches a skip
-# that was implemented but not retired.
-set_tests_properties(AutoScale PROPERTIES SKIP_RETURN_CODE 77)
+#   Reconnect          a client whose TCP session drops and comes back gets its
+#                      channel set back. Observable only over a socket, by a client
+#                      that really connects and really disconnects.
+#   PeerDiscovery      a peer advertises a dial hint and this node records it and
+#                      NEVER dials it. Needs a mesh, and a third node for the hint
+#                      to point at.
+#   AutoScale          a node announces its departure and its peers treat it as
+#                      terminal. Observable only across real links between real
+#                      processes.
+#
+# NONE OF THEM IS A PROPERTY OF A SINGLE NODE, and a target in this directory links
+# irc_core and nothing else: it cannot spawn a node, cannot own one end of a link,
+# cannot drop a socket and cannot read a 366. That is why all three files here were
+# ten-line placeholders returning 77, and why implementing the features in place was
+# not possible.
+#
+# THEY ARE NOW tests/integration/test_reconnect.c,
+# tests/integration/test_peer_discovery.c and
+# tests/integration/test_autoscale.c, and their CTest NAMES are unchanged
+# (`Reconnect`, `PeerDiscovery`, `AutoScale`) because tests/known_skips.txt names the
+# tests and scripts/check-skips.sh checks those names against the registered set in
+# BOTH directions. Renaming a test to suit a build system is how a skip line goes
+# stale without anybody noticing; renaming the TARGET and keeping the CTest name is
+# the move that keeps the ratchet honest.
+#
+# The `set_tests_properties(... SKIP_RETURN_CODE 77)` lines are GONE rather than
+# edited, and that is deliberate: leaving one would make CTest treat a FAILURE as a
+# skip, which is the same accident in the other direction. Each name is retired from
+# tests/known_skips.txt in the same change that retires the skip, which is the
+# ratchet's other half -- the one that catches a skip that was implemented but whose
+# line nobody deleted.
+#
+# The file is KEPT rather than deleted, and `add_subdirectory(loadbal)` in
+# tests/CMakeLists.txt is kept with it. A missing directory would be a smaller diff
+# and a worse record: this paragraph is where a reader looking for "where did
+# auto-scale's test go, and why is it not here" finds the answer, and the skip
+# ratchet's history is worth more than the tidiness of an absent folder. The
+# `AutoScale` name still resolves through irc_ctest_name() in
+# tests/integration/CMakeLists.txt, which is the whole reason a moved test is allowed
+# to keep its name.

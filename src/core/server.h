@@ -331,6 +331,41 @@ typedef struct server_link {
      * it -- not a tick, not a sweep, not the link's own socket closing -- so a
      * clean leave is not undone by a later event on the same link. */
     int      clean_leave;
+
+    /* PHASE 9 ITEM 4, THE PROPAGATION HALF: the load figure this link's peer last
+     * ADVERTISED, and whether T8 has already reported it as shedding.
+     *
+     * THE FIGURE IS HERE AS WELL AS IN server_t::advs, and the duplication is
+     * deliberate and is the reason this is a FIELD rather than a lookup. The store
+     * is the OBSERVATIONAL one (the advs block below: reports, logs and a collision
+     * check, never a dial target) and this is the ROUTING one -- it is what T8
+     * compares against server_t::shed_pct. Keeping the number where the policy
+     * reads it means the tick's decision does not depend on the store having been
+     * allocated, costs no linear probe per link per tick, and cannot be perturbed by
+     * anything that touches the store. Both are written from one statement sequence
+     * when an ADVERTISE is applied, so they cannot disagree.
+     *
+     * `load_seen_ok` IS SEPARATE FROM `load_seen` rather than encoded in it, because a
+     * peer that has never advertised is a DIFFERENT FACT from a peer that advertised
+     * 0%, and the field says which one this is.
+     *
+     * IT IS NOT, HOWEVER, WHAT PREVENTS THE ARM FROM REPORTING A PEER IT HAS NEVER
+     * HEARD FROM, and the field does not claim to be. An unset figure reads as 0, and
+     * 0 cannot reach a non-zero threshold (`0 >= shed_pct` is false for every shed_pct
+     * the operator can set), so the arithmetic already prevents it. The flag states
+     * the intent where the decision is made rather than making it; see link.c's T8 for
+     * why that is a real reason to keep it and NOT a claim a test can check.
+     *
+     * `shed_reported` is the EDGE LATCH, and it exists so the tick reports a
+     * crossing rather than a state: without it a peer sitting at 95% would print a
+     * line every POLL_TICK_MS for the life of the link, which is 20 lines a second
+     * per peer on a mesh where somebody is busy -- the opposite of reporting. One
+     * line per transition up is what an operator reading the log wants, and the
+     * latch is cleared when the figure comes back down and by fed_link_reset(), so a
+     * peer that sheds twice says so twice. */
+    unsigned  load_seen;
+    int       load_seen_ok;
+    int       shed_reported;
 } server_link_t;
 
 /* The initial capacity of server_t::links, and a bound on the PEER DESCRIPTORS
@@ -829,6 +864,35 @@ struct server {
      * node does not believe. */
     unsigned  load_pct;
     uint64_t  advert_sent_ms; /* the per-node advertisement interval stamp */
+    /* At or above this percentage, a PEER's advertised load is REPORTED as
+     * shedding (link.c's T8 arm). AN OPERATOR KNOB AND NOT A POLICY, for the same
+     * reason load_pct above is one: this node measures no load -- not its own and
+     * certainly not anybody else's -- so it has no opinion about what figure is too
+     * high, and "100%" as a shipped constant would be a threshold this codebase
+     * invented and then called a finding. Zero means no opinion, which is the
+     * shipped state.
+     *
+     * WHAT THE ARM IS ALLOWED TO DO WITH IT, and the whole of the value: REPORT.
+     * It prints one line per crossing and counts it. It does not route around the
+     * busy peer, does not refuse it new channels, does not move anybody anywhere,
+     * and does not touch the dial path. Two reasons, both structural rather than
+     * cautious:
+     *
+     *   2.2 makes a channel's origin IMMUTABLE and fails closed when it dies, so
+     *       there is no "move the channel to a quieter node" operation to call --
+     *       re-homing a channel is origin re-election, which 9's risk table
+     *       records as NOT STARTED and not to be begun without re-opening 2.4.
+     *   A client's session belongs to the node its socket is connected to. This
+     *       codebase has no session-transfer verb and no client-visible redirect,
+     *       so "send the load elsewhere" has no mechanism at all: there is nothing
+     *       to send and nothing that would accept it.
+     *
+     * So the honest reaction to a busy peer is to make the fact VISIBLE to whoever
+     * can act on it -- an operator, or a supervisor above this codebase, which is
+     * where node lifecycle lives. That is the whole of propagation here, and the
+     * line says so with action=REPORT_ONLY rather than leaving a reader to guess
+     * whether something further happened. */
+    unsigned  shed_pct;
 
     /* THE ADVERTISEMENT COUNTERS. Four, and the distinctions are the point:
      *
@@ -876,6 +940,19 @@ struct server {
     uint64_t  n_fed_shutdown_relayed;
     uint64_t  n_fed_shutdown_refused;
     uint64_t  n_fed_shutdown_announced;
+    /* A PEER REPORTED AS SHEDDING, counted once per threshold CROSSING rather than
+     * once per tick -- the latch is server_link_t::shed_reported and server.h's
+     * shed_pct block gives the whole argument for why the count is of crossings.
+     * Zero on every node with no threshold set, which is the shipped state, so a
+     * non-zero value means an operator asked for this and a peer crossed the line
+     * they set.
+     *
+     * It is counted rather than inferred from the `fed_shed:` lines because a log is
+     * not a number an operator can watch, and this is the one that answers "has
+     * anything on my mesh been busy, and how often". What it does NOT count is any
+     * movement of clients or channels, because this node moves none: see
+     * shed_pct's block, where the two structural reasons are stated. */
+    uint64_t  n_fed_shed;
 
     /* ------------------------------------------------------------------------
      * Phase 8: authentication. Both counters are events, not derived guesses.
@@ -925,7 +1002,42 @@ int server_init(server_t *s, const char *name);
  * federation/burst.c, so the owner has to do it. It sits with the dedup free
  * because both are "a federation module's memory, released here", and both are
  * ASSERTED NOT VERIFIED on Darwin -- LeakSanitizer does not run on this platform,
- * so the Linux CI job is what proves either free. */
+ * so the Linux CI job is what proves either free.
+ *
+ * ---------------------------------------------------------------------------
+ * THE FIRST THING IT DOES, AND IT IS NOT A FREE: IT SAYS GOODBYE
+ * ---------------------------------------------------------------------------
+ * fed_send_shutdown() runs BEFORE the by_fd walk, because the walk is what closes
+ * the sockets a goodbye would have to travel on. This is the ONLY caller of
+ * fed_send_shutdown() in the tree (link.h says so, and this is where that claim is
+ * kept true), and it is the difference between a planned restart and a crash on
+ * every peer of the mesh:
+ *
+ *   without it  this node's peers discover the departure by TIMEOUT. T4 declares
+ *               the link dead, fed_retry_arm() spends budget, T7 dials three times
+ *               and gives up -- and the departing node's name stays in the roster
+ *               of every node until a SQUIT arrives, which it never will, because
+ *               the node that would have sent it is the one that went away.
+ *   with it     each peer gets a SHUTDOWN, marks the link CLEANLY departed
+ *               (link.c's T7 arm refuses a link with clean_leave set), purges that
+ *               origin's roster, and tells its own peers onward as a SQUIT.
+ *
+ * IT IS BEST EFFORT and the limit is real: the line is queued and drained by one
+ * conn_pump() per link, and everything after this point in the function closes the
+ * descriptors it was queued on. On a lossy path a goodbye can therefore be lost,
+ * and that degradation is CORRECT rather than a defect -- the peer that does not
+ * hear it applies its retry policy and finds the node gone. The cost of sending it
+ * is that a clean leave occasionally reads as a failure; the cost of not sending it
+ * is that EVERY clean leave reads as one.
+ *
+ * IT IS SAFE ON A server_t THAT NEVER FEDERATED, and on one whose links were never
+ * established, because the sender counts ESTABLISHED links with a live conn first
+ * and returns 0 when there are none -- so the four early server_shutdown() calls in
+ * node_main.c (fed_open() failed, a peer would not resolve, listen() failed) cost
+ * one pass over a link vector that is empty or has no ESTABLISHED entry. Those four
+ * paths are why this cannot sit behind "only if we federated": each of them is a
+ * startup failure with a partially built node, and a guard that asked a question of
+ * a half-built node would be a new way to fail during startup. */
 void server_shutdown(server_t *s);
 
 /* Bind and listen on `port` (host 0.0.0.0), nonblocking, with SO_REUSEADDR.

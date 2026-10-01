@@ -1116,6 +1116,27 @@ static void fed_in_advertise(server_t *s, server_link_t *link, const char *prefi
     slot->load_pct = (unsigned)load;
     slot->seen_ms = server_now_ms();
     s->n_fed_advertise++;
+    /* AND THE ROUTING COPY, which is the propagation half's whole payload. This is
+     * the second writer of server_link_t::load_seen and the only one -- server.h
+     * says why the figure is held in two places (the store is observational, the
+     * field is what T8's policy reads), and it is written HERE rather than in the
+     * tick so that the store and the field cannot disagree: they are two halves of
+     * one statement sequence.
+     *
+     * THE EDGE LATCH IS CLEARED HERE AND ONLY HERE, when the figure arrives BELOW
+     * the threshold, so a peer that sheds, recovers and sheds again is reported
+     * twice. It is deliberately NOT cleared when the figure merely refreshes at the
+     * same level: that is what makes the tick report a crossing rather than a
+     * state, and without it a busy peer would print one line per POLL_TICK_MS for
+     * the life of the link. The threshold of 0 means "no opinion" and the
+     * comparison below it is false for every figure, so an unset shed_pct neither
+     * reports nor latches -- a node with no threshold is not a node silently
+     * suppressing reports it would otherwise make. */
+    if (s->shed_pct == 0u || (unsigned)load < s->shed_pct) {
+        link->shed_reported = 0;
+    }
+    link->load_seen = (unsigned)load;
+    link->load_seen_ok = 1;
 
     /* THE COLLISION CHECK, and it is one of the three things this store is allowed
      * to be used for (server.h lists them). 2.3 makes two nodes with one name

@@ -37,26 +37,69 @@
 # "no test may skip".
 #
 # --- the list -----------------------------------------------------------------
-#
-# NOT EMPTY YET: Phase 9 has retired four of the five (SyncState,
-# FailoverReconnect, Reconnect and PeerDiscovery) and one remains below, owned by
-# the last item of the same phase. Reconnect's line is gone because the feature is
-# implemented and its test is a real socket-level test rather than a
-# placeholder -- tests/integration/test_reconnect.c, with the CTest name
-# unchanged. PeerDiscovery's is gone for the same reason and the same move --
-# tests/integration/test_peer_discovery.c, CTest name unchanged -- and the reason
-# its test needed a file of its own is the one worth writing down here: a peer
-# that advertises a DIAL HINT cannot be caught by a node asserting on its own
-# logs, because a guard that prints `dialed=NO` and then dials anyway passes that
-# assertion. It needed a THIRD node for the hint to point at. This comment block
-# is the place the final one goes: when the last line below is deleted this file
-# holds comments and nothing else, and that is
-# different from the file being absent -- check-skips.sh fails on a MISSING list,
-# and a test that skipped with no list would otherwise be permitted by the
-# accident of the file's own absence. Every rule above still applies then, and
-# the gate is "no test may skip", which is the phrase 6.4 always said the goal
-# was.
 
-# Phase 9 (issue #83): auto-scaling. 2.3 names it in the same sentence as peer
-# discovery.
-AutoScale  Phase 9  #83  §2.3 auto-scale (spawn / shutdown / propagation)
+# EMPTY. The list has no lines, and that is the state 6.4 always said the goal was.
+#
+# PHASE 9 RETIRED ALL FIVE of the skips this file existed to account for:
+# SyncState, FailoverReconnect, Reconnect, PeerDiscovery and AutoScale. Each was
+# retired the way the rules above ask -- the feature implemented, the `return 77`
+# and its SKIP_RETURN_CODE deleted, and the line deleted HERE IN THE SAME CHANGE --
+# and each moved to a file of its own in tests/integration/ with its CTest name
+# UNCHANGED, because this file names tests by that name and
+# scripts/check-skips.sh checks every listed name against the registered set in both
+# directions. Renaming a test to suit a build system is how a line here goes stale
+# without anybody noticing; renaming the TARGET and keeping the CTest name is the
+# move that keeps the ratchet honest.
+#
+# WHY EACH OF THE FIVE NEEDED A FILE OF ITS OWN, since that is the part of the
+# history this file is for and the reasons are not the same:
+#
+#   Reconnect          a client whose TCP session drops and comes back gets its
+#                      channel set back. Only observable over a socket, by a client
+#                      that really connects and really disconnects.
+#   PeerDiscovery      a peer advertises a DIAL HINT and this node records it and
+#                      NEVER dials it -- the SSRF claim. Not observable on the node
+#                      holding the hint, because a guard that prints `dialed=NO` and
+#                      then dials anyway passes an assertion on its own log. It
+#                      needed a THIRD node for the hint to point at.
+#   AutoScale          a node announces its OWN departure and its peers treat it as
+#                      terminal rather than as a failure. Needs a mesh, and the
+#                      origination cannot be tested by writing the line by hand:
+#                      fed_send_shutdown() now has exactly one caller
+#                      (server_shutdown()), and a departure produced by a test rather
+#                      than by a node proves nothing about whether a node produces
+#                      one.
+#   FailoverReconnect  the retry POLICY's shape: backoff, a cap, a budget that is
+#                      spent and reported.
+#   SyncState          that the 4.3 resync is DRIVEN by a reconnect, and that what
+#                      it drives REPLACES rather than merges.
+#
+# ALL THREE FILES WERE CLASSIFIED HERE BY THE SKIP'S NAME RATHER THAN BY THE
+# FEATURE, and it was wrong in the same way for all of them: none is a property of a
+# single node, and a target in tests/loadbal/ links irc_core and nothing else -- it
+# cannot spawn a node, cannot own one end of a link, cannot drop a socket and cannot
+# read a 366. That is why all three were ten-line placeholders, and why implementing
+# the features in place was not possible. tests/loadbal/CMakeLists.txt is now a
+# directory of no tests and says so.
+#
+# ---------------------------------------------------------------------------
+# WHAT THE GATE IS FROM HERE ON, AND WHY THE FILE STAYS
+# ---------------------------------------------------------------------------
+# The gate is "no test may skip", which is the phrase 6.4 always said the goal was.
+# The rules at the top of this file are all still in force and all still enforced --
+# a test that skips without a line here is red -- and with no lines, every test that
+# skips is red. So the FIRST direction of the gate became total rather than
+# conditional, and the other two have nothing to check and pass vacuously.
+#
+# THE FILE IS KEPT AND NOT DELETED, and this is the one thing that changed shape when
+# the list emptied: check-skips.sh fails on a MISSING list, deliberately, because a
+# test that skipped with no list would otherwise be permitted by the accident of the
+# file's own absence. The gate's own header says so. So an empty file is the
+# finished state and an absent one is a broken gate, and the difference between them
+# is not visible from the gate's behaviour alone -- which is why this paragraph
+# exists rather than being left to whoever runs `git log`.
+#
+# ADDING A LINE BACK IS ALLOWED and needs no change to the script: a developer who
+# genuinely cannot implement something writes the line and the skip is red until
+# they do. That is still the whole point of the file, and it is why the header's
+# "CLOSING A SKIP" paragraph remains the instruction rather than a historical note.
