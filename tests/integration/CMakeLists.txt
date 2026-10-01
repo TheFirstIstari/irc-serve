@@ -392,3 +392,22 @@ irc_add_integration_test(test_nick_duplicate test_nick_duplicate.c)
 # The CTest NAME is unchanged (Reconnect) -- see irc_ctest_name() for why, and
 # tests/loadbal/CMakeLists.txt for what is left of the three.
 irc_add_integration_test(test_reconnect test_reconnect.c)
+
+# 7/Phase 9: 2.3's peer discovery -- ADVERTISE (a load figure, and a dial hint
+# this node records and NEVER dials) and SHUTDOWN (a goodbye that must not spend
+# a retry budget). Its own file because the SSRF claim is not observable on the
+# node that holds the hint: the placeholder this file replaced could only have
+# asserted that the node said `dialed=NO`, and a guard that prints its own
+# verdict and then dials anyway passes that. So it needs a THIRD node for the
+# hint to point at -- the same shape test_nick_duplicate.c documents, and the same
+# trap.
+#
+# IT MOVED HERE FROM tests/loadbal/, where the phase table put it because it was
+# one of five skips 7/Phase 9 owned. That was a classification by the skip's name
+# rather than by the feature: peer discovery and auto-scale are about a mesh over
+# real sockets, and a target in that directory links irc_core and nothing else --
+# it cannot spawn a node, cannot own one end of a link and cannot read a dial it
+# did not make. The CTest NAME is unchanged (PeerDiscovery) -- see
+# irc_ctest_name() above for why, and tests/loadbal/CMakeLists.txt for what is
+# left of the five.
+irc_add_integration_test(test_peer_discovery test_peer_discovery.c)
