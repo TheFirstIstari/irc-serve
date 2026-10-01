@@ -106,6 +106,18 @@ struct sasl_store;
  * server_t has to understand. */
 struct chan_topic;
 
+/* Phase 9's remote-nick registry: 2.1's "which server holds the user called X",
+ * the table that makes 3.1's `nick@server` row RESOLVABLE rather than merely
+ * routable. The layout and its least-recently-used ordering are
+ * federation/nickreg.c's, for the same reason the dedup entry's are
+ * federation/dedup.h's and the topic cache's are core/channel.c's: the GEOMETRY
+ * of a table is one module's business rather than a fourth thing every reader of
+ * this struct has to understand. The three counters below are NOT here for that
+ * reason -- they are properties of the NODE, which is what this struct is, and a
+ * counter in the module would be a counter a second node in the same process
+ * could not have. */
+struct fed_rnick;
+
 /* The version string this build reports in 002, 004 and PONG.
  *
  * It lives here, and not in the node's own banner, so that there is exactly
@@ -496,6 +508,45 @@ struct server {
      * streak of failures. A peer that flaps contributes many of the first and
      * none of the second. */
     uint64_t  n_fed_retry_exhausted; /* links whose retry budget ran out */
+
+    /* Phase 9: the remote-nick registry's one event, and a real loss.
+     *
+     * A count of remote users this node was told about and then had no room for.
+     * It is a finding rather than a statistic: a node whose counter climbs is a
+     * node being told about more remote users than IRC_FED_MAX_REMOTE_NICKS can
+     * hold, and every eviction is a `nick@server` that resolves to nothing until
+     * the next resync. The eviction is never a refusal -- the entry that went is
+     * the LEAST RECENTLY LEARNED, and the next resync from that peer will supply
+     * it again -- so the cost of a high count is latency on routing, not lost
+     * state.
+     *
+     * It is not n_fed_malformed and not n_fed_squit_self, for the same reason
+     * those are separate: a malformed line is a peer that does not implement
+     * 4.3, and this is a peer that implements it perfectly about a mesh larger
+     * than this node's cache. */
+    uint64_t  n_rnick_evicted;
+
+    /* The registry itself: a vector of entries, ordered least-recently-LEARNED
+     * first (so index 0 is the eviction candidate), LAZILY allocated so a node
+     * with no peers pays nothing, and released by fed_nickreg_close() from
+     * server_shutdown().
+     *
+     * `nrnicks` is the ALLOCATED length and `nrnick_used` is how much of it holds
+     * an entry, which is a distinction worth making explicit: the eviction policy
+     * is a bound on USED entries, not on the allocation, and a node that has
+     * learned one nick and then forgotten it still holds the whole 86 KiB. That
+     * is deliberate -- freeing and reallocating a table on a quiet mesh would put
+     * an allocator call on the path a burst takes, and 86 KiB of untouched heap is
+     * cheaper than that.
+     *
+     * `nrnick_swept_ms` is the sweep throttle and 0 means "never swept", which is
+     * also the state of a node that has just learned its first nick, so the first
+     * sweep is immediate rather than being delayed by an interval measured from
+     * zero. */
+    struct fed_rnick *rnicks;
+    size_t    nrnicks;   /* allocated entries */
+    size_t    nrnick_used; /* entries in use */
+    uint64_t  nrnick_swept_ms;
 
     /* ------------------------------------------------------------------------
      * Phase 6 C3: the INBOUND guard chain, one counter per guard that can drop

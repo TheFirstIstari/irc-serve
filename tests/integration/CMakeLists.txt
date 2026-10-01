@@ -367,3 +367,11 @@ irc_add_integration_test(test_failover_reconnect test_failover_reconnect.c)
 # cannot have seen. The retry scale is shortened per process; the policy's shape
 # is test_failover_reconnect's claim, not this one's.
 irc_add_integration_test(test_sync_state test_sync_state.c)
+
+# 2.1: the remote-nick registry, the scoped `nick@server` being ROUTED rather
+# than recognised, and rename-the-loser. Its own file because it is the only
+# feature whose claim is visible in FOUR places at once -- the renamed client's
+# own NICK line, the other members of its channels, the peer's rekeyed roster,
+# and the winner's non-rename -- and a test that checked one of them would pass
+# against a mesh that had resolved the duplicate in only one.
+irc_add_integration_test(test_nick_duplicate test_nick_duplicate.c)

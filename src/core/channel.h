@@ -691,10 +691,34 @@ size_t chan_remote_purge(chan_t *ch, const char *server);
 int chan_remote_set_host(chan_t *ch, const char *server, const char *nick,
                          const char *host);
 
+/* Rekey the (server, old) member to (server, new). Returns 1 when a member was
+ * renamed, 0 when there was none, -1 when `new` is not a legal nickname, is
+ * already held by another entry, or would overflow the field.
+ *
+ * IT EXISTS FOR 2.1's RENAME-THE-LOSER, and the reason a rename is not two
+ * calls (remove then add) is that it is not atomic: an entry removed and not yet
+ * added is a member this node has decided does not exist, and anything walking
+ * the roster in between -- which is a single-threaded node, so "in between" means
+ * the rest of the function, but a nested call would be a window -- would see it
+ * gone. Rekeying also keeps the entry's FLAGS, which a remove-then-add loses, and
+ * a renamed op who came back unflagged is a demotion this node would otherwise
+ * have caused by resolving a duplicate nick.
+ *
+ * `new` is refused when it collides, rather than overwriting: two entries for one
+ * member server under one nickname is the same ambiguity the policy is resolving,
+ * and a rename that created it would reintroduce the problem it was called to fix.
+ *
+ * AND IT DOES NOT TOUCH servers[], because the member server is unchanged by a
+ * rename and the set is a refcount per SERVER. A caller that thought otherwise
+ * would decrement a set it did not increment. */
+int chan_remote_rename(chan_t *ch, const char *server, const char *old_nick,
+                       const char *new_nick);
+
 /* The entry for this (server, nick), or NULL. Nicknames fold (2.1) and server
- * names fold (2.4). The SERVER is part of the key because 8/Phase 9's
- * rename-the-loser is unresolved and two nodes may currently hold the same
- * nickname, so a nickname alone is not an identity here. */
+ * names fold (2.4). The SERVER is part of the key because 2.1's rename-the-loser
+ * policy means two nodes may legitimately hold the same nickname -- exactly one of
+ * them keeps it, and the other renames -- so a nickname alone is not an identity
+ * here either. */
 chan_remote_t *chan_remote_find(const chan_t *ch, const char *server,
                                 const char *nick);
 

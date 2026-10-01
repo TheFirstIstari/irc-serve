@@ -10,6 +10,10 @@
 #include "federation/burst.h"
 #include "federation/dedup.h"
 #include "federation/link.h"
+/* Phase 9: 2.1's remote-nick registry. SNICK rekeys it, which is what makes a
+ * rename network-visible -- see fed_in_snick() for the three places it has to
+ * land and why all three are needed. */
+#include "federation/nickreg.h"
 
 /* The map, once, in the order 4.3 lists the client verbs rather than in the
  * order of the S-verbs, so that a reader comparing this against the design does
@@ -29,7 +33,21 @@ static const struct {
     { "TOPIC",   "STOPIC"   },
     /* SMODES, not 4.3's SSMODE and not the obvious SMODE. See verbs.h. */
     { "MODE",    "SMODES"   },
-    { "KICK",    "SKICK"    }
+    { "KICK",    "SKICK"    },
+    /* SNICK, which 4.3's list does not name and Phase 9 adds. 2.1's
+     * rename-the-loser policy cannot be network-visible without it: a rename this
+     * node performs on its own client is invisible to every peer, and a peer that
+     * does not learn it keeps resolving the old name to this server. The two
+     * problems are the same problem -- 2.1 says the loser must be told "on the
+     * wire, not silently renamed locally" -- and the wire is what SNICK is.
+     *
+     * IT IS A SIXTEENTH VERB AND NOT A CHANGE TO AN EXISTING ONE, which is the
+     * compatibility argument: 4.3.1's frozen format is the BURST family, and a
+     * rename is not a burst record, so nothing about SBURST is touched. A peer
+     * that predates this counts it in n_fed_unknown_verb and applies no rename --
+     * which is a stale nickname rather than a corrupted roster, and is the
+     * failure this one-liner is worth. */
+    { "NICK",    "SNICK"    }
 };
 
 const char *fed_sverb_for(const char *client_verb)
@@ -676,6 +694,24 @@ static void fed_in_sjoin(server_t *s, server_link_t *link, chan_t *ch,
                ch->name, (nparams > 1) ? params[1] : "?", link->name);
         return;
     }
+    /* 2.1's REGISTRY, on the LIVE path and not only on the burst path, and the
+     * reason is that a burst is per link ESTABLISHMENT: a member who joined this
+     * node's mesh ten minutes after the last one would be unknown to a registry
+     * fed only by SBURST, and 2.1's scoped `nick@server` would 401 a user who is
+     * right there. SJOIN is the only verb that reports a user joining, so it is
+     * the only place a live registry entry can come from. The holder is the LINK
+     * for the same reason the roster's is -- 4.3's SJOIN carries no server field
+     * -- and the two disagree only for a relaying peer's own best guess, which
+     * the next burst corrects. */
+    fed_nickreg_learn_member(s, params[1], link->name, link->name, server_now_ms());
+    /* 2.1's POLICY, ON THE LEARNING SIDE, and the reason it is a second call site
+     * rather than a detail of the learn above: a user can register `zed` on a node
+     * whose registry is empty and only later learn that a peer holds it, and a
+     * node that checked only at claim time would leave that user holding the name
+     * for ever. The far side of the same pair runs the same function against the
+     * same two names, so between the two of them exactly one renames -- which is
+     * the convergence fed_nickreg_local_loses() exists to make possible. */
+    (void)fed_nickreg_resolve_local(s, params[1], server_now_ms());
     fed_touch_server(ch, link->name, 1);
     printf("[observable] fed_sjoin: channel=%s member=%s server=%s flags=%u "
            "local=%zu remote=%zu origin=%s owned=%d\n",
@@ -683,6 +719,95 @@ static void fed_in_sjoin(server_t *s, server_link_t *link, chan_t *ch,
            ch->origin, chan_origin_is_self(s, ch));
     (void)fanout_forward_channel_sverb(s, ch, FANOUT_STATE_CHANGE, "SJOIN", prefix,
                                        params, nparams, tags);
+}
+
+/* SNICK: <old nick> <new nick>.
+ *
+ * IT NAMES NO CHANNEL, which is why it is NOT IN INBOUND: every row of that
+ * table is dispatched with its channel read from a fixed parameter position, and
+ * a two-parameter verb whose second parameter is a nickname has no position that
+ * is a channel. See the dispatch in fed_handle_message() for how SQUIT solves the
+ * same problem, and for why SNICK is asked in the same place rather than given a
+ * position that lies.
+ *
+ * THE EFFECT IS IN THREE PLACES, and all three are needed or a rename is only
+ * half-applied:
+ *   - 2.1's registry: the entry that answered `<old>`@<this peer> must answer
+ *     `<new>` instead, or every subsequent `old@peer` on this node still routes
+ *     here and every `new@peer` is a 401.
+ *   - the CHANNEL ROSTERS: the member is keyed (server, nick), so a rekeyed
+ *     member whose roster row still says the old name is a member the roster
+ *     cannot render and SPART cannot later remove.
+ *   - the LOCAL CLIENTS: an SJOIN/SPART fanout is what teaches a client's view
+ *     of the roster, and a rename that skips it leaves a client showing a name
+ *     the server no longer holds.
+ *
+ * AND IT IS NOT A STATE-DESTROYING VERB, which is the reason it is not routed
+ * through the same refusal chain a SQUIT is: nothing here ends, and a peer that
+ * sends it for a name this node never held is a peer with a stale view rather
+ * than one trying to remove a channel's member. It is still a 401-free silent
+ * accept, because "I do not have that nick" is not an error worth breaking a
+ * link over -- the next SBURST is the authority, and this node will correct
+ * itself then.
+ */
+static void fed_in_snick(server_t *s, server_link_t *link, const char *prefix,
+                         const irc_serve_tags_t *tags, const char *const *params,
+                         int nparams)
+{
+    int renamed = 0;
+
+    if (nparams != 2) {
+        return;
+    }
+    /* THE PREFIX IS IGNORED, and that is load-bearing rather than lazy. SNICK is
+     * forwarded to every established peer EXCEPT the one it came from, so on a
+     * three-node mesh a rename the middle node performed is seen by the third
+     * node as a rename the MIDDLE node performed. Attributing it to the prefix
+     * instead would move the member to a different server's roster, which is the
+     * misattribution 4.3.1 added `<server>` to SBURSTM to prevent. The member's
+     * server is the LINK, because a rename does not move anybody between servers
+     * -- it changes what this one calls them. */
+    (void)prefix;
+
+    fed_nickreg_rename(s, link->name, params[0], params[1], server_now_ms());
+    printf("[observable] fed_nickreg_rename: server=%s from=%s to=%s\n", link->name,
+           params[0], params[1]);
+
+    /* THE ROSTERS, one channel at a time. There is no index from nickname to
+     * channel, and there must not be: a member's name is not a global key, so a
+     * node-wide map would be a second registry whose only use is this walk and
+     * whose staleness would then be a second thing to reconcile. The walk is
+     * O(channels) and this node has a bounded number of them. */
+    for (size_t ci = 0, nch = server_chan_count(s); ci < nch; ci++) {
+        chan_t *ch = server_chan_at(s, ci);
+
+        if (ch == NULL || ch->nremotes == 0) {
+            continue;
+        }
+        if (chan_remote_rename(ch, link->name, params[0], params[1]) == 1) {
+            renamed++;
+            fed_touch_server(ch, link->name, 0);
+            /* THE CHANNEL'S OWN CLIENTS, and the prefix is the LINK because the
+             * line as it arrives names the link; fanout_forward_channel_sverb()
+             * renders the prefix itself and this is the shape every other
+             * state-change verb uses. A member's rename inside a channel is
+             * something a client watching the channel must be told, and the
+             * fanout is the only path to a client that exists. */
+            (void)fanout_forward_channel_sverb(s, ch, FANOUT_STATE_CHANGE, "SNICK",
+                                               link->name, params, nparams, tags);
+        }
+    }
+    if (renamed == 0) {
+        /* NO ROSTER HELD IT, which is the ordinary case for a user who is
+         * connected but not in any channel this node knows about -- the common
+         * case on a relay. The registry is still updated above, and a rename
+         * that reaches nobody is not a failure: there was nothing to tell. */
+        printf("[observable] fed_snick: server=%s from=%s to=%s rosters=0\n",
+               link->name, params[0], params[1]);
+    } else {
+        printf("[observable] fed_snick: server=%s from=%s to=%s rosters=%d\n",
+               link->name, params[0], params[1], renamed);
+    }
 }
 
 /* SPART: <member> <channel> [<reason>]. */
@@ -903,6 +1028,15 @@ static void fed_in_squit(server_t *s, server_link_t *link,
             continue;
         }
         purged += chan_remote_purge(ch, gone);
+        /* 2.1's REGISTRY PURGE, and it is here for the reason the roster purge is
+         * here and not in chan_remote_purge(): a SQUIT is positive evidence that
+         * every user of that server is gone, and a registry entry left behind
+         * would be one more claim about a server that announced its own
+         * departure. It is a separate call rather than a side effect of the
+         * roster purge because the two tables are keyed by different things --
+         * (server, nick) versus (nick, server) -- and only the caller knows
+         * which one a given line is about. */
+        fed_nickreg_purge_server(s, gone);
         if (chan_server_remove(ch, gone) > 0) {
             chans++;
         }
@@ -949,6 +1083,32 @@ static void fed_in_squit(server_t *s, server_link_t *link,
         }
         (void)fanout_forward_sverb(s, lk->name, "SQUIT", NULL, params, nparams, tags);
     }
+}
+
+/* fed_forward_all() -- verbs.h states why this exists and what the two shapes of
+ * 4.3's verb set are. The body is SQUIT's broadcast loop with SQUIT's two
+ * exclusions left at ITS call site, which is what keeps the general function free
+ * of a verb it has no business naming. */
+int fed_forward_all(server_t *s, const char *sverb, const char *prefix,
+                    const char *const *params, int nparams)
+{
+    int carried = 0;
+
+    for (size_t k = 0; k < server_link_count(s); k++) {
+        server_link_t *lk = server_link_at(s, k);
+
+        if (lk == NULL || lk->state != (int)ESTABLISHED) {
+            continue;
+        }
+        /* == 0 IS SUCCESS, which is the shape fanout_forward_sverb() returns and
+         * the shape every call site in this file tests. Inverting it here would
+         * make the count mean the opposite of the one a reader expects. */
+        if (fanout_forward_sverb(s, lk->name, sverb, prefix, params, nparams, NULL) ==
+            0) {
+            carried++;
+        }
+    }
+    return carried;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1352,6 +1512,20 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
             sp[i] = m->params[i];
         }
         fed_in_squit(s, link, &tags, sp, m->nparams);
+        return;
+    }
+
+    /* SNICK, in SQUIT's place in the chain, for SQUIT's reason: it names no
+     * channel, so INBOUND's position-indexed read cannot reach it. It is asked
+     * AFTER the SQUIT arm and BEFORE the table, so a SQUIT's own-origin
+     * refusal and the burst family's ownership checks are all unaffected -- a
+     * rename arriving on a link this node does not hold a member for is
+     * unremarkable, and the two verbs must not be able to shadow each other. */
+    if (strcmp(m->command, "SNICK") == 0) {
+        for (int i = 0; i < m->nparams && i < IRC_MAX_PARAMS; i++) {
+            sp[i] = m->params[i];
+        }
+        fed_in_snick(s, link, m->prefix, &tags, sp, m->nparams);
         return;
     }
 

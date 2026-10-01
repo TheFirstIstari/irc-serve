@@ -686,6 +686,52 @@ int chan_remote_remove(chan_t *ch, const char *server, const char *nick)
     return 0;
 }
 
+int chan_remote_rename(chan_t *ch, const char *server, const char *old_nick,
+                       const char *new_nick)
+{
+    if (ch == NULL || server == NULL || old_nick == NULL || new_nick == NULL) {
+        return 0;
+    }
+    /* THE LEGALITY OF `new_nick` IS CHANNELS.C'S BUSINESS, not this function's,
+     * and it is checked against the same rule SJOIN's entry path uses. A rename
+     * that put an unusable name in a roster would make the member unrendereable
+     * and -- because the roster is keyed on the name -- unremovable, so SPART
+     * could never clean it up and a channel would keep a member for ever. That is
+     * the failure this check exists to prevent, and it is why the refusal is here
+     * rather than left to the registry. */
+    if (!valid_nick(new_nick)) {
+        return -1;
+    }
+    /* A RENAME TO A NAME THE SAME HOLDER ALREADY USES is refused, and the scan
+     * runs BEFORE the find so a rename from `bob` to `bob_` on a roster holding
+     * both cannot overwrite the other member. Chan_remote_t has no uniqueness
+     * invariant the rest of this module maintains, so this check is what keeps
+     * "one row per (server, nick)" true. */
+    for (size_t i = 0; i < ch->nremotes; i++) {
+        if (same_name(ch->remotes[i].server, server) &&
+            same_name(ch->remotes[i].nick, new_nick)) {
+            return -1;
+        }
+    }
+    for (size_t i = 0; i < ch->nremotes; i++) {
+        if (!same_name(ch->remotes[i].server, server) ||
+            !same_name(ch->remotes[i].nick, old_nick)) {
+            continue;
+        }
+        /* IN PLACE, and the reason is the row's other fields. A remove-then-add
+         * would have to pass `flags` and `host` through two calls, and either
+         * omitting them or letting the caller re-supply them is how a rename would
+         * silently demote a channel operator. The copy goes through the same
+         * bounded helper chan_remote_add() uses, so a name that would have been
+         * refused at join time is refused here too -- and it cannot be, because
+         * valid_nick() bounds it above, which is why the return value is dropped
+         * rather than propagated. */
+        (void)snprintf(ch->remotes[i].nick, sizeof ch->remotes[i].nick, "%s", new_nick);
+        return 1;
+    }
+    return 0;
+}
+
 size_t chan_remote_count(const chan_t *ch)
 {
     return (ch != NULL) ? ch->nremotes : 0u;

@@ -21,6 +21,9 @@
 #include "core/connection.h"
 #include "core/message.h"
 #include "core/poll_loop.h"
+/* Phase 9: the stats line reports 2.1's remote-nick registry size, and the
+ * harness is where the inline children' stats are printed. */
+#include "federation/nickreg.h"
 
 /* The child used by nf_spawn_inline() and nf_spawn_inline_named(). Its name
  * must satisfy the 2.4 tag grammar, exactly as the shipped node's does.
@@ -636,6 +639,7 @@ static void nf_child_print_stats(const server_t *s)
            "fed_own_origin=%llu fed_untagged_relay=%llu "
            "fed_unknown_verb=%llu fed_verb_deferred=%llu fed_malformed=%llu "
            "fed_dup_drop=%llu fed_dedup_dup=%llu fed_squit_self=%llu "
+           "nickreg_known=%zu nickreg_evicted=%llu "
            "burst_refused=%llu burst_abandoned=%llu burst_truncated=%llu "
            "topic_cache_full=%llu\n",
            (unsigned long long)s->n_accepted, (unsigned long long)s->n_closed,
@@ -665,6 +669,8 @@ static void nf_child_print_stats(const server_t *s)
            (unsigned long long)s->n_fed_dup_drop,
            (unsigned long long)s->n_fed_dedup_dup,
            (unsigned long long)s->n_fed_squit_self,
+            (size_t)fed_nickreg_count(s),
+            (unsigned long long)s->n_rnick_evicted,
            (unsigned long long)s->n_burst_refused,
            (unsigned long long)s->n_burst_abandoned,
            (unsigned long long)s->n_burst_truncated,

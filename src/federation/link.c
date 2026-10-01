@@ -25,6 +25,9 @@
 #include "core/connection.h"
 #include "federation/burst.h"
 #include "federation/dedup.h"
+/* Phase 9: 2.1's remote-nick registry, swept from fed_tick() because a store
+ * whose owner never ticks it never expires anything. */
+#include "federation/nickreg.h"
 #include "federation/verbs.h"
 
 /* The number of members of fed_federate_result_t, and so the width of the
@@ -1842,6 +1845,27 @@ void fed_tick(server_t *s, uint64_t now_ms)
      * fed_dedup_seen()'s). */
     if (s->dedup_used > (uint64_t)(IRC_DEDUP_MAX / 2u)) {
         (void)fed_dedup_sweep(s, now_ms);
+    }
+
+    /* --- the 2.1 nick registry sweep ------------------------------------ */
+    /* HERE AND NOT BESIDE THE DEDUP SWEEP'S OCCUPANCY TEST, and the reason is
+     * what each gate measures. The dedup sweep is gated on OCCUPANCY because a
+     * dedup store that is half empty cannot be expiring anything: the time is
+     * inside it. The nick registry is gated on the TABLE existing at all, and
+     * the time is inside it too (fed_nickreg_sweep() owns the throttle, the same
+     * way fed_dedup_sweep() does). So the test here is the cheap one -- "has this
+     * node ever learned a remote nick" -- and a node with no peers and a node
+     * whose mesh has no remote users both pay one pointer comparison per tick.
+     *
+     * IT IS BEFORE THE ZERO-LINK RETURN and that placement is deliberate: the
+     * return below is justified by "a node with no peers has no federation work",
+     * and an entry learned from a peer that has since gone would never be swept
+     * if the sweep lived after it. A SQUIT purges, so a departed peer's entries
+     * are gone by the time the count reaches zero -- but a node that LOST a link
+     * without a SQUIT (T4's path) keeps the count, and its table would grow stale
+     * entries forever on a mesh that never comes back. */
+    if (s->rnicks != NULL) {
+        (void)fed_nickreg_sweep(s, now_ms);
     }
 
     /* A node with no peers pays three integer comparisons and returns: this

@@ -263,6 +263,30 @@ int fanout_is_member(const fanout_target_t *t, const conn_t *c);
  *
  * Never blocks and never closes: the write path marks CLOSING and the reaper
  * closes, as 3.4 requires. */
+/* As fanout_deliver(), with NO FORWARD. Writes the target's LOCAL destinations
+ * and stops: a peer never sees this line.
+ *
+ * IT EXISTS FOR 2.1's RENAME-THE-LOSER, and the reason is a count rather than a
+ * feature. A rename is ONE fact about ONE user, and the mesh needs it once: the
+ * SNICK that fed_nickreg_resolve_local() puts on every established link. A rename
+ * fanned out per shared channel would send a peer one SNICK-equivalent per channel
+ * the user is in, and a peer that applied each would report N renames for one user
+ * -- and one that deduped them would be relying on 2.4's identity to collapse N
+ * distinct lines that are, by construction, not the same line. The local members,
+ * on the other hand, are a SET TO ADDRESS and every one of them needs the line.
+ *
+ * So the two halves of a rename go by two paths on purpose: one call per channel
+ * for the clients, and exactly one node-wide call for the mesh. A function that
+ * did both would make the count of mesh emissions a function of how many channels
+ * a user happens to be in.
+ *
+ * `carry` IS NOT A PARAMETER, and the reason is that a local-only emission
+ * ORIGINATES: every current caller produces the fact here and now, and a relay
+ * that needed to re-broadcast it has federation/verbs.c's forwarding instead. */
+int fanout_deliver_local(server_t *s, const fanout_target_t *t, const char *prefix,
+                         const char *verb, const char *const *params, int nparams,
+                         conn_t *exclude);
+
 int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
                    const char *verb, const char *const *params, int nparams,
                    conn_t *exclude, const irc_serve_tags_t *carry);
