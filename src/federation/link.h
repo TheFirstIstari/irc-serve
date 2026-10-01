@@ -87,25 +87,159 @@
  * into a 50 ms tick would claim to have arrived at the tick boundary.
  *
  * ---------------------------------------------------------------------------
- * C2 DOES NOT AUTO-REDIAL, AND THE LATCH IS THE WHOLE OF THAT
+ * THE RECONNECT POLICY, WHICH PHASE 9 ADDED AND WHERE EACH PIECE LIVES
  * ---------------------------------------------------------------------------
  * A link that fails -- a dial that times out (T1), a handshake that never
- * answers (T2), a peer that goes silent (T4) -- returns to INIT, and T7 would
- * then dial it again on the very next tick. That is the auto-redial Phase 9
- * owns, and doing it here would be a hot loop against a black-holed peer.
+ * answers (T2), a peer that goes silent (T4) -- returns to INIT with no
+ * descriptor, and T7 would then dial it again on the very next tick. That is a
+ * hot loop against a black-holed peer, so the tick does not do it: the link
+ * carries a SCHEDULE and the tick only acts on it when the schedule says a
+ * dial is due. Three numbers, all in the tick's own arithmetic:
  *
- * The latch is server_link_t::created_ms, which T7 sets to the current stamp
- * when it dials and NEVER clears. fed_link_reset() below is the one-line
- * escape: it clears the latch, and the next tick dials again. Phase 9 replaces
- * that with a backoff schedule and a retry budget; the seam exists so that is
- * a change to one function rather than to the tick.
+ *   server_link_t::retry_at_ms   the earliest stamp at which T7 may dial. 0
+ *                                means "due now", which is the state a
+ *                                freshly CONFIGURED link is in -- so the first
+ *                                dial is immediate and only a FAILED one waits.
+ *   server_link_t::retries       consecutive failed attempts, reset to 0 by
+ *                                fed_link_established() because a link that
+ *                                came up is not in the same state as one that
+ *                                never did.
+ *   server_link_t::gave_up       the budget is spent; T7 refuses until an
+ *                                operator resets the link. A non-zero value
+ *                                here is a REPORT, not a metric: this node has
+ *                                decided it will not keep knocking.
  *
- * NOTE that created_ms is stamped when the dial STARTS rather than when the
- * connection completes. Stamping at completion leaves a window in which a dial
- * that failed is still a zeroed latch, and T7 re-dials it on the next tick --
- * which is the auto-redial this phase must not have. The stamp is also set on
- * completion, so the sequence 3.4's file map describes ("on TCP connect,
- * handshake_init(), set created_ms, handshake_send()") still reads true.
+ * THE BUDGET IS WHAT MAKES THE BACKOFF FINITE, and it is the whole of why a
+ * retry forever is a defect rather than a virtue: a node retrying a dead peer
+ * for ever spends a descriptor, a timer wake-up and an outbound connect on
+ * every tick interval for the life of the process, and reports nothing. The
+ * exhaustion is loud -- `[observable] link_retry_exhausted:` -- because the
+ * operator's next question is "why has irc.b been unreachable all morning",
+ * and a silent stop does not answer it.
+ *
+ * WHY THE RESET IS PER-LINK AND NOT GLOBAL: a mesh has more than one peer, and
+ * a policy that gave up on every link because one of them is dead would turn a
+ * single unreachable node into an outage for the rest. `gave_up` is a property
+ * of the link that earned it.
+ *
+ * ---------------------------------------------------------------------------
+ * THE INTERVALS, AND WHICH OF THEM ARE DERIVED
+ * ---------------------------------------------------------------------------
+ * Every one of the four link timers above (IRC_FED_DIAL_TIMEOUT_MS,
+ * IRC_FED_HS_TIMEOUT_MS, IRC_FED_KEEPALIVE_MS and the derived IRC_FED_DEAD_MS)
+ * has a documented derivation or an admitted convention. The three this phase
+ * adds are the same three kinds, and the derivations are:
+ *
+ *   IRC_FED_RETRY_BASE_MS  DERIVED as a multiple of IRC_FED_DEAD_MS. A link
+ *                          that has just been declared dead has been silent
+ *                          for a whole dead window, so re-dialling it
+ *                          IMMEDIATELY would be dialling a peer that has not
+ *                          yet had time to have finished dying. One further
+ *                          dead window is the smallest delay that is not
+ *                          smaller than the evidence that produced the retry.
+ *   IRC_FED_RETRY_MAX_MS   DERIVED as a multiple of the base, and the multiple
+ *                          is IRC_FED_RETRY_MAX_STEPS: the cap IS the top of
+ *                          the ladder, written as the ladder's own length
+ *                          rather than as a number, so raising the step count
+ *                          moves the ceiling with it.
+ *   IRC_FED_RETRY_BUDGET   NO DERIVATION, and it is a policy number: it is how
+ *                          many times this node will knock on one door before
+ *                          it stops. Three is the smallest that survives a
+ *                          single missed packet, and it is stated here as a
+ *                          convention for the same reason the 3 in
+ *                          IRC_FED_DEAD_MS is: there is nothing in this
+ *                          codebase to derive it from, and an invented
+ *                          argument for a specific figure would be worse than
+ *                          an admitted one.
+ *
+ * ---------------------------------------------------------------------------
+ * THE TICK'S THREE ARMS, AND WHY THE POLICY IS NOT IN A SEPARATE SUBSYSTEM
+ * ---------------------------------------------------------------------------
+ * The policy is two static functions and three comparisons inside fed_tick()'s
+ * existing per-link walk, not a new module. The reason is the cost: a policy
+ * that needed its own table would need its own walk over the same links, and
+ * the walk is the only per-tick cost a linked node has. Two integer comparisons
+ * against fields the link already has is free; a second loop is not. What this
+ * DOES cost is that the policy is not separately testable, and the answer to
+ * that is that the tests drive a real link through real failures and read the
+ * node's own account of its schedule (test_failover_reconnect), which is the
+ * only kind of assertion this project accepts anyway.
+ *
+ * ---------------------------------------------------------------------------
+ * WHICH FAILURES ARM THE SCHEDULE, AND WHICH ONE DOES NOT
+ * ---------------------------------------------------------------------------
+ * Two of the three do, and the one that does not is the interesting one:
+ *
+ *   T4  a peer that went silent after being up. THE FAILOVER CASE, and the
+ *       heartbeat is what drives it: there is no other event in this node that
+ *       means "a peer I had a route to is gone".
+ *   T1  a connect() that never completed, i.e. a peer that is down rather than
+ *       unreachable. A black-holed host produces no FIN and no ESTABLISHED and
+ *       therefore no T4, so a budget that did not cover T1 would bound the wrong
+ *       case: the peer that is merely unreachable is the one a mesh spends its
+ *       time on.
+ *   T2  a handshake that was never answered. A peer that accepts TCP and then
+ *       goes silent -- a hung process, a firewall with a half-open table, a node
+ *       stopped with SIGSTOP whose kernel still completed the three-way handshake
+ *       -- which is the most common way a peer is "there but not talking".
+ *
+ * ---------------------------------------------------------------------------
+ * ALL THREE ARM, AND ONLY ONE OF THEM ANNOUNCES -- WHICH IS WHY THE TEARDOWN
+ * TAKES A FLAG
+ * ---------------------------------------------------------------------------
+ * T4 and T2 both reach the same teardown, and the difference between them is not
+ * a detail: **a link that was ESTABLISHED and went away means peers should forget
+ * this node's roster; a link whose handshake never completed means they should
+ * not, because they never learned anything through it and this node's other links
+ * are still up.** Announcing on the T2 path would tell a healthy mesh that a live
+ * node had departed, and every peer would purge a live node's roster on the word
+ * of one socket that never authenticated.
+ *
+ * So fed_link_down() takes an `announce` argument, and it is a parameter rather
+ * than something the shared body decides because the shared body cannot know --
+ * by the time it runs, both cases are "a link with no descriptor and no route".
+ * The three call sites are T4 (announces), T2 (does not) and fed_link_reset()
+ * (announces, because an operator resetting a link is declaring this node
+ * off-peer whatever the link's own state was).
+ *
+ * ---------------------------------------------------------------------------
+ * T2 TAKES THE LINK BACK TO INIT, AND THAT IS A CORRECTION RATHER THAN A NEW RULE
+ * ---------------------------------------------------------------------------
+ * Phase 6 left TIMED_OUT terminal, on the reasoning -- recorded at the time, and
+ * still right about the ANNOUNCEMENT -- that "a handshake that never completed
+ * has nothing to tear down". It was over-applied to the STATE, and the cost was
+ * that a hung peer cost this node one dial and no retry for the life of the
+ * process: the same unbounded waiting the budget exists to bound, reached by a
+ * different road.
+ *
+ * A test found it. tests/integration/test_failover_reconnect.c freezes a peer
+ * with SIGSTOP, which leaves the socket open AND leaves the kernel accepting on
+ * the listener, so the retry's connect() succeeds and the FEDERATE is never
+ * answered -- T2, not T4. Against the Phase 6 behaviour the retry ladder stopped
+ * after one rung, and the only reason it was noticed is that the test asserts on
+ * the SECOND rung. That is what a teeth test is for, and the fix is four lines:
+ * arm the schedule, and take the link back to INIT so there is something for the
+ * schedule to act on.
+ *
+ * The cost of the correction, stated because "TIMED_OUT is now transient" is a
+ * change three other readers can see: the link dump shows INIT rather than
+ * TIMED_OUT for a link whose handshake expired, and a link dump is a diagnostic
+ * tool, so a reader looking for "did the handshake time out" must read the
+ * `link_timeout: ... state=TIMED_OUT` line (which still says so) rather than the
+ * dump's state field. The alternative was leaving the terminal state and arming
+ * a schedule nothing reads, which is a lie told to a log reader.
+ *
+ * ---------------------------------------------------------------------------
+ * C2's LATCH IS GONE, AND THIS PARAGRAPH IS THE RETRACTION
+ * ---------------------------------------------------------------------------
+ * Until this phase the no-auto-redial rule was a single field:
+ * server_link_t::created_ms was stamped at the dial and NEVER cleared, so T7's
+ * condition `created_ms == 0` was false for the life of the process and
+ * fed_link_reset() was the one-line escape. That field is STILL stamped at the
+ * dial -- it is what T2 compares against, and 3.4's file map describes the
+ * stamp -- but T7 no longer reads it as a latch. The claim "a failed link is
+ * never re-dialled" is now false and is replaced by "a failed link is
+ * re-dialled on a backoff, up to a budget, and the exhaustion is reported".
  *
  * ---------------------------------------------------------------------------
  * THE LIMITATION C2 LEAVES, NAMED
@@ -227,6 +361,78 @@
  * while its peer is merely slow. An invented argument for a specific number
  * would be worse than an admitted convention, so it is admitted. */
 #define IRC_FED_DEAD_MS (3 * IRC_FED_KEEPALIVE_MS)
+
+/* ---------------------------------------------------------------------------
+ * THE THREE RECONNECT INTERVALS -- Phase 9
+ * ---------------------------------------------------------------------------
+ * These are the BACKOFF, how far the ladder is allowed to climb, and the retry
+ * budget. The derivations are in the header's reconnect-policy block; what is
+ * here is the arithmetic and why each is wrapped in #ifndef.
+ *
+ * The #ifndef is for the reason the four timers above have it, and the two
+ * mechanisms must not be confused: a BUILD-time default serves a deployment,
+ * and a per-process override serves a test whose case must not make the next
+ * case wait out real backoff. fed_set_retry() below is the override, and a
+ * compile-time value would make a schedule a property of the binary -- every
+ * case in one test executable sharing it -- which is the difference between a
+ * test that takes 30 seconds and one that takes 300 ms.
+ */
+
+/* The first wait after a link has failed, and the base of the ladder.
+ *
+ * DERIVED as IRC_FED_DEAD_MS rather than as a fresh number, and the reason is
+ * the evidence the retry is answering: a link declared dead has been silent for
+ * a whole dead window, so dialling it again the instant it is declared dead
+ * would be dialling a peer that has not finished dying. One more dead window is
+ * the smallest wait that is not smaller than the evidence. The cost is stated:
+ * with the shipped numbers the first retry is 90 s after the link went silent,
+ * which for a peer that is genuinely restarting is 90 s of downtime this node
+ * chose. A deployment that would rather retry sooner lowers
+ * IRC_FED_KEEPALIVE_MS and this moves with it, which is the point of writing it
+ * as the expression. */
+#ifndef IRC_FED_RETRY_BASE_MS
+#define IRC_FED_RETRY_BASE_MS IRC_FED_DEAD_MS
+#endif
+
+/* How many times the ladder doubles before the ceiling.
+ *
+ * NO DERIVATION, and it is a convention: four is the conventional doubling depth
+ * (it reaches sixteen times the base in four retries), and there is nothing in a
+ * retry policy to derive a step count from. It is admitted as a convention for
+ * the reason the 3 in IRC_FED_DEAD_MS is admitted -- an invented argument for a
+ * specific number would be worse than an admitted one. The consequence is
+ * stated rather than left for a reader to work out: raising this to N lets the
+ * wait reach base * 2^N, so it is the single number that decides how patient
+ * this node is. */
+#ifndef IRC_FED_RETRY_MAX_STEPS
+#define IRC_FED_RETRY_MAX_STEPS 4
+#endif
+
+/* The ceiling, DERIVED as the top of the ladder rather than picked: the largest
+ * wait the doubling can reach is base * 2^steps, and writing the ceiling as that
+ * expression is what stops the two disagreeing when a deployment retunes the
+ * base or the step count. The cast to uint64_t is deliberate and is what keeps
+ * the multiplication from being done in int on a 32-bit target: base is a
+ * millisecond count that a deployment may raise, and a shift of a 32-bit int by
+ * a small amount is the one way this expression could wrap. */
+#ifndef IRC_FED_RETRY_MAX_MS
+#define IRC_FED_RETRY_MAX_MS                                                    \
+    ((uint64_t)IRC_FED_RETRY_BASE_MS * (uint64_t)(1u << IRC_FED_RETRY_MAX_STEPS))
+#endif
+
+/* How many consecutive failures this node accepts for ONE link before it stops
+ * knocking.
+ *
+ * NO DERIVATION -- a policy number, and the header says so where a reader would
+ * otherwise look for a reason. The consequence worth stating is the asymmetry:
+ * the budget is spent by FAILURES and fed_link_established() resets it, so a
+ * peer that flaps gets an unlimited number of chances (one fresh budget per
+ * success) while a peer that is simply dead gets exactly this many. That
+ * difference is the whole of what separates a link policy from a link ban, and
+ * it is why the budget is not a lifetime cap. */
+#ifndef IRC_FED_RETRY_BUDGET
+#define IRC_FED_RETRY_BUDGET 3
+#endif
 
 /* The bound on a configured shared secret.
  *
@@ -415,6 +621,28 @@ int fed_open(server_t *s, const char *secret);
 void fed_set_timeouts(uint64_t dial_ms, uint64_t hs_ms, uint64_t keepalive_ms,
                       uint64_t dead_ms);
 
+/* Override the three RECONNECT intervals for THIS PROCESS. A 0 argument keeps
+ * the built-in, on the same terms as fed_set_timeouts() above.
+ *
+ * IT EXISTS BECAUSE A BACKOFF TEST THAT CANNOT SHORTEN ITS OWN LADDER IS A
+ * SLOW TEST, and that is not a style complaint: the shipped ladder starts at
+ * IRC_FED_DEAD_MS (90 s) and only reaches its ceiling on the fourth retry, so a
+ * case that asserts the exhaustion would otherwise take minutes of wall clock
+ * and the whole suite would be built around the backoff. A test sets a base of
+ * two poll ticks and a budget of three and the LADDER SHAPE -- exponential,
+ * capped, and bounded by a budget that reports -- is still exactly what it is in
+ * production, because what the test shortened is the SCALE and not the rules.
+ * The cost of that trade is stated rather than hidden: a test that sets a base
+ * of 100 ms proves the schedule's shape and its termination, and it proves
+ * nothing about how a 90 s base behaves in the field. The shipped values are
+ * what a deployment runs and the shipped values are the ones in the header.
+ *
+ * `budget` is a COUNT and 0 keeps the built-in, so a caller that wants "never
+ * retry" cannot say so here -- that is deliberate, because a policy with a
+ * disable switch is a policy whose default is the thing under test. A test that
+ * wants the old no-redial behaviour asserts on the budget being SPENT. */
+void fed_set_retry(uint64_t base_ms, uint64_t max_ms, unsigned budget);
+
 /* Configure a peer: a name, and its PRE-RESOLVED address.
  *
  * The address is a struct sockaddr because 3.4 forbids a name lookup in the
@@ -466,7 +694,13 @@ server_link_t *fed_link_configure(server_t *s, const char *name,
  *   - T2  HANDSHAKE_SENT older than IRC_FED_HS_TIMEOUT_MS.
  *   - T3  ESTABLISHED and due a keepalive.
  *   - T4  ESTABLISHED and silent for longer than IRC_FED_DEAD_MS.
- *   - T7  INIT and this node dialled it and it has never been dialled: dial.
+ *   - T7  INIT, this node dialled it, and the link's RECONNECT SCHEDULE says a
+ *        dial is due: dial. The schedule is server_link_t::retry_at_ms against
+ *        IRC_FED_RETRY_BASE_MS / _MAX_MS / _BUDGET, it is armed by every arm
+ *        that takes a link down (T1, T2 and T4 all reach fed_retry_arm()), and
+ *        it is CLEARED by fed_link_established() -- which is the whole of the
+ *        "on re-establishment, drive a resync" half: the same call that makes
+ *        the link routable again re-arms it with a fresh budget AND bursts.
  */
 void fed_tick(server_t *s, uint64_t now_ms);
 
@@ -489,37 +723,46 @@ void fed_tick(server_t *s, uint64_t now_ms);
  */
 void fed_on_federate(server_t *s, conn_t *c, const message_t *m);
 
-/* The reconnect seam: return the link to INIT, keeping `initiator` and the
- * pre-resolved address, and CLEAR the no-auto-redial latch so the next tick
- * dials it again.
+/* The OPERATOR's reset: return the link to INIT, keeping `initiator` and the
+ * pre-resolved address, and spend a fresh retry budget on it.
  *
- * NO CALLER IN C2, and that is the point of writing it. 7/Phase 9 owns link
- * failure and reconnect handling, and the difference between C2 and Phase 9 is
- * exactly this function: Phase 9 decides WHEN a failed link is worth another
- * attempt (backoff, a retry budget, whether a peer that was ever established
- * is dialled more eagerly than one that never was) and calls this. C2
- * deliberately does not dial twice, so nothing here is reachable -- and a
- * function added in Phase 9 is a function nothing in this phase's tests has
- * covered, which is the same argument dedup.h makes for keeping
- * fed_dedup_reset() beside the other three while nothing calls it.
+ * WHAT IT IS FOR NOW, and it is a different job from the one it was written
+ * for. It used to be "clear the no-auto-redial latch", a one-line escape from a
+ * latch that is GONE (see the retraction block above); what it is now is the
+ * thing an operator reaches for when fed_tick() has spent the budget and set
+ * `gave_up`, and it is the ONLY way out of that state. A node that has decided
+ * a peer is gone stays decided until somebody says otherwise, which is the
+ * correct default and is useless without a door -- and this is the door, and it
+ * is exported rather than static for that reason.
  *
- * The link is NOT reset on the handshake-timeout path (T2), and that asymmetry
- * is deliberate: a handshake that never completed has nothing to tear down --
- * no peer epoch was learned, no burst was applied, and the link was never a
- * route -- whereas a link that WAS established and has gone away is a link the
- * node must stop believing in. Resetting a never-established link to INIT would
- * make the two cases look identical, which is exactly the distinction T7's
- * latch and the state dump exist to keep visible.
+ * It also clears `gave_up` and `retries`, so a reset is a full second chance
+ * rather than one more attempt against a spent budget, and it prints
+ * `[observable] link_retry_reset:` so that "somebody told the node to try again"
+ * is a fact in the log rather than an inference from a `link_dial:` line
+ * appearing.
+ *
+ * THE ASYMMETRY WITH T2 IS UNCHANGED and is still deliberate: a handshake that
+ * never completed has nothing to tear down -- no peer epoch was learned, no
+ * burst was applied, and the link was never a route -- whereas a link that WAS
+ * established and has gone away is a link the node must stop believing in.
  *
  * AND BOTH PATHS THROUGH fed_link_down() ANNOUNCE THE DEPARTURE, which is a
  * deliberate consequence of the announcement living in the shared body rather
  * than in the dead path alone. A SQUIT for this node's own name goes to every
  * ESTABLISHED peer before the teardown, and a deliberate reset IS a departure:
  * the link it is about to re-dial is not up, so a peer holding this node's
- * roster has a stale one from this moment. The cost is that a Phase 9
- * reconnect, which calls this once per retry decision, tells the mesh the
- * server is gone each time it retries -- which is true, and is the reason the
- * SQUIT is cheap to make idempotent rather than expensive to make quiet. */
+ * roster has a stale one from this moment. The cost is that a reconnect, which
+ * reaches this body once per retry decision, tells the mesh the server is gone
+ * each time it retries -- which is true, and is the reason the SQUIT is cheap to
+ * make idempotent rather than expensive to make quiet.
+ *
+ * NO CALLER IN THE SHIPPED BINARY, and that is now a FINDING rather than the
+ * point of writing it: the operator-facing door exists and nothing in this tree
+ * opens it, because node_main.c has no signal or command routed to it. That is
+ * recorded in docs/SERVER_DESIGN.md's Phase 9 block as what is still not true,
+ * and it is a real gap rather than a rounding error -- `gave_up` is currently
+ * terminal for the life of the process. The tests reach this function
+ * directly, which is how it stays covered. */
 void fed_link_reset(server_t *s, server_link_t *link);
 
 /* Dump every link and the link counters, one [observable] line for the node and

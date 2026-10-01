@@ -247,6 +247,45 @@ typedef struct server_link {
      * on a timer: a link that reconnects needs a fresh burst even if its peer
      * never went away. */
     int      burst_done;
+
+    /* ------------------------------------------------------------------------
+     * THE RECONNECT SCHEDULE -- Phase 9. Three fields, one policy, and the
+     * reason they are HERE rather than in a module-global table is the same
+     * reason the link itself is: the policy is per PEER, and a table keyed by
+     * name is a second place to look up a name. federation/link.h carries the
+     * derivations for the three intervals they are compared against.
+     * ------------------------------------------------------------------------
+     *
+     * retry_at_ms is the earliest stamp at which fed_tick()'s T7 may dial this
+     * link. 0 means DUE NOW, which is the state a freshly configured link is in
+     * -- so the FIRST dial is immediate and only a FAILED one waits, which is
+     * what keeps a healthy mesh from acquiring a start-up delay. The zero is
+     * therefore load-bearing rather than a "never stamped" sentinel, and it is
+     * the reason a dead link's dump does not read 0 as "unreachable".
+     *
+     * retries is CONSECUTIVE failed attempts. It is reset to 0 by
+     * fed_link_established(), so a peer that flaps gets a fresh budget on every
+     * success while a peer that is simply dead runs the budget down. That
+     * asymmetry is deliberate: a budget that were a lifetime cap would be a
+     * link ban, and a mesh needs a link policy more than it needs a ban.
+     *
+     * gave_up is the budget SPENT, and it is terminal for the life of the
+     * process unless fed_link_reset() clears it. Nothing in the shipped binary
+     * calls fed_link_reset() -- there is no operator door -- and that gap is
+     * recorded in docs/SERVER_DESIGN.md's Phase 9 block rather than papered
+     * over here, because the alternative (a silent give-up) is exactly the
+     * failure the budget's report exists to prevent. The field is here because
+     * a terminal state with no door is still better than an unbounded retry
+     * loop, and the door is one call away.
+     *
+     * THE COST, in one number: three integers per link, so 48 bytes on a
+     * 16-link vector. The alternative -- a module-global side table keyed by
+     * server name -- is the same 48 bytes plus a hash lookup on every T7 and a
+     * second place where a link's identity is spelled.
+     */
+    uint64_t retry_at_ms;
+    unsigned retries;
+    int      gave_up;
 } server_link_t;
 
 /* The initial capacity of server_t::links, and a bound on the PEER DESCRIPTORS
@@ -439,6 +478,24 @@ struct server {
     uint64_t  n_link_duplicate; /* refused because that name was ESTABLISHED */
     uint64_t  n_fed_hs_timeout; /* links that reached no answer within T2 */
     uint64_t  n_fed_dead;       /* ESTABLISHED links that went silent (T4) */
+
+    /* Phase 9: the node has spent a link's retry budget and stopped dialling
+     * it. federation/link.c's fed_retry_arm() is the only writer.
+     *
+     * IT IS A FINDING AND NOT A METRIC, and that is the whole reason it is on
+     * this struct rather than only in the log. A non-zero value says this node
+     * has decided a peer is gone and is not going to ask again, which is a
+     * correct decision and an OPERATIONAL one: nothing in the shipped binary
+     * clears it, so the peer stays unreachable from here until somebody restarts
+     * this node or reaches fed_link_reset(). A dashboard that showed
+     * reconnects per second would show a healthy number while the mesh was
+     * quietly partitioned, and this is the number that would not.
+     *
+     * It is not n_fed_dead: that counts a peer going silent, which is an event,
+     * and this counts a DECISION, of which there is at most one per link per
+     * streak of failures. A peer that flaps contributes many of the first and
+     * none of the second. */
+    uint64_t  n_fed_retry_exhausted; /* links whose retry budget ran out */
 
     /* ------------------------------------------------------------------------
      * Phase 6 C3: the INBOUND guard chain, one counter per guard that can drop

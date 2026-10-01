@@ -75,6 +75,16 @@ static uint64_t g_hs_ms = (uint64_t)IRC_FED_HS_TIMEOUT_MS;
 static uint64_t g_keepalive_ms = (uint64_t)IRC_FED_KEEPALIVE_MS;
 static uint64_t g_dead_ms = (uint64_t)IRC_FED_DEAD_MS;
 
+/* The three reconnect intervals, and why they are module state rather than
+ * arguments. Same argument as the four above: the tick hook's signature is
+ * fixed by core/server.h, and a schedule is not something the loop should have
+ * to be handed on every call. The seeded values are the #ifndef defaults, so a
+ * build that supplied its own at compile time and a test that supplies its own
+ * at run time reach this code by the same path. */
+static uint64_t   g_retry_base_ms = (uint64_t)IRC_FED_RETRY_BASE_MS;
+static uint64_t   g_retry_max_ms = (uint64_t)IRC_FED_RETRY_MAX_MS;
+static unsigned   g_retry_budget = (unsigned)IRC_FED_RETRY_BUDGET;
+
 /* The per-reason rejection breakdown. Indexed by fed_federate_result_t, so the
  * index of a verdict IS its counter, and a dump cannot print a reason beside
  * another reason's count. FED_OK's slot is never written: a line that is
@@ -367,12 +377,26 @@ void fed_dump(const server_t *s, const char *why)
         /* last_sent and last_recv are the two stamps T3 and T4 compare, and a
          * link dump that does not carry them makes "why did it think the peer
          * was dead" answerable only by reading the other node's log. */
+        /* THE RECONNECT SCHEDULE IS ON THIS LINE, and it is here for the reason
+         * the other four fields are: an operator reading "why is irc.b not being
+         * dialled" needs the retry count, the budget that was spent and the
+         * stamp the next attempt is waiting for, and they are all in the same
+         * struct as the state they explain. A dump without them would say
+         * `state=INIT fd=-1 initiator=1` for a link that is about to be dialled
+         * and for one that has given up, and those two need different repairs.
+         *
+         * gave_up is printed as the COUNT 0/1 rather than as a token because it
+         * shares the field with two numbers and a mixed vocabulary on one line
+         * is the thing this dump has otherwise been careful to avoid. */
         printf("[observable] link: peer=%s state=%s fd=%d initiator=%d "
-               "epoch=%llu last_sent=%llu last_recv=%llu burst_done=%d\n",
+               "epoch=%llu last_sent=%llu last_recv=%llu burst_done=%d "
+               "retries=%u gave_up=%d retry_at=%llu\n",
                link->name, fed_state_name(link->state), link->fd, link->initiator,
                (unsigned long long)link->epoch,
                (unsigned long long)link->last_sent_ms,
-               (unsigned long long)link->last_recv_ms, link->burst_done);
+               (unsigned long long)link->last_recv_ms, link->burst_done,
+               link->retries, link->gave_up,
+               (unsigned long long)link->retry_at_ms);
     }
     fflush(stdout);
 }
@@ -645,10 +669,30 @@ static int fed_send_squit(server_t *s, const server_link_t *dying)
     return sent;
 }
 
-/* The link back to INIT, keeping `initiator`, the address and the dial latch.
- * The reasoning is on fed_link_reset() in the header; this is the shared body
- * so that the dead path and the reconnect seam cannot drift apart. */
-static void fed_link_down(server_t *s, server_link_t *link)
+/* The link back to INIT, keeping `initiator` and the address.
+ *
+ * `announce` says whether this node's own departure is announced to its OTHER
+ * peers, and the parameter exists because the two callers that arrive here
+ * without a route having ever existed MUST NOT announce, and the reason is a
+ * hazard rather than a tidiness concern.
+ *
+ * A SQUIT for this node's own name tells every peer holding it to purge this
+ * node's roster and its name from its channels' servers[]. A link that was
+ * ESTABLISHED and has gone away genuinely means those peers should do that --
+ * they cannot reach this node through that link any more. A link whose HANDSHAKE
+ * NEVER COMPLETED means the opposite: it is a socket that was opened and never
+ * authenticated, so no peer ever received a burst attributed to this node
+ * through it, and the other links are still up. Announcing on that path would
+ * tell the whole mesh that a node is gone when it is serving, and every peer
+ * would purge a live node's roster. That is not a smaller version of the
+ * announcement; it is a different and wrong statement, and it is the reason the
+ * flag is a parameter rather than something every caller inherits from the
+ * shared body.
+ *
+ * The cost of the parameter is one argument at three call sites and the
+ * possibility of a caller passing the wrong value -- which is why each call site
+ * carries the argument in the name at its call and not only in the comment here. */
+static void fed_link_down(server_t *s, server_link_t *link, int announce)
 {
     if (link == NULL) {
         return;
@@ -658,7 +702,13 @@ static void fed_link_down(server_t *s, server_link_t *link)
      * queues, and every step below either closes a descriptor or forgets that a
      * peer existed. A SQUIT emitted afterwards would be a line on a link the node
      * has already stopped believing in. */
-    (void)fed_send_squit(s, link);
+    if (announce != 0) {
+        (void)fed_send_squit(s, link);
+    }
+    /* Everything below is a no-op on a link that never established, which is
+     * what made it safe to share the body in the first place: the epoch is
+     * already 0, burst_done is already 0, the stamps are already 0, and
+     * fed_burst_abandon() on a link with no transaction open returns at once. */
     handshake_init(&link->hs);
     fed_link_set_state(link);
     link->fd = -1;
@@ -691,10 +741,33 @@ void fed_link_reset(server_t *s, server_link_t *link)
     if (link == NULL) {
         return;
     }
-    /* created_ms IS the no-auto-redial latch, and clearing it is the whole of
-     * what "reconnect" means in this phase. See the header. */
+    /* A FULL second chance, not one more attempt against a spent budget. The
+     * budget is a count of consecutive failures and the reset spends a fresh
+     * one, so an operator who resets a link has not decided to allow exactly one
+     * more knock -- they have decided the node was wrong and should try again
+     * from the start. retry_at_ms goes to 0 as well, which is what makes the
+     * next tick dial IMMEDIATELY rather than after a backoff the operator did
+     * not ask for: this is the escape hatch, and an escape hatch that made you
+     * wait would be a second-class one. */
+    link->retries = 0u;
+    link->gave_up = 0;
+    link->retry_at_ms = 0u;
+    /* created_ms is NOT the latch any more -- see the retraction block in the
+     * header -- but it is cleared here anyway, and the reason is that T2
+     * compares against it. A reset that left the attempt stamp in place would
+     * put a link that has just been told to try again straight into the
+     * handshake timeout on the tick after it dials, because the stamp would
+     * already be older than IRC_FED_HS_TIMEOUT_MS. */
     link->created_ms = 0;
-    fed_link_down(s, link);
+    printf("[observable] link_retry_reset: peer=%s\n", link->name);
+    /* ANNOUNCED, and deliberately so even when the link being reset never
+     * established: fed_link_reset() is the OPERATOR's door, and an operator who
+     * resets a link is saying "I am taking this node off this peer for now" --
+     * which is a departure from the mesh's point of view whatever the link's own
+     * state was, and peers that keep a roster for a node its operator has
+     * declared off-link are holding state that is wrong. The automatic path (T2)
+     * does NOT announce, and the difference is fed_link_down()'s parameter. */
+    fed_link_down(s, link, 1);
 }
 
 /* ---------------------------------------------------------------------------
@@ -872,6 +945,26 @@ static void fed_link_established(server_t *s, server_link_t *link, conn_t *c,
             c->peer_name = copy;
         }
     }
+    /* THE BUDGET IS REFILLED HERE, and it is here rather than at the end of the
+     * function for the same reason federation_resync() is below it: a link that
+     * has just come up is a link that should be dialled AGAIN without waiting,
+     * and a link that came up after a backoff still has that backoff's stamp on
+     * it. Leaving it would mean a link that recovered keeps waiting out a
+     * schedule earned for a failure it has already fixed.
+     *
+     * `retries` goes to 0 rather than being decremented, and the difference
+     * matters: it is what makes the budget a budget of CONSECUTIVE failures
+     * rather than a lifetime cap on a link, so a peer that flaps is retried
+     * indefinitely (one fresh budget per success) while a peer that is simply
+     * dead is not. `gave_up` is cleared for the same reason, and it is cleared
+     * HERE rather than only in fed_link_reset() because a link cannot reach
+     * ESTABLISHED without coming through this function -- so a link whose budget
+     * ran out and which then succeeded has, by the fact of its success, been
+     * fixed, and holding the give-up against it would be holding it against the
+     * evidence. */
+    link->retries = 0u;
+    link->gave_up = 0;
+    link->retry_at_ms = 0u;
     printf("[observable] link_established: peer=%s fd=%d initiator=%d "
            "epoch=%llu\n",
            link->name, link->fd, link->initiator,
@@ -1388,6 +1481,25 @@ void fed_set_timeouts(uint64_t dial_ms, uint64_t hs_ms, uint64_t keepalive_ms,
     }
 }
 
+void fed_set_retry(uint64_t base_ms, uint64_t max_ms, unsigned budget)
+{
+    if (base_ms != 0u) {
+        g_retry_base_ms = base_ms;
+    }
+    /* The ceiling is only ever LOWERED onto a base the caller also chose, and
+     * never raised above a base that is smaller than it: a caller passing
+     * max_ms < base_ms would otherwise get a ladder whose every step is above
+     * its own ceiling, which is a policy with no first rung. Clamping here is
+     * the difference between "the caller asked for a short scale" and "the
+     * caller asked for something incoherent". */
+    if (max_ms != 0u) {
+        g_retry_max_ms = (max_ms > g_retry_base_ms) ? max_ms : g_retry_base_ms;
+    }
+    if (budget != 0u) {
+        g_retry_budget = budget;
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * The tick
  * ---------------------------------------------------------------------------
@@ -1416,6 +1528,87 @@ static dial_t *fed_dial_for(server_t *s, const char *peer_name)
     return NULL;
 }
 
+/* ---------------------------------------------------------------------------
+ * THE RECONNECT SCHEDULE
+ * ---------------------------------------------------------------------------
+ * Three questions, one function, and the reason they are a function rather than
+ * three comparisons at three call sites is the reason EVERY refusal in this file
+ * goes through one place: the counter, the next attempt's stamp, and the "this
+ * node has stopped trying" report are three numbers that must agree, and three
+ * call sites are three chances for them to disagree.
+ *
+ * `why` is a short stable token naming the failure that armed the schedule, and
+ * it is on the observable line because the operator's question is "why is it
+ * trying again" and the answer is which arm fired.
+ *
+ * THE BUDGET IS CHECKED FIRST AND IS NOT REARMED, and that ordering is the whole
+ * of "a node that retries forever is a leak": once the budget is spent the
+ * schedule is left where it was and `gave_up` is set, so T7's condition is false
+ * for the rest of the process. Nothing wakes it and nothing clears it but
+ * fed_link_reset().
+ */
+static void fed_retry_arm(server_t *s, server_link_t *link, uint64_t now_ms,
+                          const char *why)
+{
+    uint64_t delay;
+    unsigned step;
+
+    if (s == NULL || link == NULL) {
+        return;
+    }
+    if (link->gave_up != 0) {
+        /* Already spent, and NOT re-reported. The exhaustion is reported once at
+         * the moment it happens; a line per tick for a link that will never be
+         * dialled again would be a log that fills up at 20 lines per second on
+         * a node with a dead peer, which is the opposite of reporting. */
+        return;
+    }
+    /* ALREADY SCHEDULED, AND THAT IS NOT A NO-OP WORTH SKIPPING SILENTLY. The
+     * ladder is armed by several arms of the tick and a single failure can reach
+     * two of them -- a peer that is down produces a dial that completes and a
+     * handshake that then times out, and a peer that is unreachable produces a
+     * dial that is retired by T1 on one tick and observed by the DIAL_FAILED arm
+     * on the next. Arming twice for one failure would double the wait and spend
+     * two of a three-attempt budget on one dead peer.
+     *
+     * The test is "a schedule is already running", which is `retry_at_ms` in the
+     * future -- NOT "retry_at_ms is non-zero", because a link whose last schedule
+     * has EXPIRED also has a non-zero stamp and is exactly the link that needs
+     * re-arming. Getting that backwards would make a link that had exhausted its
+     * ladder refuse to arm again, which is the opposite of the intent. */
+    if (link->retry_at_ms > now_ms) {
+        return;
+    }
+    if (link->retries >= g_retry_budget) {
+        link->gave_up = 1;
+        s->n_fed_retry_exhausted++;
+        printf("[observable] link_retry_exhausted: peer=%s attempts=%u budget=%u "
+               "reason=AFTER_%s\n",
+               link->name, link->retries, g_retry_budget, (why != NULL) ? why : "?");
+        return;
+    }
+
+    /* THE LADDER: the base doubled once per attempt already made, capped at the
+     * ceiling. The shift is bounded by the step constant rather than by
+     * `retries`, so a link that somehow accumulated a large retry count cannot
+     * shift an integer out of its own width -- which is a real hazard and not a
+     * theoretical one, because `retries` counts events a peer can drive by
+     * refusing a handshake. */
+    step = link->retries;
+    if (step >= (unsigned)IRC_FED_RETRY_MAX_STEPS) {
+        step = (unsigned)IRC_FED_RETRY_MAX_STEPS;
+    }
+    delay = g_retry_base_ms * ((uint64_t)1u << step);
+    if (delay > g_retry_max_ms) {
+        delay = g_retry_max_ms;
+    }
+    link->retries++;
+    link->retry_at_ms = now_ms + delay;
+    printf("[observable] link_retry: peer=%s attempt=%u/%u delay_ms=%llu after=%s\n",
+           link->name, link->retries, g_retry_budget,
+           (unsigned long long)delay, (why != NULL) ? why : "?");
+}
+
 /* T1. A connect() that poll() will never report on.
  *
  * The one close() in this file, and it closes a DIAL rather than a connection:
@@ -1441,6 +1634,26 @@ static void fed_dial_expired(server_t *s, size_t i, uint64_t now_ms)
     s->dials[i].fd = -1;
     s->dials[i].state = DIAL_FAILED;
     s->n_dial_failed++;
+    /* A CONNECT THAT NEVER COMPLETED IS THE FAILURE A RETRY BUDGET IS MOST
+     * OBVIOUSLY FOR, and T1 is the only arm that reaches it: a black-holed host
+     * produces no FIN, no ESTABLISHED, and therefore no T4, so a peer that is
+     * down rather than unreachable never gets there. The link is found by NAME
+     * because the dial table is keyed by nothing and holds a display copy, and
+     * this is the one place where the link and the dial for the same peer are
+     * related by that name rather than by a pointer -- which is why the lookup
+     * is a scan of a vector this small rather than a stored back-pointer.
+     *
+     * The link is left in INIT by this arm (a dial that never completed never
+     * promoted it), so the schedule armed here is the one T7 reads. */
+    for (size_t k = 0; k < server_link_count(s); k++) {
+        server_link_t *link = server_link_at(s, k);
+
+        if (link != NULL && same_name(link->name, peer) &&
+            link->state == (int)INIT) {
+            fed_retry_arm(s, link, now_ms, "DIAL_TIMEOUT");
+            break;
+        }
+    }
 }
 
 /* The dial completed: the link gets its descriptor and starts its exchange.
@@ -1471,6 +1684,31 @@ static void fed_link_promote(server_t *s, server_link_t *link, dial_t *d)
         s->n_dial_failed++;
         return;
     }
+    /* THE DIAL SLOT IS RETIRED HERE, and it did not used to be, and the reason it
+     * has to be is that fed_dial_for() treats a DIAL_CONNECTED slot as a LIVE
+     * DIAL. Before this line, the slot stayed DIAL_CONNECTED for the rest of the
+     * link's life, and that produced two distinct defects once a link could be
+     * re-dialled:
+     *
+     *   - T7's live-dial guard saw a live dial for a link that was already
+     *     promoted, so a link that had just come back from HANDSHAKE_SENT to
+     *     INIT could not dial for another whole dial timeout.
+     *   - On the tick after the promotion, if the connection had been reaped in
+     *     the meantime, fed_link_promote() ran again on the same slot and
+     *     reported `link_promote_failed: reason=CONNECTION_GONE` for a link that
+     *     had in fact been up and had simply been taken down. That is a
+     *     MISLEADING line about a link that was not failing, and an operator
+     *     reading it would chase a peer that was fine.
+     *
+     * DIAL_CONNECTED is retired as DIAL_FAILED rather than as anything else, and
+     * for the reason fed_link_promote()'s CONNECTION_GONE arm gives: FAILED is
+     * the one state the shutdown walk does not close, so a slot left in it can
+     * never be double-closed. It is not a claim that this dial failed -- the
+     * promotion below is what says whether it worked -- it is the state that
+     * means "this slot holds nothing you may close". */
+    d->state = DIAL_FAILED;
+    d->fd = -1;
+
     link->fd = c->fd;
     handshake_init(&link->hs);
     link->created_ms = server_now_ms();
@@ -1573,7 +1811,17 @@ static void fed_dead(server_t *s, server_link_t *link, conn_t *c,
     (void)handshake_fail(&link->hs);
     fed_link_set_state(link);
     s->n_fed_dead++;
-    fed_link_down(s, link);
+    /* THE FAILOVER ARM, and it is here rather than at the end of the tick for a
+     * reason that is about the order of events: fed_link_down() is what clears
+     * the link's descriptor and hands the state back to INIT, and T7 runs in
+     * the SAME tick's switch. Arming before the teardown means the schedule is
+     * already stamped by the time this link reaches the INIT arm, so a link that
+     * has been dead for a whole IRC_FED_DEAD_MS is re-dialled on the NEXT tick
+     * rather than one tick after that. */
+    fed_retry_arm(s, link, now_ms, "DEAD");
+    /* ANNOUNCED, because this link WAS a route: every other peer holding this
+     * node's name learned it through here, and cannot reach it here any more. */
+    fed_link_down(s, link, 1);
     if (c != NULL) {
         conn_mark_closing(c);
     }
@@ -1648,21 +1896,54 @@ void fed_tick(server_t *s, uint64_t now_ms)
 
         switch (link->state) {
         case (int)INIT:
-            /* --- T7: dial it ------------------------------------------- */
-            /* Three conditions and all three are load-bearing. The latch:
-             * clearing created_ms is fed_link_reset()'s job and Phase 9's, so
-             * C2 never dials the same peer twice (see the header). The
-             * address: a link created by an inbound claim has none, and
-             * server_dial() would be handing a struct sockaddr of zeros to
-             * connect(). The live-dial test: between T7 dialling and the dial
-             * completing the latch is NOT yet set, so without this the very
-             * next tick would open a second socket to the same peer. */
-            if (link->initiator && link->addrlen != 0 && link->created_ms == 0u &&
+            /* --- T7: dial it, if the schedule says so ------------------- */
+            /* FIVE CONDITIONS, AND EVERY ONE OF THEM IS LOAD-BEARING. The
+             * count is the price of replacing a single latch with a policy.
+             *
+             *   initiator        an ACCEPTED link has no address, and
+             *                   server_dial() would be handed a zeroed sockaddr.
+             *   addrlen != 0     same, stated separately because a link with a
+             *                   zero length is a different defect from a link
+             *                   that never dialled and the two are worth telling
+             *                   apart in a dump.
+             *   gave_up == 0     the budget. Checked HERE rather than inside a
+             *                   helper so that the whole refusal is visible in
+             *                   one place: this is the line a reader comes to
+             *                   when a link is not being dialled.
+             *   due              the backoff. retry_at_ms == 0 means DUE NOW,
+             *                   which is the state a freshly configured link is
+             *                   in, so a healthy mesh's first dial is immediate
+             *                   and only a failed one waits.
+             *   no live dial     UNCHANGED from Phase 6 and still the arm with
+             *                   the subtlest failure: between this call to
+             *                   server_dial() and the dial resolving there is no
+             *                   state change on the link at all, so a link whose
+             *                   stamp is already in the past opens a SECOND
+             *                   socket to the same peer on the very next tick.
+             *                   The backoff does not fix this -- the schedule
+             *                   says the link is due and it stays due until the
+             *                   attempt resolves.
+             *
+             * created_ms is stamped here and is NOT read as a latch any more
+             * (the header retracts that claim); what it is for now is T2's
+             * comparison against IRC_FED_HS_TIMEOUT_MS and for the dump, where
+             * "when did this attempt begin" is one of the two numbers an
+             * operator needs to tell a slow handshake from a dead link. */
+            if (link->initiator != 0 && link->addrlen != 0 && link->gave_up == 0 &&
+                (link->retry_at_ms == 0u || now_ms >= link->retry_at_ms) &&
                 fed_dial_for(s, link->name) == NULL) {
                 link->created_ms = now_ms;
                 if (server_dial(s, (const struct sockaddr *)&link->addr,
                                 link->addrlen, link->name) == 0) {
                     printf("[observable] link_dial: peer=%s\n", link->name);
+                } else {
+                    /* A DIAL THAT COULD NOT BE STARTED AT ALL -- an exhausted
+                     * descriptor table, or a socket() the kernel refused -- is a
+                     * failed attempt and must cost budget, or a node in that
+                     * state dials on every tick for ever. server_dial() has
+                     * already counted it on n_dial_failed; this counts the
+                     * LINK's side, which is the different fact. */
+                    fed_retry_arm(s, link, now_ms, "DIAL_REFUSED");
                 }
             }
             break;
@@ -1676,6 +1957,33 @@ void fed_tick(server_t *s, uint64_t now_ms)
                 s->n_fed_hs_timeout++;
                 printf("[observable] link_timeout: peer=%s state=TIMED_OUT\n",
                        link->name);
+                /* T2 ARMS THE SCHEDULE AND TAKES THE LINK BACK TO INIT, and
+                 * both halves were corrections rather than new behaviour. Phase 6
+                 * left TIMED_OUT terminal on the reasoning that a handshake which
+                 * never completed has nothing to tear down -- which is true of the
+                 * ANNOUNCEMENT and was then over-applied to the STATE, with the
+                 * consequence that a peer accepting TCP and then going silent
+                 * cost this node one dial and no retry for the life of the
+                 * process. That is the same silent resource leak the budget
+                 * exists to bound, reached by a different road, and a test
+                 * (test_failover_reconnect.c) found it by freezing a peer whose
+                 * kernel still completes the handshake: the retry arrived, the
+                 * FEDERATE was unanswered, and the link sat in a terminal state
+                 * that nothing dials out of.
+                 *
+                 * SO THE ARM IS NOT OPTIONAL HERE and the teardown below is what
+                 * makes it readable: without returning the link to INIT the
+                 * schedule would be stamped by a path that never dials again,
+                 * which is worse than not arming at all -- a reader would see a
+                 * `link_retry:` line and conclude a retry was coming.
+                 *
+                 * NOT ANNOUNCED (fed_link_down's third argument), and that is the
+                 * load-bearing part of the correction: no peer ever learned
+                 * anything about this node through a handshake that never
+                 * finished, and the node's OTHER links are still up, so a SQUIT
+                 * here would tell a healthy mesh that a live node had departed. */
+                fed_retry_arm(s, link, now_ms, "HANDSHAKE_TIMEOUT");
+                fed_link_down(s, link, 0);
                 if (c != NULL) {
                     conn_mark_closing(c);
                 }
@@ -1700,6 +2008,15 @@ void fed_tick(server_t *s, uint64_t now_ms)
                 }
             }
             if ((uint64_t)(now_ms - link->last_recv_ms) > g_dead_ms) {
+                /* THE FAILOVER ARM, once. T4 is the only place a link that was
+                 * ESTABLISHED can be declared dead, so the heartbeat is the only
+                 * thing that drives a redial of a link that WAS up: there is no
+                 * other event in this node that means "this peer is gone" for a
+                 * link that had a descriptor and a route. That is the whole of
+                 * "heartbeat-driven failover" -- the liveness signal does not
+                 * merely close the link, it ARMS the redial, and the arm happens
+                 * in fed_retry_arm() above rather than being a decision T4
+                 * delegates to the next tick. */
                 fed_dead(s, link, c, now_ms);
             }
             break;
