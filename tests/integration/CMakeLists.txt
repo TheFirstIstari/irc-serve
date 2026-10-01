@@ -46,6 +46,16 @@ function(irc_ctest_name name out)
     set(${out} "CapNegotiation" PARENT_SCOPE)
   elseif(${name} STREQUAL "test_multi_prefix")
     set(${out} "MultiPrefix" PARENT_SCOPE)
+  elseif(${name} STREQUAL "test_failover_reconnect")
+    set(${out} "FailoverReconnect" PARENT_SCOPE)
+  elseif(${name} STREQUAL "test_sync_state")
+    set(${out} "SyncState" PARENT_SCOPE)
+  elseif(${name} STREQUAL "test_peer_discovery")
+    set(${out} "PeerDiscovery" PARENT_SCOPE)
+  elseif(${name} STREQUAL "test_reconnect")
+    set(${out} "Reconnect" PARENT_SCOPE)
+  elseif(${name} STREQUAL "test_autoscale")
+    set(${out} "AutoScale" PARENT_SCOPE)
   else()
     set(${out} "${name}" PARENT_SCOPE)
   endif()
@@ -336,3 +346,24 @@ irc_add_integration_test(test_fed_guards test_fed_guards.c)
 # the only link. The last case owns one end of a link, like test_fed_guards.c,
 # because no second node built from this code will send the line.
 irc_add_integration_test(test_fed_resync test_fed_resync.c)
+
+# 7/Phase 9: the reconnect POLICY -- exponential backoff, a cap, and a retry
+# budget that is SPENT and reported rather than retried for ever. Two nodes, a
+# frozen peer (SIGSTOP, not a kill: a killed peer sends a FIN and the survivor
+# would observe a closed connection rather than the silence T4 exists to
+# notice), and the ladder read out of the node's own delay_ms= reports. The
+# ladder is scaled down per process through fed_set_retry(), because the shipped
+# base is 90 s and a test that waited out even the first rung would be a slow
+# test rather than a test.
+irc_add_integration_test(test_failover_reconnect test_failover_reconnect.c)
+
+# 7/Phase 9: the 4.3 resync being DRIVEN by a reconnect, which is 8's
+# "Link loss and reconnect re-syncs channel state via SBURST". Phase 6 proved
+# both halves either side of this and explicitly declined the middle: nothing in
+# the node decided to reconnect, so a test's own signal was doing it. This case
+# asserts the node recovers on its own AND that the resync it drives REPLACES
+# rather than merges -- checked on the wire, with a member who parts and one who
+# joins WHILE the link is down, which is the only way to produce state the mesh
+# cannot have seen. The retry scale is shortened per process; the policy's shape
+# is test_failover_reconnect's claim, not this one's.
+irc_add_integration_test(test_sync_state test_sync_state.c)

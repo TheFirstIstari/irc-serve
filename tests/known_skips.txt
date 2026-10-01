@@ -37,17 +37,14 @@
 # "no test may skip".
 #
 # --- the list -----------------------------------------------------------------
-
-# Phase 9 (issue #83): the §4.3 resync DRIVEN BY a reconnect -- backoff, a retry
-# budget, and a SBURST triggered by a reconnect rather than by establishment.
-# Phase 6 owns the verb and its wire format and proves both halves either side of
-# this gap; the policy is what is missing.
-SyncState  Phase 9  #83  link-loss reconnect policy driving the §4.3 SBURST resync
-
-# Phase 9 (issue #83): peer failover and reconnect. C5 proves a failed link is not
-# re-dialled (the latch) and that a deliberate retry through fed_link_reset()
-# re-establishes and re-bursts; the automatic policy is not started.
-FailoverReconnect  Phase 9  #83  automatic peer failover: backoff and retry budget
+#
+# EMPTY, and it is empty because Phase 9 retired the last five lines. The file
+# still EXISTS and is still read by scripts/check-skips.sh, because an absent file
+# is a different failure from an empty one: check-skips.sh fails on a missing
+# list, and a test that skipped with no list would otherwise be permitted by the
+# accident of the file's own absence. Every comment above still applies -- the
+# gate is now "no test may skip", which is the phrase 6.4 always said the goal
+# was.
 
 # Phase 9 (issue #83): peer discovery. 2.3 says "Peer discovery and auto-scale stay
 # Phase 9", verbatim.
