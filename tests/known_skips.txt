@@ -38,22 +38,24 @@
 #
 # --- the list -----------------------------------------------------------------
 #
-# NOT EMPTY YET: Phase 9 has retired three of the five (SyncState,
-# FailoverReconnect and Reconnect) and two remain below, each owned by a later
-# item of the same phase. Reconnect's line is gone because the feature is
+# NOT EMPTY YET: Phase 9 has retired four of the five (SyncState,
+# FailoverReconnect, Reconnect and PeerDiscovery) and one remains below, owned by
+# the last item of the same phase. Reconnect's line is gone because the feature is
 # implemented and its test is a real socket-level test rather than a
 # placeholder -- tests/integration/test_reconnect.c, with the CTest name
-# unchanged. This comment block is the place the final one goes: when the last
-# line below is deleted this file holds comments and nothing else, and that is
+# unchanged. PeerDiscovery's is gone for the same reason and the same move --
+# tests/integration/test_peer_discovery.c, CTest name unchanged -- and the reason
+# its test needed a file of its own is the one worth writing down here: a peer
+# that advertises a DIAL HINT cannot be caught by a node asserting on its own
+# logs, because a guard that prints `dialed=NO` and then dials anyway passes that
+# assertion. It needed a THIRD node for the hint to point at. This comment block
+# is the place the final one goes: when the last line below is deleted this file
+# holds comments and nothing else, and that is
 # different from the file being absent -- check-skips.sh fails on a MISSING list,
 # and a test that skipped with no list would otherwise be permitted by the
 # accident of the file's own absence. Every rule above still applies then, and
 # the gate is "no test may skip", which is the phrase 6.4 always said the goal
 # was.
-
-# Phase 9 (issue #83): peer discovery. 2.3 says "Peer discovery and auto-scale stay
-# Phase 9", verbatim.
-PeerDiscovery  Phase 9  #83  §2.3 peer discovery (advertise / graceful leave)
 
 # Phase 9 (issue #83): auto-scaling. 2.3 names it in the same sentence as peer
 # discovery.
