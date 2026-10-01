@@ -252,9 +252,7 @@ static void cap_reply(server_t *s, conn_t *c, const char *sub, const char *args)
  * request a client composes from a CAP LS it received, and the bound is here so
  * that `names` below is a fixed array: a client naming ten thousand
  * capabilities must be refused, not allocated for. */
-#define CAP_MAX_REQ 16
 
-#define CAP_NAME_MAX 64
 
 static int cap_split(char *arg, char out[][CAP_NAME_MAX + 1], int max)
 {
