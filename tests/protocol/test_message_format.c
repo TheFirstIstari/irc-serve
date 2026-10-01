@@ -323,10 +323,10 @@ int main(void)
             "a b;c:d\\e",       /* all four at once, in the final param */
         };
         /* tags[] holds the block in wire form, i.e. already escaped. */
-        assert(message_build(&m, "note=a\\sb\\;c\\:d\\\\e", "irc.a!u@h",
+        assert(message_build(&m, "note=a\\sb\\:c:d\\\\e", "irc.a!u@h",
                              "PrIvMsG", params, 6) == 0);
         assert_format(&m,
-                      "@note=a\\sb\\;c\\:d\\\\e :irc.a!u@h PRIVMSG #chan "
+                      "@note=a\\sb\\:c:d\\\\e :irc.a!u@h PRIVMSG #chan "
                       "nick!user@host a;b c:d back\\slash :a b;c:d\\e");
         {
             /* One leg of the round trip: the rendered line re-parses to the
@@ -337,7 +337,7 @@ int main(void)
             assert(message_parse(line, &r) == 0);
             assert(strcmp(r.command, "PRIVMSG") == 0);
             assert(strcmp(r.prefix, "irc.a!u@h") == 0);
-            assert(strcmp(r.tags, "note=a\\sb\\;c\\:d\\\\e") == 0);
+            assert(strcmp(r.tags, "note=a\\sb\\:c:d\\\\e") == 0);
             assert(r.nparams == 6);
             for (int i = 0; i < 6; i++) {
                 assert(strcmp(r.params[i], params[i]) == 0);
@@ -349,7 +349,7 @@ int main(void)
              * escaping is a genuine two-way round trip. */
             char rescaped[64];
             assert(message_tag_escape(value, rescaped, sizeof rescaped) > 0);
-            assert(strcmp(rescaped, "a\\sb\\;c\\:d\\\\e") == 0);
+            assert(strcmp(rescaped, "a\\sb\\:c:d\\\\e") == 0);
             message_free(&r);
         }
         assert_round_trip("PRIVMSG #chan nick!user@host a;b c:d "
@@ -386,10 +386,15 @@ int main(void)
     /* --- IRCv3 escaping, serialize direction --- */
     {
         char e[64];
-        assert(message_tag_escape(":", e, sizeof e) == 2);
-        assert(strcmp(e, "\\:") == 0);
+        /* A COLON IS NOT ESCAPED. IRCv3's table is ';' -> \:, ' ' -> \s,
+         * '\' -> \\, CR -> \r, LF -> \n, and everything else raw -- so a
+         * colon is one of "everything else". This asserted "\:" and "\;",
+         * which is the wrong table in BOTH directions and was asserted here
+         * for months. The assertion is corrected rather than the behaviour. */
+        assert(message_tag_escape(":", e, sizeof e) == 1);
+        assert(strcmp(e, ":") == 0);
         assert(message_tag_escape(";", e, sizeof e) == 2);
-        assert(strcmp(e, "\\;") == 0);
+        assert(strcmp(e, "\\:") == 0);
         assert(message_tag_escape(" ", e, sizeof e) == 2);
         assert(strcmp(e, "\\s") == 0);
         assert(message_tag_escape("\\", e, sizeof e) == 2);
@@ -398,9 +403,10 @@ int main(void)
         assert(strcmp(e, "\\r") == 0);
         assert(message_tag_escape("\n", e, sizeof e) == 2);
         assert(strcmp(e, "\\n") == 0);
-        /* All six at once, in order. */
-        assert(message_tag_escape(":; \\\r\n", e, sizeof e) == 12);
-        assert(strcmp(e, "\\:\\;\\s\\\\\\r\\n") == 0);
+        /* Every escapable byte at once, in order, with the colon raw: the
+         * value is ':' ';' ' ' '\\' CR LF. */
+        assert(message_tag_escape(":; \\\r\n", e, sizeof e) == 11);
+        assert(strcmp(e, ":\\:\\s\\\\\\r\\n") == 0);
         /* Nothing to escape stays byte-identical. */
         assert(message_tag_escape("plain", e, sizeof e) == 5);
         assert(strcmp(e, "plain") == 0);
@@ -412,7 +418,15 @@ int main(void)
         assert(strcmp(e, "ab") == 0);
         assert(message_tag_escape("ab", e, 2) == 0);
         assert(e[0] == '\0');
-        assert(message_tag_escape("a:", e, 3) == 0);
+        /* An escapable byte costs THREE bytes on the wire ('a', '\\', ':') and
+         * a fourth for the NUL, so cap 4 is exactly enough and cap 3 is one
+         * short. The byte tested is ';' rather than ':' because ':' is no
+         * longer escaped at all: with the corrected table "a:" needs two. */
+        assert(message_tag_escape("a:", e, 3) == 2);
+        assert(strcmp(e, "a:") == 0);
+        assert(message_tag_escape("a;", e, 4) == 3);
+        assert(strcmp(e, "a\\:") == 0);
+        assert(message_tag_escape("a;", e, 3) == 0);
         assert(e[0] == '\0');
         assert(message_tag_escape(NULL, e, sizeof e) == 0);
         assert(message_tag_escape("a", NULL, sizeof e) == 0);
@@ -422,8 +436,14 @@ int main(void)
     /* --- IRCv3 escaping, deserialize direction --- */
     {
         char u[64];
+        /* '\:' is the encoding of a SEMICOLON, not of a colon. */
         assert(message_tag_unescape("\\:", u, sizeof u) == 0);
-        assert(strcmp(u, ":") == 0);
+        assert(strcmp(u, ";") == 0);
+        /* '\;' is not a valid encoding at all, and the specification's rule for
+         * an invalid escape is to DROP THE BACKSLASH, so this is a semicolon
+         * too. Refusing the block instead would make this node stricter than
+         * the specification and would drop a peer's message over a byte that
+         * costs nothing. */
         assert(message_tag_unescape("\\;", u, sizeof u) == 0);
         assert(strcmp(u, ";") == 0);
         assert(message_tag_unescape("\\s", u, sizeof u) == 0);
@@ -440,7 +460,8 @@ int main(void)
         assert(strcmp(u, "") == 0);
         assert(message_tag_unescape("ab\\", u, sizeof u) == 0);
         assert(strcmp(u, "ab") == 0);
-        /* An escape before a character outside the set yields the character. */
+        /* An escape before a character outside the set DROPS the backslash and
+         * yields the character, so `\b` is `b`. */
         assert(message_tag_unescape("a\\qb", u, sizeof u) == 0);
         assert(strcmp(u, "aqb") == 0);
         /* Refuses rather than truncating. */
@@ -488,8 +509,8 @@ int main(void)
             { NULL, "skipped" }, /* a NULL key is skipped */
         };
         const size_t n = message_tags_format(tags, 5, block, sizeof block);
-        assert(n == strlen("a=1;b=x\\sy;c=p\\;q;d="));
-        assert(strcmp(block, "a=1;b=x\\sy;c=p\\;q;d=") == 0);
+        assert(n == strlen("a=1;b=x\\sy;c=p\\:q;d="));
+        assert(strcmp(block, "a=1;b=x\\sy;c=p\\:q;d=") == 0);
 
         /* Reject rather than truncate. */
         assert(message_tags_format(tags, 5, block, n) == 0);

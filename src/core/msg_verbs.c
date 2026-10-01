@@ -10,6 +10,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "core/cap.h"
 #include "core/channel.h"
 #include "core/fanout.h"
 #include "core/reply.h"
@@ -206,14 +207,43 @@ void handle_notice(server_t *s, conn_t *c, const message_t *m)
  * and 'G' for one who is gone, and separately allows '@' and '+' for channel
  * operator and voice. Away therefore changes one letter and nothing else, which
  * is what lets a client render "away" out of a WHO without asking a second
- * question. */
-static void who_flags(char *out, size_t cap, const conn_t *c, const chan_t *ch)
+ * question.
+ *
+ * MULTI-PREFIX APPLIES HERE TOO, and it is the reason this function takes a
+ * `multiprefix` argument rather than reading the destination itself: IRCv3's
+ * `multi-prefix` names BOTH 353 and 352, so answering it in one and not the other
+ * would be a node that honours the capability halfway and a client that reads 353
+ * as authoritative and 352 as a summary. RFC 2812 3.3.4's field is free text
+ * beginning with H or G, so `@+` after that first letter is within the grammar.
+ *
+ * WHY IT IS A PARAMETER AND NOT `dst`: WHO is answered to one client, so the
+ * answer is the same for every row of the reply, and asking per entry would ask
+ * the same question once per row of a reply this node builds in a loop. The
+ * question is asked once, in handle_who().
+ *
+ * THE COST, stated rather than left for a reader to wonder about: a client WITHOUT
+ * the capability still gets one sigil here, and a member who is both op and voiced
+ * is reported as the higher of the two -- a lossy answer, and the same lossy
+ * answer it gets in 353 without the capability. That is what the capability is
+ * for. */
+static void who_flags(char *out, size_t cap, const conn_t *c, const chan_t *ch,
+                      int multiprefix)
 {
     size_t n = 0;
 
     out[0] = (c->away[0] != '\0') ? 'G' : 'H';
     n = 1u;
-    if (ch != NULL && chan_has_flag(ch, c, CHAN_MEMBER_OP)) {
+    if (multiprefix != 0) {
+        /* INDEPENDENT TESTS, not an `else if` chain: +o and +v are
+         * independent bits and an op+voice member is exactly the case the
+         * capability exists for. In PREFIX order, for the reason cap.h gives. */
+        if (ch != NULL && chan_has_flag(ch, c, CHAN_MEMBER_OP)) {
+            out[n++] = '@';
+        }
+        if (ch != NULL && chan_has_flag(ch, c, CHAN_MEMBER_VOICE)) {
+            out[n++] = '+';
+        }
+    } else if (ch != NULL && chan_has_flag(ch, c, CHAN_MEMBER_OP)) {
         out[n++] = '@';
     } else if (ch != NULL && chan_has_flag(ch, c, CHAN_MEMBER_VOICE)) {
         out[n++] = '+';
@@ -233,11 +263,14 @@ static void who_flags(char *out, size_t cap, const conn_t *c, const chan_t *ch)
  * the socket for has been forwarded nowhere. A node answering 1 here would be
  * claiming a relay that did not happen. */
 static void who_entry(server_t *s, conn_t *dst, const conn_t *who,
-                      const char *channel, const chan_t *ch)
+                      const char *channel, const chan_t *ch, int multiprefix)
 {
-    char flags[4];
+    /* Five bytes, not four: 'G' or 'H', then '@', then '+', then the NUL. The
+     * fourth byte the old four-byte buffer had was room for ONE sigil, and
+     * multi-prefix is two. */
+    char flags[5];
 
-    who_flags(flags, sizeof flags, who, ch);
+    who_flags(flags, sizeof flags, who, ch, multiprefix);
     (void)reply(s, dst, "352",
                 (const char *const[]){ (channel != NULL) ? channel : "*",
                                         who->user, who->host, s->name, who->nick,
@@ -250,6 +283,10 @@ void handle_who(server_t *s, conn_t *c, const message_t *m)
 {
     const char *mask = "*";
     char canonical[CHAN_MAX_NAME + 1];
+    /* ONE ANSWER FOR THE WHOLE REPLY, asked once because a WHO is answered to a
+     * single client and asking per entry would ask the same question once per row
+     * of a reply this node builds in a loop. See who_flags(). */
+    const int multiprefix = cap_multiprefix_enabled(c);
 
     if (m->nparams > 1) {
         (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
@@ -289,7 +326,7 @@ void handle_who(server_t *s, conn_t *c, const message_t *m)
                 ch->members[i].c->nick[0] == '\0') {
                 continue;
             }
-            who_entry(s, c, ch->members[i].c, ch->name, ch);
+            who_entry(s, c, ch->members[i].c, ch->name, ch, multiprefix);
         }
         (void)reply(s, c, "315", (const char *const[]){ ch->name }, 1,
                     "End of WHO list");
@@ -307,7 +344,7 @@ void handle_who(server_t *s, conn_t *c, const message_t *m)
         if (fanout_mask_match(mask, who->nick) == 0) {
             continue;
         }
-        who_entry(s, c, who, NULL, NULL);
+        who_entry(s, c, who, NULL, NULL, multiprefix);
     }
     (void)reply(s, c, "315", (const char *const[]){ mask }, 1,
                 "End of WHO list");

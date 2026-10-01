@@ -31,21 +31,12 @@
 # SAME CHANGE. Leaving it is a CI failure, which is the point: the list is meant
 # to be hard to leave stale.
 #
-# Zero skips is still the goal. Phase 8 retires the two IRCv3 lines below and
-# Phase 9 retires the other five, and when the last line goes this file is empty
-# and the gate is a plain "no test may skip".
+# Zero skips is still the goal. Phase 8 retired the two IRCv3 lines that were
+# here (CapNegotiation and MultiPrefix) and Phase 9 retires the five that
+# remain, and when the last line goes this file is empty and the gate is a plain
+# "no test may skip".
 #
 # --- the list -----------------------------------------------------------------
-
-# Phase 8 (issue #82): IRCv3 CAP negotiation -- LS/REQ/ACK/NAK. 7/Phase 8 names
-# CAP explicitly, and 4.2's 4.4 has no numeric for any of it.
-CapNegotiation  Phase 8  #82  IRCv3 CAP negotiation (LS/REQ/ACK/NAK)
-
-# Phase 8 (issue #82): the IRCv3 `multi-prefix` capability, which renders more
-# than one prefix per member in 353. chan_verbs.c's send_names_list() renders
-# EXACTLY one of @/+ per member by design, so this is a capability question and
-# not a bug in the render.
-MultiPrefix  Phase 8  #82  IRCv3 multi-prefix in 353
 
 # Phase 9 (issue #83): the §4.3 resync DRIVEN BY a reconnect -- backoff, a retry
 # budget, and a SBURST triggered by a reconnect rather than by establishment.

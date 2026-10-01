@@ -37,6 +37,37 @@
  * field must not be added back.
  *
  * ---------------------------------------------------------------------------
+ * THE PHASE 8 FIELDS, AND WHY THEY ARE HERE RATHER THAN IN cap.c
+ * ---------------------------------------------------------------------------
+ * 2.1 makes this struct's shape final, so the state a capability negotiation and
+ * an authentication exchange need had to be added here or nowhere. They are
+ * ADDITIONS, not rearrangements, and each one is a fact about this connection
+ * that another module has to ask:
+ *
+ *   caps              what this client negotiated. A bitmask over the table in
+ *                     core/cap.h, so enabling a capability is one OR and asking
+ *                     is one AND -- and so a NEW capability is a new bit rather
+ *                     than a new field, which is the shape 2.1 predicted.
+ *   cap_negotiating   1 while a CAP LS/REQ is in flight. Registration is HELD
+ *                     until CAP END arrives, and this is the flag that holds it.
+ *                     It is a separate field rather than a bit in `caps` because
+ *                     "the client asked" and "the client was granted" are
+ *                     different facts and conflating them would make a client
+ *                     that asked for nothing look like one that had finished.
+ *   sasl              the SASL exchange's observable state, as the sasl_state_t
+ *                     sasl_framework.h defines. ABORTED until a client offers a
+ *                     mechanism; FAILED is TERMINAL and is what stops registration
+ *                     completing, because a client that failed to authenticate
+ *                     must not be able to register as though it had.
+ *
+ * WHAT NONE OF THEM GRANT. There is no operator flag on this struct and none was
+ * added: a successful SASL establishes that the client holds a password, and
+ * there is nothing in this node that it could legitimately be granted. Saying
+ * so here is the point -- the field a future phase adds is the first place a
+ * capability would become a privilege, and it should be added when there is a
+ * privilege to grant.
+ *
+ * ---------------------------------------------------------------------------
  * THE WRITE QUEUE
  * ---------------------------------------------------------------------------
  * wbuf[woff .. wlen) is the unsent tail; woff is the retained offset. A
@@ -184,6 +215,9 @@ typedef struct conn {
     char        away[CONN_MAX_AWAY + 1];
     time_t      signon_at;         /* accept time; 317's <signon time> */
     time_t      last_active;       /* last byte read; 317's <idle> */
+    unsigned    caps;              /* negotiated capabilities; core/cap.h bits */
+    int         cap_negotiating;   /* CAP LS/REQ in flight; CAP END clears it */
+    int         sasl;              /* sasl_state_t; FAILED is terminal */
     struct chan **chans;           /* channels joined; Phase 4 */
     size_t      nchans;
     size_t      cap;

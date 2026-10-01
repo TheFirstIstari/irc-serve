@@ -182,10 +182,42 @@
  * The shipped defaults are IRC_FED_DIAL_TIMEOUT_MS (10s) and
  * IRC_FED_HS_TIMEOUT_MS (5s); these now match the handshake one and nothing in the
  * happy path waits either way. */
+/* This file's dial and handshake budgets are 12000, not the 5000 the two-node
+ * federation tests use, and the reason is the node count.
+ *
+ * The four-node case runs four poll loops plus four parent pumps plus CTest on a
+ * GitHub runner that has TWO cores. A dial and a FEDERATE exchange that settle in
+ * two ticks on an idle box can miss even a 5s budget there, and the failure reads
+ * as "federation does not work", which is the most expensive kind of wrong.
+ *
+ * Node A also dials TWO peers in one tick here, which is the only place the
+ * multi-dial path is exercised at all; the other three federation tests are one
+ * dial per node. T7 latches created_ms before calling server_dial(), and although
+ * the dial table reallocs, neither touches s->links, so the iteration the tick
+ * holds is safe. The budget is the exposure, not a defect.
+ *
+ * WHY 12000 AND NOT 6000. Phase 6 deliberately does NOT auto-redial -- that is
+ * Phase 9's policy -- so a node gets exactly ONE attempt at a peer. If that attempt
+ * times out, the link sits at INIT for the rest of the test doing nothing and the
+ * assertion deadline expires on a link that never got a second chance. The budget
+ * therefore has to leave room for the whole of T_IO_MS (15000) to be spent on ONE
+ * attempt, rather than for several, because there is only one.
+ *
+ * Getting this wrong twice is not hypothetical. The first attempt set the budget
+ * EQUAL to the deadline, which is worse than no fix: a timeout then consumed the
+ * entire window and the link could not establish however healthy it was. The second
+ * set it to 6000 -- inside the deadline, but leaving half of it unused, so a
+ * slow-but-successful dial was killed at 6s with nowhere left to succeed. Both
+ * failed on CI with the same "link_established: peer=irc.a" timeout, on node C's
+ * link to A and then node A's link to B. A moving target like that is the
+ * signature of a budget, not of a defect.
+ *
+ * The margin is 3s, so a genuinely dead link still fails the assertion rather than
+ * running to the harness deadline. */
 #define TEST_KEEPALIVE_MS 250
 #define TEST_DEAD_MS (3 * TEST_KEEPALIVE_MS)
-#define TEST_DIAL_MS 5000
-#define TEST_HS_MS 5000
+#define TEST_DIAL_MS 12000
+#define TEST_HS_MS 12000
 
 /* ---------------------------------------------------------------------------
  * PRE-FORK STATE

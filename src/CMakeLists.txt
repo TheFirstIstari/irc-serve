@@ -21,6 +21,11 @@ add_library(irc_core STATIC
   core/reply.c
   core/fanout.c
   core/commands.c
+  # Phase 8: the IRCv3 capability negotiation. It is a module of its own rather
+  # than part of commands.c because the TABLE of what this node implements is
+  # the part that has to be read in one place -- a capability advertised by a
+  # literal at a call site is a claim with no owner.
+  core/cap.c
   core/chan_verbs.c
   core/msg_verbs.c
   # Phase 6. federation/ is a DIRECTORY of its own rather than more core/*.c,

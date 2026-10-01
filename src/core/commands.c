@@ -8,12 +8,14 @@
 #include <string.h>
 #include <time.h>
 
+#include "core/cap.h"
 #include "core/chan_verbs.h"
 #include "core/channel.h"
 #include "core/fanout.h"
 #include "core/msg_verbs.h"
 #include "core/reply.h"
 #include "federation/verbs.h"
+#include "sasl_framework.h"
 
 /* ---------------------------------------------------------------------------
  * THE STATE ENUM IS A PROJECTION OF TWO FACTS
@@ -188,7 +190,7 @@ static void send_welcome(server_t *s, conn_t *c)
  * CHANGE after registration also leaves both facts true, so a nick change never
  * produces a second welcome burst -- which matters, because the burst is what a
  * client uses to decide it has connected. */
-static void update_state(server_t *s, conn_t *c)
+void commands_state_update(server_t *s, conn_t *c)
 {
     int state;
 
@@ -204,10 +206,51 @@ static void update_state(server_t *s, conn_t *c)
     if (state == c->state) {
         return;
     }
+    /* ------------------------------------------------------------------------
+     * THE CAP END GATE, and it is here rather than in cap.c because this is the
+     * ONE place a connection becomes CONN_REG_READY.
+     * ------------------------------------------------------------------------
+     * A client that sent `CAP LS` or `CAP REQ` has a negotiation in flight, and
+     * registration is HELD until `CAP END` arrives. Getting this wrong is not a
+     * compatibility detail: a server that completes registration as soon as it
+     * holds NICK and USER sends 001-005 in the middle of the client's CAP
+     * exchange, every current client reads the burst as the answer to something
+     * else, and the connection hangs with nothing in either log. cap_do_end()
+     * calls back into this function, so the release is the same code path as a
+     * NICK and a USER rather than a second promotion.
+     *
+     * The state field is left ALONE while negotiation is open, rather than being
+     * set to something like CONN_REG_CAP: the enum is a projection of the two
+     * facts the file header describes ("no nick, no user", ...), and inventing a
+     * fourth combination for a fact that is not either of those would break that
+     * projection. A connection held by CAP is a connection whose projection
+     * says REG_NICK or REG_USER and whose gate says no, and the two answers are
+     * about different questions.
+     */
+    if (state == CONN_REG_READY && cap_negotiating(c) != 0) {
+        printf("[observable] reg_held: fd=%d reason=CAP_NEGOTIATING\n", c->fd);
+        return;
+    }
+    /* And a client whose SASL exchange FAILED never registers at all. The
+     * alternative -- registering it unauthenticated -- would make a client that
+     * mistyped a password indistinguishable from one that chose not to
+     * authenticate, and it is the second of those two that a server must be
+     * able to tell apart from the first. handle_authenticate() marks the
+     * connection CLOSING after the 464, so this arm is the belt to that
+     * braces: it holds for any path that sets SASL_FAILED without closing. */
+    if (state == CONN_REG_READY && c->sasl == (int)SASL_FAILED) {
+        printf("[observable] reg_held: fd=%d reason=SASL_FAILED\n", c->fd);
+        return;
+    }
     c->state = state;
     if (state == CONN_REG_READY) {
         send_welcome(s, c);
     }
+}
+
+static void update_state(server_t *s, conn_t *c)
+{
+    commands_state_update(s, c);
 }
 
 /* ---------------------------------------------------------------------------
@@ -835,6 +878,233 @@ static void handle_choper(server_t *s, conn_t *c, const message_t *m)
            c->nick, who->nick, (unsigned long long)s->n_pass_seen);
 }
 
+/* CAP. A one-line pass-through to cap.c, and it is here rather than a function
+ * pointer straight into cap_handle() so that the dispatch table's entry has the
+ * same shape as every other entry in it. The logic is cap.c's; this says only
+ * that `CAP` reaches it. */
+static void handle_cap_wrapper(server_t *s, conn_t *c, const message_t *m)
+{
+    cap_handle(s, c, m);
+}
+
+/* ---------------------------------------------------------------------------
+ * CAP and AUTHENTICATE (Phase 8)
+ * ---------------------------------------------------------------------------
+ * Both are pre-registration verbs, and BOTH HAVE TO BE: the protocol puts CAP
+ * before NICK and USER, and RFC 4422's SASL is answered inside the registration
+ * burst rather than after it. Marking either `pre_reg = 0` would answer 451 to a
+ * client that is doing exactly what the specification says, which is the failure
+ * that hangs every modern client.
+ *
+ * The handlers live here rather than in cap.c and a new sasl handler file because
+ * this is the dispatch table and a verb with no entry here cannot be reached at
+ * all. The LOGIC lives in cap.c and sasl_framework.c; these two functions are the
+ * wire. */
+
+/* AUTHENTICATE, RFC 4422 3.1 / IRCv3 sasl.
+ *
+ *   AUTHENTICATE PLAIN                 -> server: AUTHENTICATE +
+ *   AUTHENTICATE PLAIN <base64>        -> one-shot, verified
+ *   AUTHENTICATE <base64>              -> the response to the '+'
+ *   AUTHENTICATE *                     -> the client abandons the exchange
+ *
+ * The '+' is the initial-response request: it asks the client to send a
+ * PLAIN payload without naming the mechanism again, which is the form every
+ * client actually uses and the form that would be impossible to answer if this
+ * node only understood a mechanism on the first line.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT A BAD CREDENTIAL DOES
+ * ---------------------------------------------------------------------------
+ * It fails REGISTRATION, and that is the requirement this design is explicit
+ * about rather than incidental. The three responses are, in order:
+ *
+ *   1. `AUTHENTICATE *` -- RFC 4422's server-chosen abort. It tells the client the
+ *      exchange is over, so a client that is waiting for a verdict gets one and
+ *      does not wait for a deadline.
+ *   2. `464 ERR_PASSWDMISMATCH` -- the RFC numeric for credentials that did not
+ *      take. NOT 908 (RPL_SASLMECHS, which would offer the client a second try at
+ *      a credential it just got wrong, turning one failure into an unlimited
+ *      guessing loop) and NOT 451.
+ * The connection is NOT closed here, and the reason is a property of the loop
+ * rather than a judgement about the client: poll_loop.c refuses to pump the write
+ * queue of a CONN_CLOSING connection, and the reaper frees that queue with the
+ * conn_t. Marking CLOSING in the same dispatch that queues the abort and the 464
+ * would DISCARD BOTH, so a client whose credential failed would see a bare FIN
+ * with no explanation -- strictly worse than telling it. So the connection is
+ * left open and unusable: commands_state_update() refuses the transition while
+ * c->sasl is SASL_FAILED, so every non-registration command is 451 and 001 can
+ * never arrive.
+ *
+ * THE COST, stated rather than hidden: a client that neither disconnects nor
+ * gives up holds one slot in by_fd and one write queue until it goes away, and
+ * nothing here closes it for it. The slot is bounded by SERVER_FD_TABLE, so this
+ * is a cap on how many such connections can exist rather than an unbounded leak,
+ * and the alternative -- an immediate close that throws away the explanation --
+ * is worse. Closing them on the next poll iteration would need a second state
+ * that distinguishes "closing after the reason was queued" from every other
+ * CLOSING, which is a loop change and not an authentication one.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT IS AND IS NOT IN THE [observable] LINE
+ * ---------------------------------------------------------------------------
+ * The authcid and the outcome. NEVER the password, the base64 payload, or the
+ * authzid -- and the authzid is excluded for a reason beyond tidiness: it is a
+ * third field of the payload and a caller-supplied string that a client can put
+ * anything in, so logging it adds an injection vector to the log for no
+ * diagnostic gain. The authcid is a login name and the operator needs it; the
+ * other two are the credential.
+ *
+ * The payload is also not rendered into a buffer anywhere on this path: it is
+ * decoded into a stack array, split, verified, and dropped. There is no place in
+ * this function where a credential could be printed by accident later, because
+ * there is no variable holding one afterwards. */
+static void handle_authenticate(server_t *s, conn_t *c, const message_t *m)
+{
+    const char *mech = NULL;
+    const char *arg = NULL;
+    unsigned char payload[SASL_MAX_PAYLOAD];
+    char authzid[SASL_MAX_AUTHCID + 1];
+    char authcid[SASL_MAX_AUTHCID + 1];
+    char passwd[SASL_MAX_PASSWORD + 1];
+    long decoded;
+    const char *params[2];
+
+    /* AUTHENTICATE * is the ABORT (RFC 4422 3.1), and it is answered before any
+     * parsing: a client abandoning an exchange must not have to supply a
+     * well-formed one to be allowed to stop. It leaves the connection
+     * registerable, because declining to authenticate is not failing to. */
+    if (m->nparams >= 1 && strcmp(m->params[0], "*") == 0) {
+        c->sasl = (int)SASL_ABORTED;
+        printf("[observable] sasl: fd=%d outcome=ABORTED\n", c->fd);
+        return;
+    }
+
+    /* WHICH PARAMETER IS THE MECHANISM, AND WHICH IS THE RESPONSE.
+     *
+     * RFC 4422's first form is `AUTHENTICATE <mechanism> [<initial-response>]`,
+     * so two parameters is unambiguous. The SECOND form -- the client answering
+     * the '+' this node sent -- is a single parameter that is NOT a mechanism
+     * name, and there is no syntactic way to tell the two apart: a base64 blob
+     * may have no '=' padding and may begin with any of the 64 alphabet
+     * characters, so "does it contain '='" and "does it start with a plausible
+     * name" are both guesses that break on a real client.
+     *
+     * The answer is the STATE, and that is why c->sasl is a field on the
+     * connection at all. A single parameter while an exchange is in progress is
+     * the response; a single parameter with no exchange in progress is a
+     * mechanism name. The alternative -- guessing from the bytes -- is how a
+     * server accepts a credential it never asked for. */
+    if (m->nparams >= 2) {
+        mech = m->params[0];
+        arg = m->params[1];
+    } else if (m->nparams == 1) {
+        if (c->sasl == (int)SASL_IN_PROGRESS) {
+            mech = "PLAIN";
+            arg = m->params[0];
+        } else {
+            mech = m->params[0];
+        }
+    }
+    if (mech == NULL) {
+        /* Either a bare `AUTHENTICATE` or a first line that is neither a known
+         * mechanism nor a payload. 908 offers the one mechanism this node has,
+         * which is the answer a client needs and the only honest one: a node with
+         * no credential store has NO mechanism, and saying so is what 908's list
+         * being empty means. */
+        params[0] = (sasl_store_count(s->sasl_store) > 0u) ? "PLAIN" : "";
+        (void)reply(s, c, RPL_SASLMECHS, params, 1,
+                    "are available SASL mechanisms");
+        printf("[observable] sasl: fd=%d outcome=NO_MECHANISM store=%zu\n", c->fd,
+               sasl_store_count(s->sasl_store));
+        return;
+    }
+    if (strcasecmp(mech, "PLAIN") != 0) {
+        /* A mechanism this node names but does not implement, or one it does not
+         * know at all. 908 rather than a refusal: the client asked what it can
+         * use, and the answer is what it can use. */
+        params[0] = (sasl_store_count(s->sasl_store) > 0u) ? "PLAIN" : "";
+        (void)reply(s, c, RPL_SASLMECHS, params, 1,
+                    "are available SASL mechanisms");
+        printf("[observable] sasl: fd=%d outcome=MECH_REFUSED mech=%s\n", c->fd,
+               mech);
+        return;
+    }
+
+    if (arg == NULL) {
+        /* Start the exchange. The '+' is a trailing parameter with no space in
+         * it, and RFC 4422 requires it to be exactly that. */
+        c->sasl = (int)SASL_IN_PROGRESS;
+        params[0] = c->nick[0] != '\0' ? c->nick : "*";
+        params[1] = "+";
+        (void)send_line(s, c, NULL, "AUTHENTICATE", params, 2);
+        printf("[observable] sasl: fd=%d outcome=STARTED mech=PLAIN\n", c->fd);
+        return;
+    }
+
+    decoded = sasl_b64_decode(arg, strlen(arg), payload, sizeof payload);
+    if (decoded < 0 ||
+        sasl_plain_parse((const char *)payload, (size_t)decoded, authzid,
+                         sizeof authzid, authcid, sizeof authcid, passwd,
+                         sizeof passwd) != 0) {
+        c->sasl = (int)SASL_FAILED;
+        s->n_sasl_fail++;
+        /* ONE parameter, so the line is exactly `AUTHENTICATE *`. With two the
+         * formatter would colonned the '*' (a value beginning with ':' or
+         * holding a space needs the marker, and this one needs neither) and the
+         * client would see a trailing parameter where RFC 4422 3.1 specifies a
+         * single one. The abort is the one line in this exchange a client reads
+         * with a byte comparison, so it is written as the RFC writes it. */
+        params[0] = "*";
+        (void)send_line(s, c, NULL, "AUTHENTICATE", params, 1);
+        (void)reply(s, c, "464", NULL, 0,
+                    "SASL PLAIN payload was not base64 or not three "
+                    "NUL-separated fields");
+        conn_mark_closing(c);
+        printf("[observable] sasl: fd=%d outcome=REJECTED reason=BAD_PAYLOAD\n",
+               c->fd);
+        return;
+    }
+
+    /* The verification itself. No store means no authentication, and the node
+     * does not pretend otherwise: cap.c has already withheld `sasl` from CAP LS,
+     * so a client that reached here has either ignored the advertisement or
+     * arrived with a hard-coded configuration. */
+    if (!sasl_plain_verify(s->sasl_store, authzid, authcid, passwd)) {
+        const int no_store = (sasl_store_count(s->sasl_store) == 0u);
+
+        c->sasl = (int)SASL_FAILED;
+        s->n_sasl_fail++;
+        params[0] = "*";
+        (void)send_line(s, c, NULL, "AUTHENTICATE", params, 1);
+        /* The text says WHICH failure, because the operator needs to know
+         * whether to fix the store or to look for an attack, and the client
+         * needs to know not to retry the same password. It never says anything
+         * about the credential itself. */
+        (void)reply(s, c, "464", NULL, 0, "SASL authentication failed: %s",
+                    no_store ? "this node holds no client credential store"
+                             : "the credentials did not verify");
+        printf("[observable] sasl: fd=%d authcid=%s outcome=REJECTED reason=%s\n",
+               c->fd, authcid, no_store ? "NO_STORE" : "BAD_CREDENTIAL");
+        return;
+    }
+
+    /* Verified. Nothing is GRANTED, because there is nothing here to grant -- see
+     * sasl_framework.h on what SASL authenticates against. What is recorded is
+     * the fact and the identity, so a later numeric could report it; the counter
+     * is the node's own claim and it is incremented here because this is the
+     * only place a credential is ever accepted. */
+    c->sasl = (int)SASL_COMPLETED;
+    s->n_sasl_ok++;
+    printf("[observable] sasl: fd=%d authcid=%s outcome=COMPLETED granted=0\n",
+           c->fd, authcid);
+    /* Registration is not forced here. A client that sent NICK and USER before
+     * its AUTHENTICATE has already satisfied the state machine, and if it was
+     * held for CAP it is still held -- so the gate is re-evaluated rather than
+     * bypassed. */
+    commands_state_update(s, c);
+}
+
 /* ---------------------------------------------------------------------------
  * The command table
  * ------------------------------------------------------------------------ */
@@ -854,6 +1124,12 @@ typedef struct {
 
 static const command_t k_commands[] = {
     { "PASS",    handle_pass,  1 },
+    /* 7/Phase 8. Both are pre-registration verbs: CAP is sent BEFORE NICK and
+     * USER by every current client, and SASL is answered inside the registration
+     * burst. `pre_reg = 1` on both is load-bearing -- see the comment above
+     * handle_cap() and handle_authenticate(). */
+    { "CAP",     handle_cap_wrapper, 1 },
+    { "AUTHENTICATE", handle_authenticate, 1 },
     { "NICK",    handle_nick,  1 },
     { "USER",    handle_user,  1 },
     { "PING",    handle_ping,  1 },

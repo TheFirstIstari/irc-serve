@@ -58,6 +58,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "core/cap.h"
 #include "core/reply.h"
 #include "federation/verbs.h"
 
@@ -339,6 +340,122 @@ int fanout_line_fits(const char *prefix, const char *verb, const char *target,
  * ---------------------------------------------------------------------------
  */
 
+/* ---------------------------------------------------------------------------
+ * THE EMISSION'S 2.4 IDENTITY, COMPUTED ONCE
+ * ---------------------------------------------------------------------------
+ * One call, one stamp, and that is the whole point of it being here rather than
+ * inside fanout_forward_sverb().
+ *
+ * WHY IT HAD TO MOVE. The forward leg is called ONCE PER TARGET, so a mint in
+ * there is a mint per peer: an emission forwarded to two peers reached them
+ * under two different (origin, epoch, id) pairs. For the dedup store that was
+ * survivable -- the store is per node, and the two copies of one message to two
+ * peers are not copies of one message arriving twice -- but it is fatal for the
+ * IRCv3 `msgid`, which is derived from this same triple and is read by CLIENTS.
+ * Two members of one channel on two nodes would see two different msgids for one
+ * message, which is precisely the "two deliveries look like two messages" failure
+ * the capability exists to remove, and it would be this node's own minting that
+ * caused it.
+ *
+ * So the identity is computed once per EMISSION here, before the local write and
+ * before the target walk, and both consume the same stamp. This is also the
+ * argument fanout.h makes about why `carry` is an argument and not a field on
+ * fanout_target_t: an identity is a property of one emission, and an emission is
+ * what fanout_deliver() is given.
+ *
+ * WHAT CHANGED FOR THE FORWARD LEG, and it is worth stating because the hop
+ * arithmetic moved with the mint. Before, fanout_forward_sverb() decided between
+ * "mint" and "carry and add a hop" and so was the only place that knew either
+ * answer. Now the stamp that goes on the wire is computed HERE, which means a
+ * caller that already has the stamp must be able to say "this one is already
+ * what the wire gets" -- and that is a second entry point onto the same static
+ * body, not a second body. fanout_forward_sverb() keeps its public contract
+ * exactly (tests/integration/test_fed_dedup.c pins it on the wire, carry in and
+ * hops+1 out), so the +1 it did for itself is done by fanout_stamp() instead.
+ *
+ * `relayed` travels out of here rather than being re-derived at each use, because
+ * the two facts it separates are genuinely different and each is checked at one
+ * place: a stamp this node minted has origin == s->name and hops == 0 and is
+ * EXACTLY what goes on the wire, while a stamp a peer sent is one hop old before
+ * this node forwards it and 2.4's own-origin rule applies to it and not to the
+ * other. */
+static void fanout_stamp(server_t *s, const irc_serve_tags_t *carry,
+                         irc_serve_tags_t *out, int *relayed)
+{
+    if (carry == NULL) {
+        /* ORIGINATING. This node minted the emission, so the identity is minted
+         * with it: origin is this node's name -- which is what makes 2.4's
+         * never-forward-own-origin rule decidable on the far side without any
+         * extra state -- epoch is this node's per-boot value, and the id is the
+         * next from the per-SERVER counter. hops is 0 because nothing has
+         * forwarded it yet, and 2.4 counts forwards rather than hops travelled. */
+        memset(out, 0, sizeof *out);
+        memcpy(out->origin, s->name, strlen(s->name) + 1u);
+        out->epoch = s->epoch;
+        out->id = server_next_msg_id(s);
+        out->hops = 0u;
+        *relayed = 0;
+        return;
+    }
+    /* RELAYING. origin/epoch/id carry through UNCHANGED and only hops moves. A
+     * restamp here would give the copy a new identity, the far side's dedup
+     * store would treat it as a message it has never seen, and the message would
+     * come back -- that is the loop, and it is not bounded by the hop ceiling in
+     * any useful sense because each pass would mint a fresh id. hops is the ONLY
+     * field a forward may change, and this is the only place it changes.
+     *
+     * THE INCREMENT SATURATES, and that is not a detail. It is done in a wider
+     * type on purpose: `carry->hops + 1u` in uint32_t wraps, and a stamp that
+     * arrives carrying hops=UINT32_MAX would become hops=0 -- which is the one
+     * value the hop ceiling refuses least, because it is the value that means
+     * "nothing has forwarded this yet". A hostile or broken peer sending that
+     * stamp would therefore get its message forwarded unboundedly, which is
+     * exactly what 2.4's ceiling exists to prevent, and it would get there
+     * through arithmetic rather than through a policy decision.
+     * tests/integration/test_fed_dedup.c sends that stamp and requires it to be
+     * refused; saturating at UINT32_MAX -- the largest value 2.4's value grammar
+     * admits for hops -- keeps it refused for the right reason rather than by
+     * accident. */
+    *out = *carry;
+    {
+        const uint64_t hops = (uint64_t)carry->hops + 1u;
+
+        out->hops = (hops > (uint64_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)hops;
+    }
+    *relayed = 1;
+}
+
+/* The client-visible `msgid` tag for one DESTINATION, or NULL when this
+ * destination gets none.
+ *
+ * PER DESTINATION, because the capability is per connection: two members of one
+ * channel can disagree about `message-tags` and the block is written per member
+ * inside the member walk rather than once for the emission. That is why this
+ * takes the conn_t and not just the stamp.
+ *
+ * The failure branch is a BUG REPORT and not a fallback. irc_serve_msgid_tag()
+ * returns 0 only for a stamp 2.4's grammar would refuse or a buffer one byte too
+ * small, and both are impossible here (the stamp was just computed by
+ * fanout_stamp() from s->epoch and the counter, so it is legal; the buffer is
+ * sized from the derivation in message.h). Emitting the line untagged would be
+ * the quiet half of a claim this file makes -- "a client that asked for msgids
+ * gets them" -- so it is refused loudly instead and the caller sends nothing. */
+static const char *fanout_msgid_tag(const conn_t *dst,
+                                    const irc_serve_tags_t *ident, char *out,
+                                    size_t cap)
+{
+    if (cap_message_ids_enabled(dst) == 0) {
+        return NULL;
+    }
+    if (irc_serve_msgid_tag(ident, out, cap) == 0u) {
+        printf("[observable] msgid_refused: fd=%d origin=%s id=%llu\n",
+               (dst != NULL) ? dst->fd : -1, ident->origin,
+               (unsigned long long)ident->id);
+        return NULL;
+    }
+    return out;
+}
+
 /* Write one line to every local member of `t->chan`, minus `exclude`.
  *
  * The same chan_member_live() rule every other member walk applies, for the
@@ -350,7 +467,7 @@ int fanout_line_fits(const char *prefix, const char *verb, const char *target,
 static int write_to_members(server_t *s, const fanout_target_t *t,
                             const char *prefix, const char *verb,
                             const char *const *params, int nparams,
-                            conn_t *exclude)
+                            conn_t *exclude, const irc_serve_tags_t *ident)
 {
     /* The target is `t->name` -- 2.2's CANONICAL form -- and not whatever the
      * caller typed, PREPENDED to the caller's own parameters. That is why the
@@ -392,6 +509,7 @@ static int write_to_members(server_t *s, const fanout_target_t *t,
     }
     for (size_t i = 0; i < t->chan->nmembers; i++) {
         conn_t *m = t->chan->members[i].c;
+        char msgid[IRC_MAX_MSGTAG + 1u];
 
         if (!chan_member_live(&t->chan->members[i])) {
             continue;
@@ -399,7 +517,16 @@ static int write_to_members(server_t *s, const fanout_target_t *t,
         if (exclude != NULL && m == exclude) {
             continue;
         }
-        (void)send_line(s, m, prefix, verb, all, nparams + 1);
+        /* PER MEMBER, and the buffer is per member too rather than hoisted: the
+         * tag is rendered inside the walk because the capability is per
+         * connection, and two members of one channel are free to disagree about
+         * it. Hoisting the render would be wrong for a second reason too -- the
+         * block is a pointer into this frame, so one buffer re-used across the
+         * walk is a buffer whose contents change while the previous member's
+         * line is already queued (which is harmless) but whose NUL is assumed by
+         * send_line_tagged() (which is not, and would be the bug). */
+        (void)send_line_tagged(s, m, prefix, verb, all, nparams + 1,
+                               fanout_msgid_tag(m, ident, msgid, sizeof msgid));
         n++;
     }
     return n;
@@ -429,16 +556,28 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
      * lands in the `default` that says it is unhandled. The two properties the
      * warnings were after are preserved and the warning set is untouched. */
     int kind;
+    /* THE EMISSION'S IDENTITY, computed once for every row. It has to be above
+     * the switch rather than inside the arms that need it, because the two
+     * things it feeds -- the local write and the forward -- live in DIFFERENT
+     * arms, and a stamp minted per arm would be a different identity for the
+     * copy the members on this node see and the copy the peers see. That is the
+     * same "one emission, one identity" argument fanout.h makes about `carry`
+     * being an argument and not a field, and it is why the number is spent here
+     * and nowhere else. */
+    irc_serve_tags_t ident;
+    int relayed;
 
     if (s == NULL || t == NULL || verb == NULL || (params == NULL && nparams != 0) ||
         nparams < 0) {
         return 0;
     }
     kind = (int)t->kind;
+    fanout_stamp(s, carry, &ident, &relayed);
 
     switch (kind) {
     case FANOUT_LOCAL_USER: {
         const char *all[IRC_MAX_PARAMS + 1];
+        char msgid[IRC_MAX_MSGTAG + 1u];
         int n = 0;
 
         /* The same `>=` and the same reason as write_to_members() above: the
@@ -462,13 +601,21 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
              * what lets a client confirm delivery without a second command. */
             return 0;
         }
-        (void)send_line(s, t->user, prefix, verb, all, nparams + 1);
+        /* The msgid gate, asked about THIS destination, which is the one
+         * connection this row writes to. A PRIVMSG to a user rather than to a
+         * channel is still one emission with one 2.4 identity, and the stamp the
+         * identity came from is the same one a channel row would have forwarded,
+         * so the value a user sees and the value a peer would see for the same
+         * message are the same string. */
+        (void)send_line_tagged(s, t->user, prefix, verb, all, nparams + 1,
+                               fanout_msgid_tag(t->user, &ident, msgid, sizeof msgid));
         n = 1;
         return n;
     }
 
     case FANOUT_LOCAL_CHANNEL: {
-        int n = write_to_members(s, t, prefix, verb, params, nparams, exclude);
+        int n = write_to_members(s, t, prefix, verb, params, nparams, exclude,
+                                 &ident);
 
         /* 3.1's two owned rows, AND THEY NOW SHARE ONE FORWARD ARM.
          *
@@ -481,8 +628,15 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
          * otherwise be a second walk over servers[] and the links, and the exact
          * duplication this module exists to prevent. See fanout.h on that
          * function. */
+        /* AND IT IS HANDED THE EMISSION'S STAMP rather than `carry`, which is the
+         * whole of the change this pass makes to the forward leg: the identity a
+         * local member has just seen rendered as a `msgid` and the identity that
+         * goes on the wire are the same three numbers, because they are the same
+         * stamp. A `carry` of NULL here would mint a SECOND id for one emission,
+         * and the two clients -- one on this node, one on the peer -- would then be
+         * told two different things about one message. */
         (void)fanout_forward_channel(s, t->chan, t->vclass, verb, prefix, params,
-                                     nparams, carry);
+                                     nparams, &ident, relayed);
         return n;
     }
 
@@ -501,7 +655,7 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
              * caller, so "FORWARD ONLY" is what the node does rather than a
              * comment promising it would. */
             (void)fanout_forward_channel(s, t->chan, t->vclass, verb, prefix, params,
-                                         nparams, carry);
+                                         nparams, &ident, relayed);
             return 0;
         }
         /* "message": write to local members AND forward to the owner. Both
@@ -527,10 +681,11 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
          * member of it still has to carry that channel's message to the servers
          * that do. */
         {
-            int n = write_to_members(s, t, prefix, verb, params, nparams, exclude);
+            int n = write_to_members(s, t, prefix, verb, params, nparams, exclude,
+                                     &ident);
 
             (void)fanout_forward_channel(s, t->chan, t->vclass, verb, prefix, params,
-                                         nparams, carry);
+                                         nparams, &ident, relayed);
             return n;
         }
 
@@ -660,13 +815,109 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
  * channel with no member-server and no ESTABLISHED link has nowhere to send it,
  * and a leaf that does not own the channel and has no route to the owner gets
  * the NO_ROUTE report from fanout_forward_sverb() rather than a silent drop. */
+/* ONE PEER, with the stamp ALREADY DECIDED. The target-set walk above and
+ * fanout_forward_sverb() both reach this, and it is the only place the two
+ * 2.4 forward-time guards and the render-and-queue live.
+ *
+ * `relayed` is the one fact that cannot be re-derived from `stamp` and it is a
+ * parameter rather than a comparison because the comparison would be wrong. A
+ * stamp this node MINTED has origin == s->name, and so does a stamp a peer sent
+ * naming this node -- which federation/verbs.c's inbound guard already refuses
+ * with `fed_own_origin_drop` before it could reach a forward. The two are told
+ * apart by where the value came from, not by what it says, and guessing from the
+ * bytes would either refuse every forward this node originates or forward back
+ * the message that came home, which is the loop 2.4 exists to stop.
+ *
+ * NOT STATIC-BY-NECESSITY: it is static because the guards belong with the queue
+ * call they report, and the two callers that reach it are the two halves of one
+ * operation (a target-set walk, and a single named peer). A third caller would
+ * be the moment to ask whether the walk wants the stamp too. */
+static int forward_one_peer(server_t *s, const char *peer_name, const char *sverb,
+                            const char *src, const char *const *params, int nparams,
+                            const irc_serve_tags_t *stamp, int relayed)
+{
+    const char *target = (params != NULL && nparams > 0) ? params[0] : "-";
+    conn_t *peer;
+    fed_queue_why_t why = FED_QUEUE_OK;
+
+    /* The link is resolved here rather than by the caller, because the refusals
+     * below name the peer and because a caller that had to resolve it would have
+     * two places deciding what a route is. server_find_peer() is the ESTABLISHED
+     * predicate: a link that has not finished the handshake FSM is not a route,
+     * and 2.3 requires the server-name uniqueness check to happen before
+     * ESTABLISHED for the reason this would otherwise be a duplicate-name bug on
+     * the wire. */
+    peer = server_find_peer(s, peer_name);
+    if (peer == NULL) {
+        printf("[observable] fanout_forward_dropped: verb=%s target=%s peer=%s "
+               "reason=NO_ROUTE\n",
+               sverb, target, peer_name);
+        return 0;
+    }
+
+    /* ---- 2.4's two forward-time guards, and they are RELAY guards ---- */
+    if (relayed != 0) {
+        if ((uint64_t)stamp->hops >= (uint64_t)IRC_MAX_HOPS) {
+            /* 2.4: "irc-serve-hops increments per forward and the message is
+             * dropped at 10." `stamp->hops` is already the value that WOULD go
+             * on the wire -- fanout_stamp() did the increment -- so the test is
+             * on it directly and not on hops + 1. It is unchanged in effect: the
+             * largest value that may be FORWARDED is IRC_MAX_HOPS - 1. */
+            printf("[observable] fanout_forward_dropped: verb=%s target=%s "
+                   "peer=%s reason=hop_limit hops=%lu ceiling=%d\n",
+                   sverb, target, peer_name, (unsigned long)stamp->hops,
+                   IRC_MAX_HOPS);
+            return 0;
+        }
+        if (same_origin(stamp->origin, s->name)) {
+            /* 2.4: "A node never forwards a message whose irc-serve-origin is
+             * itself." This is the second of the three loop rules, and it is the
+             * one that stops the SHORT cycle -- two nodes bouncing one message
+             * between them -- which the hop ceiling alone would only slow down.
+             *
+             * The comparison is ASCII case-insensitive, and message.h says
+             * explicitly that this is the caller's job: server names are
+             * case-insensitive (2.1, RFC 1459 2.3.2), so a peer that spells this
+             * node's name `IRC.A` in a tag is naming THIS node, and treating it
+             * as a different server would forward back into the sender for ever
+             * up to the hop ceiling. */
+            printf("[observable] fanout_forward_dropped: verb=%s target=%s "
+                   "peer=%s reason=own_origin origin=%s self=%s\n",
+                   sverb, target, peer_name, stamp->origin, s->name);
+            return 0;
+        }
+    }
+
+    /* The prefix is the caller's, and for two of the seven S-verbs that is the
+     * whole point: SPRIVMSG and SNOTICE are about a USER, so the receiver needs
+     * a `nick!user@host` to put on the message it delivers to its own members.
+     * verbs.h documents the argument and the fallback.
+     *
+     * fed_queue_line() and NOT fed_send_sverb(), because the verb here is
+     * ALREADY an S-verb: fed_send_sverb() exists to map a client verb and
+     * refuses a name it cannot map, and a relay's verb is exactly such a name.
+     * The mapping and the shared step are separated for the same reason they are
+     * for the T3 keepalive. */
+    if (fed_queue_line(s, peer, stamp, src, sverb, params, nparams, &why) != 0) {
+        /* fed_queue_why_name() has already been printed by nothing, so this
+         * function says it, once. Counting a second, vaguer refusal here would
+         * give an operator two lines to read for one event. */
+        printf("[observable] fanout_forward_dropped: verb=%s target=%s peer=%s "
+               "reason=%s\n",
+               sverb, target, peer_name, fed_queue_why_name(why));
+        return 0;
+    }
+    return 1;
+}
+
 /* THE TARGET SET WALK, and the only copy of it. Static because both exported
  * entry points below reach it, and because a target set that two functions could
  * each implement is a target set with two answers. */
 static int forward_channel_targets(server_t *s, const chan_t *ch,
                                    fanout_class_t vclass, const char *sverb,
                                    const char *prefix, const char *const *params,
-                                   int nparams, const irc_serve_tags_t *carry)
+                                   int nparams, const irc_serve_tags_t *stamp,
+                                   int relayed)
 {
     int queued = 0;
     int owned;
@@ -689,15 +940,15 @@ static int forward_channel_targets(server_t *s, const chan_t *ch,
         /* Both non-owned rows go to the owner, and the two classes differ only
          * in whether the caller also wrote locally -- which is the caller's
          * half of the row, not this one's. */
-        return fanout_forward_sverb(s, ch->origin, sverb, prefix, params, nparams,
-                                    carry);
+        return forward_one_peer(s, ch->origin, sverb, prefix, params, nparams, stamp,
+                                relayed);
     }
     /* servers[] first, because those are the peers this node KNOWS hold
      * members, and a name in that set with no ESTABLISHED link is a finding
      * worth reporting rather than a peer to skip quietly. */
     for (size_t i = 0; i < ch->nservers; i++) {
-        queued += fanout_forward_sverb(s, ch->servers[i].name, sverb, prefix, params,
-                                       nparams, carry);
+        queued += forward_one_peer(s, ch->servers[i].name, sverb, prefix, params,
+                                   nparams, stamp, relayed);
     }
     for (size_t j = 0; j < s->nlinks; j++) {
         const server_link_t *lk = &s->links[j];
@@ -713,8 +964,8 @@ static int forward_channel_targets(server_t *s, const chan_t *ch,
             }
         }
         if (already == 0) {
-            queued += fanout_forward_sverb(s, lk->name, sverb, prefix, params, nparams,
-                                           carry);
+            queued += forward_one_peer(s, lk->name, sverb, prefix, params, nparams,
+                                       stamp, relayed);
         }
     }
     return queued;
@@ -723,7 +974,7 @@ static int forward_channel_targets(server_t *s, const chan_t *ch,
 int fanout_forward_channel(server_t *s, const chan_t *ch, fanout_class_t vclass,
                            const char *client_verb, const char *prefix,
                            const char *const *params, int nparams,
-                           const irc_serve_tags_t *carry)
+                           const irc_serve_tags_t *stamp, int relayed)
 {
     const char *sverb;
     const char *sp[FED_SVERB_MAX_PARAMS];
@@ -754,7 +1005,8 @@ int fanout_forward_channel(server_t *s, const chan_t *ch, fanout_class_t vclass,
                client_verb, ch->name);
         return 0;
     }
-    return forward_channel_targets(s, ch, vclass, sverb, prefix, sp, shaped, carry);
+    return forward_channel_targets(s, ch, vclass, sverb, prefix, sp, shaped, stamp,
+                                   relayed);
 }
 
 int fanout_forward_channel_sverb(server_t *s, const chan_t *ch,
@@ -765,9 +1017,26 @@ int fanout_forward_channel_sverb(server_t *s, const chan_t *ch,
     /* The relay half: the line is ALREADY an S-verb in 4.3's frozen shape, so
      * there is nothing to re-shape and only the target set to decide. Same walk,
      * same rules, same refusals -- which is the whole reason it is a second
-     * entry point onto one static function rather than a second function. */
+     * entry point onto one static function rather than a second function.
+     *
+     * AND IT COMPUTES THE STAMP ITSELF, rather than being handed one the way
+     * fanout_forward_channel() above is. This one is called by
+     * federation/verbs.c with the stamp a PEER sent, and its one obligation is
+     * the same one fanout_forward_sverb() has: add this node's hop and change
+     * nothing else. The stamp is computed once here rather than per target
+     * because for a relay the arithmetic is idempotent -- every target of a walk
+     * would compute the same three numbers -- and computing it once means the
+     * value a local member sees and the value every peer sees are the same
+     * triple even on a mesh where they are the same emission by two routes. */
+    irc_serve_tags_t ident;
+    int relayed;
+
+    if (s == NULL) {
+        return 0;
+    }
+    fanout_stamp(s, carry, &ident, &relayed);
     return forward_channel_targets(s, ch, vclass, sverb, prefix, params, nparams,
-                                   carry);
+                                   &ident, relayed);
 }
 
 /* The shape-free forward: one ALREADY-SHAPED S-verb to one named peer, with the
@@ -791,9 +1060,9 @@ int fanout_forward_sverb(server_t *s, const char *peer_name, const char *sverb,
                          int nparams, const irc_serve_tags_t *carry)
 {
     const char *target = (params != NULL && nparams > 0) ? params[0] : "-";
-    irc_serve_tags_t tags;
     conn_t *peer;
-    fed_queue_why_t why = FED_QUEUE_OK;
+    irc_serve_tags_t tags;
+    int relayed;
     size_t pbytes = 0;
     /* The prefix this line will carry. NULL means the caller had none, and the
      * fallback is this node's own name -- correct for the five state verbs,
@@ -853,7 +1122,19 @@ int fanout_forward_sverb(server_t *s, const char *peer_name, const char *sverb,
      * and it is the ESTABLISHED one: a link that has not finished the handshake
      * FSM is not a route, and 2.3 requires the server-name uniqueness check to
      * happen before ESTABLISHED for the reason this would otherwise be a
-     * duplicate-name bug on the wire. */
+     * duplicate-name bug on the wire.
+     *
+     * AND IT IS LOOKED UP TWICE, once here and once in forward_one_peer(). That is
+     * deliberate rather than an oversight left for a reader to puzzle over: THIS
+     * one is the pre-mint refusal, so a forward to a server with no route spends
+     * no id -- and tests/integration/test_fed_dedup.c pins exactly that, by
+     * refusing an originating forward down a link that is not ESTABLISHED and then
+     * requiring the counter to be exactly one id further on. The second lookup is
+     * needed because the target-set walk reaches forward_one_peer() with a NAME and
+     * no resolved peer. The cost is one linear scan of the link table per forwarded
+     * target, which is negligible beside the line render it precedes, and the
+     * alternative -- resolving every target in the walk before spending anything --
+     * would be a second copy of the target set to keep in step with the first. */
     peer = server_find_peer(s, peer_name);
     if (peer == NULL) {
         printf("[observable] fanout_forward_dropped: verb=%s target=%s peer=%s "
@@ -862,69 +1143,19 @@ int fanout_forward_sverb(server_t *s, const char *peer_name, const char *sverb,
         return 0;
     }
 
-    /* ---- 2.4: the stamp, and the loop guard, at forward time ---- */
-    if (carry == NULL) {
-        /* ORIGINATING. This node minted the message, so the identity is minted
-         * with it -- and the origin is this node's name, which is what makes 2.4's
-         * never-forward-own-origin rule decidable on the far side without any
-         * extra state. */
-        memset(&tags, 0, sizeof tags);
-        memcpy(tags.origin, s->name, strlen(s->name) + 1u);
-        tags.epoch = s->epoch;
-        tags.id = server_next_msg_id(s);
-        tags.hops = 0u;
-    } else {
-        /* RELAYING. origin/epoch/id are carried through and only hops moves.
-         * `tags = *carry` cannot accidentally restamp, because a restamp would
-         * have to be a write after this line and there is none. */
-        if ((uint64_t)carry->hops + 1u >= (uint64_t)IRC_MAX_HOPS) {
-            printf("[observable] fanout_forward_dropped: verb=%s target=%s "
-                   "peer=%s reason=hop_limit hops=%lu ceiling=%d\n",
-                   sverb, target, peer_name, (unsigned long)carry->hops,
-                   IRC_MAX_HOPS);
-            return 0;
-        }
-        if (same_origin(carry->origin, s->name)) {
-            /* 2.4: "A node never forwards a message whose irc-serve-origin is
-             * itself." This is the second of the three loop rules, and it is the
-             * one that stops the SHORT cycle -- two nodes bouncing one message
-             * between them -- which the hop ceiling alone would only slow down.
-             *
-             * The comparison is ASCII case-insensitive, and message.h says
-             * explicitly that this is the caller's job: server names are
-             * case-insensitive (2.1, RFC 1459 2.3.2), so a peer that spells this
-             * node's name `IRC.A` in a tag is naming THIS node, and treating it
-             * as a different server would forward back into the sender for ever
-             * up to the hop ceiling. */
-            printf("[observable] fanout_forward_dropped: verb=%s target=%s "
-                   "peer=%s reason=own_origin origin=%s self=%s\n",
-                   sverb, target, peer_name, carry->origin, s->name);
-            return 0;
-        }
-        tags = *carry;
-        tags.hops = carry->hops + 1u;
-    }
-
-    /* The prefix is the caller's, and for two of the seven S-verbs that is the
-     * whole point: SPRIVMSG and SNOTICE are about a USER, so the receiver needs
-     * a `nick!user@host` to put on the message it delivers to its own members.
-     * verbs.h documents the argument and the fallback.
+    /* ---- 2.4: the stamp, and the loop guard, at forward time ----
      *
-     * fed_queue_line() and NOT fed_send_sverb(), because the verb here is
-     * ALREADY an S-verb: fed_send_sverb() exists to map a client verb and
-     * refuses a name it cannot map, and a relay's verb is exactly such a name.
-     * The mapping and the shared step are separated for the same reason they are
-     * for the T3 keepalive. */
-    if (fed_queue_line(s, peer, &tags, src, sverb, params, nparams, &why) != 0) {
-        /* fed_queue_why_name() has already been printed by nothing, so this
-         * function says it, once. Counting a second, vaguer refusal here would
-         * give an operator two lines to read for one event. */
-        printf("[observable] fanout_forward_dropped: verb=%s target=%s peer=%s "
-               "reason=%s\n",
-               sverb, target, peer_name, fed_queue_why_name(why));
-        return 0;
-    }
-    return 1;
+     * THE STAMP IS COMPUTED HERE AND NOT DELEGATED to fanout_stamp()'s callers,
+     * because of WHERE it sits: below the size check and below the peer lookup,
+     * both of which can refuse, and an id spent on a line that is then refused is
+     * a hole in the per-SERVER sequence. That reasoning is the paragraph above and
+     * it is why this function's public contract is unchanged even though the walk
+     * above it now hands a pre-computed stamp to forward_one_peer(): a caller with
+     * one target and no client-facing local write still gets the per-target mint
+     * this has always done, and only fanout_deliver() -- which has an identity to
+     * share with its own local members -- takes the other route. */
+    fanout_stamp(s, carry, &tags, &relayed);
+    return forward_one_peer(s, peer_name, sverb, src, params, nparams, &tags, relayed);
 }
 
 int fanout_forward_link(server_t *s, const char *peer_name,

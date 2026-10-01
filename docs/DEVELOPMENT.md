@@ -236,7 +236,9 @@ demanding zero would demand a feature Phase 7 must not build, and the only ways
 out would be to delete the tests — the exact failure the gate prevents — or to
 build two phases inside one.
 
-Seven skips are permitted today, and the list is the account of all seven.
+Seven skips were permitted when this gate landed, and the list was the account of
+all seven. **Five are permitted now**: Phase 8 closed `CapNegotiation` and
+`MultiPrefix`, and the remaining five are §7/Phase 9's.
 
 ### Adding a skip
 

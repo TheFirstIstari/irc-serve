@@ -233,6 +233,28 @@ Every relayed message carries hidden internal tags:
 - A node never forwards a message whose `irc-serve-origin` is itself.
 - All `irc-serve-*` tags are stripped before delivery to clients.
 
+**The identity is minted ONCE PER EMISSION, and that is a property the dedup store
+alone would not have forced.** The obvious place to mint is where the line leaves
+the node toward a peer, and that is where this node used to do it — which meant a
+message forwarded to two peers was stamped with two different ids. For the dedup
+store that was survivable (the store is per node, and the two copies of one
+message to two peers are not one message arriving twice). It is fatal for the
+client-visible `msgid`, which is **rendered from this same triple** as
+`<origin>_<epoch>_<id>`: two members of one channel on two nodes would have been
+told two different values for one message, which is exactly the failure the
+IRCv3 `draft/message-ids` capability exists to remove. So `fanout_deliver()`
+computes the stamp once, before the local write and before the target walk, and
+both consume it. Deriving the msgid from the triple rather than from a second
+counter is what makes it invariant for free: a counter for msgids would mean one
+thing here and something else to a peer, so no relay could carry it.
+
+The `irc-serve-id` in a relayed line and the `msgid` a client reads are therefore
+the same three numbers rendered twice — one for a peer, one for a client. They
+are **not** the same tag and they are **not** the same audience: `irc-serve-*` is
+internal and stripped, `msgid` is negotiated and public. A node that served both
+from one counter without saying so would have a value that means two things, and
+the `msgid` would stop being derivable from a dedup key.
+
 Hop count + never-forward-own-origin + per-node `(origin,epoch,id)` dedup is
 sufficient here; the per-connection counter and the per-peer LRU are not, which
 is why that scheme was replaced. The per-connection notion is deleted, not
@@ -467,6 +489,27 @@ Rules (RFC 1459 §3.1, §3.3; IRCv3 message-tags):
   constant exists to prevent. Phase 1 formats a maximally-long legal block and
   asserts the measured overhead **equals** 179, so raising a value bound above
   without re-deriving fails the suite instead of the network.
+
+  **A `msgid` does NOT go into this 179, and the reason is worth stating because
+  adding it is the obvious move.** This constant is the cost of the INTERNAL
+  block on a PEER link, and the `msgid` is a CLIENT-facing tag: 2.4's tags are
+  stripped before delivery, so the two never appear on the same line and there is
+  nothing to add. What does need checking is the SUM on the client side, and it
+  fits:
+
+  ```
+    client-facing cap                8013   IRC_MAX_RELAY_LINE
+    '@' + worst-case msgid tag        112   1 + IRC_MAX_MSGTAG (111)
+    --
+    8125   against IRC_MAX_LINE      8192   67 bytes of headroom
+  ```
+
+  That headroom is why `reply.c` has **no** "drop the tag, keep the message"
+  retry: the window in which a maximal client line could not carry a maximal tag
+  does not exist, and `tests/integration/test_ircv3_msgid.c` asserts the headroom
+  as bytes rather than taking this paragraph's word for it. Every other emission
+  this node makes — the numerics, a `353`, a `STOPIC`, an `SJOIN` — is bounded by
+  its own field sizes and has no path to a maximal line at all.
 - embedded CR/LF or NUL in the middle → reject
 - **accepts a leading `:` prefix**, which is what makes peer messages parse
   identically to local ones
@@ -775,12 +818,32 @@ mandatory — many clients misbehave without it.
 
 | Item | Problem | Action |
 |---|---|---|
-| `ircv3_tags.c` | `tags_parse` and `tags_serialize` are the same function; roundtrip is vacuous; no escaping | Real parse → tag list, real serialize, and IRCv3 escaping (`\:` `\;` `\s` `\\` `\r` `\n` + lone-`\` rule) **both ways**. Doubles as the internal `@irc-serve-*` transport tags (§2.4) |
+| `ircv3_tags.c` | `tags_parse` and `tags_serialize` are the same function; roundtrip is vacuous; no escaping | Real parse → tag list, real serialize, and IRCv3 escaping **both ways**. Doubles as the internal `@irc-serve-*` transport tags (§2.4) |
 | `sasl_framework.c` | not in `irc_core`; `sasl_step` discards input, auto-completes after 2 calls; self-test harness lives in `src/` | Move the harness to `tests/`; implement real SASL PLAIN (base64 → `authzid\0authcid\0passwd` → credential store). Credentials are per-server, so a federated deployment shares via link auth |
 | `message_id.c` | orphan, not compiled, not tested, global counter, not IRCv3-shaped | Fold into §2.4: per-SERVER monotonic counter + boot `epoch`, dedup key `(origin,epoch,id)` scoped per node — unique without a global lock |
 | `lockfree_contract.c` | `volatile int`, one writer, no atomics | **Delete.** The single-threaded loop needs no lock-free structure. The claim comes out of the docs |
 | `server.c` | `printf` theatre; parses literal `"PING"` | Rewrite as the real `server_t` |
 | `node_main.c` | closes every client immediately (line 115) | Keeps its real `socket`/`bind`/`listen` and signals; loop becomes §3.4; port configurable, not hardcoded 6667 |
+
+**The escape set named above was wrong, and is corrected here rather than left
+for a reader to disprove.** Phase 8 checked it against the IRCv3 message-tags
+specification and this row listed `` `\:` `\;` `\s` `\\` `\r` `\n` ``, which is
+a plausible reading and is the wrong table in both directions: a semicolon is
+written `` `\:` `` and a **colon is not escaped at all**. `core/message.c` carried
+that table in its own `switch` and had asserted it in `test_message_format.c`
+for several phases, which is the usual way one survives — the test looked like the
+thing protecting the value while it was the thing keeping it wrong. Both were
+corrected in Phase 8: the escape table now lives in exactly one place
+(`src/ircv3_tags.c`) and `message_tag_escape()`/`message_tag_unescape()` delegate
+to it, because two copies are a tree that disagrees with itself about what a tag
+value means. Unescaping was wrong in a second, less visible way — a `\` before a
+character outside the set kept the backslash, so `\x` decoded to `\x` where the
+specification says `x`; it now drops it, which is also what makes a block written
+with the wrong table by a peer decode to the value its author meant.
+
+A tag value's escape set is **not** a parameter's, and the two are not
+interchangeable: RFC 1459 has no parameter escaping at all, and 3.2's formatter
+refuses or colons a parameter rather than escaping it.
 
 **Preserved as-is:** `federation_handshake.c` (real FSM, becomes the peer-link
 driver).
@@ -887,11 +950,17 @@ The gate runs in `ci_test` (the required merge gate), in `local-ci.sh`, and in
 skip code with a message naming it* — is unchanged, and the first direction is
 what enforces it: **a new skip without a line in `tests/known_skips.txt` is red.**
 
-Seven skips are permitted today, and `tests/known_skips.txt` is the
-phase-by-phase account of all seven. Zero remains the correct goal; closing a
-skip is implementing the feature and deleting its line **in the same change**.
-§7/Phase 8 retires two of them and §7/Phase 9 retires the other five, and when
-the last line goes the file is empty and the gate is a plain "no test may skip".
+Five skips are permitted today, all of them §7/Phase 9's, and
+`tests/known_skips.txt` is the phase-by-phase account of all five. Zero remains
+the correct goal; closing a skip is implementing the feature and deleting its
+line **in the same change**. §7/Phase 8 retired the two IRCv3 ones and §7/Phase 9
+owns the other five, and when the last line goes the file is empty and the gate is
+a plain "no test may skip".
+
+The "seven" this section used to say was correct when it was written — Phase 7
+landed with seven — and went stale the moment Phase 8 closed the first of them,
+because a sentence that is only updated when a phase *begins* is not a ratchet.
+The count here is now the count in the file, and Phase 8 is where it moved.
 
 ---
 
@@ -1071,8 +1140,11 @@ rather than as a defect C5 could have avoided.
 answer on the wire, `test_topic_persist` is a real test of real topic
 persistence, and the gate fails in **both** directions. **"Zero skipped tests", as
 this phase once read, is not met and was never reachable here** — §6.4 gives the
-argument and `tests/known_skips.txt` is the phase-by-phase account of the seven
-that remain.
+argument and `tests/known_skips.txt` was the phase-by-phase account of the seven
+that remained at the end of this phase. **Five, not seven, is what it accounts for
+now**: Phase 8 closed the two IRCv3 ones, and the number here is corrected in
+Phase 8 rather than left for a reader to disprove against the file, which is the
+same retraction §6.4 made about the two claims it used to carry.
 
 *What is in, and what the honest refusals are.* `INVITE` `LUSERS` `ADMIN` `INFO`
 `USERHOST` `KNOCK` `CHOPER` are implemented, and two of them are refusals rather
@@ -1104,9 +1176,36 @@ cache's bounds, its three alternatives that were considered and rejected, and wh
 it deliberately does **not** carry are in `core/channel.h`.
 
 **Phase 8 — IRCv3.** Real tag escaping + roundtrip, CAP negotiation
-(LS/REQ/ACK/NAK), real SASL PLAIN, message-ids. Turns the 2 skipped IRCv3
-tests green, and the ratchet then refuses the run until their lines come out of
-`tests/known_skips.txt`.
+(LS/REQ/ACK/NAK), real SASL PLAIN, message-ids, multi-prefix. Both IRCv3 skips
+this phase was given are retired: `CapNegotiation` and `MultiPrefix`, and both of
+their lines are out of `tests/known_skips.txt`, which is the ratchet's other
+direction and has to be the same change. The count goes 7 → 5.
+
+*What landed, and the two decisions in it that a reader should be able to check.*
+
+**`msgid` is 2.4's own `(origin, epoch, id)` rendered, not a second counter** —
+`<origin>_<epoch>_<id>`, `_` because 2.4's origin grammar excludes it and the
+three fields therefore stay separable. The argument is in 2.4: a second counter
+would mean one thing to this node and something else to a peer, so no relay could
+carry it and the tag would be defeated by the first hop. The consequence is that
+the emission's identity is minted **once**, in `fanout_deliver()`, and the same
+stamp feeds the local write and every forward target — see 2.4, which now says so
+and which is the claim `test_ircv3_msgid.c`'s two-client case checks.
+
+**`multi-prefix` is implemented rather than declined**, and it was a real choice:
+asserting "this node does not offer it" is legitimate and checkable, but the
+change is two draws in two functions and both were already gated on a
+`cap_multiprefix_enabled()` that had existed with no implementation behind it.
+Shipping a capability table with a reserved bit, a gate and no behaviour is the
+"documented but absent" pattern this project keeps retracting. It is offered in
+**353 and in 352**, because IRCv3's multi-prefix names both numerics and honouring
+it in one alone would be a node whose `353` is authoritative and whose `WHO` is a
+summary. 005's `PREFIX=(ov)@+` is the table the drawn run is ordered by — a client
+indexes the run left to right into PREFIX — so `PREFIX=` is load-bearing for the
+rendering and not merely decoration. Without the capability a member who is both
+op and voiced is drawn `@nick`, exactly as before, because a client that did not
+negotiate it indexes the first byte and would otherwise be handed a nickname it
+cannot resolve.
 
 **Phase 9 — Federation hardening.** Link failure and reconnect handling, driving
 the §4.3 `SBURST` resync (Phase 6 owns the verb and its wire format, not this
@@ -1132,11 +1231,18 @@ Single node:
       item — the count only goes down and every skip is accounted for — by a list
       in `tests/known_skips.txt` and a gate that fails in **both** directions. See
       §6.4, which is where the original wording is retracted, and
-      `docs/DEVELOPMENT.md` for how to close a skip.
+      `docs/DEVELOPMENT.md` for how to close a skip. **Phase 8 closed the two
+      IRCv3 ones it was given and five remain**, all of them §7/Phase 9's.
 - [ ] Two clients connect, register, `#JOIN` a channel, exchange a `PRIVMSG`,
       `#QUIT` cleanly
-- [ ] All MUST commands and numerics in §4 implemented
-- [ ] `005` advertises `PREFIX=(ov)@+`, `CHANTYPES=#&`
+- [ ] All MUST commands in §4 implemented
+- [ ] `005` advertises `PREFIX=(ov)@+`, `CHANTYPES=#&` — **and `PREFIX=` is now
+      load-bearing rather than decorative.** Phase 8's `multi-prefix` draws a
+      member's whole prefix set in the order `PREFIX=` names the sigils, because a
+      client indexes the run left to right into that table; a node that drew `+@`
+      while advertising `(ov)@+` would be telling a client a status it does not
+      hold. `tests/integration/test_multi_prefix.c` asserts the drawn token and
+      `005` in the same case.
 
 Federated:
 - [ ] Two-node fixture: cross-server join visibility, cross-server `PRIVMSG`
