@@ -411,3 +411,29 @@ irc_add_integration_test(test_reconnect test_reconnect.c)
 # irc_ctest_name() above for why, and tests/loadbal/CMakeLists.txt for what is
 # left of the five.
 irc_add_integration_test(test_peer_discovery test_peer_discovery.c)
+
+# 7/Phase 9: 2.3's auto-scale, SCOPED TO WHAT A NODE CAN HONESTLY DO. Its own file
+# and its own CTest name because the scoping decision is the deliverable as much as
+# the code is: a node does NOT spawn or stop nodes (that is a supervisor's job, and
+# a node that cannot measure its own load has nothing honest to decide a spawn on),
+# so the placeholder this file replaced asserted nothing. What it asserts instead is
+# the half that IS a node's business -- a node announces its own departure on the
+# wire before it goes, its peers treat that as terminal rather than as a failure, and
+# a peer that advertises itself as busy is reported to whoever can act on it without
+# anything being moved.
+#
+# IT IS A SEPARATE FILE FROM test_peer_discovery.c AND NOT AN EXTENSION OF IT,
+# because the two assert opposite halves of the same verbs. That file writes its own
+# SHUTDOWN and its own ADVERTISE onto a socket, because at the time no node in this
+# build ORIGINATED either. This one uses two real forked nodes, because
+# fed_send_shutdown() now has a caller (server_shutdown()) and a departure that can
+# only be produced by writing the line by hand proves nothing about whether a node
+# produces one. Same reasoning the SSRF claim forced a third node there, applied to
+# the origination question here.
+#
+# IT MOVED HERE FROM tests/loadbal/, where the phase table put it because it was one
+# of five skips 7/Phase 9 owned -- a classification by the skip's NAME rather than by
+# the feature, since auto-scale as this codebase implements it is a property of a mesh
+# over real sockets. The CTest NAME is unchanged (AutoScale) -- see irc_ctest_name()
+# above for why, and tests/loadbal/CMakeLists.txt for what is left of the five.
+irc_add_integration_test(test_autoscale test_autoscale.c)

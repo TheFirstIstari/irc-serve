@@ -24,6 +24,14 @@
  * reason, so this is a direction this tree already has. */
 #include "core/resume.h"
 #include "federation/burst.h"
+/* Phase 9's ADVERTISE / SHUTDOWN half, for the ONE thing server_shutdown() does
+ * that is not a free: the goodbye at the top of the teardown. Same direction of
+ * include as burst.h above and for the same class of reason -- a federation module's
+ * entry point, called from the one function that ends every allocation on this
+ * struct. It used to be reached only through federation/nickreg.h, which includes
+ * this header, and that was an accident of include order rather than a decision:
+ * a file calling fed_send_shutdown() should say so itself. */
+#include "federation/link.h"
 /* Phase 9's remote-nick registry. Included here rather than declared extern
  * because it is a teardown arm on a table this struct holds, exactly as
  * federation/burst.h is: the layout belongs to the module that owns it and the
@@ -629,6 +637,19 @@ void server_shutdown(server_t *s)
     if (s == NULL) {
         return;
     }
+    /* THE GOODBYE, AND IT IS FIRST because everything below closes the sockets it
+     * would have to travel on. See server.h's server_shutdown() block for the whole
+     * argument: without this arm a planned restart is a crash on every peer, and
+     * the node that would have told them otherwise is the one that went away. It is
+     * safe on the half-built server_t the four startup-failure paths hand it, which
+     * is stated in the header because those paths are the reason it cannot sit
+     * behind a "did we federate" guard.
+     *
+     * `NULL` rather than a reason string, and fed_send_shutdown() takes the reason
+     * and does not send it: 4.3's verb list has no SHUTDOWN, so a field a second
+     * implementation would have to guess at is a compatibility break bought for
+     * nothing, and the receiver's log already names who left. */
+    (void)fed_send_shutdown(s, NULL);
     for (i = 0; i < SERVER_FD_TABLE; i++) {
         if (s->by_fd != NULL && s->by_fd[i] != NULL) {
             server_close_conn(s, (int)i);

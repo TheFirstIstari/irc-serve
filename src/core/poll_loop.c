@@ -123,13 +123,106 @@ static void conn_on_readable(server_t *s, int fd)
     }
     rc = conn_fill(c);
     if (rc == CONN_FILL_EOF) {
+        /* ------------------------------------------------------------------------
+         * FRAME WHAT conn_fill() ALREADY BUFFERED, BEFORE HONOURING THE EOF, and
+         * the reason is that the alternative throws away a line the peer really
+         * did send.
+         *
+         * conn_fill() LOOPS: it recv()s, appends, and goes round again until
+         * recv() answers EAGAIN or 0. So a peer that writes its last line and then
+         * closes -- or half-closes -- in the same breath gets ONE conn_fill() call
+         * that buffers the line AND reports EOF, and an EOF arm that returns
+         * without framing discards it. The bytes sit in c->rbuf, were never turned
+         * into a line, and are freed with the conn. The node's own counters say so
+         * exactly: n_lines does not move, and both parse_reject and frame_error are
+         * 0 -- it never became a line.
+         *
+         * THAT IS NOT A CORNER CASE FOR A GOODBYE. A graceful leave IS "send the
+         * line, then go" (link.h's fed_send_shutdown() paragraph), so the one
+         * sequence Phase 9's departure verb exists for is the one this ordering ate.
+         * A node that announced its departure and closed would have every peer treat
+         * the departure as a crash, which is the exact cost fed_send_shutdown() is
+         * written to avoid.
+         *
+         * WHAT IT IS NOT: a "drain on close" that keeps reading. There is nothing
+         * more to read -- EOF means the peer closed its half -- so this frames what
+         * is IN HAND and nothing else. A trailing fragment with no terminator still
+         * dies here: conn_next_line() reports "need more bytes" for it, this loop
+         * ends, and the reaper frees the buffer. That is correct, because an
+         * unterminated final fragment was never a line under 3.3 and a peer that
+         * meant to send one did not send it.
+         *
+         * ORDERING, and it is the whole of the fix: frame and dispatch FIRST, then
+         * print the close and mark CLOSING. Doing it the other way round would
+         * dispatch into a connection the reaper is entitled to collect on this same
+         * iteration. And the close line is printed AFTER the dispatch, so a reader
+         * of the log sees the peer's last words before the news that they were the
+         * last words.
+         *
+         * COST, and it is one pointer comparison on a path that only runs when the
+         * buffer is non-empty: on the EOF path with nothing buffered this is
+         * identical to what it was, so a peer that closes with an empty buffer pays
+         * nothing and the ordinary case is unchanged.
+         *
+         * It also makes fed_in_shutdown()'s own socket close REACHABLE FROM THE
+         * WIRE, which is what the header's third requirement needs: before this,
+         * a peer that announced and closed was indistinguishable from one that
+         * closed without announcing, because the announcement never arrived.
+         *
+         * Recorded because it is a CHANGE to a 3.4 path rather than a Phase 9
+         * addition, and a reader diffing this function against a description of the
+         * loop should be able to see that it happened here and why.
+         * ------------------------------------------------------------------------ */
+        if (c->rlen > 0u) {
+            conn_readable(s, c);
+        }
         printf("[observable] conn_close: fd=%d reason=eof\n", c->fd);
         conn_mark_closing(c);
         return;
     }
     if (rc < 0) {
-        printf("[observable] conn_close: fd=%d reason=read_error errno=%d\n",
-               c->fd, errno);
+        /* SAME REASON AS THE EOF ARM ABOVE, AND IT MATTERS MORE. A read ERROR is
+         * what a peer that closed with data still unread in its receive queue
+         * produces: the kernel answers close() with RST rather than FIN, and RST is
+         * reported here as ECONNRESET. So this arm is not an exotic failure -- it is
+         * the ordinary way a peer link ends when the peer's shutdown found a line
+         * from us still sitting unread on its side.
+         *
+         * WHICH MEANS IT IS THE SAME LINE GETTING EATEN. A graceful leave is "send
+         * the line, then go" (link.h's fed_send_shutdown()), so if the departure
+         * arrives followed by an RST -- which it does whenever the departing node's
+         * last inbound line had not been read when it closed -- the departure is in
+         * c->rbuf, was never framed, and is freed with the conn. The peer then
+         * declares the link dead, arms the whole retry ladder against a peer that
+         * said goodbye, and the cost fed_send_shutdown() exists to avoid is paid in
+         * full. The node's counters say exactly what happened: n_lines does not move
+         * and frame_error stays 0 -- it never became a line.
+         *
+         * This was measured rather than assumed: with a peer sending keepalives every
+         * 60 ms and a departing node closing immediately, this arm was reached in
+         * roughly one run in twenty-five of the test that found it, and
+         * `conn_close: reason=read_error errno=54` on the receiver is the signature.
+         *
+         * WHAT IT IS NOT: a retry loop, and not a "read until it works". A read error
+         * is the end of the connection as far as this node is concerned -- the data
+         * that survives is whatever conn_fill() already appended, exactly as in the
+         * EOF arm, and there is no attempt to read again from a descriptor whose peer
+         * has gone. A trailing fragment with no terminator still dies here, for the
+         * same reason it does above: it was never a line under 3.3.
+         *
+         * ORDERING is as above: frame and dispatch FIRST, then report and mark
+         * CLOSING. Dispatching into a connection the reaper may collect on this same
+         * iteration is the thing to avoid, and the reaper runs at step 7 -- after all
+         * of this.
+         *
+         * COST: one pointer comparison when nothing is buffered, which is the
+         * overwhelming majority of times this arm is reached, and a fragment and
+         * dispatch of whatever is in hand when something is. */
+        if (c->rlen > 0u) {
+            conn_readable(s, c);
+        }
+        printf("[observable] conn_close: fd=%d reason=read_error errno=%d\n", c->fd,
+               errno);
         conn_mark_closing(c);
         return;
     }

@@ -845,6 +845,37 @@ int fed_send_advertise(server_t *s);
  * be a number this node does not believe. Clamped to 0..100 on the way out. */
 void fed_set_load(server_t *s, unsigned pct);
 
+/* Set the level at or above which a PEER's advertised load is reported as shedding,
+ * by fed_tick()'s T8 arm. 0 (the shipped value) means no opinion.
+ *
+ * WHERE THE PROPAGATION HALF STOPS, and this function is the place the decision is
+ * written down rather than inferred from an absence:
+ *
+ *   IT DOES   report. One `[observable] fed_shed: ... action=REPORT_ONLY` line per
+ *             crossing, and n_fed_shed counted, so the fact that a peer is busy
+ *             reaches whoever can act on it.
+ *   IT DOES NOT move clients, channels or load. Three reasons, and the first two are
+ *             structural rather than cautious:
+ *             - 2.2 makes a channel's origin IMMUTABLE and fails closed when it
+ *               dies. Re-homing a channel IS origin re-election, which 9's risk
+ *               table records as not started and not to be begun without re-opening
+ *               2.4's dedup key. So there is no "move the channel" call to make.
+ *             - A client's session belongs to the node its socket is connected to.
+ *               There is no session-transfer verb and no client-visible redirect in
+ *               4.3, so "send the load elsewhere" has no mechanism on either end.
+ *             - Node lifecycle is not this codebase's remit. Spawning and stopping
+ *               nodes is a supervisor's job (systemd, an orchestrator), and a node
+ *               that cannot measure its own load (see fed_set_load) has nothing
+ *               honest to decide with.
+ *
+ * WHY THE DEFAULT IS 0 AND NOT A CONSTANT: the percentage is an operator's number
+ * about the peer's load, so the level at which it matters is a deployment's
+ * judgement. Shipping a threshold would be inventing a figure this codebase cannot
+ * justify and calling the result a feature. An operator who wants the report sets
+ * one, and a node with no threshold prints nothing rather than printing a verdict
+ * it has no basis for. */
+void fed_set_shed_pct(server_t *s, unsigned pct);
+
 /* What one peer ADVERTISED, for a log or a counter. `name` and `host` are bounded
  * buffers and `port_out`/`load_out` may be NULL; each is zeroed or emptied on
  * entry so a caller that ignores one gets an empty value rather than a stale one.

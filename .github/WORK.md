@@ -26,6 +26,12 @@ Notes on accuracy:
 - `tests/benchmark/mem_footprint.c` does not exist; actual file is `tests/benchmark/footprint.c`.
 - `tests/compliance/test_sasl_framework.c` does not exist; actual file is `tests/compliance/test_sasl_handshake.c`.
 - Several branches (`feat/bench-mem`, `feat/ircv3-sasl`, `feat/loadbal-reconnect`, `feat/loadbal-discovery`, `feat/ircv3-tags`) are not present in the repository. Issues reference planned work.
+- **The two `tests/loadbal/` paths above (#18, #19) no longer exist**, and neither does a
+  `tests/loadbal/test_autoscale.c` for #83. All three features were implemented and all
+  three tests now live in `tests/integration/` with their **CTest names unchanged**
+  (`Reconnect`, `PeerDiscovery`, `AutoScale`); `tests/loadbal/` is a directory of no
+  tests. `docs/SPEC_TRACKING.md` is the current table — this file is a dated audit
+  (2026-09-06) and was already stale on the entries above before Phase 9 closed.
 
 ## PR index (verified against GitHub PR list)
 
