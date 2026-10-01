@@ -95,6 +95,10 @@
 #include "core/poll_loop.h"
 #include "core/server.h"
 #include "federation/link.h"
+/* Phase 9: the stats line reports the 2.1 remote-nick registry's size, which is
+ * the only way a test can tell a table that is working from one that never
+ * learned anything. */
+#include "federation/nickreg.h"
 #include "sasl_framework.h"
 
 /* The node's own name, when --name is not given. It must satisfy the 2.4 tag
@@ -623,6 +627,7 @@ int main(int argc, char **argv)
            "fed_own_origin=%llu fed_untagged_relay=%llu "
            "fed_unknown_verb=%llu fed_verb_deferred=%llu fed_malformed=%llu "
            "fed_dup_drop=%llu fed_dedup_dup=%llu fed_squit_self=%llu "
+           "nickreg_known=%zu nickreg_evicted=%llu "
            "burst_refused=%llu burst_abandoned=%llu burst_truncated=%llu "
            "topic_cache_full=%llu sasl_ok=%llu sasl_fail=%llu\n",
            (unsigned long long)srv.n_ticks, (unsigned long long)srv.n_eintr,
@@ -651,6 +656,8 @@ int main(int argc, char **argv)
            (unsigned long long)srv.n_fed_dup_drop,
            (unsigned long long)srv.n_fed_dedup_dup,
            (unsigned long long)srv.n_fed_squit_self,
+            (size_t)fed_nickreg_count(&srv),
+            (unsigned long long)srv.n_rnick_evicted,
            (unsigned long long)srv.n_burst_refused,
            (unsigned long long)srv.n_burst_abandoned,
            (unsigned long long)srv.n_burst_truncated,

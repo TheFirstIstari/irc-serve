@@ -60,6 +60,10 @@
 
 #include "core/cap.h"
 #include "core/reply.h"
+/* Phase 9: 2.1's remote-nick registry, which is what turns 3.1's `nick@server`
+ * row from a shape this node recognises into a target it can resolve. See the
+ * resolution comment at the branch below. */
+#include "federation/nickreg.h"
 #include "federation/verbs.h"
 
 /* ASCII-only case folding, deliberately: 005 advertises CASEMAPPING=ascii, so
@@ -224,14 +228,130 @@ int fanout_resolve(server_t *s, conn_t *from, const char *arg,
     }
 
     /* A `nick@server` target. 2.1's scoped identity splits at the LAST '@', and
-     * a client may send one at any time; recognising the FORM is what keeps 3.1
-     * from growing a new row in Phase 6. There is nothing to route it to yet
-     * (fanout.h, on FANOUT_REMOTE_USER), so it resolves to a target with no
-     * destination rather than being reported as a missing nickname -- which is
-     * the difference between "this node cannot reach that server" and "that
-     * user does not exist", and on a federated node only one of those is ever
-     * true. */
+     * a client may send one at any time.
+     *
+     * AND NOW IT IS RESOLVED rather than merely recognised, which is the
+     * difference Phase 9's registry makes and the reason this branch reads a
+     * module rather than parsing a string. Before the registry existed there was
+     * nothing to ask "does that server hold that nick" and the row resolved to a
+     * target with no destination; now the answer is a server this node has an
+     * ESTABLISHED link to, or nothing at all.
+     *
+     * THE REFUSAL IS 401 AND IT IS RIGHT, and the reason it is a refusal rather
+     * than a forward-anyway is the difference 3.1's note draws between "this node
+     * cannot reach that server" and "that user does not exist": on a federated
+     * node only one of those is ever true, and a node that forwards to a server
+     * which has never heard of the nick is a node that cannot tell a client why
+     * its message went nowhere. A client is owed the difference.
+     *
+     * THE TWO HALVES THAT CAN FAIL, and they fail differently:
+     *   - the REGISTRY does not know the nick at all, or does not know that server
+     *     holding it: 401, because nobody told this node about that user.
+     *   - the registry knows, but there is no ESTABLISHED link: still 401, and
+     *     deliberately not a different numeric. 4.4 has no numeric for "the user
+     *     exists and the node cannot reach them", and 402 (ERR_NOSUMSERVER) is
+     *     LUSERS's and ADMIN's `<server>` mask. Inventing one here would be a
+     *     numeric every client has to be taught, and 401 is the answer a client
+     *     already handles by telling the user.
+     */
     if (strrchr(arg, '@') != NULL) {
+        const char *at = strrchr(arg, '@');
+        char nick[FANOUT_NAME_MAX + 1];
+        char server[IRC_MAX_SERVER_NAME + 1];
+        char holder[IRC_MAX_SERVER_NAME + 1];
+        size_t nlen = (size_t)(at - arg);
+
+        /* THE SPLIT IS AT THE LAST '@' and not the first, and that is 2.1's rule
+         * rather than this function's: '@' is not a legal nick character (2.1's
+         * own charset rule) but a server name is an opaque string and may itself
+         * contain one. Splitting at the first would name a peer that does not
+         * exist. */
+        if (nlen == 0u || nlen > sizeof nick - 1u) {
+            /* A name this node could not be given, or an empty nick: no holder
+             * can answer for it, so 401 rather than a parse error the client has
+             * no way to act on. */
+            (void)reply(s, from, "401", (const char *const[]){ arg }, 1,
+                        "No such nick/channel");
+            return 0;
+        }
+        memcpy(nick, arg, nlen);
+        nick[nlen] = '\0';
+        if (strlen(at + 1) == 0u || strlen(at + 1) > (size_t)IRC_MAX_SERVER_NAME) {
+            (void)reply(s, from, "401", (const char *const[]){ arg }, 1,
+                        "No such nick/channel");
+            return 0;
+        }
+        memcpy(server, at + 1, strlen(at + 1) + 1u);
+
+        /* THE SCOPE NAMES THIS NODE, and that is a LOCAL user and not a
+         * forwarding failure. 2.1's scoped identity is "the user called nick on
+         * the server called server", and nothing in it says the server has to be
+         * a different one -- a client writing `zed@irc.b` from irc.b is naming a
+         * user of its own node through the qualified form, and the honest answer
+         * is to deliver it. Refusing it would make the qualified form unusable for
+         * exactly the server where the name is unambiguous, and a node that
+         * answered 401 there would be telling a client that a user standing next to
+         * it does not exist.
+         *
+         * IT IS A LOCAL LOOKUP AND NOT A REGISTRY ASK, because the registry holds
+         * only REMOTE nicks by construction (a local name is server_t::nicks'
+         * business, and 2.1's "bob@a and bob@b are distinct registry keys" is a
+         * statement about names on DIFFERENT servers). Asking the registry here
+         * would find nothing and 401 a user this node is holding.
+         *
+         * AND THE PARAMETERS ARE REBUILT, not reused: the local rows are addressed
+         * by the bare nickname with the client's own parameters, and `name` is the
+         * qualified string. Passing the qualified string to a local row would
+         * render ":router!u@h PRIVMSG zed@irc.b :text" to a client, which is not
+         * what any client parses as a target. */
+        if (chan_same_name(server, s->name)) {
+            conn_t *lu = server_nick_lookup(s, nick);
+
+            if (lu == NULL) {
+                (void)reply(s, from, "401", (const char *const[]){ arg }, 1,
+                            "No such nick/channel");
+                return 0;
+            }
+            memcpy(out->name, lu->nick, strlen(lu->nick) + 1u);
+            out->user = lu;
+            out->kind = FANOUT_LOCAL_USER;
+            return 1;
+        }
+
+        /* THE REGISTRY IS ASKED ABOUT THE NICK, NOT ABOUT THE PAIR, and the
+         * difference is the whole of a duplicate. A client naming
+         * `bob@irc.c` where two servers hold bob is naming one of them
+         * SPECIFICALLY, so the pair is what it gets: this asks for a holder equal
+         * to the named server, and a name nobody holds is a 401 rather than a
+         * silent redirect to whichever of two holders came first in the table. */
+        if (fed_nickreg_holder(s, nick, holder, sizeof holder, NULL) == NULL) {
+            (void)reply(s, from, "401", (const char *const[]){ arg }, 1,
+                        "No such nick/channel");
+            return 0;
+        }
+        /* The named server is the CLIENT'S claim about where the user is, and
+         * the registry is this node's claim. When they disagree the client is
+         * wrong, and this node says so rather than forwarding to a server that
+         * does not hold the nick -- which is the "silently redirecting" failure
+         * the comment above names. It is 401 rather than a redirect because a
+         * client that wanted the redirect should send the name it means. */
+        if (!chan_same_name(holder, server)) {
+            (void)reply(s, from, "401", (const char *const[]){ arg }, 1,
+                        "No such nick/channel");
+            return 0;
+        }
+        /* AND THE LAST THING BEFORE IT IS A ROUTE, so the refusal above names
+         * the real reason rather than a derived one. There is deliberately no
+         * attempt to reach the server: 3.4 forbids a name lookup in the event
+         * loop, and the only addresses this node can dial are the ones its
+         * operator configured (3.4's "pre-resolved peer addresses"). A server
+         * nobody has a link to is a server this node cannot route to, and that
+         * is the same answer for every reason it has no link. */
+        if (server_find_peer(s, server) == NULL) {
+            (void)reply(s, from, "401", (const char *const[]){ arg }, 1,
+                        "No such nick/channel");
+            return 0;
+        }
         memcpy(out->name, arg, len + 1u);
         out->kind = FANOUT_REMOTE_USER;
         return 1;
@@ -530,6 +650,70 @@ static int write_to_members(server_t *s, const fanout_target_t *t,
         n++;
     }
     return n;
+}
+
+int fanout_deliver_local(server_t *s, const fanout_target_t *t, const char *prefix,
+                         const char *verb, const char *const *params, int nparams,
+                         conn_t *exclude)
+{
+    irc_serve_tags_t ident;
+    int relayed = 0;
+
+    if (s == NULL || t == NULL || verb == NULL || (params == NULL && nparams != 0) ||
+        nparams < 0) {
+        return 0;
+    }
+    /* THE STAMP IS MINTED AND THEN NOT USED, and that is deliberate: a local-only
+     * emission still needs an identity because a member's client may be tracking
+     * 2.4's msgid, and the one this function computes is the one the SAME
+     * emission would have carried. It is discarded rather than not computed
+     * because write_to_members() takes it as a parameter, and a NULL there would
+     * be a second thing to decide about. */
+    fanout_stamp(s, NULL, &ident, &relayed);
+
+    switch ((int)t->kind) {
+    case FANOUT_LOCAL_USER:
+        /* The one-connection row, and it is the same code as fanout_deliver()'s
+         * rather than a second rendering of it -- including the sender-excluded
+         * case, which is why this is a function over the target rather than a
+         * "loop over members". */
+        if (t->user == NULL || nparams >= IRC_MAX_PARAMS) {
+            return 0;
+        }
+        if (exclude != NULL && t->user == exclude) {
+            return 0;
+        }
+        {
+            const char *all[IRC_MAX_PARAMS + 1];
+
+            all[0] = t->name;
+            for (int i = 0; i < nparams; i++) {
+                all[i + 1] = params[i];
+            }
+            (void)send_line(s, t->user, prefix, verb, all, nparams + 1);
+        }
+        return 1;
+
+    case FANOUT_LOCAL_CHANNEL:
+    case FANOUT_REMOTE_CHANNEL:
+        /* A REMOTE channel is here as well as a local one because the two share
+         * the roster and the caller may not know which it has: 3.1's state-change
+         * row for a non-owned channel is "forward only", and a caller that wanted
+         * no forward has already decided it does not want one, so asking it which
+         * kind of channel it resolved would be asking a question with no answer
+         * that changes anything. */
+        return write_to_members(s, t, prefix, verb, params, nparams, exclude, &ident);
+
+    case FANOUT_REMOTE_USER:
+    case FANOUT_NONE:
+    default:
+        /* NO LOCAL DESTINATION EXISTS, and a caller that reached here with one of
+         * these has a bug: there is no connection on this node to write to, and
+         * inventing one would be a delivery to nobody counted as a delivery to
+         * somebody. Counting nothing is the honest outcome, exactly as
+         * fanout_deliver()'s FANOUT_NONE arm states. */
+        return 0;
+    }
 }
 
 int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,

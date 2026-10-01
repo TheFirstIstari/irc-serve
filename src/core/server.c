@@ -23,6 +23,11 @@
  * core/commands.c already include federation/ headers for the same class of
  * reason, so this is a direction this tree already has. */
 #include "federation/burst.h"
+/* Phase 9's remote-nick registry. Included here rather than declared extern
+ * because it is a teardown arm on a table this struct holds, exactly as
+ * federation/burst.h is: the layout belongs to the module that owns it and the
+ * pointer belongs to the node. */
+#include "federation/nickreg.h"
 #include "sasl_framework.h"
 
 /* ---------------------------------------------------------------------------
@@ -719,6 +724,19 @@ void server_shutdown(server_t *s)
      * pointer into it. */
     sasl_store_free(s->sasl_store);
     s->sasl_store = NULL;
+    /* Phase 9's remote-nick registry: 2.1's "which server holds the user called
+     * X", the table that makes 3.1's last row resolvable. A CALL rather than a
+     * free for the same reason as the two arms above -- the layout and the
+     * least-recently-used ordering are federation/nickreg.c's, and the owner also
+     * reports whether the table held anything.
+     *
+     * IT IS SAFE HERE AND AT ANY POINT in the walk above: an entry holds three
+     * copied strings and two integers and no conn_t*, no chan_t* and no
+     * server_link_t*, so nothing it can be holding has been freed yet. And it is
+     * safe on a node that never called fed_open(), which is every test that links
+     * this library without the federation fixture -- the table is a field on
+     * server_t, so it is already NULL. */
+    fed_nickreg_close(s);
     strtab_free(s->nicks);
     s->nicks = NULL;
     strtab_free(s->chans);

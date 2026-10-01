@@ -38,12 +38,14 @@
 #
 # --- the list -----------------------------------------------------------------
 #
-# EMPTY, and it is empty because Phase 9 retired the last five lines. The file
-# still EXISTS and is still read by scripts/check-skips.sh, because an absent file
-# is a different failure from an empty one: check-skips.sh fails on a missing
-# list, and a test that skipped with no list would otherwise be permitted by the
-# accident of the file's own absence. Every comment above still applies -- the
-# gate is now "no test may skip", which is the phrase 6.4 always said the goal
+# NOT EMPTY YET: Phase 9 has retired two of the five (SyncState and
+# FailoverReconnect) and three remain below, each owned by a later item of the
+# same phase. This comment block is the place the final one goes: when the last
+# line below is deleted this file holds comments and nothing else, and that is
+# different from the file being absent -- check-skips.sh fails on a MISSING list,
+# and a test that skipped with no list would otherwise be permitted by the
+# accident of the file's own absence. Every rule above still applies then, and
+# the gate is "no test may skip", which is the phrase 6.4 always said the goal
 # was.
 
 # Phase 9 (issue #83): peer discovery. 2.3 says "Peer discovery and auto-scale stay

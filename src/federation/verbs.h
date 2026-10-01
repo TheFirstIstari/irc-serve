@@ -516,4 +516,40 @@ const char *fed_prefix_server(const char *prefix, char *out, size_t cap);
  */
 void fed_dispatch(server_t *s, conn_t *c, const message_t *m);
 
+/* ---------------------------------------------------------------------------
+ * The node-wide forward, for the verbs that are about the NODE and not about a
+ * channel
+ * ---------------------------------------------------------------------------
+ */
+
+/* Put `sverb` on every ESTABLISHED link, with `prefix` as the message prefix and
+ * NULL as `carry` -- this node is ORIGINATING, so 2.4's identity is minted at each
+ * forward rather than relayed. Returns how many links carried it.
+ *
+ * IT EXISTS BECAUSE 4.3's VERB SET HAS TWO SHAPES and the SQUIT arm was the only
+ * one of them implemented. A verb that names a CHANNEL is forwarded through
+ * fanout_forward_channel_sverb(), because the set of links is the set of links
+ * holding that channel -- a smaller set, and a different criterion. A verb that
+ * names NOTHING is about the node, and every established link is interested,
+ * because every one of them holds a claim about the same fact. SQUIT is the
+ * implemented example, and its arm is left where it is: it needs to skip the link
+ * it arrived on and a link named by the line itself, and expressing those as
+ * arguments to a general helper would put a SQUIT's two special cases in a
+ * function that has no business knowing about SQUIT.
+ *
+ * `prefix` MAY BE NULL, which renders the line with this node's own name -- the
+ * correct prefix for a state change this node decided on its own. It is a
+ * parameter rather than always s->name because the one caller in this build
+ * (commands.c's rename-the-loser) has a client's hostmask to render, and a
+ * function that could not carry one would force that line to lose the only part of
+ * it a reader can use.
+ *
+ * `carry` IS NOT A PARAMETER, and that is deliberate: everything this node
+ * forwards on its own account originates here, and a relay that needed to
+ * re-broadcast someone else's node-wide fact would be a third case, which does
+ * not exist yet. Adding a `carry` parameter for a caller that does not exist is
+ * how a function ends up with an unreachable branch. */
+int fed_forward_all(server_t *s, const char *sverb, const char *prefix,
+                    const char *const *params, int nparams);
+
 #endif /* IRC_FEDERATION_VERBS_H */

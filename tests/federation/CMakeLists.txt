@@ -1,17 +1,30 @@
-# These two are UNIT tests: they exercise federation_handshake.c with a
-# caller-owned context and need no sockets, no children and no loop, so they
-# link the library and nothing else.
+# These are UNIT tests: they exercise a function directly, need no sockets, no
+# children and no loop, and link the library and nothing else. Two of them exercise
+# federation_handshake.c with a caller-owned context; the third exercises 2.1's
+# rename-the-loser comparison.
 add_executable(test_federate_handshake test_federate_handshake.c)
 add_executable(test_heartbeat test_heartbeat.c)
+# Phase 9: 2.1's rename-the-loser DECISION, as the total order it has to be for
+# the mesh to converge. It belongs HERE and not with the integration test because
+# the claim is a property of a comparison function -- antisymmetric, transitive,
+# case-blind, and defined on the prefix pairs of two legal 2.4 server names -- and
+# an integration test cannot build a node named `irc.b1` next to `irc.b` without
+# configuring two peers that differ only in length. The integration test
+# (tests/integration/test_nick_duplicate.c) asserts the mesh; this asserts the
+# arithmetic the mesh's convergence rests on.
+add_executable(test_nick_policy test_nick_policy.c)
 
 target_link_libraries(test_federate_handshake PRIVATE irc_core)
 target_link_libraries(test_heartbeat PRIVATE irc_core)
+target_link_libraries(test_nick_policy PRIVATE irc_core)
 
 add_test(NAME FederateHandshake COMMAND test_federate_handshake)
 add_test(NAME Heartbeat COMMAND test_heartbeat)
+add_test(NAME NickPolicy COMMAND test_nick_policy)
 
 set_tests_properties(FederateHandshake PROPERTIES LABELS Federation)
 set_tests_properties(Heartbeat PROPERTIES LABELS Federation)
+set_tests_properties(NickPolicy PROPERTIES LABELS Federation)
 
 # ---------------------------------------------------------------------------
 # The two that were SKIPS and are now REAL tests, and WHY THEY MOVED
