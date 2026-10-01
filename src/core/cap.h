@@ -118,7 +118,46 @@ size_t cap_available_list(const server_t *s, char *out, size_t cap);
  * new capability cannot be added without the buffer growing with it -- which is
  * the failure where a truncated LS silently hides a capability from every client
  * that asks. */
-#define CAP_LS_MAX 256
+/* The worst case a CAP LS/REQ/NAK reply can occupy, DERIVED rather than picked.
+ *
+ * This was 256, and CodeQL was right that three snprintf calls could overflow it:
+ * cap_split() accepts up to CAP_MAX_REQ names of up to CAP_NAME_MAX bytes each, so
+ * the reply can need CAP_MAX_REQ * (CAP_NAME_MAX + 1) bytes of names PLUS one
+ * separator between each pair -- 1040 + 15 = 1055 into a 256-byte stack buffer.
+ * Reachable from the wire by any client sending sixteen long capability names.
+ *
+ * The arithmetic is spelled out here so the number cannot drift from the inputs
+ * again, which is what made 256 wrong in the first place: it was a guess about how
+ * much text a reply needs rather than a function of how much text can arrive. */
+/* How many capability names one CAP REQ may carry, and the longest name accepted.
+ * cap_split() rejects anything longer than CAP_NAME_MAX as "not a capability", and
+ * more than CAP_MAX_REQ names as "more than we will consider" -- both refusals,
+ * not silent truncation. They live here rather than in cap.c because CAP_LS_MAX is
+ * derived from them and a derived constant in one file reading inputs in another is
+ * how the two drift apart. */
+#define CAP_MAX_REQ 16
+#define CAP_NAME_MAX 64
+
+/* The worst case a CAP LS/REQ/DEL/NAK reply can occupy, DERIVED from its inputs.
+ *
+ * This was 256, and CodeQL was right that the accumulating snprintf calls in cap.c
+ * could overflow it. cap_split() accepts up to CAP_MAX_REQ names of up to
+ * CAP_NAME_MAX bytes each, so a refused list can need
+ * CAP_MAX_REQ * (CAP_NAME_MAX + 1) + CAP_MAX_REQ bytes -- 1040 + 16 = 1056 --
+ * into what was a 256-byte STACK buffer. Measured: sixteen 64-character capability
+ * names, which any client may send, need 1040 bytes, so the overflow is 784 bytes
+ * and it is reachable from the wire.
+ *
+ * The accumulation is what makes it an overflow rather than a truncation:
+ * snprintf returns the length it WOULD have written, so `rn` grows past the end of
+ * the buffer, `refused + rn` is already out of bounds, and `sizeof refused - rn`
+ * underflows as a size_t. Three bugs in one expression.
+ *
+ * 256 was a guess about how much text a reply needs rather than a function of how
+ * much text can arrive, and CAP_MAX_REQ and CAP_NAME_MAX live here rather than in
+ * cap.c so the derivation can see them -- a derived constant in one file reading
+ * inputs in another is exactly how the two drifted apart. */
+#define CAP_LS_MAX (CAP_MAX_REQ * (CAP_NAME_MAX + 1) + CAP_MAX_REQ)
 
 /* Is the client still mid-negotiation, and therefore is registration held?
  * TRUE from the first `CAP LS` or `CAP REQ` until `CAP END`. This is the one

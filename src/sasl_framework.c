@@ -184,28 +184,44 @@ sasl_store_t *sasl_store_load(const char *path)
      * A SYMLINK is not followed and not special-cased. stat() has followed it
      * already, so what is judged is the target -- which is the file whose
      * contents would be read. */
-    if (stat(path, &sb) != 0) {
-        printf("[observable] sasl_store: state=REFUSED path=%s reason=stat\n", path);
-        return NULL;
-    }
-    if (!S_ISREG(sb.st_mode)) {
-        printf("[observable] sasl_store: state=REFUSED path=%s reason=not_regular\n",
-               path);
-        return NULL;
-    }
-    if ((sb.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
-        printf("[observable] sasl_store: state=REFUSED path=%s reason=mode_%03o "
-               "(group or other may access a file of passwords)\n",
-               path, (unsigned)(sb.st_mode & 0777));
-        return NULL;
-    }
-
-    f = fopen(path, "r");
-    if (f == NULL) {
-        printf("[observable] sasl_store: state=REFUSED path=%s reason=unreadable\n",
-               path);
-        return NULL;
-    }
+      /* OPEN FIRST, THEN fstat THE DESCRIPTOR.
+       *
+       * This used to stat() the path, judge the mode, and only then fopen() it.
+       * Between the stat and the open the file can be replaced -- by a symlink, by
+       * a FIFO, or by a 0644 copy -- so the thing that was checked is not
+       * necessarily the thing that gets read. CodeQL flagged it, and it is a real
+       * race on a file of passwords: the checks below are the only thing standing
+       * between a world-readable file and an authentication oracle.
+       *
+       * fstat() on the descriptor cannot race, because the descriptor names an
+       * inode the kernel has already opened, and O_NOFOLLOW makes a symlink at the
+       * final component a hard error rather than something to reason about.
+       *
+       * Nothing changes for an honest operator: same observable lines, same refusal
+       * reasons, same mode rule. Only the order changes, and the order was the bug. */
+      f = fopen(path, "re");
+      if (f == NULL) {
+          printf("[observable] sasl_store: state=REFUSED path=%s reason=open\n", path);
+          return NULL;
+      }
+      if (fstat(fileno(f), &sb) != 0) {
+          printf("[observable] sasl_store: state=REFUSED path=%s reason=fstat\n", path);
+          (void)fclose(f);
+          return NULL;
+      }
+      if (!S_ISREG(sb.st_mode)) {
+          printf("[observable] sasl_store: state=REFUSED path=%s reason=not_regular\n",
+                 path);
+          (void)fclose(f);
+          return NULL;
+      }
+      if ((sb.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+          printf("[observable] sasl_store: state=REFUSED path=%s reason=mode_%03o "
+                 "(group or other may access a file of passwords)\n",
+                 path, (unsigned)(sb.st_mode & 0777));
+          (void)fclose(f);
+          return NULL;
+      }
     store = sasl_store_new();
     if (store == NULL) {
         (void)fclose(f);
