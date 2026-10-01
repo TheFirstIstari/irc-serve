@@ -177,6 +177,37 @@ int reply(server_t *s, conn_t *src, const char *code,
 int send_line(server_t *s, conn_t *dst, const char *prefix,
               const char *command, const char *const *params, int nparams);
 
+/* As send_line(), with the final parameter colonned whether or not RFC 1459
+ * requires it. Exists for IRCv3's CAP, whose capability list every server writes
+ * as `CAP * LS :a b` and which RFC 1459's "colonned only when it has to be"
+ * rule would render bare; see message_format_ex() for why the specification's
+ * bytes win there. Everything else about the destination rules, the refusals and
+ * the counters is send_line()'s, because it is the same door. */
+int send_line_colon(server_t *s, conn_t *dst, const char *prefix,
+                    const char *command, const char *const *params, int nparams);
+
+/* As send_line(), with a tag block on the outbound line. This is the ONLY way a
+ * tag reaches a client, and it exists as a separate function rather than as a
+ * NULL-tags sentinel inside send_line() because a tag block on a line is a
+ * per-destination decision (one client negotiated `message-tags` and the next
+ * did not) while the other six arguments are the same message: the callers that
+ * write to a LIST of members each ask the question once per member, and a flag
+ * would have to be threaded through the same walk either way.
+ *
+ * `tags` is a block WITHOUT the leading '@' and NUL-terminated -- the contract
+ * irc_serve_tags_format() and irc_serve_msgid_tag() both produce. NULL means no
+ * tag block, and is exactly send_line().
+ *
+ * 3.2's rule that the internal `irc-serve-*` tags are STRIPPED before delivery
+ * to a client is enforced by what is passed in here, not by this function: the
+ * caller decides, and the only caller that has a client-visible tag to pass is
+ * the one that negotiated for it. That is deliberate -- a filter here would be a
+ * second place that decides what a client may see about this node's internals,
+ * and 2.4's rule is one sentence a reader can check at the call site. */
+int send_line_tagged(server_t *s, conn_t *dst, const char *prefix,
+                     const char *command, const char *const *params, int nparams,
+                     const char *tags);
+
 /* As many middle parameters as the 15-parameter cap leaves room for once
  * <target> and the trailing text have taken two slots. */
 #define REPLY_MAX_MID (IRC_MAX_PARAMS - 2)

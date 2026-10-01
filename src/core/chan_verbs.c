@@ -41,6 +41,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "core/cap.h"
 #include "core/channel.h"
 #include "core/fanout.h"
 #include "core/reply.h"
@@ -276,8 +277,60 @@ static int names_group_flags(unsigned flags)
     return 0;
 }
 
+/* The sigils drawn in front of `nick`, in the order 005's `PREFIX=(ov)@+` names
+ * them, into `out`. Two bytes plus a NUL is the whole of what this node can draw
+ * -- the two prefix modes are +o and +v and channel.h says so -- so `out` is
+ * sized by that and not by a guess.
+ *
+ * MULTI-PREFIX OFF IS EXACTLY ONE SIGIL, and it is the HIGHEST the member holds.
+ * RFC 2812 4.4.2 describes a prefix as "one or more" but every client that has
+ * not negotiated `multi-prefix` indexes the first character it finds and looks
+ * it up in PREFIX, so handing it two characters hands it a nickname it cannot
+ * resolve. Op outranks voice, which is what names_group() says about the ORDER and
+ * what this says about the DRAWING: an op+voice member is one entry in the op
+ * group and one '@'.
+ *
+ * MULTI-PREFIX ON IS THE WHOLE SET, `@+nick`, in PREFIX order rather than in a
+ * member-flag order. That order is not taste: a client reading the run left to
+ * right and indexing into PREFIX has to reach the same answer this node did, and
+ * 005 is where it reads PREFIX from. It is also the order that makes the drawn run
+ * self-describing -- the leftmost sigil is the highest status, so a client that
+ * only wants one can take the first byte and be right.
+ *
+ * WHY THE GATE IS A PARAMETER rather than read from `dst` here. It COULD be read
+ * from `dst`, and it is passed instead for the reason the rest of this function
+ * takes (nick, flags) rather than reading either roster: one decision, taken once
+ * per list by the caller that knows the destination, so that a 353 assembled from
+ * six passes cannot disagree with itself. `send_names_list()` asks once. */
+static const char *names_signs(unsigned flags, int multiprefix, char *out,
+                               size_t cap)
+{
+    size_t n = 0;
+
+    if (out == NULL || cap < 2u) {
+        return "";
+    }
+    out[0] = '\0';
+    if (multiprefix == 0) {
+        if ((flags & CHAN_MEMBER_OP) != 0u) {
+            out[n++] = '@';
+        } else if ((flags & CHAN_MEMBER_VOICE) != 0u) {
+            out[n++] = '+';
+        }
+    } else {
+        if ((flags & CHAN_MEMBER_OP) != 0u) {
+            out[n++] = '@';
+        }
+        if ((flags & CHAN_MEMBER_VOICE) != 0u) {
+            out[n++] = '+';
+        }
+    }
+    out[n] = '\0';
+    return out;
+}
+
 /* Emit `nick` into the 353 line under construction, flushing first if it will not
- * fit. Returns the new `used`. The flush is RFC 2812 3.3.5's "a 353 MAY be
+ * fit. Returns the new `used`. The flush is RFC 2819 3.3.5's "a 353 MAY be
  * split across lines" and 3.2's "never deliver a shortened value" together: a
  * half-written nickname is worse than one more line.
  *
@@ -286,14 +339,24 @@ static int names_group_flags(unsigned flags)
  * makes 7/Phase 4's fixed order -- nicks, then ops, then voiced -- a property of
  * this function rather than of whichever list a member happens to be in, and it
  * is what lets the LOCAL roster and the REMOTE roster share one order instead of
- * two that could disagree. */
+ * two that could disagree.
+ *
+ * `flags` is the member's FULL prefix set, and it is what the sigils are derived
+ * from. It used to be an `int group` -- the ORDER this member is drawn in, 0 plain
+ * 1 op 2 voice -- and that is precisely why a member holding both modes could only
+ * ever be drawn with one of them: the order is three exclusive buckets and a
+ * member in two of them belongs to exactly one. The ORDER is still decided by the
+ * caller's loop and this function still renders the members it is handed in the
+ * order it is handed them, so dropping the parameter changes nothing about where a
+ * name lands -- only about how much is drawn in front of it. */
 static size_t names_emit(server_t *s, conn_t *dst, const char *const *mid,
-                         int group, const char *nick, char *line, size_t used,
-                         int *produced)
+                         unsigned flags, const char *nick, char *line,
+                         size_t used, int *produced, int multiprefix)
 {
-    const char *sign = (group == 1) ? "@" : (group == 2) ? "+" : "";
+    char signs[4];
+    size_t slen = strlen(names_signs(flags, multiprefix, signs, sizeof signs));
     size_t nicklen = strlen(nick);
-    size_t need = strlen(sign) + nicklen + 1u; /* +1 for the joining space */
+    size_t need = slen + nicklen + 1u; /* +1 for the joining space */
 
     if (used != 0 && used + need > (size_t)CHAN_NAMES_LINE) {
         (void)reply(s, dst, "353", mid, 2, "%s", line);
@@ -303,9 +366,12 @@ static size_t names_emit(server_t *s, conn_t *dst, const char *const *mid,
     if (used != 0) {
         line[used++] = ' ';
     }
-    if (sign[0] != '\0') {
-        line[used++] = sign[0];
-    }
+    /* TWO bytes copied rather than one char written twice: with multi-prefix the
+     * run is a variable-length string and a `line[used++] = sign[0]` here would
+     * silently drop the second sigil, which is the defect this whole change is
+     * about. */
+    memcpy(line + used, signs, slen);
+    used += slen;
     memcpy(line + used, nick, nicklen);
     used += nicklen;
     line[used] = '\0';
@@ -328,6 +394,13 @@ static size_t names_emit(server_t *s, conn_t *dst, const char *const *mid,
 static void send_names_list(server_t *s, conn_t *dst, const chan_t *ch)
 {
     const char *const mid[2] = { "=", ch->name };
+    /* ASKED ONCE, and this is the whole of the per-destination decision. A 353 is
+     * a line to ONE client, and two clients on this node may disagree about
+     * `multi-prefix`; the roster is shared, the rendering is not. 005's
+     * `PREFIX=(ov)@+` is what says which sigils exist and what they mean, and it
+     * is true either way -- multi-prefix changes how MANY are drawn, not which
+     * sigils exist. See cap.h. */
+    const int multiprefix = cap_multiprefix_enabled(dst);
     int produced = 0;
 
     for (int group = 0; group < 3; group++) {
@@ -345,7 +418,8 @@ static void send_names_list(server_t *s, conn_t *dst, const chan_t *ch)
             if (names_group(m) != group) {
                 continue;
             }
-            used = names_emit(s, dst, mid, group, m->c->nick, line, used, &produced);
+            used = names_emit(s, dst, mid, m->flags, m->c->nick, line, used,
+                              &produced, multiprefix);
         }
         for (size_t i = 0; i < ch->nremotes; i++) {
             const chan_remote_t *r = &ch->remotes[i];
@@ -353,7 +427,8 @@ static void send_names_list(server_t *s, conn_t *dst, const chan_t *ch)
             if (r->nick[0] == '\0' || names_group_flags(r->flags) != group) {
                 continue;
             }
-            used = names_emit(s, dst, mid, group, r->nick, line, used, &produced);
+            used = names_emit(s, dst, mid, r->flags, r->nick, line, used,
+                              &produced, multiprefix);
         }
         if (used != 0) {
             (void)reply(s, dst, "353", mid, 2, "%s", line);

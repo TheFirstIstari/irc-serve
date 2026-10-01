@@ -76,10 +76,12 @@ static int emit_to_client(server_t *s, conn_t *c, const char *code,
  * the call named. `params` holds the FULL parameter list including the target
  * and the trailing text; `code` is the command word. `prefix` NULL means the
  * node's own name, which is the rule for every numeric and for a PONG; a
- * client-originated broadcast passes the acting user's hostmask. */
-static int emit_built(server_t *s, conn_t *c, const char *code,
-                      const char *prefix,
-                      const char *const *params, int nparams)
+ * client-originated broadcast passes the acting user's hostmask. `tags` is a
+ * client-visible tag block WITHOUT the leading '@', or NULL for none. */
+static int emit_built_ex(server_t *s, conn_t *c, const char *code,
+                         const char *prefix,
+                         const char *const *params, int nparams,
+                         int force_colon, const char *tags)
 {
     message_t m;
     /* IRC_MAX_LINE counts a legal line INCLUDING its terminator, and
@@ -88,11 +90,11 @@ static int emit_built(server_t *s, conn_t *c, const char *code,
     char line[IRC_MAX_LINE + 2];
     size_t len;
 
-    if (message_build(&m, NULL, (prefix != NULL) ? prefix : s->name, code,
+    if (message_build(&m, tags, (prefix != NULL) ? prefix : s->name, code,
                       params, nparams) != 0) {
         return refuse(s, c, code, "unbuildable");
     }
-    len = message_format(&m, line, sizeof line - 2u);
+    len = message_format_ex(&m, line, sizeof line - 2u, force_colon);
     message_free(&m);
     if (len == 0) {
         /* A representable message that did not fit, or one holding a value
@@ -100,11 +102,43 @@ static int emit_built(server_t *s, conn_t *c, const char *code,
          * a partial line: message_format() renders all or nothing. */
         return refuse(s, c, code, "unrepresentable");
     }
+    /* A `tags` BLOCK THAT DOES NOT FIT IS NOT A DEFENCE AND WAS NOT ADDED AS ONE.
+     * The obvious worry about send_line_tagged() is a client's `msgid` pushing an
+     * already-maximal line past IRC_MAX_LINE and the message being lost to a
+     * decoration. It cannot happen, and the arithmetic is short enough to state
+     * where it matters rather than guard against at run time:
+     *
+     *   3.2's cap on a client's own message is IRC_MAX_RELAY_LINE (8013), which
+     *   is IRC_MAX_LINE minus IRC_MAX_TAG_OVERHEAD (179) -- and it is applied to
+     *   the TEXT in msg_verbs.c BEFORE delivery, at the same place and for the
+     *   same reason a render failure is not how a limit is discovered.
+     *   The largest client-visible tag is IRC_MAX_MSGTAG (111) bytes, so the
+     *   worst tagged line is 112 bytes over the cap and 67 bytes under
+     *   IRC_MAX_LINE.
+     *   Every other emission this node makes -- the numerics, a 353, a STOPIC
+     *   relay, an SJOIN -- is bounded by its own field sizes (CHAN_MAX_TOPIC is
+     *   255) and has no path to a maximal line.
+     *
+     * So the retry that would drop the tag and keep the message is DELIBERATELY
+     * ABSENT rather than merely unnecessary: it would be unreachable today, and
+     * this project does not keep code that defends against something it has just
+     * shown cannot happen. If a future emission reaches here with a maximal line
+     * and a tag, the refusal below is the correct answer and n_reply_refused --
+     * the counter held at zero precisely because a non-zero value means a bug --
+     * is the alarm. Whoever adds such an emission must charge the tag against
+     * IRC_MAX_RELAY_LINE where fanout_line_fits() is applied. */
     /* RFC 1459 2.3: CRLF. message_format() terminates nothing, so this is
      * where the line terminator comes from. */
     line[len] = '\r';
     line[len + 1u] = '\n';
     return emit_to_client(s, c, code, line, len + 2u);
+}
+
+static int emit_built(server_t *s, conn_t *c, const char *code,
+                      const char *prefix,
+                      const char *const *params, int nparams)
+{
+    return emit_built_ex(s, c, code, prefix, params, nparams, 0, NULL);
 }
 
 /* <target> per RFC 2812 3.3: the client's nickname, or "*" when it does not
@@ -182,9 +216,50 @@ int send_line(server_t *s, conn_t *dst, const char *prefix,
     return emit_built(s, dst, command, prefix, params, nparams);
 }
 
+int send_line_tagged(server_t *s, conn_t *dst, const char *prefix,
+                     const char *command, const char *const *params, int nparams,
+                     const char *tags)
+{
+    if (s == NULL || command == NULL || command[0] == '\0') {
+        return refuse(s, dst, command, "bad_args");
+    }
+    if (params == NULL && nparams != 0) {
+        return refuse(s, dst, command, "bad_args");
+    }
+    if (nparams < 0 || nparams > IRC_MAX_PARAMS) {
+        return refuse(s, dst, command, "too_many_params");
+    }
+    /* An empty block is refused rather than rendered as a bare '@': message_build()
+     * rejects one, and asking it to would turn a caller bug into an "unbuildable"
+     * report that names the wrong fault. An empty `tags` is not a tag block this
+     * node can have produced -- irc_serve_msgid_tag() returns 0 rather than an
+     * empty string for the same reason -- so it is a caller mistake worth naming. */
+    if (tags != NULL && tags[0] == '\0') {
+        return refuse(s, dst, command, "empty_tags");
+    }
+    /* The SAME door as send_line(), so the peer-target and CLOSING refusals and
+     * the one queueing site are shared rather than restated. See the file header. */
+    return emit_built_ex(s, dst, command, prefix, params, nparams, 0, tags);
+}
+
 /* ---------------------------------------------------------------------------
  * send_pong
  * ------------------------------------------------------------------------ */
+
+int send_line_colon(server_t *s, conn_t *dst, const char *prefix,
+                    const char *command, const char *const *params, int nparams)
+{
+    if (s == NULL || command == NULL || command[0] == '\0') {
+        return refuse(s, dst, command, "bad_args");
+    }
+    if (params == NULL && nparams != 0) {
+        return refuse(s, dst, command, "bad_args");
+    }
+    if (nparams < 0 || nparams > IRC_MAX_PARAMS) {
+        return refuse(s, dst, command, "too_many_params");
+    }
+    return emit_built_ex(s, dst, command, prefix, params, nparams, 1, NULL);
+}
 
 int send_pong(server_t *s, conn_t *src, const char *token)
 {

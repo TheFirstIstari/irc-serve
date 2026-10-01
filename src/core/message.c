@@ -4,9 +4,15 @@
  * by the compiler. */
 #include "message.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+
+/* The ONE escape table in this tree. message_tag_escape()/message_tag_unescape()
+ * below delegate here rather than carrying their own switch; see the comments on
+ * those two wrappers for why, and ircv3_tags.h for the table itself. */
+#include "ircv3_tags.h"
 
 /* Longest decimal we read or write for a uint64_t: UINT64_MAX is 20 digits.
  * Bounds the numeric tag parse and the size computations below. */
@@ -155,41 +161,29 @@ static int tag_block_find(const char *block, const char *key,
     return 0;
 }
 
-/* Escape `value` per IRCv3. Returns 0 on success and writes the byte count to
- * *written, or -1 if it does not fit. Never truncates. */
+/* Escape `value` per IRCv3 into `out` and write the byte count to *written.
+ * Returns 0 on success, -1 if it does not fit. Never truncates.
+ *
+ * A THIN WRAPPER, and deliberately so. ircv3_tags.c owns the escape table --
+ * there is exactly one in this tree, because two copies are a tree that
+ * disagrees with itself about what a value means. This function used to carry
+ * its own switch, and it carried the WRONG one: it escaped ':' as '\:' and ';'
+ * as '\;', which is a plausible reading of the table and is not the
+ * specification's. IRCv3 maps ';' to '\:' and leaves a colon raw. The mistake is
+ * retracted here rather than preserved for a test that asserted it.
+ *
+ * The cost of the delegation is one call per value on the serialize path, which
+ * is one per relayed message, and it is not measurable next to the render that
+ * follows it. */
 static int tag_escape_into(const char *value, char *out, size_t cap,
                            size_t *written)
 {
-    size_t n = 0;
-    for (size_t i = 0; value[i] != '\0'; i++) {
-        char c = value[i];
-        const char *rep = NULL;
-        switch (c) {
-        case ':':  rep = "\\:"; break;
-        case ';':  rep = "\\;"; break;
-        case ' ':  rep = "\\s"; break;
-        case '\\': rep = "\\\\"; break;
-        case '\r': rep = "\\r"; break;
-        case '\n': rep = "\\n"; break;
-        default:   break;
-        }
-        const size_t add = (rep != NULL) ? 2u : 1u;
-        if (n + add + 1 > cap) {
-            return -1;
-        }
-        if (rep != NULL) {
-            out[n] = '\\';
-            out[n + 1] = rep[1];
-            n += 2;
-        } else {
-            out[n] = c;
-            n++;
-        }
-    }
-    if (n + 1 > cap) {
+    const size_t n = ircv3_escape_value(value, out, cap);
+
+    if (n == 0u && value != NULL && value[0] != '\0') {
+        out[0] = '\0';
         return -1;
     }
-    out[n] = '\0';
     *written = n;
     return 0;
 }
@@ -211,35 +205,20 @@ size_t message_tag_escape(const char *value, char *out, size_t cap)
 /* Unescape exactly `len` bytes of `value` into `out`. Split out so that
  * message_tag_get, which knows a value's span inside a block and not just its
  * length, does not have to copy the value out of the block first. Returns 0 on
- * success, -1 if it does not fit. Never grows the value. */
+ * success, -1 if it does not fit. Never grows the value.
+ *
+ * Also a thin wrapper, for the reason tag_escape_into() gives. The rule it now
+ * inherits is the specification's: a '\' before a character outside the escape
+ * set has its BACKSLASH DROPPED and yields the character, and a lone trailing
+ * '\' produces nothing. It used to keep the backslash as a literal character,
+ * which meant a peer sending `\x` produced a value no peer would agree with --
+ * the same value, spelled two ways, on two nodes. */
 static int tag_unescape_span(const char *value, size_t len, char *out, size_t cap)
 {
-    if (len + 1 > cap) {
+    if (out == NULL || cap == 0) {
         return -1;
     }
-    size_t n = 0;
-    for (size_t i = 0; i < len; i++) {
-        char c = value[i];
-        if (c == '\\') {
-            if (i + 1 >= len) {
-                break; /* a lone trailing '\' is dropped */
-            }
-            c = value[++i];
-            switch (c) {
-            case ':':  c = ':';  break;
-            case ';':  c = ';';  break;
-            case 's':  c = ' ';  break;
-            case '\\': c = '\\'; break;
-            case 'r':  c = '\r'; break;
-            case 'n':  c = '\n'; break;
-            default:   break;   /* an unknown escape yields the character */
-            }
-        }
-        out[n] = c;
-        n++;
-    }
-    out[n] = '\0';
-    return 0;
+    return ircv3_unescape_value(value, len, out, cap);
 }
 
 int message_tag_unescape(const char *value, char *out, size_t cap)
@@ -694,6 +673,12 @@ static int needs_colon(const char *s)
 
 size_t message_format(const message_t *m, char *out, size_t cap)
 {
+    return message_format_ex(m, out, cap, 0);
+}
+
+size_t message_format_ex(const message_t *m, char *out, size_t cap,
+                         int force_colon)
+{
     if (m == NULL || out == NULL || cap == 0) {
         return 0;
     }
@@ -752,8 +737,14 @@ size_t message_format(const message_t *m, char *out, size_t cap)
     }
     sink_puts(&s, m->command);
     for (int i = 0; i < m->nparams; i++) {
+        /* force_colon applies to the LAST parameter only, and only when there is
+         * one. Applying it to every parameter would put a ':' in a target field,
+         * which is not a marker at all. */
+        const int last = (i == m->nparams - 1);
+
         sink_putc(&s, ' ');
-        if (needs_colon(m->params[i]) != 0) {
+        if (needs_colon(m->params[i]) != 0 ||
+            (force_colon != 0 && last)) {
             sink_putc(&s, ':');
         }
         sink_puts(&s, m->params[i]);
@@ -937,6 +928,94 @@ int irc_serve_tags_parse(const message_t *m, irc_serve_tags_t *out)
     out->id = i_id;
     out->hops = (uint32_t)h;
     return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * The IRCv3 `msgid` -- see the block comment on irc_serve_msgid_tag() in
+ * message.h, which is where the format and the argument for it live. What is
+ * here is the renderer and the one check that keeps the promise in that comment
+ * true.
+ * ------------------------------------------------------------------------ */
+
+static const char TAG_MSGID[] = "msgid";
+
+/* The '_' that separates the three fields. Spelled as a constant rather than
+ * written into the format string because it is the load-bearing byte of the
+ * whole format: message.h's argument is that 2.4's origin grammar excludes it,
+ * so the three fields stay separable. A reader changing the separator to '-'
+ * should have to find this line. */
+#define MSGID_SEP '_'
+
+size_t irc_serve_msgid_value(const irc_serve_tags_t *t, char *out, size_t cap)
+{
+    if (out == NULL || cap == 0) {
+        return 0;
+    }
+    out[0] = '\0';
+    /* The same legality gate irc_serve_tags_format() uses, for the same reason:
+     * a stamp the 2.4 grammar would refuse must not be able to become a
+     * client-visible identity, because a client cannot check it and a peer
+     * cannot re-derive the dedup key from a value that was never legal. */
+    if (irc_serve_tags_valid(t) != 1) {
+        return 0;
+    }
+    char epoch[NUM_DIGITS_U64 + 1];
+    char id[NUM_DIGITS_U64 + 1];
+    if (format_decimal(t->epoch, epoch, sizeof epoch) == 0 ||
+        format_decimal(t->id, id, sizeof id) == 0) {
+        return 0;
+    }
+    /* snprintf rather than concatenation, because the bound is three variable
+     * lengths and a hand-rolled sum is the kind of arithmetic that is wrong
+     * once and then forever. The cap is checked by snprintf and 0 is returned,
+     * so a caller that sized its buffer from the derivation in message.h is
+     * right and one that did not is refused rather than overrunning. */
+    const int n = snprintf(out, cap, "%s%c%s%c%s", t->origin, MSGID_SEP, epoch,
+                           MSGID_SEP, id);
+    if (n < 0 || (size_t)n >= cap) {
+        out[0] = '\0';
+        return 0;
+    }
+    /* THE ESCAPE CLAIM, CHECKED. message.h says this value needs no escaping
+     * because every byte is a letter, a digit, '_' or '.'; that is a claim about
+     * the grammar above, and a grammar that later widens -- an origin rule that
+     * admitted ';' or a space -- would turn it into a value that corrupts the
+     * block it is written into. Refusing here is a bug report, not a fallback:
+     * there is no second spelling of this tag and silently emitting an
+     * unescaped one is the failure ircv3_tags.h exists to prevent. */
+    for (const char *p = out; *p != '\0'; p++) {
+        const unsigned char ch = (unsigned char)*p;
+
+        const int alnum = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                          (ch >= '0' && ch <= '9');
+        if (alnum == 0 && ch != (unsigned char)MSGID_SEP && ch != (unsigned char)'.') {
+            out[0] = '\0';
+            return 0;
+        }
+    }
+    return (size_t)n;
+}
+
+size_t irc_serve_msgid_tag(const irc_serve_tags_t *t, char *out, size_t cap)
+{
+    if (out == NULL || cap == 0) {
+        return 0;
+    }
+    out[0] = '\0';
+    /* The one tag rather than the four, so message_tags_format() does the
+     * assembling -- including the `key=value` join and the block's own contract
+     * -- instead of a second copy of it here. A hand-written "msgid=" prefix
+     * would be a place where the key spelling and the separator could drift from
+     * the one message.h documents. */
+    char value[IRC_MAX_MSGTAG + 1];
+    const size_t vlen = irc_serve_msgid_value(t, value, sizeof value);
+
+    if (vlen == 0u) {
+        return 0;
+    }
+    const message_tag_t one[1] = { { TAG_MSGID, value } };
+
+    return message_tags_format(one, 1, out, cap);
 }
 
 /* --------------------------------------------------------------------------

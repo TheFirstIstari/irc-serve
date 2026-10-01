@@ -95,6 +95,7 @@
 #include "core/poll_loop.h"
 #include "core/server.h"
 #include "federation/link.h"
+#include "sasl_framework.h"
 
 /* The node's own name, when --name is not given. It must satisfy the 2.4 tag
  * grammar, because it is stamped on every outbound irc-serve-origin tag, and a
@@ -191,7 +192,7 @@ static int install_handler(int sig, void (*handler)(int))
 static void usage(FILE *out, const char *argv0)
 {
     fprintf(out, "usage: %s [port] [--name NAME] [--secret S]\n", argv0);
-    fprintf(out, "            [--peer NAME,HOST,PORT]...\n");
+    fprintf(out, "            [--sasl-store PATH] [--peer NAME,HOST,PORT]...\n");
     fprintf(out, "\n");
     fprintf(out, "  port   TCP port to listen on, 0-%d; 0 asks the kernel for\n"
                  "         an ephemeral port and reports which one it chose\n",
@@ -264,6 +265,12 @@ typedef struct {
 typedef struct {
     const char *name;
     const char *secret;
+    /* The SASL credential store, or NULL. NULL is the DEFAULT and it means "this
+     * node authenticates nobody", which is why it is a NULL and not an empty
+     * path: a node that was handed a path it cannot read must be visibly
+     * different from a node that was never handed one, and the two print
+     * different startup lines and advertise different capabilities. */
+    const char *sasl_store;
     int         port;
     int         have_port;
     node_peer_t peers[NODE_MAX_PEERS];
@@ -362,7 +369,7 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
             return 1;
         }
         if (strcmp(arg, "--name") == 0 || strcmp(arg, "--secret") == 0 ||
-            strcmp(arg, "--peer") == 0) {
+            strcmp(arg, "--peer") == 0 || strcmp(arg, "--sasl-store") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "irc-serve: %s needs a value\n", arg);
                 return -1;
@@ -385,6 +392,8 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
             o->name = value;
         } else if (strcmp(arg, "--secret") == 0) {
             o->secret = value;
+        } else if (strcmp(arg, "--sasl-store") == 0) {
+            o->sasl_store = value;
         } else {
             if (o->npeers >= NODE_MAX_PEERS) {
                 fprintf(stderr, "irc-serve: at most %d --peer options\n",
@@ -525,6 +534,31 @@ int main(int argc, char **argv)
     }
     srv.on_tick = fed_tick;
 
+    /* ------------------------------------------------------------------------
+     * THE CREDENTIAL STORE, loaded here and nowhere else.
+     * ------------------------------------------------------------------------
+     * It is loaded BEFORE the loop is armed and that is the whole of the design:
+     * 3.4 forbids a blocking call inside the event loop, and reading a file is
+     * the most blocking call there is. Once loaded, the store is an in-memory
+     * array on server_t and every AUTHENTICATE is a bounded linear scan of at
+     * most SASL_MAX_CREDENTIALS records.
+     *
+     * A STORE THAT FAILED TO LOAD IS NOT A STARTUP FAILURE. The node comes up,
+     * says so on stderr and in the startup line, and advertises no `sasl`. The
+     * alternative -- refusing to start -- would turn a typo in a path into a
+     * node that will not serve anybody, over a feature most deployments of this
+     * design do not use. And a node that WILL NOT ADVERTISE what it cannot do is
+     * the rule cap.c exists to enforce, so "no store" has to be a state this
+     * binary can be in, and it is.
+     */
+    if (opts.sasl_store != NULL) {
+        srv.sasl_store = sasl_store_load(opts.sasl_store);
+        if (srv.sasl_store == NULL) {
+            fprintf(stderr, "irc-serve: --sasl-store %s was refused; this node "
+                            "will advertise no sasl capability\n", opts.sasl_store);
+        }
+    }
+
     /* Resolve and configure the peers, still before the loop. */
     for (i = 0; i < opts.npeers; i++) {
         if (resolve_peer(&srv, &opts.peers[i]) != 0) {
@@ -551,11 +585,15 @@ int main(int argc, char **argv)
     }
     printf("[observable] tcp_bind: port=%d fd=%d state=LISTENING\n",
            bound, srv.listen_fd);
+    /* `sasl=` is the startup line's half of "advertise only what you have": a
+     * reader comparing two nodes' startup output can tell which one offers
+     * authentication without opening either one's credential file. */
     printf("[observable] server initialized: name=%s epoch=%llu peers=%d "
-           "secret=%s\n",
+           "secret=%s sasl=%s\n",
            opts.name, (unsigned long long)srv.epoch,
            (int)server_link_count(&srv),
-           (opts.secret[0] == '\0') ? "none" : "set");
+           (opts.secret[0] == '\0') ? "none" : "set",
+           sasl_store_count(srv.sasl_store) > 0u ? "loaded" : "none");
 
     /* Readiness: emitted after the listener is up and immediately before the
      * loop is armed, so anything waiting on this line is talking to a serving
@@ -585,7 +623,7 @@ int main(int argc, char **argv)
            "fed_unknown_verb=%llu fed_verb_deferred=%llu fed_malformed=%llu "
            "fed_dup_drop=%llu fed_dedup_dup=%llu fed_squit_self=%llu "
            "burst_refused=%llu burst_abandoned=%llu burst_truncated=%llu "
-           "topic_cache_full=%llu\n",
+           "topic_cache_full=%llu sasl_ok=%llu sasl_fail=%llu\n",
            (unsigned long long)srv.n_ticks, (unsigned long long)srv.n_eintr,
            (unsigned long long)srv.n_accepted, (unsigned long long)srv.n_closed,
            (unsigned long long)srv.n_lines,
@@ -614,7 +652,9 @@ int main(int argc, char **argv)
            (unsigned long long)srv.n_burst_refused,
            (unsigned long long)srv.n_burst_abandoned,
            (unsigned long long)srv.n_burst_truncated,
-           (unsigned long long)srv.n_topic_cache_full);
+           (unsigned long long)srv.n_topic_cache_full,
+           (unsigned long long)srv.n_sasl_ok,
+           (unsigned long long)srv.n_sasl_fail);
 
     /* The link table itself, and last, after the counters: 8 asks for "a way to
      * dump peers and their FSM states" and the state is what the counters are
