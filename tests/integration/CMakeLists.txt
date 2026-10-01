@@ -375,3 +375,20 @@ irc_add_integration_test(test_sync_state test_sync_state.c)
 # and the winner's non-rename -- and a test that checked one of them would pass
 # against a mesh that had resolved the duplicate in only one.
 irc_add_integration_test(test_nick_duplicate test_nick_duplicate.c)
+
+# 2.1/2.2/8: a client whose TCP session is LOST and who comes back gets its
+# channel set, with the per-channel prefix flags re-derived rather than copied.
+# Its own file because the claim is a SEQUENCE over a real socket -- register,
+# join, become op, CLOSE THE SOCKET, wait for the node to reap it, connect a
+# second real socket -- and every step of that sequence is a place a test can
+# stop being real. A unit test could assert that a window was recorded and
+# nothing else, and the placeholder this file replaced said exactly why that was
+# not enough: "honest CTest skip rather than SIMULATED RECONNECT STATE".
+#
+# IT MOVED HERE FROM tests/loadbal/, where the phase table put it because it was
+# one of five skips 7/Phase 9 owned. That was a classification by the skip's name
+# rather than by the feature: peer discovery and auto-scale are about a mesh, and
+# a client reconnecting is a single node's business with no peer in the file.
+# The CTest NAME is unchanged (Reconnect) -- see irc_ctest_name() for why, and
+# tests/loadbal/CMakeLists.txt for what is left of the three.
+irc_add_integration_test(test_reconnect test_reconnect.c)

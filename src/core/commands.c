@@ -13,6 +13,7 @@
 #include "core/channel.h"
 #include "core/fanout.h"
 #include "core/msg_verbs.h"
+#include "core/resume.h"
 #include "core/reply.h"
 #include "federation/nickreg.h"
 #include "federation/verbs.h"
@@ -246,6 +247,27 @@ void commands_state_update(server_t *s, conn_t *c)
     c->state = state;
     if (state == CONN_REG_READY) {
         send_welcome(s, c);
+        /* THE SESSION WINDOW IS APPLIED HERE AND NOWHERE ELSE, and the position
+         * is the whole of what makes it possible: this is the one place a
+         * connection has all three of nick, ident and host -- the window's key
+         * -- AND is about to be addressed as a client, which is what a re-join
+         * needs because 3.1's table is keyed on the connection's class. Applying
+         * it at NICK time would compare an EMPTY ident against every window and
+         * match none; applying it at USER time would be a second place that
+         * promotes a connection to ready.
+         *
+         * IT IS AFTER THE WELCOME BURST, and that is a client-visible ordering
+         * choice rather than an accident: 001-005 and the MOTD are the server
+         * introducing itself, and a client that has not been told what it
+         * connected to should not be told what it is already a member of. Every
+         * real client parses 376 as "the server has finished talking", and the
+         * JOINs and rosters that follow read as the session coming back rather
+         * than as part of the handshake.
+         *
+         * IT IS A NO-OP FOR EVERY CONNECTION THAT DID NOT COME BACK FROM A DROP,
+         * which is every connection on a node whose clients never drop, and it
+         * costs one pointer comparison when there is no table. */
+        (void)resume_apply(s, c, server_now_ms());
     }
 }
 

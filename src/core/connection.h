@@ -133,6 +133,20 @@ struct chan; /* opaque until Phase 4 (2.2) */
                            sizeof(((conn_t *)0)->user) + \
                            sizeof(((conn_t *)0)->host) + 3u)
 
+/* The widths of conn_t::user and conn_t::host, derived from the struct rather
+ * than written down, for the reason CONN_HOSTMASK_MAX above is derived: a
+ * caller that sizes a buffer from a literal and the struct is raised is a buffer
+ * one byte short, and the symptom is a bounded copy that silently truncates an
+ * identity field.
+ *
+ * Phase 9 needs them for the resume window, whose key is (nick, ident, host) --
+ * see core/resume.h. Neither field has a bound of its own: USER has no RFC
+ * length limit, and 2.1 records the OBSERVED address rather than what the client
+ * typed, so the host is truncated to a fixed width at accept time by
+ * describe_peer() and this is that width. */
+#define CONN_USER_MAX (sizeof(((conn_t *)0)->user) - 1u)
+#define CONN_HOST_MAX (sizeof(((conn_t *)0)->host) - 1u)
+
 /* conn_t::away, the AWAY message. Empty means "not away", the same idiom
  * nick[0]/user[0] already use for "this fact is not established yet", so no
  * separate flag is needed and the two can never disagree.

@@ -19,6 +19,7 @@ add_library(irc_core STATIC
   core/channel.c
   core/poll_loop.c
   core/reply.c
+  core/resume.c
   core/fanout.c
   core/commands.c
   # Phase 8: the IRCv3 capability negotiation. It is a module of its own rather

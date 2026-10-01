@@ -17,6 +17,10 @@
 #include <string.h>
 #include <strings.h>
 
+/* Phase 9: the session window, asked by chan_dispose_if_empty() whether a
+ * channel is still HELD by a client that is coming back to it. See the guard there
+ * for why the hold is short: 2.2's disposal rule is delayed, not exempted. */
+#include "core/resume.h"
 #include "core/reply.h"
 
 /* ---------------------------------------------------------------------------
@@ -1036,6 +1040,37 @@ int chan_dispose_if_empty(server_t *s, chan_t *ch)
      * owner, so the channel SURVIVES. Freeing it here is the specific bug that
      * would make servers[] a declared-but-unused field. */
     if (ch->nmembers != 0 || ch->nservers != 0) {
+        return 0;
+    }
+    /* PHASE 9: A SESSION WINDOW STILL HOLDS THIS CHANNEL, so it is NOT disposed --
+     * and this is the third reason to exist, after local members and remote ones,
+     * and the only one that is TIMED rather than permanent.
+     *
+     * WITHOUT IT THE FEATURE IS WORTHLESS ON THE COMMON CASE, which is worth
+     * spelling out because it is not obvious from the code: a client that drops is
+     * parted out of every channel it was in (chan_conn_gone, called from the
+     * reaper), so a client who was the only member of every channel it was in
+     * leaves every one of them with nothing to remember it for. The window that
+     * was recorded one line earlier names channels that no longer exist, and the
+     * restore finds nothing to put the client back into -- on a single-client
+     * node, silently, which is the worst combination of the two.
+     *
+     * THE HOLD IS SHORT AND DERIVED (core/resume.h), and the shortness is the
+     * point rather than a compromise: 2.2's disposal rule above is DELAYED, not
+     * exempted. A hold as long as the window would keep a channel alive for two
+     * minutes after its last member left, and tests/integration/
+     * test_topic_persist.c -- which empties a channel by dropping one client and
+     * QUITting the other, which is exactly the pair of events that records a
+     * window, and then waits fifteen seconds for `chan_destroy` -- would fail.
+     * A hold of a few seconds covers the population this feature serves
+     * completely, because a client whose session was lost is already reconnecting
+     * by then.
+     *
+     * AND IT IS A GUARD IN THE EXISTING RULE, NOT A NEW ONE. Putting it here
+     * rather than in the four callers that offer a channel for disposal means one
+     * check covers all of them, and a path that forgot it would dispose a channel
+     * a returning client is about to be restored into. */
+    if (resume_holds(s, ch->name)) {
         return 0;
     }
     printf("[observable] chan_destroy: channel=%s reason=empty\n", ch->name);
