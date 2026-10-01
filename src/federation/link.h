@@ -339,6 +339,22 @@
  * dead peer in 90 s. Halving it detects in 45 s at twice the line rate;
  * doubling it detects in 180 s at half the line rate. 30 s is the middle of
  * that trade and it is also the conventional IRC link-probe period. */
+/* How often this node publishes its own load to each established peer.
+ *
+ * DERIVED from IRC_FED_KEEPALIVE_MS, deliberately equal to it, and that equality
+ * is the requirement rather than a coincidence: an advertisement is a liveness
+ * signal as well as a load figure, so the peer must never conclude "this node
+ * has stopped advertising" and treat the mesh as degraded while T4 still
+ * considers the link healthy. At equal intervals a peer that hears nothing has
+ * heard nothing for a whole keepalive period, which is exactly the signal T4 is
+ * already using. Making the advertise period SHORTER would spend lines to be
+ * early on something T4 already detects; making it LONGER would make a healthy
+ * peer look dead. 0 disables advertisement entirely, and the arm below honours
+ * that, so a node can be run without publishing its load at all. */
+#ifndef IRC_FED_ADVERTISE_MS
+#define IRC_FED_ADVERTISE_MS IRC_FED_KEEPALIVE_MS
+#endif
+
 #ifndef IRC_FED_KEEPALIVE_MS
 #define IRC_FED_KEEPALIVE_MS 30000
 #endif
@@ -763,6 +779,130 @@ void fed_on_federate(server_t *s, conn_t *c, const message_t *m);
  * and it is a real gap rather than a rounding error -- `gave_up` is currently
  * terminal for the life of the process. The tests reach this function
  * directly, which is how it stays covered. */
+/* ---------------------------------------------------------------------------
+ * Phase 9 item 4: ADVERTISE and SHUTDOWN
+ * ---------------------------------------------------------------------------
+ */
+
+/* How many peer advertisements this node can hold, and it is IRC_FED_MAX_PEERS
+ * because that is how many peers a node can be configured with -- so the store
+ * cannot grow past this node's own peer set, and an advertisement from a stranger
+ * has nowhere to go even if the guard chain were removed. */
+#define IRC_FED_MAX_ADVERTISED ((size_t)IRC_FED_MAX_PEERS)
+
+/* Mark a link as CLEANLY DEPARTED (`set != 0`) or as diallable again (`set == 0`).
+ * Returns 1 if the flag changed, 0 if it did not or on a bad argument.
+ *
+ * IT SETS ONE FIELD AND DOES NOTHING ELSE, which is the whole of its contract:
+ * no socket is closed, no roster is purged, no retry is armed or disarmed. Those
+ * are three other pieces of a departure and they live in three other places; the
+ * flag is the one thing they share, so a function that also did one of them would
+ * be a function whose callers could not skip it without skipping the rest.
+ *
+ * `set == 0` HAS EXACTLY ONE CALLER, fed_link_reset(), because that is the
+ * OPERATOR's door: an operator who resets a link is saying "I want this peer back".
+ * Nothing else clears the flag, so a clean leave is not undone by a later event
+ * on the same link -- not a tick, not a sweep, not the socket closing. */
+int fed_mark_clean_leave(server_t *s, server_link_t *link, int set);
+
+/* Send `SHUTDOWN` to every ESTABLISHED link and return how many carried it.
+ * Called from server_shutdown() and from nowhere else, which is what a graceful
+ * leave IS: this node says it is going and then it goes.
+ *
+ * BEST EFFORT, and the limit is stated because it is real: the line is queued and
+ * the queue is drained by a single conn_pump() per link, so on a lossy path a
+ * SHUTDOWN can fail to arrive. That degradation is CORRECT rather than a defect:
+ * a peer that does not hear it sees a closed socket, applies its retry policy,
+ * and finds the node gone. The cost of sending it is that a clean leave
+ * occasionally reads as a failure; the cost of not sending it is that EVERY clean
+ * leave reads as one. `reason` is taken and not sent -- 4.3 has no SHUTDOWN and
+ * its shape is this phase's to choose, and a field a second implementation has to
+ * guess about is a compatibility break bought for nothing. */
+int fed_send_shutdown(server_t *s, const char *reason);
+
+/* Send `ADVERTISE <load%> [<name> <host> <port>]` to every ESTABLISHED link,
+ * minting a SEPARATE 2.4 id per link, and return how many carried it.
+ *
+ * SEPARATE IDS PER LINK, which is the opposite of fed_send_squit_named()'s one id
+ * for the whole fan-out and for a reason worth stating: a SQUIT is ONE logical
+ * announcement with several targets, so one id is right and a node reachable by
+ * two of this node's peers MUST drop the second copy. An ADVERTISE is a per-link
+ * STATE REPORT, the two copies are not the same message, and sharing an id would
+ * have the second peer learn nothing at all.
+ *
+ * WHAT IT PUBLISHES IS THIS NODE'S OWN CONFIGURATION -- its own name, the address
+ * the operator gave it, and the load percentage from fed_set_load() -- and never
+ * anything a peer told it. A node advertising an address it had resolved or
+ * inferred would be publishing a guess, and a peer that dialled a guess would be
+ * dialling the wrong server. That is a correctness reason and it is separate from
+ * the SSRF reason on server_t::advs, which is about what this node does with what
+ * it is TOLD. */
+int fed_send_advertise(server_t *s);
+
+/* Set this node's advertised load percentage. A KNOB and NOT A METRIC, because
+ * this node measures no load: the honest thing to put on the wire from a node
+ * that cannot measure itself is a value an operator set, and a fabricated 0% would
+ * be a number this node does not believe. Clamped to 0..100 on the way out. */
+void fed_set_load(unsigned pct);
+
+/* What one peer ADVERTISED, for a log or a counter. `name` and `host` are bounded
+ * buffers and `port_out`/`load_out` may be NULL; each is zeroed or emptied on
+ * entry so a caller that ignores one gets an empty value rather than a stale one.
+ * Returns the advertised NAME, which is the peer's own claim and need not equal
+ * the link it arrived on -- a relay is a legitimate thing to be -- or NULL when
+ * this peer has advertised nothing.
+ *
+ * THIS FUNCTION IS THE ENTIRE READ SURFACE OF THE ADVERTISEMENT STORE, and its
+ * RETURN TYPE IS PART OF THE SSRF ENFORCEMENT and not only a comment. It hands out
+ * two bounded strings and two numbers. There is no function anywhere in this
+ * module that returns a sockaddr, a server_link_t, or anything the dial path could
+ * be built from, and the only writer of a link's dial address is
+ * fed_link_configure(), which takes it from the operator's command line. See
+ * server.h on server_t::advs for the threat and for what a future reader would
+ * have to write down before changing any of this. */
+const char *fed_advertised(const server_t *s, const char *peer, char *name,
+                           size_t name_cap, char *host, size_t host_cap,
+                           unsigned *port_out, unsigned *load_out);
+
+/* How many peers have advertised something. 0 on a node with no peers, and the
+ * number a test asserts on to tell "the store recorded nothing" from "the store
+ * does not exist". */
+size_t fed_advertised_count(const server_t *s);
+
+/* Free the advertisement store. The TEARDOWN ARM, called from
+ * server_shutdown() next to the burst shadow's and the nick registry's, and it
+ * prints whether the table was OPEN so it can be asserted on a platform whose
+ * LeakSanitizer does not run. Safe on a server that never allocated one, and safe
+ * on NULL. */
+void fed_advert_close(server_t *s);
+
+/* Announce `server` to every ESTABLISHED link as a `SQUIT <server>`, and return how
+ * many carried it. `dying` is the link the line must NOT go out on -- NULL for
+ * "no such link" -- because a link that is closing cannot read it and counting it
+ * as a peer told would be a claim the wire does not support.
+ *
+ * IT IS ONE FUNCTION FOR TWO SENTENCES. `fed_send_squit_named(s, NULL, link)` says
+ * "THIS node's name is gone" and is what fed_link_down() announces with.
+ * `fed_send_squit_named(s, name, link)` says "THE SERVER CALLED `name` is gone"
+ * and is what the SHUTDOWN handler forwards, so a node two hops away learns about
+ * a departing peer. Both mint ONE 2.4 id for the whole fan-out, which is what 2.4's
+ * per-node dedup needs for a single logical announcement -- a node reachable by two
+ * of this node's peers must drop the second copy.
+ *
+ * A SQUIT AND NOT A RELAYED `SHUTDOWN`, and the asymmetry is why forwarding is
+ * right: a receiver refuses a SQUIT naming ITSELF but accepts one naming a third
+ * server, so a third node that has never heard of SHUTDOWN still purges
+ * correctly. A peer that predates this build would count an unknown verb and apply
+ * nothing, which is a stale roster -- the degradation, not the goal. */
+int fed_send_squit_named(server_t *s, const char *server, const server_link_t *dying);
+
+/* How often an ESTABLISHED link is advertised on, and the reason it is a knob
+ * and not a constant: the test needs the peer to learn about this node inside its
+ * own deadline, and the shipped value is chosen for a mesh where a stale load
+ * figure is not worth a line. The ADVERTISE is ALSO sent once on establishment,
+ * which is the half that matters for a peer that has just arrived. */
+void fed_set_advertise_interval(uint64_t ms);
+
 void fed_link_reset(server_t *s, server_link_t *link);
 
 /* Dump every link and the link counters, one [observable] line for the node and

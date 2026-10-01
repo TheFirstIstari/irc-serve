@@ -106,6 +106,13 @@ struct sasl_store;
  * server_t has to understand. */
 struct chan_topic;
 
+/* Phase 9 item 4: one peer's ADVERTISE, as OBSERVED. The whole structure is
+ * OBSERVATIONAL: it is read by logs, by the stats line and by the name-collision
+ * check, and it is never read by the dial path. See the comment on
+ * server_t::advs for why that separation is a security property rather than an
+ * omission, and what a future reader would have to write down before changing it. */
+struct fed_advert;
+
 /* Phase 9's remote-nick registry: 2.1's "which server holds the user called X",
  * the table that makes 3.1's `nick@server` row RESOLVABLE rather than merely
  * routable. The layout and its least-recently-used ordering are
@@ -298,6 +305,32 @@ typedef struct server_link {
     uint64_t retry_at_ms;
     unsigned retries;
     int      gave_up;
+
+    /* PHASE 9 ITEM 4: THIS PEER SAID IT IS LEAVING. It is a FIELD rather than a
+     * fifth handshake state because the FSM is 2.1's and has exactly four states,
+     * and adding one would be a change to a specification this phase does not own.
+     * The distinction it carries needs no new state, either: a departing peer is a
+     * link that must not be dialled rather than a link in a new place.
+     *
+     * WHAT IT SUPPRESSES IS EXACTLY ONE THING: the T7 arm's dial. Not the
+     * keepalive, not the dump, not the handshake -- the link stays ESTABLISHED
+     * until the peer's own teardown closes its socket, and everything this node
+     * knows about the peer stays readable.
+     *
+     * IT IS A SEPARATE FLAG FROM `gave_up` BECAUSE THE TWO SAY OPPOSITE THINGS, and
+     * overloading one for both would make a peer that left on purpose look like a
+     * peer that was flaky: `gave_up` is this node's budget SPENT and its counter
+     * is a finding about a link an operator should investigate, while this is the
+     * peer ANSWERING and there is nothing to investigate. The same reasoning
+     * server.h's own comment about the three integers makes, one level up: a
+     * number that means two things is a number nobody can act on.
+     *
+     * IT IS CLEARED BY fed_link_reset() ONLY, because that is the OPERATOR's door:
+     * an operator who resets a link is saying "I want this peer back", and a peer
+     * that left cleanly comes back if an operator asks for it. Nothing else clears
+     * it -- not a tick, not a sweep, not the link's own socket closing -- so a
+     * clean leave is not undone by a later event on the same link. */
+    int      clean_leave;
 } server_link_t;
 
 /* The initial capacity of server_t::links, and a bound on the PEER DESCRIPTORS
@@ -749,6 +782,100 @@ struct server {
     uint64_t  n_resume_chan_taken;
     uint64_t  n_resume_alloc_failed;
     uint64_t  n_resume_swept;
+
+    /* ------------------------------------------------------------------------
+     * Phase 9 item 4: what a peer ADVERTISES about itself. OBSERVATIONAL ONLY, and
+     * that is the load-bearing word in the whole structure.
+     * ------------------------------------------------------------------------
+     *
+     * A peer on an established link may tell this node its own name, its own
+     * dial hint (host and port) and a load percentage. This node records all
+     * three, reports them, and -- this is the security property, and it is
+     * STRUCTURAL rather than a check somebody has to remember -- NEVER uses them
+     * as a dial target.
+     *
+     * WHY THAT MATTERS ENOUGH TO SHAPE THE DATA STRUCTURE. `FEDERATE` carries
+     * the shared federation secret, so anything this node accepts as a peer is
+     * something that knows the secret. A store of learned addresses that fed the
+     * dial path would let a peer -- or anything that has obtained the secret, or
+     * a misconfigured peer on the far side of a compromised host -- hand this
+     * node an arbitrary host:port and make it open a connection there. That is a
+     * server-side request forgery primitive wearing a protocol, and the address
+     * it would connect to is exactly the thing an SSRF wants: a host that is not
+     * reachable from outside, reached from inside, on a port the attacker chose.
+     *
+     * SO THE STORE IS NOT `server_t::links` AND NOT `server_t::dials`, and that
+     * separation is the enforcement. The only writer of a link's dial address is
+     * fed_link_configure(), which takes it from the OPERATOR's command line
+     * (3.4: "HOST and PORT are resolved to a address ONCE, at startup, and never
+     * inside the event loop"). The tick's T7 arm dials only a link that has
+     * `initiator != 0` AND `addrlen != 0`, and both of those are set by that one
+     * function. A learned advertisement cannot reach either field because there
+     * is no API that would let it, and `fed_advertised_*` below returns TEXT for
+     * logs and counters and nothing else.
+     *
+     * A future reader who wants to dial from this store is about to introduce an
+     * SSRF and must first write the threat model that makes it acceptable: which
+     * peers are trusted to name which addresses, what stops a compromised peer
+     * from naming an internal one, and what an operator does when a peer names an
+     * address this node is not allowed to reach. None of those questions has an
+     * answer in this build, and "the secret is shared" is not one. */
+    struct fed_advert *advs;
+    size_t    nadv;      /* live entries; the array is allocated at its bound */
+    /* THIS NODE'S OWN LOAD, which is what an outbound ADVERTISE carries. A knob
+     * rather than a metric, because this node has no load measurement: the
+     * honest thing to put on the wire from a node that cannot measure its own
+     * load is a value an operator set, and a fabricated 0% would be a number this
+     * node does not believe. */
+    unsigned  load_pct;
+    uint64_t  advert_sent_ms; /* the per-node advertisement interval stamp */
+
+    /* THE ADVERTISEMENT COUNTERS. Four, and the distinctions are the point:
+     *
+     *   n_fed_advertise        ADVERTISE lines applied. An advertisement the node
+     *                         did not understand is not this.
+     *   n_fed_advertise_bad    ADVERTISE lines REFUSED for a payload that is not
+     *                         one: a load outside 0..100, a name that is not a
+     *                         legal 2.4 server name, a port outside 1..65535, a
+     *                         hint that is not three parameters. Zero on a
+     *                         healthy mesh, so a non-zero value is a peer running
+     *                         something this build does not speak.
+     *   n_fed_advertise_collision
+     *                         A peer advertised a name this node already has a
+     *                         LINK to, or its own. 2.3 makes two nodes with one
+     *                         name "catastrophic and undetectable later", and an
+     *                         advertisement is the cheapest way to detect it --
+     *                         which is one of the three things this store is
+     *                         allowed to be used for. It is a FINDING: the
+     *                         handshake refuses the second node, so this counter
+     *                         is how an operator finds out that two of their
+     *                         peers are about to fight over a name.
+     *   n_fed_shutdown         SHUTDOWN lines applied: a peer said it is leaving
+     *                         deliberately.
+     *   n_fed_shutdown_relayed SHUTDOWNs this node passed ONWARD as a SQUIT for
+     *                         the departing server, so a node two hops away
+     *                         learns about it. Separate from the first because a
+     *                         node that received a SHUTDOWN and did not relay it
+     *                         is a node whose third neighbours keep a roster for a
+     *                         server that is gone.
+     *   n_fed_shutdown_refused
+     *                         SHUTDOWN lines refused for a bad payload, and SHUTDOWN
+     *                         that arrived from a link that was not ESTABLISHED
+     *                         (the guard chain drops those at G1 and counts them
+     *                         on n_fed_preauth_drop, so this is only the arity
+     *                         half).
+     *   n_fed_shutdown_announced
+     *                         SHUTDOWNs this node SENT on its own way out, and the
+     *                         reason it is counted here rather than being a bare
+     *                         observable is that a graceful leave that nobody
+     *                         received is indistinguishable from a crash. */
+    uint64_t  n_fed_advertise;
+    uint64_t  n_fed_advertise_bad;
+    uint64_t  n_fed_advertise_collision;
+    uint64_t  n_fed_shutdown;
+    uint64_t  n_fed_shutdown_relayed;
+    uint64_t  n_fed_shutdown_refused;
+    uint64_t  n_fed_shutdown_announced;
 
     /* ------------------------------------------------------------------------
      * Phase 8: authentication. Both counters are events, not derived guesses.
