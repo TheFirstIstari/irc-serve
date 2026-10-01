@@ -23,6 +23,7 @@
 #include "core/poll_loop.h"
 /* Phase 9: the stats line reports 2.1's remote-nick registry size, and the
  * harness is where the inline children' stats are printed. */
+#include "core/resume.h"
 #include "federation/nickreg.h"
 
 /* The child used by nf_spawn_inline() and nf_spawn_inline_named(). Its name
@@ -640,6 +641,9 @@ static void nf_child_print_stats(const server_t *s)
            "fed_unknown_verb=%llu fed_verb_deferred=%llu fed_malformed=%llu "
            "fed_dup_drop=%llu fed_dedup_dup=%llu fed_squit_self=%llu "
            "nickreg_known=%zu nickreg_evicted=%llu "
+           "resume_noted=%llu resume_applied=%llu resume_expired=%llu "
+           "resume_rejected=%llu resume_evicted=%llu resume_swept=%llu "
+           "resume_chan_gone=%llu resume_chan_taken=%llu resume_held=%zu "
            "burst_refused=%llu burst_abandoned=%llu burst_truncated=%llu "
            "topic_cache_full=%llu\n",
            (unsigned long long)s->n_accepted, (unsigned long long)s->n_closed,
@@ -671,6 +675,15 @@ static void nf_child_print_stats(const server_t *s)
            (unsigned long long)s->n_fed_squit_self,
             (size_t)fed_nickreg_count(s),
             (unsigned long long)s->n_rnick_evicted,
+            (unsigned long long)s->n_resume_noted,
+            (unsigned long long)s->n_resume_applied,
+            (unsigned long long)s->n_resume_expired,
+            (unsigned long long)s->n_resume_rejected,
+            (unsigned long long)s->n_resume_evicted,
+            (unsigned long long)s->n_resume_swept,
+            (unsigned long long)s->n_resume_chan_gone,
+            (unsigned long long)s->n_resume_chan_taken,
+            (size_t)resume_count(&(*s)),
            (unsigned long long)s->n_burst_refused,
            (unsigned long long)s->n_burst_abandoned,
            (unsigned long long)s->n_burst_truncated,

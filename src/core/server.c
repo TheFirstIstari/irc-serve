@@ -22,6 +22,7 @@
  * here rather than left to federation/dedup.c. core/fanout.c and
  * core/commands.c already include federation/ headers for the same class of
  * reason, so this is a direction this tree already has. */
+#include "core/resume.h"
 #include "federation/burst.h"
 /* Phase 9's remote-nick registry. Included here rather than declared extern
  * because it is a teardown arm on a table this struct holds, exactly as
@@ -698,6 +699,21 @@ void server_shutdown(server_t *s)
      * ASSERTED here too: a test can prove the arm ran without a leak checker,
      * and Linux CI can read the same line next to its LSan run. */
     fed_burst_close(s);
+    /* The client session window, the third optional store this function ends,
+     * and the second one it has to CALL rather than free. Same reasoning as the
+     * burst shadow above: the records are core/resume.c's, the pointer is here,
+     * and a teardown that could not see this allocation would not be a teardown
+     * of everything on this struct. It is SAFE at this point in the walk,
+     * because a window holds no conn_t*, no chan_t* and no server_link_t* -- it
+     * holds three strings and a bounded array of channel NAMES, and every
+     * connection and channel the walk above released has already been copied
+     * out as text.
+     *
+     * The arm PRINTS whether the table was OPEN, for the reason the shadow's
+     * does: LeakSanitizer does not run on Darwin, so a missing free here is
+     * invisible locally and the only local evidence is a line a test can assert
+     * on. Linux CI reads the same line next to its own LSan run. */
+    resume_close(s);
     /* Phase 7's topic cache: a plain free of a plain vector, which is the
      * simplest arm on this function and the newest. It sits HERE rather than at
      * the end because the ordering that matters on this struct is "the peer links
@@ -840,6 +856,35 @@ void server_tick(server_t *s, uint64_t now_ms)
         return;
     }
     s->n_ticks++;
+    /* THE SESSION WINDOW'S SWEEP IS HERE AND NOT IN on_tick, and the reason is
+     * ownership: the window is a CORE structure and this is the core tick, while
+     * on_tick belongs to whichever module the embedding application installed
+     * (federation's fed_tick in this build). A core store swept from a
+     * federation callback would never expire on a node that federates with
+     * nobody -- which is exactly the quiet node whose windows are all stale.
+     *
+     * IT IS THROTTLED HERE AND NOT IN resume_sweep(), so the walk happens about
+     * once per window/16 rather than on every 50 ms tick: expiry is O(windows)
+     * and nothing about it needs millisecond resolution. The same split
+     * fed_dedup_sweep()'s throttle makes, and for the same reason -- the TIME
+     * half of "is a sweep due" belongs to the store's owner, and the OCCUPANCY
+     * half to the tick. */
+    if (s->resume_windows != NULL) {
+        /* The divisor is CLAMPED AT 1 and the guard is the same `now >=` test
+         * the sweep itself uses: a window shorter than the divisor has to be
+         * swept every tick, and a stamp in the future (which a clock that went
+         * backwards would produce) must not be read as "due long ago". */
+        uint64_t due = resume_window_ms() / RESUME_TICK_DIVISOR;
+
+        if (due == 0u) {
+            due = 1u;
+        }
+        if (s->resume_swept_ms == 0u || now_ms < s->resume_swept_ms ||
+            (now_ms - s->resume_swept_ms) >= due) {
+            (void)resume_sweep(s, now_ms);
+            s->resume_swept_ms = now_ms;
+        }
+    }
     if (s->on_tick != NULL) {
         s->on_tick(s, now_ms);
     }
@@ -961,6 +1006,20 @@ void server_close_conn(server_t *s, int fd)
     if (c == NULL) {
         return; /* unregistered: a second close is a no-op, not a double close */
     }
+
+    /* THE SESSION WINDOW IS RECORDED HERE AND NOT BELOW, and the position is
+     * the whole of what makes it work: chan_conn_gone() -- the very next call --
+     * walks c->chans, parts the client out of every channel and disposes of any
+     * that have run out of reasons to exist. A window noted after it would
+     * record an empty channel list and restore nothing, SILENTLY, and a silent
+     * no-op is the failure mode core/resume.h is arranged to avoid.
+     *
+     * IT IS BEFORE THE NICK IS RETIRED too, for the same reason and not by
+     * accident: core/resume.c distinguishes a lost session from an explicit
+     * QUIT by asking whether this connection still holds its nickname, and the
+     * QUIT handler has already unclaimed it by the time a QUIT reaches here.
+     * See resume_note() for why a QUIT is not a resumable session. */
+    resume_note(s, c, server_now_ms());
 
     /* Take the connection out of its channels BEFORE it is detached, and
      * before conn_free() releases the array.

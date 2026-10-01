@@ -674,6 +674,83 @@ struct server {
     uint64_t  n_topic_cache_full;
 
     /* ------------------------------------------------------------------------
+     * Phase 9: the client session window. core/resume.c owns the records; this
+     * struct holds the table pointer and the count, for the same reason the
+     * dedup table's does -- so that the function which ends every other
+     * allocation on this struct can also end this one, visibly.
+     * ------------------------------------------------------------------------
+     *
+     * `resume_windows` is a flat array of IRC_RESUME_MAX fixed-size records,
+     * LAZILY allocated on the first client that drops without a QUIT, and
+     * `nresume_used` is how much of it is live. The array is allocated at its
+     * FULL bound rather than grown: the bound is about 85 KiB, a growable
+     * vector would be a second thing to keep in step with the count, and a
+     * partially filled array is the simplest thing to sweep and to index.
+     *
+     * IT IS NOT A MEMBER-BY-MEMBER LIST, and the reason is the same one the
+     * channel set is a list but this is not: a window is about a client, and the
+     * thing a client owns is a fixed-size key plus a bounded array of channel
+     * names, so a variable-size record per user would make the table's size a
+     * function of how many channels users are in -- a number a client
+     * controls. See core/resume.h. */
+    struct resume_window *resume_windows;
+    size_t    nresume_used;
+    /* THE SWEEP THROTTLE, and 0 means "never swept", which is also the state of
+     * a node that has just recorded its first window -- so the first sweep is
+     * immediate rather than being delayed by an interval measured from zero. */
+    uint64_t  resume_swept_ms;
+
+    /* THE RESUME COUNTERS, and they are the ones an operator actually reads.
+     * Four of them are events rather than statistics, and the distinctions are
+     * the point:
+     *
+     *   n_resume_noted        a window was recorded: a client dropped with no
+     *                         QUIT, was registered, and had joined something.
+     *   n_resume_applied      a window was consumed by a returning client. The
+     *                         PAIR (noted, applied) is the feature working; a
+     *                         node where noted climbs and applied does not is a
+     *                         node whose clients are not coming back, or whose
+     *                         windows are being missed for another reason.
+     *   n_resume_expired      a window aged out, whether by the sweep or by the
+     *                         miss at restore time. This is the number that says
+     *                         "the bound is too short for this node's clients",
+     *                         and it is separated from n_resume_chan_gone because
+     *                         an expired window and a vanished channel are
+     *                         different problems with different fixes.
+     *   n_resume_rejected     a window was refused outright: the table could not
+     *                         be allocated, or the client had no channels to
+     *                         record. Zero on any healthy node, so a non-zero
+     *                         value is a finding.
+     *   n_resume_evicted      the table was FULL and the oldest window went. A
+     *                         node whose counter climbs is a node where clients
+     *                         are dropping faster than IRC_RESUME_MAX can hold
+     *                         them, which is the number that says "raise the
+     *                         bound".
+     *   n_resume_chan_gone    a channel in the window no longer exists. Expected
+     *                         after a restart of the client, common after a
+     *                         channel was disposed while the client was away, and
+     *                         the client is told each time.
+     *   n_resume_chan_taken   a channel in the window now has a DIFFERENT local
+     *                         member under the same nickname -- another client
+     *                         claimed the nick inside the window and joined. The
+     *                         restore is refused for that channel rather than
+     *                         putting two members with one nickname in a roster.
+     *   n_resume_alloc_failed the table could not be allocated. A node that
+     *                         cannot remember cannot resume, and saying so is
+     *                         better than a feature that silently did not record.
+     *   n_resume_swept        windows dropped by the sweep, cumulatively. The
+     *                         total, where the others are per-window events. */
+    uint64_t  n_resume_noted;
+    uint64_t  n_resume_applied;
+    uint64_t  n_resume_expired;
+    uint64_t  n_resume_rejected;
+    uint64_t  n_resume_evicted;
+    uint64_t  n_resume_chan_gone;
+    uint64_t  n_resume_chan_taken;
+    uint64_t  n_resume_alloc_failed;
+    uint64_t  n_resume_swept;
+
+    /* ------------------------------------------------------------------------
      * Phase 8: authentication. Both counters are events, not derived guesses.
      * ------------------------------------------------------------------------
      *

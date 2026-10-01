@@ -86,6 +86,27 @@
 int chan_split_list(char *store, size_t dstcap, const char *src,
                     const char **names, int max);
 
+/* Put `c` on `ch` as a member with `flags`, and tell everybody who needs to
+ * know: the local members, the mesh (through 3.1's table), and `c` itself
+ * through the topic, the roster, the creation time and 366. Returns 0 when the
+ * member is on the channel and has been told, -1 with 437 already sent
+ * otherwise.
+ *
+ * IT IS THE SINGLE DEFINITION of a local membership CHANGE, and handle_join() is
+ * not its only caller: core/resume.c's session window re-joins a returning
+ * client through this function, so a restored client is on the mesh, is subject
+ * to the same 437s, and gets the same four numerics as one that typed JOIN. A
+ * resume that had its own copy of the sequence would be a second place deciding
+ * what membership means, with its own idea of which peers to tell.
+ *
+ * `flags` is the CALLER's decision and this function applies it without judging
+ * it: handle_join() passes CHAN_MEMBER_OP for a channel it has just created and 0
+ * otherwise, and the resume passes what the channel is willing to re-grant (see
+ * core/resume.h on why that is not what the window recorded). Keeping the
+ * judgement with the caller is what lets the two callers have different policies
+ * without this function growing a parameter that means "and decide". */
+int chan_admit(server_t *s, conn_t *c, chan_t *ch, unsigned flags);
+
 /* The three answers to "may this node make that change?", which is the question
  * 2.2's single-writer rule asks and which every state verb asks before it
  * touches anything.
