@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "core/message.h"
 #include "sasl_framework.h"
 
 int account_logged_in(const conn_t *c)
@@ -90,4 +91,37 @@ void account_clear(conn_t *c)
      * it. See server_close_conn() for who calls this. */
     c->account[0] = '\0';
     c->logged_in = 0;
+}
+
+size_t account_tag_block(const char *name, char *out, size_t cap)
+{
+    /* Initialised here rather than assigned field by field below, so that every
+     * path through this function sees a fully-formed pair. */
+    message_tag_t one[1];
+
+    if (out == NULL || cap == 0u) {
+        return 0u;
+    }
+    /* `out` is cleared FIRST and unconditionally, so the caller's "no block" is
+     * true on every path including the ones that cannot render.
+     * send_line_tagged() treats an empty string as a CALLER BUG and refuses it, so
+     * a function that left a stale block behind on a failure would turn "I could
+     * not render this" into "you passed nonsense" -- and the caller cannot tell
+     * those apart. */
+    out[0] = '\0';
+    /* NO NAME, NO TAG. Not an `account=` with an empty value: the specification
+     * says the tag MUST NOT be sent for a user who is not identified, so an empty
+     * account is a tag that must not EXIST rather than a tag with no value. The
+     * check is here as well as at the call site because this is the function that
+     * would render one. */
+    if (name == NULL || name[0] == '\0') {
+        return 0u;
+    }
+    /* ONE PAIR THROUGH THE ONE SERIALISER, rather than a hand-written "account="
+     * followed by the value. message_tags_format() owns the '=' and the escaping,
+     * and it is the same call irc_serve_msgid_tag() makes -- so the key/value shape
+     * of this tag and of that one cannot come to disagree. */
+    one[0].key = ACCOUNT_TAG_KEY;
+    one[0].value = name;
+    return message_tags_format(one, 1u, out, cap);
 }

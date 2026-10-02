@@ -489,6 +489,13 @@ int irc_serve_tags_valid(const irc_serve_tags_t *t);
  * be a bug report, not a value to encode.
  */
 
+/* The `msgid` tag's key, as one constant. Exported rather than kept private to
+ * message.c because fanout.c assembles a block containing BOTH this tag and the
+ * `account` one, and a key spelled as a literal beside a key spelled as a
+ * constant is a spelling that can drift. It is used here for `irc_serve_msgid_tag()`
+ * so there is exactly one of it in the tree. */
+#define IRCV3_TAG_MSGTAG "msgid"
+
 /* Worst-case bytes of the rendered `msgid=` TAG, derived from the same bounds
  * the overhead table above uses and not from a guess:
  *

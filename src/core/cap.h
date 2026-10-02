@@ -59,45 +59,52 @@
  * The consistency that DOES have to hold is between `CAP LS` and the code: every
  * name in cap_available() must be a name something here implements. That is why
  * there is no `cap-notify` (this node never sends an unsolicited CAP NEW), no
- * `away-notify`, `chghost`, `account-notify` or `echo-message` (it sends none of
- * those), and no `server-time` or `userhost-in-names` (it stamps neither).
+ * `away-notify`, `chghost` or `echo-message` (it sends none of those), and no
+ * `server-time` or `userhost-in-names` (it stamps neither).
  *
  * ---------------------------------------------------------------------------
- * `account-tag` IS NOT IN THE TABLE, AND PHASE 10.1 ADDED THE SUBSYSTEM IT
- * NEEDS WITHOUT ADDING THE NAME. Read this before adding it.
+ * `account-tag` IS IN THE TABLE, AND BOTH HALVES OF IT LANDED TOGETHER
  * ---------------------------------------------------------------------------
- * Phase 10.1 built the account identity: a `conn_t` now carries an account name
- * and a `logged_in` flag, set from the SASL `authcid` when -- and only when --
- * both an operator's credential store and their account registry verify the
- * credential. That is what seven blocked IRCv3 specs were waiting for. It is not
- * `account-tag`, and the capability is deliberately absent from k_caps[].
+ * Phase 10.1 built the account identity -- a `conn_t` carries an account name and
+ * a `logged_in` flag, set from the SASL `authcid` when -- and only when -- both
+ * an operator's credential store and their account registry verify the
+ * credential -- and DELIBERATELY left the capability out of k_caps[].
  *
- * THE REASON IS THE SPEC'S OWN SENTENCE, quoted because paraphrasing it loses
- * the part that matters: the `account-tag` specification says the server adds the
- * tag, that the tag MUST be added to all commands sent by a user, and that
- * **"If the user is not identified to any services account, the tag MUST NOT be
- * sent."**
+ * The reason it left it out was the specification's own sentence, quoted because
+ * paraphrasing it loses the part that matters: **"If the user is not identified
+ * to any services account, the tag MUST NOT be sent."** The tag's ABSENCE is an
+ * assertion -- a client reads "no `account` tag" as "this user is anonymous" --
+ * so advertising the capability and then never emitting the tag would not merely
+ * fail to help: it would tell every client that every logged-in user on this node
+ * is anonymous.
  *
- * That last clause is the whole argument. The tag's ABSENCE is an assertion -- a
- * client reads "no `account` tag" as "this user is anonymous" -- so advertising
- * the capability and then never emitting the tag does not merely fail to help: it
- * tells every client that every logged-in user on this node is anonymous. This
- * node HAS logins now, so that is not a harmless gap; it is a node whose account
- * subsystem's entire observable purpose is inverted by the advertisement. The
- * same rule cap.c was written for -- a listed capability is a client switching
- * the feature on and then behaving as though this node honoured it -- applies
- * here with the sign flipped: a missing one is a client that carries on, a listed
- * one is a client that draws the wrong conclusion from every line.
+ * THAT REASONING WAS CORRECT AND IT IS NOW RESOLVED RATHER THAN OVERTURNED. The
+ * name went in at the same moment as the emission -- fanout.c's
+ * `fanout_tag_block()` writes the tag, and this table lists the name -- and with
+ * both halves present the incoherence does not arise: a client that negotiates
+ * `account-tag` gets the tag on every line a logged-in sender emits to it, and a
+ * client that does not negotiate it is written to exactly as before. The
+ * advertisement is no longer a claim about an absence, and the paragraph above is
+ * KEPT rather than deleted because the incoherent version is one table line away
+ * and nobody should have to rediscover the argument.
  *
- * WHEN IT GOES IN: with the emission, and both halves of it at once -- the tag on
- * every command a client sends, and the availability check that goes in beside
- * sasl_possible() above, because a node with no registry must withhold the name
- * for exactly the reason sasl is withheld. Adding the name to this table in a
- * phase that does not emit the tag is the exact defect the table's header warns
- * about, and a store check would not save it: that check asks whether there is
- * anything to SAY, and with no emission there is nothing to say however many
- * accounts exist.
+ * THE AVAILABILITY CHECK IS ACCOUNT_POSSIBLE(), beside sasl_possible() below, and
+ * it is 0 on a node with no registry for exactly the reason `sasl` is withheld
+ * there: with nothing behind the name there is nothing the tag could say, and a
+ * node that listed it would be a node whose every logged-in user -- which cannot
+ * exist -- is anonymous. The check asks whether there is anything to SAY, which is
+ * what makes it the right question now that there is something to say.
+ *
+ * THE TAG IS NOT SENT TO A CLIENT THAT DID NOT NEGOTIATE IT, and that is a
+ * second, independent gate in cap_account_tag_enabled() below. Absence is an
+ * assertion, so an UNSOLICITED `account` tag is as wrong as a missing one: it
+ * tells a client that opted out of tags that this user is identified. The emission
+ * is therefore per DESTINATION, exactly like the `msgid` tag, and the ACCOUNT NAME
+ * ITSELF is resolved once per emission in fanout.c rather than once per
+ * destination -- the comment on fanout_emitter_account() gives the argument, and
+ * getting it wrong is the same class of bug as the one an emission's id had.
  */
+
 #ifndef IRC_CORE_CAP_H
 #define IRC_CORE_CAP_H
 
@@ -114,6 +121,7 @@
 #define CAP_MESSAGE_TAGS "message-tags"
 #define CAP_MESSAGE_IDS "draft/message-ids"
 #define CAP_SASL "sasl"
+#define CAP_ACCOUNT_TAG "account-tag"
 
 /* 410 ERR_INVALIDCAPSUBCOMMAND. Not in design 4.4's numeric list, which is a gap
  * in the list rather than in the protocol, for the same reason 301, 303, 417,
@@ -222,6 +230,18 @@ int cap_message_tags_enabled(const conn_t *c);
  * interchangeable -- see cap.c for why a msgid without tag support is not a
  * best-effort thing to do. */
 int cap_message_ids_enabled(const conn_t *c);
+
+/* account-tag: whether this node writes an `account` tag naming the SENDER's
+ * account on a line it delivers to this client. REQUIRES message-tags for
+ * exactly the reason cap_message_ids_enabled() does, and the second half of the
+ * emission is the account NAME -- which this node resolves from its own registry,
+ * once per emission, and renders per destination.
+ *
+ * BOTH GATES ARE PER DESTINATION. That is the shape of the whole feature and it
+ * is not a detail: two members of one channel are free to disagree about whether
+ * they want to be told who sent a message, and a tag block written once for an
+ * emission would put it on the line of the one who asked for none. */
+int cap_account_tag_enabled(const conn_t *c);
 
 /* Handle one `CAP` line. Returns 1 if it was handled, 0 if it was not a CAP at
  * all (which cannot happen: the caller has already dispatched on the verb). */

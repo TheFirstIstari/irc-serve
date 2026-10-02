@@ -144,4 +144,50 @@ int account_logged_in(const conn_t *c);
  * should call account_logged_in() first; this is the VALUE. */
 const char *account_name(const conn_t *c);
 
+/* The `account` tag, rendered as a message-tag block WITHOUT the leading '@' --
+ * the same contract irc_serve_msgid_tag() has, so a caller joins blocks from two
+ * modules the same way it joins two blocks from one.
+ *
+ * Returns the byte count written, or 0 for an absent or empty `name`, for a NULL
+ * or zero `cap`, or for a value that does not fit. 0 is unambiguous for the same
+ * reason it is for the msgid renderer: a real tag is never empty, and "no tag" is
+ * what a caller passes to send_line_tagged() to mean "no block at all".
+ *
+ * IT IS HERE AND NOT IN message.c BECAUSE THE MODULE THAT OWNS THE NAME OWNS ITS
+ * SPELLING, for the reason fanout.c keeps one copy of the ASCII fold: two places
+ * that write `account` are two places that can write it two ways. The value is
+ * ESCAPED by message_tags_format() rather than concatenated, and that is not
+ * tidiness -- an account name is a SASL authcid, and sasl_plain_parse() bounds its
+ * length but not its charset, so a name may hold ';', ':' or '\\'. Escaping is what
+ * stops such a name from ending the tag pair and starting one of its own; the
+ * alternative is a hand-written "account=" prefix beside a value with no encoding,
+ * which is a corruption primitive handed to any client that can authenticate. */
+size_t account_tag_block(const char *name, char *out, size_t cap);
+
+/* The tag's key, as one constant, for the same reason message.h exports the
+ * msgid one: fanout.c assembles a block holding both and a key spelled two ways
+ * is a key that can drift. */
+#define ACCOUNT_TAG_KEY "account"
+
+/* The worst case account_tag_block() can write, DERIVED rather than picked, and
+ * including the terminator the renderer writes:
+ *
+ *     7   "account"              the key, ACCOUNT_TAG_KEY
+ *     1   '='                    the key/value separator message_tags_format()
+ *                                writes for every pair
+ *   126   the escaped value      ACCOUNT_MAX_NAME doubled, because the IRCv3
+ *                                escaper maps some bytes to two
+ *     1   NUL
+ *     ---
+ *   135
+ *
+ * THE DOUBLING IS DELIBERATE OVER-CAPACITY, and it is why this is a bound rather
+ * than a size. Every byte the escaper touches (';', ':', '\\', SP, CR, LF) is one
+ * this node already refuses to put in an account name where the name is an IRC
+ * parameter, so on today's reachable values the doubling never happens -- but a
+ * bound sized to the VALUES rather than to the ESCAPING is a bound that starts
+ * overflowing the day the charset is widened, and a stack buffer that overflows
+ * on a rare value is the failure this whole tree keeps refusing. */
+#define ACCOUNT_TAG_MAX (sizeof(ACCOUNT_TAG_KEY) + 1u + (ACCOUNT_MAX_NAME * 2u) + 1u)
+
 #endif /* IRC_CORE_ACCOUNT_H */
