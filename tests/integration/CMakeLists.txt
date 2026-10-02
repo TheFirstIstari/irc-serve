@@ -138,6 +138,15 @@ irc_add_integration_test(test_ircv3_msgid test_ircv3_msgid.c)
 # the ratchet asks.
 irc_add_integration_test(test_multi_prefix test_multi_prefix.c)
 
+# userhost-in-names (Phase 10.5), here beside test_multi_prefix for one reason:
+# both are about what a `353` roster LOOKS LIKE per destination, and both are the
+# kind of test that passes with one client and fails with two. A separate file, not
+# a second case in test_multi_prefix.c, because this one is a privacy assertion --
+# it checks that a hostmask is disclosed to the client that asked and ONLY to that
+# client -- and burying it beside a sigil-ordering case would make the disclosure
+# easy to skim past.
+irc_add_integration_test(test_userhost_in_names test_userhost_in_names.c)
+
 # 2.1 / 5: valid_nick() enforced at runtime. Phase 1 shipped the predicate with
 # no caller in src/, so this is the test that makes it load-bearing. Asserts the
 # RESPONSE, never that the function was called.

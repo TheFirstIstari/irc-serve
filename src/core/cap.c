@@ -35,7 +35,8 @@ enum {
     CAPBIT_SASL = 1u << 3,
     CAPBIT_ACCOUNT_TAG = 1u << 4,
     CAPBIT_ACCOUNT_NOTIFY = 1u << 5,
-    CAPBIT_EXTENDED_JOIN = 1u << 6
+    CAPBIT_EXTENDED_JOIN = 1u << 6,
+    CAPBIT_USERHOST_IN_NAMES = 1u << 7
 };
 
 /* THE BIT ORDER IS FIXED AND THE TABLE BELOW IS THE CLAIM.
@@ -64,7 +65,8 @@ static const cap_def_t k_caps[] = {
     { CAP_SASL, CAPBIT_SASL },
     { CAP_ACCOUNT_TAG, CAPBIT_ACCOUNT_TAG },
     { CAP_ACCOUNT_NOTIFY, CAPBIT_ACCOUNT_NOTIFY },
-    { CAP_EXTENDED_JOIN, CAPBIT_EXTENDED_JOIN }
+    { CAP_EXTENDED_JOIN, CAPBIT_EXTENDED_JOIN },
+    { CAP_USERHOST_IN_NAMES, CAPBIT_USERHOST_IN_NAMES }
 };
 
 static const size_t k_ncaps = sizeof k_caps / sizeof k_caps[0];
@@ -288,6 +290,24 @@ int cap_account_notify_enabled(const conn_t *c)
 int cap_extended_join_enabled(const conn_t *c)
 {
     return cap_enabled(c, CAP_EXTENDED_JOIN);
+}
+
+/* userhost-in-names: ONE GATE AND NO AVAILABILITY CHECK. The capability is a
+ * question about what a `353` may DRAW, and every member this node can draw has a
+ * host: a local one had accept() fill `c->host` before it had a nickname, and a
+ * remote one has the host 4.3's SBURSTN carries. There is no configuration under
+ * which this node has a roster and no host in it, so there is nothing to withhold
+ * the name over -- which is the same shape as account-notify's answer and the
+ * opposite of account-tag's.
+ *
+ * THE PRIVACY IS THE DOCUMENTATION, and cap.h carries it in full. What is worth
+ * saying here is where the gate is READ: `chan_verbs.c`'s `send_names_list()`,
+ * once per destination, for the connection being answered. A node that asked once
+ * per channel -- or once per node -- would hand every member's hostmask to every
+ * member whether they negotiated it or not. */
+int cap_userhost_in_names_enabled(const conn_t *c)
+{
+    return cap_enabled(c, CAP_USERHOST_IN_NAMES);
 }
 
 /* --------------------------------------------------------------------------

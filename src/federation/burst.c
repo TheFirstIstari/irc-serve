@@ -1242,6 +1242,33 @@ static const char *shadow_host(const char *nick)
     return NULL;
 }
 
+/* The IDENT a burst's nick record announced, or NULL on the same rule
+ * shadow_host() has.
+ *
+ * IT IS A SECOND WALK RATHER THAN A THIRD FIELD RETURNED BY THE FIRST, and the
+ * reason is that the two answers are asked separately and may be asked in either
+ * order relative to each other -- `apply_nick()` fills the shadow before the
+ * member loop runs, but nothing in this file promises that a future caller will
+ * keep that order, and a function that returned both would be wrong the moment one
+ * of them was wanted without the other. The walk is O(n) over the nicks a burst
+ * announced, once per member of the burst, and a burst is a resync rather than a
+ * hot path; the honest cost is O(n*m) on a large burst and it is paid once.
+ *
+ * WHY IT EXISTS AT ALL: 4.3's SBURSTN carries `<user>`, the shadow below has
+ * stored it since Phase 6, and this file copied only the HOST out of it. Half a
+ * hostmask was being discarded, which cost nothing until Phase 10.5's
+ * `userhost-in-names` needed to draw `nick!user@host` for a member this node does
+ * not host -- a remote member has no conn_t to read the pair from. */
+static const char *shadow_ident(const char *nick)
+{
+    for (size_t i = 0; i < g_shadow.nnicks; i++) {
+        if (chan_same_name(g_shadow.nicks[i].nick, nick)) {
+            return g_shadow.nicks[i].user;
+        }
+    }
+    return NULL;
+}
+
 /* Does this node already know a member by that name in this channel, as a LOCAL
  * member or in the remote roster?
  *
@@ -1549,6 +1576,21 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
             host = shadow_host(sc->members[k].nick);
             if (host != NULL) {
                 (void)chan_remote_set_host(ch, origin, sc->members[k].nick, host);
+            }
+            /* AND THE IDENT, from the same shadow record and by the same lookup,
+             * for the reason shadow_ident() gives. It is set SEPARATELY rather than
+             * as a second half of the host setter because the two have different
+             * failure modes on the wire -- 4.3's SJOIN carries neither, and a burst
+             * may announce a member line for a nick whose nick record arrived in a
+             * different order or not at all -- so one of them being absent must not
+             * cost the other. */
+            {
+                const char *ident = shadow_ident(sc->members[k].nick);
+
+                if (ident != NULL) {
+                    (void)chan_remote_set_user(ch, origin, sc->members[k].nick,
+                                               ident);
+                }
             }
             installed++;
         }

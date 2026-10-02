@@ -1439,6 +1439,52 @@ the token would mean making the mode letters constants and threading them throug
 the mode evaluator — a change to what a mode *is* in this tree, made for the sake
 of one string. It is named here as a finding rather than done quietly.
 
+#### 4.4.3 `userhost-in-names`, and the disclosure it makes
+
+Phase 10.5 lets a `353` roster carry `nick!user@host` instead of a bare nickname.
+
+**This is a privacy decision and it is stated as one.** What the capability does is
+disclose **every member's ident and observed host address to every other member of
+the channel** — to clients that member has never spoken to, and to clients who
+joined after them. There is no per-member consent anywhere in it: one client asking
+puts the whole roster's hostmasks on the wire to that client. The ident in
+particular is the thing RFC 1459 gives servers *permission* to know about a user
+and never tells a client to expect to learn.
+
+Two properties follow, and both are load-bearing rather than stylistic:
+
+- **The shape is decided per destination.** `chan_verbs.c`'s `names_entry()` asks
+  `cap_userhost_in_names_enabled(dst)` for the connection being answered, so two
+  clients on one channel see two different roster shapes for the same member. A
+  node that decided once per channel — or once per node — would hand every
+  member's hostmask to every member whether they asked or not, which is a
+  disclosure nobody agreed to. This is the same per-destination discipline as
+  `multi-prefix` and `extended-join`; here the cost of getting it wrong is not a
+  mis-drawn sigil.
+- **`352` and `311` are untouched.** Those numerics already carry `<user>` and
+  `<host>` in the RFC's own shape, so they were never the gap. The gap was `353`
+  alone and so is the scope.
+
+**The federation roster, and what it cost to be able to render one.** A remote
+member has no `conn_t`, so the `nick!user@host` had to come from
+`chan_remote_t` — and `chan_remote_t` had a `host` and **no ident**. 4.3's `SBURSTN`
+carries `<user>`, `federation/burst.c`'s shadow has stored it since Phase 6, and
+the join from the shadow to the roster copied only the host across: **half a
+hostmask was on the wire and being discarded.** Phase 10.5 adds
+`chan_remote_t::user` and `chan_remote_set_user()`, fed from `shadow_ident()` in the
+same place the host is. The cost is 64 bytes per remote-member element and
+`CHAN_MAX_REMOTE_MEMBERS` (64) elements, so **4 KiB per channel of addressed array**
+of which only the used prefix is touched.
+
+**When the node has no hostmask to draw, it draws the bare nick.** A remote member
+learned from a *live* SJOIN has neither half — 4.3's SJOIN is
+`<server> <chan> <nick> <flags>` — and that empty host is the documented normal
+state (`channel.h`'s `chan_remote_t` says so). Putting `*` in place of a missing
+half was refused: `*` is a byte that reads as part of a hostmask and means nothing
+to a client parsing one. A negotiated client that still sees a bare nickname has
+learned the true thing, and RFC 2812 3.3.5 permits a `353` of bare nicknames, so
+the mixed roster is parseable rather than surprising.
+
 **What `CASEMAPPING=rfc1459` would cost**, since the honest answer is only useful
 if the alternative is on the record: `[]\~` and `{}\|^` become fold-equivalent,
 which makes it *unsafe* to use any of those bytes in a nickname, a channel name or
@@ -1998,6 +2044,17 @@ Single node:
       list of tokens that must be absent. `KICKLEN` is absent because no bound
       exists; §4.4.2 names the cost of that gap, which is a reachable
       `n_reply_refused`.
+- [ ] `005` advertises `PREFIX=(ov)@+`, `CHANTYPES=#&` — **and every roster a
+      client is shown is the roster THAT client asked for.** Phase 10.5 added
+      `userhost-in-names`, and its obligation is not "draw a hostmask" but "draw
+      one for the client that negotiated it and a bare nickname for the client that
+      did not, on the same channel, at the same time" (§4.4.3). That is a
+      **disclosure** capability — it hands every member's ident and host to every
+      other member — so the per-destination decision is the security-relevant part,
+      not a rendering detail.
+      `tests/integration/test_userhost_in_names.c` runs three connections against
+      one channel and one member: two that negotiated and one that did not, and the
+      bare-nick answer is asserted on a connection that has seen nothing else.
 
 Federated:
 - [ ] Two-node fixture: cross-server join visibility, cross-server `PRIVMSG`
@@ -2184,4 +2241,5 @@ Quality:
 | **Account identity treated as authority** (Phase 10.1) | a future phase reads `logged_in` as a privilege and every access-control rule silently inherits it | `logged_in` is documented at the struct and at the module as a NAME plus a VERIFICATION and grants nothing (§2.1.1), and the "what none of them grant" block in `connection.h` says so where a future editor will read it |
 | **The account store drifting from the credential store** (Phase 10.1) | a client authenticates and is not identified, or is identified for a name the operator removed | Both must agree or authentication stops (§2.5.1), the refusal is counted on `n_account_refused` and named on the node's own output, and `test_account.c` runs the not-identified path against a node whose two files **disagree** — byte-identical to a node with no registry at all |
 | **An `005` token this node does not honour** (Phase 10.4) | a client sizes a buffer from a bound nothing enforces, or switches on a feature this node has not implemented, and then behaves as though the server agreed — which is worse than the token's absence, because absence is a client that carries on | **Every token is derived from the constant that enforces it, and every absence is named with its reason (§4.4.2).** `k_005[]` renders each `*LEN` through `IRC_STR()` from the bound itself rather than writing it out, and `test_registration.c` asserts the whole `005` against **literals**, so raising a bound in another file fails the test unless `005` moved with it. The absences with a live feature behind them — `BOT`, `EXTBAN`, `SAFELIST`, `MONITOR`, `MSGREFTYPES`, `ACCEPT`, `silence`, `draft/CHATHISTORY` — are asserted **absent** on the wire, so adding one without implementing it fails a test |
+| **`userhost-in-names` disclosing hostmasks to the wrong client** (Phase 10.5) | every member's ident and host reach every other member of the channel, including clients that member has never spoken to — and there is no per-member consent anywhere in the capability | **The roster shape is decided per DESTINATION**, in `chan_verbs.c`'s `names_entry()`, for the connection being answered — so a client is shown the long form only if it negotiated it (§4.4.3). A node deciding once per channel would disclose to the whole channel on one client's request. A member the node cannot render a hostmask for gets the **bare nick**, not a `*` placeholder: inventing a half would put a byte on the wire that reads as part of a hostmask and means nothing |
 | **`KICKLEN` has no bound to advertise** (Phase 10.4) | an over-long KICK reason is not refused with a numeric; it reaches `message_format()`, which refuses it as `unrepresentable` — a non-zero `n_reply_refused`, the counter `reply.c` holds at zero because a non-zero value of it is a bug report | **Reported, not fixed, and the reason is scope.** The fix is a reason bound plus a `417` in `handle_kick()`, which is a change to a command this pass did not touch. §4.4.2 states it; the honest mitigation today is that the node logs `reply_refused ... reason=unrepresentable` naming the command, so the condition is visible rather than silent |
