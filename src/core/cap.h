@@ -61,13 +61,14 @@
  * there is no `cap-notify` (this node never sends an unsolicited CAP NEW) and no
  * `away-notify` or `chghost` (it sends neither).
  *
- * **Phase 10.5 retired one name from that sentence.** It used to read "and no
- * `server-time` or `userhost-in-names` (it stamps neither)" — true when written,
- * and no longer true of `userhost-in-names`, which is in the table above and
- * implemented behind it. `server-time` is still absent, because this node stamps
- * no time tag on anything. The line is corrected rather than deleted because an
- * out-of-date "and no X" in a header is the exact shape of the incoherence this
- * file exists to prevent, and the build cannot see it.
+ * **Phase 10.5 and 10.6 retired two names from that sentence.** It used to read
+ * "and no `server-time` or `userhost-in-names` (it stamps neither)" — true when
+ * written, and no longer true of `userhost-in-names` (Phase 10.5) or `setname`
+ * (Phase 10.6), both of which are in the table above and implemented behind it.
+ * `server-time` is still absent, because this node stamps no time tag on anything.
+ * The line is corrected rather than deleted because an out-of-date "and no X" in a
+ * header is the exact shape of the incoherence this file exists to prevent, and the
+ * build cannot see it.
  *
  * ---------------------------------------------------------------------------
  * `account-tag` IS IN THE TABLE, AND BOTH HALVES OF IT LANDED TOGETHER
@@ -132,6 +133,7 @@
 #define CAP_ACCOUNT_NOTIFY "account-notify"
 #define CAP_EXTENDED_JOIN "extended-join"
 #define CAP_USERHOST_IN_NAMES "userhost-in-names"
+#define CAP_SETNAME "setname"
 
 /* 410 ERR_INVALIDCAPSUBCOMMAND. Not in design 4.4's numeric list, which is a gap
  * in the list rather than in the protocol, for the same reason 301, 303, 417,
@@ -320,6 +322,30 @@ int cap_extended_join_enabled(const conn_t *c);
  * carry `<user>` and `<host>` as their own RFC fields, so they were never the gap.
  * The gap was `353` alone, and that is the whole scope. */
 int cap_userhost_in_names_enabled(const conn_t *c);
+
+/* setname: whether this node will act on a `SETNAME` command from THIS client.
+ *
+ * THE GATE WORKS OPPOSITE TO THE OTHERS IN ONE RESPECTABLE WAY, and the asymmetry
+ * is the specification's rather than this file's. `setname` says the server MUST
+ * support the command **even while the capability is not negotiated**, and that a
+ * `SETNAME` from a client that did not negotiate it SHOULD be handled **silently**
+ * -- no response, no change. So:
+ *
+ *   - the NAME is advertised unconditionally, because the verb exists whatever the
+ *     client asked for, and a client that saw `setname` in `CAP LS` and then got
+ *     421 would read "this server has never heard of SETNAME", which would be a
+ *     lie about a verb this dispatch table has a row for.
+ *   - the GATE decides whether this connection's `SETNAME` changes anything. "Handled
+ *     silently" IS the refusal, and it is observable: nothing arrives on the wire,
+ *     and nothing changes. A client that wanted to try the command anyway, which
+ *     the specification explicitly permits, gets silence rather than an error.
+ *
+ * It gates the CONFIRMATION too, which is the other half of the rule and the reason
+ * this is not merely "whether the field changes": the server-to-client `SETNAME`
+ * line MUST NOT be sent to a client that did not negotiate the capability. So a
+ * client that asked cannot discover another member's realname change by watching
+ * them, and this capability cannot become a disclosure channel by accident. */
+int cap_setname_enabled(const conn_t *c);
 
 /* Handle one `CAP` line. Returns 1 if it was handled, 0 if it was not a CAP at
  * all (which cannot happen: the caller has already dispatched on the verb). */
