@@ -686,6 +686,18 @@ static void case_a_dropped_client_gets_its_channels_back(void)
                          (int)rlen, (roster != NULL) ? roster : "");
         }
         tc_close(&second);
+        /* And `again` is closed HERE, not only at line 617. It is registered TWICE
+         * -- once as beat 4's restored client, and again in this beat as the
+         * second presenter -- and the close in between frees the first buffer but
+         * not the second, because tc_close() frees what the struct holds AT THAT
+         * MOMENT. LeakSanitizer reported 4096 bytes from exactly this frame.
+         *
+         * My first sweep for this defect missed it, and the reason is worth
+         * recording: it compared the number of registrations against the number of
+         * closes per NAME, and `again` has 2 and 1 -- which looked like "closed
+         * once" rather than "one registration is unclosed". A leak sweep that
+         * counts is not a leak sweep; it has to pair them. */
+        tc_close(&again);
     }
 
     /* CLAIM 4, THE KEY. Same nick, DIFFERENT ident: no window, and the client is
