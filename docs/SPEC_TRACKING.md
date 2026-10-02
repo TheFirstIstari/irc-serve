@@ -842,7 +842,7 @@ design (design §4.4.1 carries the reasoning for the first).
 |---|---|---|
 | `extended-ispupport` | **IMPLEMENTED (Phase 10.4).** The `005` went from five hand-written tokens to eleven, every `*LEN` rendered from the constant that **enforces** it, and eight tokens that would have been claims about unimplemented features deliberately left out. | **Two findings, both reported rather than answered.** `KICKLEN` is absent because `handle_kick()` takes `<reason>` verbatim with no length test — so no number in the tree describes the largest reason accepted, and an over-long one reaches `message_format()` and trips `n_reply_refused`, the counter `reply.c` holds at zero. `USERLEN` is absent even though `CONN_USER_MAX` exists, because `USER`'s ident is *truncated* rather than refused, so the token would promise a limit the node does not apply. `PREFIX=(ov)@+` remains a written-out token: no constant names the mode letters, and making one would mean changing the mode evaluator. The cost of the work itself is one new constant (`MSG_MAX_TARGETS`), two sigil macros, and a test that now holds the whole `005` against **literals** rather than the constants. |
 | `userhost-in-names` | **IMPLEMENTED (Phase 10.5).** `353` renders `nick!user@host` per destination, on the recipient's own negotiation, for local *and* remote members. | **The privacy decision, stated plainly: this discloses every member's ident and observed host to every other member of the channel.** It is why the capability is opt-in and why the roster shape is decided per destination. The cost is `chan_remote_t::user` — the ident was on the wire in `SBURSTN` and in the burst shadow all along and was being **discarded**, so a federated roster could not have rendered a hostmask without it; +64 bytes per remote-member element, 4 KiB per channel's addressed array. See design §4.4.3. |
-| `setname` | **IMPLEMENTED in part (Phase 10.6).** The command, the capability, `NAMELEN`, and the confirmation to the originating client. | **The common-channel fan-out is NOT implemented, and that is the specification's MUST.** `core/fanout.c`'s per-destination decision is a choice between two wire **shapes** (the `fanout_form_t` the extended JOIN introduced); "send this member nothing" is a **third** outcome, and expressing it means a contract change to the routing module — which is the reason the alternative, a second member walk inside a handler, is worse. Named rather than faked. The refusals are also not `FAIL SETNAME INVALID_REALNAME` as the spec asks, because `standard-replies` is a separate pass and inventing a `FAIL` numeric was out of bounds; the node answers `417`, which is the numeric this tree already uses for an over-long parameter. |
+| `setname` | **IMPLEMENTED in part (Phase 10.6).** The command, the capability, `NAMELEN`, and the confirmation to the originating client. | The validation is a predicate **shared with `USER`** (`conn_realname_check()`), which is what makes "not a looser path than registration" a property of the code; `SETNAME` refuses over-long and control-bearing values while `USER` truncates length and empties a hostile one, because refusing `USER` would strand a half-registered client — §4.2.1 argues it. **The common-channel fan-out is NOT implemented, and that is the specification's MUST.** `core/fanout.c`'s per-destination decision is a choice between two wire **shapes** (the `fanout_form_t` the extended JOIN introduced); "send this member nothing" is a **third** outcome, and expressing it means a contract change to the routing module — which is the reason the alternative, a second member walk inside a handler, is worse. Named rather than faked. The refusals are also not `FAIL SETNAME INVALID_REALNAME` as the spec asks, because `standard-replies` is a separate pass and inventing a `FAIL` numeric was out of bounds; the node answers `417`, which is the numeric this tree already uses for an over-long parameter. |
 | `echo-message` | **IMPLEMENTED (Phase 10.7).** A sender who negotiated it gets its own `NOTICE` back, with its own hostmask as the source. | **Almost nothing, and the reason is the interesting part: `PRIVMSG` was already echoed.** This node delivers a channel `PRIVMSG` to every local member *including* the sender, so the copy `echo-message` requires already exists on the wire — the spec's example is byte-identical to what the normal path produces. The only gap was `NOTICE`, which RFC 1459 2.4.2 says is never returned to its sender. So the implementation is **one argument**: `exclude` stays `c` unless the sender negotiated the capability. There is no second emission, and that is the whole defence against the double-delivery bug the capability invites. `batch` echoes are out of scope, as is the acknowledgement for a `nick@server` target (no local destination exists to send one to). |
 
 ### 10.6 What the four cost, with evidence
@@ -855,7 +855,41 @@ design (design §4.4.1 carries the reasoning for the first).
 | A `353` roster's shape differs per destination for the same sender | `chan_verbs.c`'s `send_names_list()` / `names_emit()` | `test_userhost_in_names.c`: one channel, one member, three connections — negotiated, not negotiated, and a second negotiated one — with the long form required on two and the bare nick required on one |
 | The federation roster can render a hostmask at all | `chan_remote_t::user`, fed from `SBURSTN` | `test_fed_roster.c` — the ident was previously discarded by `burst.c`'s shadow→roster join and is now stored, which is the only reason a remote entry is not stuck at `nick` |
 | A sender who negotiated `echo-message` gets exactly **one** copy | `msg_verbs.c`'s `send_message()`, the `exclude` argument | `test_echo_message.c`: `PRIVMSG` to a channel counts 1 for a negotiating sender, 0 for a non-negotiating one; `NOTICE` counts 1 and 0 the same way |
-| The echoed copy is not *also* delivered by the normal path | there is one delivery call; `echo-message` chooses `exclude`, it does not add a second | the same test, with the double-delivery fault injected and watched to fail |
+| The echoed copy is not *also* delivered by the normal path | there is one delivery call; `echo-message` chooses `exclude`, it does not add a second | `test_echo_message.c`: the double-delivery fault (an extra `fanout_deliver_local()` aimed at the sender) is injected and watched failing with **2 copies where 1 is expected** |
+| A client that did **not** negotiate is served exactly as before | `exclude` stays `c` unless the sender negotiated | the same test, cases 2 and 4: a non-negotiating sender's `PRIVMSG` gets **one** copy and its `NOTICE` gets **zero** |
+| `setname` is refused pre-registration / without the capability / over-long / hostile | `handle_setname()`'s three gates and `conn_realname_check()` | `test_setname.c`: `451`; **silence** (asserted exhaustively — the drain `PONG` must be the only line); `417` at 256 with the previous value read back off the wire through a `JOIN`; `417` for ESC+BEL; 255 accepted; empty accepted |
+| `userhost-in-names` is a per-destination decision, not a per-node one | `chan_verbs.c`'s `names_entry()` | `test_userhost_in_names.c`: three connections, one channel, one member; the long form required on two and the bare nick required on one |
+| The federation roster can render a hostmask at all | `chan_remote_t::user`, fed from `SBURSTN` via `shadow_ident()` | `test_fed_roster.c` still passes with the field added; the ident was previously **discarded** by burst.c's shadow→roster join |
+| Teeth, each watched red with the **build checked first** | the TEETH blocks at the foot of each test | **18 faults red across the four passes** (2 for `extended-ispupport`, 4 for `userhost-in-names`, 7 for `setname`, 5 for `echo-message`), plus **2 that did not compile** and so never reached a run. Four of them found a missing assertion or a no-op check; all four are recorded in place rather than quietly fixed — see 10.6a |
+
+### 10.6a The teeth that found something
+
+Eighteen faults were watched go red. **Four of them found a defect in the tests
+rather than in the node**, and they share one class: *a check that is only
+sometimes checked.* They are recorded here and in the test files rather than fixed
+quietly, because a negative that passes once is the kind of thing that survives
+indefinitely.
+
+- **`setname` answered with `482` instead of staying silent.** The case asserted the
+  absence of `417`, `421`, `451` and the `SETNAME` line — a list of the numerics
+  somebody thought of, which is not a test of silence. Fixed by requiring the drain
+  `PONG` to be the **only** line in the window (`lines_since()`), so any reply of any
+  kind fails.
+- **The `echo-message` source-prefix fault was a no-op**, because it only rewrote the
+  prefix when `exclude != NULL` and that never holds in the passing cases. The test
+  went green on a fault that changed nothing — the same trap reached from the other
+  side, and caught the same way: the test being green is not evidence that the fault
+  was harmless.
+- **Two faults did not compile** and so never reached a run: an `if (0)` branch trips
+  `-Wunreachable-code`, and the first `userhost-in-names` gate fault left `dst`
+  unused in `chan_verbs.c` under `-Weverything` (moved to `cap.c`, where it
+  compiles). A fault that does not build leaves the previous binary in place and
+  reports a pass — which is why the build is checked before every run and the
+  per-fault build result is recorded rather than assumed.
+- **`userhost-in-names`'s per-destination gate fault did not compile** in
+  `chan_verbs.c` (`dst` becomes an unused parameter under `-Weverything`), so it was
+  moved to `cap.c`. Recorded because a fault that does not build leaves the previous
+  binary in place and reports a pass, and the build check is what caught it.
 
 ### 10.7 The honest limits of these four
 

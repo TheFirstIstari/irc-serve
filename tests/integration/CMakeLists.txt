@@ -154,6 +154,12 @@ irc_add_integration_test(test_userhost_in_names test_userhost_in_names.c)
 # cases are all "this line is on the wire".
 irc_add_integration_test(test_setname test_setname.c)
 
+# echo-message (Phase 10.7). Its own file because its assertions are COUNTS and no
+# other capability here has that shape: the defect it invites is two identical
+# deliveries, and a substring search for either one reports success. Every case
+# below is tf_count over a marked region.
+irc_add_integration_test(test_echo_message test_echo_message.c)
+
 # 2.1 / 5: valid_nick() enforced at runtime. Phase 1 shipped the predicate with
 # no caller in src/, so this is the test that makes it load-bearing. Asserts the
 # RESPONSE, never that the function was called.

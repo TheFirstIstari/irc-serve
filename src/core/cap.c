@@ -37,7 +37,8 @@ enum {
     CAPBIT_ACCOUNT_NOTIFY = 1u << 5,
     CAPBIT_EXTENDED_JOIN = 1u << 6,
     CAPBIT_USERHOST_IN_NAMES = 1u << 7,
-    CAPBIT_SETNAME = 1u << 8
+    CAPBIT_SETNAME = 1u << 8,
+    CAPBIT_ECHO_MESSAGE = 1u << 9
 };
 
 /* THE BIT ORDER IS FIXED AND THE TABLE BELOW IS THE CLAIM.
@@ -68,7 +69,8 @@ static const cap_def_t k_caps[] = {
     { CAP_ACCOUNT_NOTIFY, CAPBIT_ACCOUNT_NOTIFY },
     { CAP_EXTENDED_JOIN, CAPBIT_EXTENDED_JOIN },
     { CAP_USERHOST_IN_NAMES, CAPBIT_USERHOST_IN_NAMES },
-    { CAP_SETNAME, CAPBIT_SETNAME }
+    { CAP_SETNAME, CAPBIT_SETNAME },
+    { CAP_ECHO_MESSAGE, CAPBIT_ECHO_MESSAGE }
 };
 
 static const size_t k_ncaps = sizeof k_caps / sizeof k_caps[0];
@@ -322,6 +324,16 @@ int cap_userhost_in_names_enabled(const conn_t *c)
 int cap_setname_enabled(const conn_t *c)
 {
     return cap_enabled(c, CAP_SETNAME);
+}
+
+/* echo-message: ONE GATE. Whether the SENDER stays in the audience of the delivery
+ * that is happening anyway is decided in msg_verbs.c and nowhere else; this
+ * function exists so the answer has a name in cap.h beside the others and so no
+ * caller spells the capability string out a second time. See cap.h for why there is
+ * no second emission here. */
+int cap_echo_message_enabled(const conn_t *c)
+{
+    return cap_enabled(c, CAP_ECHO_MESSAGE);
 }
 
 /* --------------------------------------------------------------------------
