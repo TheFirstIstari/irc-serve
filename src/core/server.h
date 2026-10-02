@@ -99,6 +99,30 @@ struct fed_dedup_entry;
  * and the SASL path treats it that way rather than treating it as "no opinion". */
 struct sasl_store;
 
+/* Phase 10.1's ACCOUNT REGISTRY: which account names EXIST, and the password each
+ * is held under. It is an OPAQUE pointer for the same reason the credential
+ * store's is -- account_store.h owns the layout and the file format, and this
+ * header holds only the pointer, so a reader of server_t does not also have to
+ * understand a three-field record and four size bounds.
+ *
+ * It is NULL until account_store_load() succeeds, and that is the honest state of
+ * a node started without --account-store. THE TWO NULL STORES ARE NOT THE SAME
+ * KIND OF ABSENCE and the distinction is load-bearing:
+ *
+ *   sasl_store == NULL      nobody may AUTHENTICATE here. Every AUTHENTICATE is
+ *                           refused, and `sasl` is withheld from CAP LS.
+ *   account_store == NULL   nobody may BE LOGGED IN, but authentication still
+ *                           works and `sasl` is still advertised. A client that
+ *                           authenticates is simply not identified to an account,
+ *                           which is the same answer it gets on a node with a
+ *                           registry by declining to authenticate.
+ *
+ * The second is what makes the account subsystem addable without changing what a
+ * node without it does: a deployment that adds no account store keeps exactly the
+ * behaviour it had, and core/account.h's invariant ("account == '' is
+ * indistinguishable from no account system") is the statement that makes it so. */
+struct account_store;
+
 /* Phase 7's topic cache: one entry per channel whose topic outlived the
  * channel. The layout is channel.h's, for the same reason the dedup entry's is
  * federation/dedup.h's -- this header holds opaque pointers so the geometry of
@@ -973,6 +997,27 @@ struct server {
     struct sasl_store *sasl_store;
     uint64_t  n_sasl_ok;
     uint64_t  n_sasl_fail;
+
+    /* ------------------------------------------------------------------------
+     * Phase 10.1: the account registry and the ONE event it has.
+     * ------------------------------------------------------------------------
+     *
+     * `n_account_refused` counts account_set() calls that were REFUSED, and the
+     * reason is always one of four and is named on the node's observable output
+     * at the site: no registry, no exchange completed, the registry does not hold
+     * the name with that password, or the name did not fit the field. Two of
+     * those are the fail-closed direction working (no registry, no exchange) and
+     * two are a genuine mismatch between an operator's two files -- which is the
+     * number an operator wants, because "my credential store has alice and my
+     * account registry does not" is invisible on every other surface this node
+     * has.
+     *
+     * It counts REFUSALS only and there is deliberately no matching success
+     * counter: the success is already on the connection, on the `account=` line
+     * account_set() prints, and in the fact that a client is identified. A second
+     * number for it would be one more place for the two to disagree. */
+    struct account_store *account_store;
+    uint64_t  n_account_refused;
 
     int       trace;             /* emit [observable] per-line output */
 };

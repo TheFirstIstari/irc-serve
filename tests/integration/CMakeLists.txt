@@ -437,3 +437,18 @@ irc_add_integration_test(test_peer_discovery test_peer_discovery.c)
 # over real sockets. The CTest NAME is unchanged (AutoScale) -- see irc_ctest_name()
 # above for why, and tests/loadbal/CMakeLists.txt for what is left of the five.
 irc_add_integration_test(test_autoscale test_autoscale.c)
+
+# 7/Phase 10.1: the ACCOUNT subsystem -- an identity that outlives a socket,
+# which is the thing seven IRCv3 specs were blocked on because src/ had no
+# account concept at all. In tests/integration/ and not tests/protocol/ for the
+# same reason test_cap_negotiation.c is: the properties are all about what a
+# CLIENT sees and what a node says at start-up and teardown, so they need a real
+# socket, a real forked node, and the node's own stdout.
+#
+# Its own file because the claims are asymmetric and cannot be split by a file
+# boundary without the file's testing itself: a registry that LOADS and a registry
+# that does not must produce the SAME observable behaviour for a client that is
+# not identified (that is the "account == \"\" is indistinguishable from no
+# account system" invariant), and the only way to assert that is to run one set of
+# assertions over both configurations.
+irc_add_integration_test(test_account test_account.c)

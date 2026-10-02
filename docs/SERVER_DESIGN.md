@@ -54,6 +54,9 @@ typedef struct conn {
     char     nick[64];          /* local nick, pre-@ */
     char     user[64], host[128], realname[256];
     int      state;             /* REG_PASS | REG_NICK | REG_USER | REG_READY | CLOSING */
+    /* Phase 10.1: the second axis. See "THE SECOND AXIS" below. */
+    char     account[64];       /* "" == not logged in */
+    int      logged_in;         /* a password was verified for `account` */
     /* no per-conn id: message ids come from server_t (§2.4) */
     struct chan **chans; size_t nchans, cap;   /* channels this conn is in */
 } conn_t;
@@ -86,6 +89,60 @@ That is not sufficient. `bob` on two servers is just `bob` to a user.
 Network-visible nick ambiguity needs a **rename-the-loser** policy plus a
 **nick-registry broadcast**; that lands in **Phase 9**. Until then, duplicate
 nicks across servers are user-visible and undefined.
+
+### 2.1.1 The second axis: an account
+
+**Added in Phase 10.1. This subsection is the amendment §2.1 needed and did not
+know it needed until seven IRCv3 specifications turned out to be blocked on it.**
+
+`nick@server` answers **"how does this node address a user"**. It is a correct
+answer, it is why federation needs no lock, and it is **not** an answer to **"who
+is this person"** — because `bob@irc.a` and `bob@irc.b` are two registry keys and
+both are true, and **neither survives the person reconnecting**.
+
+An **account** is the other axis: a name that outlives the socket and is the same
+on every node that knows about it. The two axes are not alternatives:
+
+| | scoped nick (§2.1) | account (§2.1.1) |
+|---|---|---|
+| scope | one connection, one node | the person, across connections |
+| set by | `NICK` | a verified credential, operator-side |
+| survives a reconnect | no | yes |
+| uniqueness | per server, no policy | per deployment, via the registry |
+| what it grants | nothing | **nothing** |
+
+**AN ACCOUNT GRANTS NOTHING ON THIS NODE, and that is Phase 10.1's most
+load-bearing negative claim.** It is a *name* and a *fact about a connection*; it
+is not an operator flag, not channel privilege, not an exemption from a mode
+change and not a mode any consumer reads yet. §5's Phase 8 entry says SASL
+"grants nothing: no operator flag, no channel privilege, no service, no exemption
+from a mode change", and the account identity is on the same footing. What it
+buys is **visibility** — `330 RPL_WHOISACCOUNT` reports it and §2.1.2's
+`account-tag` will stamp it — and visibility is not authority. A later phase that
+wants `logged_in` to mean a *privilege* is making a different decision and owes a
+threat model for it.
+
+The invariant that makes the subsystem **additive**, and which is structural
+rather than conventional:
+
+> **`account == ""` is indistinguishable from "this node has no account system".**
+
+There is exactly one writer (`account_set()` in `core/account.c`), it requires
+both an operator's credential store *and* an operator's account registry to
+verify the credential, and the predicate every consumer asks (`account_logged_in()`)
+is local to the connection and consults no store. So a node with no registry
+answers "not logged in" to every client — which is the answer it gives a client
+that declined to authenticate. A deployment that configures nothing keeps exactly
+the behaviour it had.
+
+The three guards that produce the invariant are **redundant on purpose**, and the
+teeth proved which of them is load-bearing: `account_set()` refuses an empty name,
+`account_store_verify()` refuses one, and `account_store_add()` refuses to create
+a record *named* one. Deleting only the first is invisible; deleting all three is
+what makes `""` an account, and `tests/integration/test_account.c`'s in-process
+case asserts the third — the **key space** — as the one that matters. An account
+name that no registry record can carry is a name no connection can be logged in
+as, whatever the predicate does with the string it is handed.
 
 ### 2.2 Channels: origin-owned
 
@@ -309,6 +366,177 @@ gives per-link ordering. Do not reopen this in Phase 9.
 
 Without these rules two nodes bounce a message forever. This is the single most
 common federation bug, so it is specified up front and tested early.
+
+### 2.5 The account registry
+
+**Added in Phase 10.1.** §2.1.1 defines the identity; this is where it comes from,
+and the three decisions below are the ones a reader should be able to check
+rather than take on trust.
+
+#### 2.5.1 A SEPARATE FILE FROM THE CREDENTIAL STORE, AND WHY
+
+The registry is `--account-store PATH`, one record per line:
+
+```
+<name> TAB <password> TAB <created>
+```
+
+It is **a different file from `--sasl-store`**, and the argument is that the two
+answer different questions with different lifetimes and different blast radii:
+
+- `sasl_store_t` — **who may AUTHENTICATE here.** One row per authcid. SASL PLAIN
+  grants nothing on this node (§5), so this file is a gate and nothing more: a row
+  can be rewritten freely, because deleting one stops a login working and affects
+  nobody else.
+- `account_store_t` — **which accounts EXIST.** A row is a statement about a
+  *name*: `alice` is an account whether or not she has ever connected. Losing one
+  is the loss of an **identity**, not of access, and that is a different kind of
+  event.
+
+The alternative — one file with a per-record "this is also an account" flag — was
+rejected because it makes the FILE's meaning a property of a byte inside a line,
+and a credential file whose rows mean different things depending on a flag is a
+file whose blast radius is one bad edit wide. **The cost, stated: an operator
+configures two files**, read at the same point in `main()` and in the same
+pre-loop phase §3.4 requires, and the two must agree or authentication stops
+(§2.5.3).
+
+It is otherwise the **same kind of thing and held to the same discipline**:
+bounded (`ACCOUNT_MAX_RECORDS` 64, all four bounds constants rather than
+configuration, for `sasl_framework.h`'s reason that a store whose size comes from
+the file is a store whose bound is the file), operator-supplied, and file-backed
+with the **hardened credential path** — `fopen(path, "re")` and then `fstat()` on
+the **descriptor**, never `stat()`-then-open, plus `S_ISREG` and a refusal when the
+group or world bits are set. The passwords are **overwritten through a `volatile`
+pointer before the memory is released**, for `sasl_store_free()`'s reason: `free()`
+scrubs nothing, and the allocator reuses the buffer for the next node of the same
+size. `email` is **deliberately not stored**; §2.5.2 says why.
+
+A **malformed record fails the whole load** and the node comes up with **no**
+registry, which is the same state as "the operator configured none" and is why
+§2.1.1's invariant needs no special case for it.
+
+#### 2.5.2 REGISTER and UNREGISTER ARE REFUSED — a security decision, not a feature
+
+**`account-registration` is NOT implemented. It is refused.** That is the
+deliverable of this subsection, and four independent reasons support it; each is
+sufficient on its own.
+
+1. **The specification says not to.** `account-registration` is a
+   work-in-progress document whose own header says implementations **"MUST NOT
+   use the unprefixed account-registration capability name"**, SHOULD use
+   `draft/account-registration` instead, and that it **"may change at any time and
+   we do not recommend implementing it in a production environment"**. Shipping a
+   stable `REGISTER` that a draft will redefine is how a server becomes
+   un-upgradable without anyone noticing.
+2. **Its wire form does not exist yet.** The draft answers with the standard
+   replies framework — `FAIL ACCOUNT_REGISTER <reason>` — and this node has no
+   `FAIL`, no `ERROR` and no `WARN`: they are Phase 10 item 8. There is no numeric
+   a real client parses as a registration answer, and inventing a different answer
+   in a different numeric is the "a numeric that lies about what it is" failure
+   §4.4 refuses.
+3. **Open registration here would be a name-claiming primitive, not a feature.**
+   `REGISTER` takes a password and an optional email. With no verification mail
+   (no MTA, no outbound queue, and §3.4 forbids both inside the loop) and no rate
+   limit, nothing stops an unauthenticated client from taking any name. And taking
+   a name is not a nuisance once `account-tag` exists: the account name is stamped
+   on every message a client sends, and the **entire value of that tag is that it
+   means "this is who this is"**. An open registry makes it worthless to every
+   honest user and perfectly usable as an impersonation tool against them. There
+   is also no write in this tree that could record a registration even if one were
+   allowed: the store is read once at start-up.
+4. **`UNREGISTER` is worse than nothing, which is why it is refused too.** The
+   store is an operator's file, loaded before the loop, so an in-memory removal
+   vanishes on the next restart. Telling a user "your account has been deleted"
+   and then finding it intact after a restart is a falsehood from the one server
+   that is supposed to be the authority on whether an account exists — and account
+   deletion is precisely the case where a user is relying on the answer.
+
+**The threat model, stated once.** On a node with this pair refused, an attacker
+can still connect, register a nickname, send messages and join channels —
+everything this node has always allowed. What they **cannot** do is assert an
+account identity, because the only writer of `conn_t::account` is `account_set()`
+and it requires a credential the operator's credential store holds **and** a
+registry entry the operator's registry holds. The **cost** of that model is that
+accounts on this node are created by an operator editing a file: real, the reason a
+deployment wanting open registration should not use this node, and cheaper than
+the alternative.
+
+**The numeric is `482 ERR_CHANOPRIVSNEEDED` and it is wrong.** Not wrong in its
+RFC text — *"Permission Denied- You're not an IRC operator"* — which is the
+truest answer available, since this node has no operator concept at all and a
+client that has not been made one is being told the truth. It is wrong in its
+**name**, which is channel-specific. It is also the numeric `CHOPER` already
+answers with for the same reason, so "there is no operator here" is one numeric.
+The honest numeric is `FAIL ACCOUNT_REGISTRATION NOT_ENABLED`, and it arrives with
+standard-replies.
+
+`draft/account-registration` is **not** in `cap.c`'s table either: this build has
+not heard of it, which is true, and a capability this node refuses is a `421`
+rather than a `NAK`.
+
+#### 2.5.3 WHY `account-tag` IS **NOT** IN `k_caps[]`
+
+**The capability entry is NOT in the table, and this is a decision rather than an
+omission.** The task of adding it was available and was declined, and the reason
+is the specification's own sentence:
+
+> The tag MUST be named `account`… If the user is not identified to any services
+> account, the tag MUST NOT be sent.
+
+**The tag's ABSENCE is an assertion.** A client reads "no `account` tag" as "this
+user is anonymous". So advertising `account-tag` on a node that does not emit the
+tag would not merely fail to help — it would tell every client that **every
+logged-in user on this node is anonymous**. This node *has* logins now, so that
+is the subsystem's entire observable purpose inverted by its own advertisement.
+
+The same rule `cap.c` exists for applies with the sign flipped: a **missing**
+capability is a client that carries on; a **listed** one is a client that draws
+the wrong conclusion from every line it receives. And a store check would not
+save it — the check `sasl_possible()` makes asks whether there is anything to
+**say**, and with no emission there is nothing to say however many accounts exist.
+
+It lands with the emission, with the availability check beside `sasl_possible()`.
+
+**What *is* on the wire, and why it is not `account-tag`:** `330
+RPL_WHOISACCOUNT` in `WHOIS` (§4.4's sixth added numeric). It answers a question
+a client **asked**, on a connection that already registered, about a person it
+named; nothing is stamped on anybody's traffic, and no capability negotiates it.
+It is in this phase for one further reason: without it, §2.1.1's invariant has
+**no wire proof at all**, because "a node with accounts and a node without answer
+a not-logged-in client identically" is only checkable if a logged-in client
+produces something *different* — and `test_account.c` runs one set of assertions
+over both configurations for exactly that reason. The cost is stated at the
+emission: one more line in a WHOIS, so a client must find `330` by number rather
+than by offset, and it is the only place a person's account name is revealed to
+another user, so an operator who does not want that has no way to switch it off
+short of not loading a registry.
+
+#### 2.5.4 WHERE IT IS FREED, for LeakSanitizer
+
+**LeakSanitizer does not run on Darwin** (§7/Phase 1's hygiene note), so the
+account registry's release is *reasoned about* here and *verified* on the Linux CI
+job:
+
+- `server_shutdown()` calls `account_store_free(s->account_store)` and NULLs the
+  field, beside `sasl_store_free()`. It is safe at that point because every
+  connection was closed by the `by_fd` walk above and every one of those closures
+  called `account_clear()`, so no `conn_t::account` — and no connection that
+  borrowed the registry — can still be pointing into it.
+- The arm prints `[observable] account_store_close: store=OPEN|NONE records=N`,
+  following `fed_burst_close: shadow=OPEN|NONE`. That makes the arm **asserted**
+  on every platform and **verified** on the one with a leak checker.
+- The `[observable]` line proves the arm **ran**. It does **not** prove the `free`
+  happened — a build that prints the line and drops the call satisfies it exactly,
+  and that was one of this phase's ten injected faults. So the call itself is
+  asserted by **source inspection** in `test_account.c`, using `test_util.h`'s
+  `tf_calls()`, for the same reason `test_close_sites.c` exists: no runtime test
+  can check it, because the failure mode is a missing call that leaves every
+  runtime invariant intact.
+- No other site allocates one. `account_store_load()` frees the half-built store
+  on every refusal path (which is why a refused file leaks nothing), and
+  `test_account.c`'s in-process case builds one with `account_store_new()` and
+  releases it through `server_shutdown()` rather than a second path.
 
 ---
 
@@ -864,6 +1092,18 @@ one a client understands, and the discrepancy is flagged at the emission.
   this one cannot reach. On a single node there is nowhere to forward the
   question, which is precisely what 402 says.
 
+Phase 10.1 added a sixth of the same kind, and the gap is the same shape:
+
+- `330` `RPL_WHOISACCOUNT` — `<client> <nick> <account> :is logged in as`, and
+  **sent only when there is an account**. RFC 1459 3.3.4 defines it and §2.1.1's
+  account identity is what finally gives it a second parameter to carry: before
+  Phase 10.1 this tree had no `<account>` value to put in it. Its absence means
+  "not identified", which on this node is exactly and only true. §2.5.3 carries
+  the whole argument for why it is sent while `account-tag` is withheld, and that
+  argument is **not** "330 is safer than a tag" — it is that a `WHOIS` answers a
+  question the client asked about a person it named, while a tag is stamped on
+  traffic whether the client wants it or not.
+
 `432` `ERR_ERRONEUSNICKNAME` is for a nickname that is **malformed** — illegal
 under §2.1. It is distinct from `433` `ERR_NICKNAMEINUSE`, which is for a legal
 nickname already claimed. The two must not be conflated: answering an illegal
@@ -1320,6 +1560,43 @@ Parallelisable: Phase 1's tokenizer and the IRCv3 tag-escaping work are
 independent. Phase 2 blocks the rest. Phase 6 is the largest single phase and
 should not be split across people.
 
+**Phase 10 — IRCv3 client support.** Ten sub-phases against 41 non-draft IRCv3
+specifications, in the order the dependencies force.
+
+**Phase 10.1 — THE ACCOUNT SUBSYSTEM (issue #117). COMPLETE.** It exists because
+issue #117's gate was a single absence: `src/` had **zero** hits for
+`account_tag`, `logged_in`, `serviced_login` or `account_name`, and that one
+absence blocked **seven** specifications at once, because `account-tag` needs to
+know who is logged in on *every* message and `extended-join` needs the account on
+*every* `JOIN`. None of them is a capability that can be bolted on.
+
+What landed: §2.1.1's second axis on `conn_t`; §2.5's registry as a separate
+operator file; §2.5.2's refusal of `REGISTER`/`UNREGISTER`; and §2.5.3's
+deliberate **absence** of `account-tag` from `cap.c`'s table. The one wire
+surface is `330 RPL_WHOISACCOUNT` (§4.4).
+
+**What is NOT in Phase 10.1, and why each was left:** `account-tag` **emission**,
+`account-notify`, `extended-join`, `oper-tag`, `chghost`, `account-extban` and
+`away-notify` all **consume** this subsystem and are P10.2/P10.3/P10.8. chathistory
+and websocket/sts/SASL-SCRAM are **decisions for the user, not implementation
+tasks** — chathistory because this design's posture is fail-closed with no
+buffered state, and that is a genuine conflict with §2.2's disposal rules rather
+than an omission.
+
+**The remaining order, unchanged by 10.1:** 10.2 `account-tag` + `account-notify`;
+10.3 `extended-join`, `away-notify`, `chghost`; then the nine with no dependencies —
+`extended-isupport`, `userhost-in-names`, `setname`, `echo-message`,
+**standard-replies** (which §2.5.2 is waiting on), `labeled-response` +
+`client-batch`, `invite-notify`, `read-marker`. `client-tags`/`channel-context`,
+`react`, `reply` and `typing` are **client-only** and are to be documented as
+**N/A**: a server implementing them would be implementing something that is not
+their subject.
+
+**There is no official IRCv3 conformance suite.** `ircv3/ircv3-test-suite` and
+`ircv3/chathistory-test-suite` do not exist. Compliance here is hand-written tests
+against spec text, which is a weaker guarantee than a green third-party runner and
+is stated rather than implied.
+
 ---
 
 ## 8. Definition of done
@@ -1420,6 +1697,33 @@ Federated:
 - [x] *Phase 9:* network-visible nick ambiguity resolved by rename-the-loser
       plus a nick-registry broadcast. Until then, duplicate cross-server nicks
       are user-visible and undefined
+- [ ] **An identity that outlives a socket** — **PARTIAL, and the partial is
+      stated rather than rounded up.** §2.1.1's second axis exists: a connection
+      carries an account name and the fact that a password was verified for it,
+      the only writer requires an operator's credential store *and* an operator's
+      account registry to agree, and `330 RPL_WHOISACCOUNT` reports it on the wire.
+      **Not met, and three things are missing rather than one.** (a) An account
+      **cannot be created by a client** — `REGISTER` is refused, deliberately,
+      for the four reasons in §2.5.2, so this criterion is only reachable by an
+      operator editing a file. (b) An account **cannot be left**, and `UNREGISTER`
+      is refused for the same family of reasons (§2.5.2 reason 4), so an account's
+      lifetime is entirely the operator's business. (c) The identity is **not yet
+      visible on ordinary traffic**: `account-tag` emission is Phase 10.2 and the
+      capability is deliberately **withheld** from `CAP LS` until then, because the
+      tag's absence is an assertion (§2.5.3). What exists is a subsystem and one
+      reporting numeric, not a network-visible identity.
+- [x] *Phase 10.1:* **`account == ""` is indistinguishable from "this node has no
+      account system"**, and the invariant is structural rather than conventional:
+      one writer, two stores consulted, a connection-local predicate. A
+      deployment that configures nothing keeps exactly the behaviour it had, which
+      is what makes the subsystem additive rather than a change to who can log in.
+      `tests/integration/test_account.c` runs **one** set of assertions against a
+      node WITH a registry and a node WITHOUT, for the same not-logged-in client,
+      and both must hold.
+- [x] *Phase 10.1:* **zero new skips, and the advertised capability table still
+      names only implementations.** `cap_available()` gained no name, because the
+      capability whose implementation landed would tell a client that every
+      logged-in user here is anonymous (§2.5.3).
 - [ ] Origin is immutable and a dead origin is **failed closed**: local members
       still see each other, origin-requiring actions are `437` naming the origin,
       and re-linking a server of the same name resurrects the channel — **met in
@@ -1483,3 +1787,7 @@ Quality:
 | Blocking call in the event loop | stalls every client on the node | Dial state machine, pre-resolved peer addresses, bounded write queues (§3.4) |
 | Nick charset left unvalidated | `nick@server` ambiguous; scoped identity unsound | `valid_nick()` in Phase 1 (§5) |
 | Vector clocks reopened | scope creep | Deliberately rejected in §2.4; explicitly not a Phase 9 item |
+| **An account name becomes a claimable string** (Phase 10.1) | impersonation: `account-tag` stamps the name on every message, so a name anybody can take is a name that proves nothing — and is a tool against the people who chose theirs | **Registration is operator-side only.** `REGISTER` is refused (§2.5.2), so the name space changes only when an operator edits a file, and only ONE writer of `conn_t::account` exists and it requires a credential verified against *two* operator stores. The cost is stated: no client may create an account, so a deployment that wants open registration must not use this node. |
+| **Advertising `account-tag` before emitting it** (Phase 10.1) | every client concludes every logged-in user is anonymous — the tag's absence is an assertion | **The capability is not in `cap.c`'s table**, with the full argument in §2.5.3, and the teeth include the inverted rule: adding the name with a store check still fails the suite. |
+| **Account identity treated as authority** (Phase 10.1) | a future phase reads `logged_in` as a privilege and every access-control rule silently inherits it | `logged_in` is documented at the struct and at the module as a NAME plus a VERIFICATION and grants nothing (§2.1.1), and the "what none of them grant" block in `connection.h` says so where a future editor will read it |
+| **The account store drifting from the credential store** (Phase 10.1) | a client authenticates and is not identified, or is identified for a name the operator removed | Both must agree or authentication stops (§2.5.1), the refusal is counted on `n_account_refused` and named on the node's own output, and `test_account.c` runs the not-identified path against a node whose two files **disagree** — byte-identical to a node with no registry at all |

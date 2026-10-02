@@ -34,6 +34,15 @@ changed: **§2** (the skip list, and the claim that CI does not count skips),
 **§5.1** (which phase owns the skip gate), and the `TopicPersistence` row of
 §2's table. Everything else here is as of 2026-09-28.
 
+**A Phase 10.1 addendum, in the same spirit.** Nothing in the audit below is
+rewritten, because none of it is about accounts; what Phase 10.1 adds is a new
+**§10** at the end, which is the only place in this document that records what
+the account subsystem did and did not unblock. The one claim below that the phase
+**does** falsify is corrected in place and marked as such: **§8's** IRCv3 bullet,
+which said CAP negotiation, SASL and `msgid` were unimplemented — already false at
+Phase 8, but Phase 10.1 is the phase that made `account-tag` a decision rather
+than an absence, so it is the right place to say so.
+
 ### Commit under verification
 
 `HEAD` = `e958ea9` ("Phase 2: server core - poll loop, conn_t framing,
@@ -578,6 +587,11 @@ Source: `gh issue list --milestone "Federated IRC Server v1.0" --state all`
 | 8 | #82 | Phase 8: IRCv3 - real tag escaping, CAP negotiation, SASL PLAIN | OPEN | Not started. Turns `CapNegotiation` green and replaces `ircv3_tags.c` and `sasl_framework.c`. |
 | 9 | #83 | Phase 9: Federation hardening, peer discovery, auto-scaling | DONE | Turns `SyncState`, `FailoverReconnect`, `PeerDiscovery`, `Reconnect`, `AutoScale` green. All five retired; `tests/known_skips.txt` is EMPTY and the gate is "no test may skip". Auto-scale is scoped to propagation + graceful leave, NOT node lifecycle (§2.3). |
 
+**The table above is the 2026-09-28 `gh issue list` snapshot and is left as
+written.** Phase 10.1 (issue **#117**) is not in it because that list predates it;
+**§10** is where the account subsystem is measured, including which of the seven
+IRCv3 specifications it unblocked and which it did not.
+
 Phases 1 and 2 are done and committed. **Phase 3 is not done in any sense a
 reader can rely on** — the work exists and passes, but it lives in uncommitted
 changes on `phase/3-registration` and issue #77 is still open. Design Phase 5 is
@@ -720,8 +734,14 @@ present:
   `CASEMAPPING`) are specified here.
 - **IRCv3** — https://ircv3.net/
   Message tags and the tag-escaping rules (implemented in `core/message.c`),
-  and the three features this node has **not** implemented: CAP negotiation,
-  SASL, and `msgid`.
+  **CAP negotiation, SASL PLAIN and `draft/message-ids`** (implemented in Phase 8 —
+  this bullet said the three were *not* implemented and had been false since then;
+  corrected here because Phase 10.1 made `account-tag` a decision rather than an
+  absence, and this is the reference that bullet governs), and the account family
+  (§10). **There is no official IRCv3 conformance suite** —
+  `ircv3/ircv3-test-suite` and `ircv3/chathistory-test-suite` do not exist, so
+  every compliance claim in §10 is hand-written tests against spec text, which is
+  a weaker guarantee than a green third-party runner.
 
 Additional reference named by RFC 2812, which the design and code rely on for
 nickname syntax and `432`/`433`, and which is not CI-checked:
@@ -742,3 +762,76 @@ https://datatracker.ietf.org/doc/html/rfc2812
   on it, that is called out.
 - **It does not restate the design.** `docs/SERVER_DESIGN.md` is the plan;
   this file is the measurement of the code against it. Where they conflict, §5.
+
+---
+
+## 10. Phase 10.1 — the account subsystem
+
+Issue #117. `docs/SERVER_DESIGN.md` §2.1.1, §2.5, §2.5.1–§2.5.4 and §7's Phase 10
+block carry the reasoning; this section is the measurement, and it has one job:
+**which of the seven gated specifications are now unblocked and which are not.**
+
+### 10.1 The gate, as it was
+
+`src/` had **zero** hits for `account_tag`, `logged_in`, `serviced_login` or
+`account_name`. That single absence blocked seven specifications at once, because
+`account-tag` needs to know who is logged in on *every* message and `extended-join`
+needs the account on *every* `JOIN`. None of them is a capability that can be
+bolted on, which is why P10.1 is a subsystem and the rest follows from it.
+
+### 10.2 The seven, one by one
+
+**"Unblocked" here means: the missing account concept exists, so the
+specification no longer needs a new subsystem. It does NOT mean the specification
+is implemented** — every one of these still has its own implementation phase, and
+saying otherwise is exactly the failure this document is written to prevent.
+
+| Spec | Unblocked by P10.1? | What is still missing, and where it lands |
+|---|---|---|
+| `account-registration` | **Yes, and REFUSED rather than implemented.** The identity it would describe exists and `330` reports it. | `REGISTER`/`UNREGISTER` answer `482`; the draft's own header says not to implement it in production and says to use `draft/account-registration`, and its wire form is `FAIL ACCOUNT_REGISTER`, which needs **standard-replies** (Phase 10 item 8). Design §2.5.2 gives four independent reasons. |
+| `account-tag` | **Yes — the identity it carries now exists.** | **The emission.** The capability is deliberately **withheld from `CAP LS`**, because the specification says the tag MUST NOT be sent for an unidentified user, so absence is an assertion and advertising without emitting tells every client that every logged-in user here is anonymous. Phase 10.2. Design §2.5.3. |
+| `account-notify` | **Yes.** | The unsolicited `ACCOUNT` line on login and logout, which is a *delivery* decision — it fans out to the user's own channels and needs `account-tag`'s emission settled first. Phase 10.2. |
+| `extended-join` | **Yes.** | The `JOIN` extension carrying account **and** realname, plus `cap 302`-style availability and a client that asks for it. Phase 10.3. |
+| `away-notify` | **Yes — and it needed nothing from this phase at all.** | The unsolicited `AWAY` on state change. It was never account-gated; it was simply not started. Listed here because issue #117 groups it with the account family, and the honest answer is that this phase unblocked **nothing** for it. Phase 10.3. |
+| `chghost` | **Partly, and the part is worth naming.** It needs the **account on the `CHGHOST` echo**, which now exists. | The verb itself, and the `userhost-in-names` interaction. Phase 10.3. |
+| `oper-tag` | **Yes.** | The `+` tag on `PRIVMSG`/`NOTICE` — which needs **operator flags**, and **this node has no operator concept at all** (`CHOPER` answers `464` for every request). So `oper-tag` is now unblocked *as far as the account is concerned* and blocked *on a subsystem that does not exist*. Phase 10.8. |
+| `account-extban` | **Yes.** | `~&account:name` match types, which need the account **and** a ban-expression evaluator — and this node evaluates **no** channel modes beyond the ones §4.4 advertises. Phase 10.8. |
+
+**Summary: all seven are unblocked as far as the ACCOUNT is concerned; zero are
+implemented.** One (`away-notify`) was never account-gated at all. One (`oper-tag`)
+is blocked on operator flags rather than on accounts. One (`account-registration`)
+is delivered as a **refusal**, which is a decision rather than an implementation
+and is recorded as such.
+
+### 10.3 What P10.1 actually delivered, with evidence
+
+| Claim | Where | Evidence |
+|---|---|---|
+| An account name on `conn_t`, set only from a verified credential | `src/core/connection.h` (`CONN_MAX_ACCOUNT`), `src/core/account.c` (`account_set()`) | `test_account.c`'s in-process case, on return values |
+| **An account grants nothing** | `connection.h`'s "what none of them grant" block, design §2.1.1 | — (a negative claim, stated where a future editor reads it) |
+| A registry, as a **separate operator file** with the credential store's discipline | `src/account_store.{h,c}`, `--account-store` in `node_main.c` | `test_account.c`: five refusal cases, each landing in the no-registry state |
+| Passwords overwritten before release | `account_store_free()` — `volatile` write pass | **LeakSanitizer is Linux-only**; reasoned at design §2.5.4, verified on the CI job |
+| `account == ""` indistinguishable from no account system | `account_logged_in()`, one writer, two stores | `test_account.c` runs **one** assertion set over a node with a registry and a node without |
+| Two operator files disagreeing ⇒ not identified | `account_set()`'s registry check | `test_account.c`: `reason=NOT_IN_REGISTRY`, then the not-identified path byte-for-byte |
+| `REGISTER`/`UNREGISTER` refused with `482`, never `421` | `core/commands.c` | `test_account.c`, with the 421 absence asserted |
+| **`account-tag` NOT advertised** | `src/core/cap.h` (the argument is in the header) | `test_account.c`: absent from `CAP LS`, NAKed by `CAP REQ`, and the whole list compared byte-for-byte on a default node |
+| The one wire surface: `330 RPL_WHOISACCOUNT` | `src/core/msg_verbs.c` | `test_account.c`, from the client **and from a second client** |
+| The teardown arm | `server_shutdown()`, `[observable] account_store_close: store=OPEN|NONE` | asserted on both states; the `free` itself asserted by source inspection (`tf_calls`), because a line with no free behind it satisfies the line |
+
+### 10.4 The honest limits of this phase
+
+- **The identity is visible in exactly one numeric.** `330`, on a `WHOIS`, by
+  number. It is not on any message a client sends, which is what `account-tag` is
+  for and is Phase 10.2.
+- **No client can create or delete an account.** By decision (§2.5.2), and the
+  cost is stated: a deployment wanting open registration must not use this node.
+- **Accounts do not federate.** A registry is per node and per operator, exactly as
+  `sasl_store_t` is — design §2.1.1's second axis is not propagated over §2.3's
+  links, and a two-node mesh with two registries will disagree about who somebody
+  is. That is the same limitation `sasl_framework.h` states for credentials and
+  the same unresolved question §9's risk table points at; nothing here pretends
+  otherwise.
+- **`account-extban` and `oper-tag` are unblocked by accounts and blocked by
+  subsystems that do not exist** (no channel-mode evaluator, no operator flags).
+- **Compliance is hand-written tests against spec text**, not a third-party runner:
+  `ircv3/ircv3-test-suite` and `ircv3/chathistory-test-suite` do not exist.

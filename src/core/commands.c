@@ -8,6 +8,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "core/account.h"
 #include "core/cap.h"
 #include "core/chan_verbs.h"
 #include "core/channel.h"
@@ -944,6 +945,110 @@ static void handle_cap_wrapper(server_t *s, conn_t *c, const message_t *m)
 }
 
 /* ---------------------------------------------------------------------------
+ * REGISTER and UNREGISTER -- REFUSED, and this is the decision rather than the
+ * omission. Read the argument before changing the answer.
+ * ---------------------------------------------------------------------------
+ * The IRCv3 `account-registration` specification is in k_caps[]' absence and in
+ * both of these handlers. Four independent reasons, and each of them is
+ * sufficient on its own; they are given in the order they would stop a reviewer.
+ *
+ * 1. THE SPECIFICATION SAYS NOT TO. `account-registration` is a
+ *    work-in-progress document whose own header says implementations "MUST NOT
+ *    use the unprefixed account-registration capability name", SHOULD use
+ *    `draft/account-registration` instead, and that the specification "may change
+ *    at any time and we do not recommend implementing it in a production
+ *    environment". Shipping a stable command named `REGISTER` that a draft will
+ *    later redefine is how a server ends up un-upgradable without anyone noticing.
+ *
+ * 2. ITS WIRE FORM DOES NOT EXIST YET. The draft answers with the standard
+ *    replies framework -- `FAIL ACCOUNT_REGISTER <reason>` -- and this node has
+ *    no FAIL, no ERROR and no WARN: they are Phase 10 item 8, and until they
+ *    land there is no numeric a real client parses as a registration answer. The
+ *    honest response to a command whose answer is specified and unavailable is
+ *    to refuse it, not to invent a different answer in a different numeric and
+ *    hope a client reads the text.
+ *
+ * 3. OPEN REGISTRATION IS NOT A FEATURE HERE, IT IS A NAME-CLAIMING PRIMITIVE.
+ *    REGISTER takes a password and an optional email and, without a verification
+ *    mail and without a rate limit, the ONLY thing stopping an unauthenticated
+ *    client from taking any name is the speed of the connection. And taking a
+ *    name is not a nuisance here: once `account-tag` exists, an account name is
+ *    stamped on every message a client sends, and the entire value of the tag is
+ *    that it means "this is who this is". An open registry makes that value
+ *    worthless to every honest user while remaining perfectly usable as an
+ *    impersonation tool against them -- so the failure mode is not "the feature
+ *    is half-built", it is "the feature actively harms the people it was built
+ *    for". There is no rate limiter, no captcha and no mail path in this tree,
+ *    and the account store is READ-ONLY after startup: there is no write in this
+ *    tree that could record a registration even if one were allowed.
+ *
+ * 4. UNREGISTER IS WORSE THAN NOTHING, which is why it is refused too and not
+ *    implemented. The store is an operator's file, loaded once before the loop
+ *    (3.4 forbids a blocking write inside it), so an in-memory removal would
+ *    vanish on the next restart. A client told "your account has been deleted"
+ *    and then finding it intact after a restart has been told a falsehood by a
+ *    server that is supposed to be the authority on whether an account exists --
+ *    and account deletion is precisely the case where a user is relying on the
+ *    answer. Refusing is the only answer that is true at every moment.
+ *
+ * THE THREAT MODEL, stated once and plainly: on a node with this pair of
+ * commands refused, an attacker can still connect, register a nickname, send
+ * messages, and join channels -- everything this node has always allowed. What
+ * they CANNOT do is assert an account identity, because the only writer of
+ * conn_t::account is account_set() and it requires a credential the operator's
+ * credential store holds AND a registry entry the operator's registry holds.
+ * That is the whole of the model, and the cost of it is that accounts on this
+ * node are created by an operator editing a file. That cost is stated rather than
+ * hidden: it is real, it is the reason a deployment with open registration
+ * should not use this node, and it is cheaper than the alternative.
+ *
+ * ---------------------------------------------------------------------------
+ * 482, AND WHY IT IS WRONG
+ * ---------------------------------------------------------------------------
+ * 482 ERR_CHANOPRIVSNEEDED. Not in RFC 1459's sense -- it is not about a channel
+ * -- but its own RFC text is "Permission Denied- You're not an IRC operator",
+ * and that is the truest available answer: this node has NO operator concept at
+ * all, so a client that has not been made one is being told the truth. It is also
+ * the numeric CHOPER already answers with, for the same reason, and reusing it
+ * keeps "there is no operator here" to one numeric.
+ *
+ * The honest numeric is `FAIL ACCOUNT_REGISTRATION NOT_ENABLED`, and it does not
+ * exist until standard-replies does. That gap is recorded in the design rather
+ * than papered over, and it is the third of the four reasons above.
+ */
+static void account_refuse(server_t *s, conn_t *c, const char *verb,
+                           const char *text)
+{
+    (void)reply(s, c, "482", NULL, 0, "%s", text);
+    printf("[observable] account_cmd_refused: fd=%d nick=%s verb=%s "
+           "reason=OPERATOR_SIDE_REGISTRY registry=%s\n",
+           c->fd, (c->nick[0] != '\0') ? c->nick : "*", verb,
+           (s->account_store != NULL) ? "loaded" : "none");
+}
+
+/* REGISTER <password> [email]. Refused unconditionally and without reading the
+ * arguments, and the arity is NOT checked first: a `REGISTER` with no password
+ * and a `REGISTER` with one both get the same answer, because answering one of
+ * them differently would be a way to probe which inputs the node recognises --
+ * which is the shape of every oracle this tree has refused to build. */
+static void handle_register(server_t *s, conn_t *c, const message_t *m)
+{
+    (void)m;
+    account_refuse(s, c, "REGISTER",
+                   "REGISTER is not available: this node's accounts are created "
+                   "by its operator in a registry file");
+}
+
+/* UNREGISTER [password]. Refused unconditionally, for reason 4 above. */
+static void handle_unregister(server_t *s, conn_t *c, const message_t *m)
+{
+    (void)m;
+    account_refuse(s, c, "UNREGISTER",
+                   "UNREGISTER is not available: this node's accounts are created "
+                   "by its operator in a registry file");
+}
+
+/* ---------------------------------------------------------------------------
  * CAP and AUTHENTICATE (Phase 8)
  * ---------------------------------------------------------------------------
  * Both are pre-registration verbs, and BOTH HAVE TO BE: the protocol puts CAP
@@ -1145,15 +1250,51 @@ static void handle_authenticate(server_t *s, conn_t *c, const message_t *m)
         return;
     }
 
-    /* Verified. Nothing is GRANTED, because there is nothing here to grant -- see
-     * sasl_framework.h on what SASL authenticates against. What is recorded is
-     * the fact and the identity, so a later numeric could report it; the counter
-     * is the node's own claim and it is incremented here because this is the
-     * only place a credential is ever accepted. */
+    /* Verified. What is recorded is the fact and the identity, so a later numeric
+     * could report it; the counter is the node's own claim and it is incremented
+     * here because this is the only place a credential is ever accepted.
+     *
+     * AND THE ACCOUNT IS ESTABLISHED HERE, which is the whole of what Phase 10.1
+     * added to this function. Until now `c->sasl = SASL_COMPLETED` granted
+     * nothing and recorded an authcid nothing could read, which is why seven
+     * IRCv3 specs were blocked on an account concept that did not exist: SASL
+     * authenticates a CONNECTION and an account is what you are ACROSS
+     * connections.
+     *
+     * THE PASSWORD IS HANDED TO account_set() AND NOT STORED, and it is the same
+     * `passwd` local that sasl_plain_verify() just read. account_set() re-checks
+     * it against the OPERATOR'S ACCOUNT REGISTRY -- a different table from the
+     * credential store this function verified against -- so a node whose two
+     * files disagree about `alice` logs her in as nobody rather than logging her
+     * in as an account that does not exist. That is the fail-closed direction and
+     * it costs one bounded constant-time walk on a path that runs once per login.
+     *
+     * A REFUSAL HERE IS NOT AN AUTHENTICATION FAILURE. The credential verified;
+     * the client is authenticated and is simply not identified to an account,
+     * which is the same state as a client that declined to authenticate. So
+     * `c->sasl` stays COMPLETED, registration proceeds, and the node says why on
+     * its own output -- because the alternative (refusing the whole exchange
+     * because an account was not configured) would make adding an account
+     * registry a change to who can log in, and it must not be.
+     */
     c->sasl = (int)SASL_COMPLETED;
     s->n_sasl_ok++;
-    printf("[observable] sasl: fd=%d authcid=%s outcome=COMPLETED granted=0\n",
-           c->fd, authcid);
+    if (account_set(s, c, authcid, passwd) != 0) {
+        s->n_account_refused++;
+        printf("[observable] account: fd=%d authcid=%s outcome=REFUSED reason=%s "
+               "registry=%s\n",
+               c->fd, authcid,
+               (s->account_store == NULL) ? "NO_REGISTRY" : "NOT_IN_REGISTRY",
+               (s->account_store != NULL) ? "loaded" : "none");
+    }
+    /* TWO KEYS AND NOT ONE, and the split is deliberate: `logged_in` is the
+     * BOOLEAN and `account=` on account_set()'s line is a NAME. Rendering both
+     * as `account=` would put a name and a 0/1 behind one key on two different
+     * lines, and a reader (or a grep, or a test) asking "what is this user's
+     * account" would have to know which of the two it had found. */
+    printf("[observable] sasl: fd=%d authcid=%s outcome=COMPLETED granted=0 "
+           "logged_in=%d\n",
+           c->fd, authcid, account_logged_in(c));
     /* Registration is not forced here. A client that sent NICK and USER before
      * its AUTHENTICATE has already satisfied the state machine, and if it was
      * held for CAP it is still held -- so the gate is re-evaluated rather than
@@ -1237,7 +1378,15 @@ static const command_t k_commands[] = {
     { "LUSERS",  handle_lusers,  0 },
     { "ADMIN",   handle_admin,   0 },
     { "INFO",    handle_info,    0 },
-    { "CHOPER",  handle_choper,   0 }
+    { "CHOPER",  handle_choper,   0 },
+    /* 7/Phase 10.1: the account-registration pair, REFUSED rather than
+     * unimplemented, and in the table rather than left to the 421 path for the
+     * reason handle_register()/handle_unregister() give. A client that sends
+     * REGISTER and gets 421 would read "this server has never heard of
+     * REGISTER"; this node HAS heard of it and has decided. The distinction is
+     * the whole of what a refusal is, and 421 cannot express it. */
+    { "REGISTER",   handle_register,   0 },
+    { "UNREGISTER", handle_unregister, 0 }
 };
 
 static const command_t *lookup(const char *verb)

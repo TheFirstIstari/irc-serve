@@ -49,6 +49,11 @@
  *      417 and 302. Each is used because the protocol needs it and the list
  *      does not have it, and each is flagged where it is emitted, exactly as
  *      Phase 3 flagged 432. They are collected in the report.
+ *   5. Phase 10.1 added a FIFTH: 330 RPL_WHOISACCOUNT, carrying the account name
+ *      for a user who is identified, and OMITTED otherwise. It is the one wire
+ *      surface the account subsystem has, it is gated on nothing (no capability
+ *      negotiates it), and the whole argument for why `account-tag` is withheld
+ *      while this is sent is at handle_whois().
  */
 #ifndef IRC_CORE_MSG_VERBS_H
 #define IRC_CORE_MSG_VERBS_H
