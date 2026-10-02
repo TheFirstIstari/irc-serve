@@ -790,7 +790,7 @@ saying otherwise is exactly the failure this document is written to prevent.
 |---|---|---|
 | `account-registration` | **Yes, and REFUSED rather than implemented.** The identity it would describe exists and `330` reports it. | `REGISTER`/`UNREGISTER` answer `482`; the draft's own header says not to implement it in production and says to use `draft/account-registration`, and its wire form is `FAIL ACCOUNT_REGISTER`, which needs **standard-replies** (Phase 10 item 8). Design §2.5.2 gives four independent reasons. |
 | `account-tag` | **Yes — the identity it carries now exists.** | **Nothing.** **IMPLEMENTED in Phase 10.2a.** The tag is stamped once per emission in `fanout.c`, per destination on the recipient's own `account-tag` (plus `message-tags`), withheld from an unidentified sender, withheld from a node with no registry, and **not** forwarded across a link. Design §2.5.3. |
-| `account-notify` | **Yes.** | The unsolicited `ACCOUNT` line on login and logout, which is a *delivery* decision — it fans out to the user's own channels and needs `account-tag`'s emission settled first. Phase 10.2. |
+| `account-notify` | **Yes.** | **PARTLY IMPLEMENTED in Phase 10.2b, and the part left is named.** The `ACCOUNT <account> PASS` / `ACCOUNT *` line, gated on the recipient's own negotiation, with the capability available **unconditionally** because "you have no account" is an answer this node can give truthfully. **Not implemented:** the *channel-scoped* half of the specification and `ACCOUNT <account> FAIL`. On this node the association is established by SASL before registration, so when it becomes true the connection has no nickname, no hostmask and no channel — there is never a shared member to notify, and there is no logout to notify about. Design §2.5.6. |
 | `extended-join` | **Yes.** | The `JOIN` extension carrying account **and** realname, plus `cap 302`-style availability and a client that asks for it. Phase 10.3. |
 | `away-notify` | **Yes — and it needed nothing from this phase at all.** | The unsolicited `AWAY` on state change. It was never account-gated; it was simply not started. Listed here because issue #117 groups it with the account family, and the honest answer is that this phase unblocked **nothing** for it. Phase 10.3. |
 | `chghost` | **Partly, and the part is worth naming.** It needs the **account on the `CHGHOST` echo**, which now exists. | The verb itself, and the `userhost-in-names` interaction. Phase 10.3. |
@@ -803,11 +803,15 @@ all. One (`oper-tag`) is blocked on operator flags rather than on accounts. One
 (`account-registration`) is delivered as a **refusal**, which is a decision rather
 than an implementation and is recorded as such.
 
-**Updated as of Phase 10.2a: `account-tag` is IMPLEMENTED**, which makes the count
-**one of seven implemented and six not.** The table above is the per-spec record and
-each row says which. Nothing else moved: `account-notify` and `extended-join` are
-Phase 10.2b and 10.3, `away-notify` and `chghost` were never account-gated, and
-`oper-tag` and `account-extban` are blocked on subsystems this node does not have.
+**Updated as of Phase 10.2b: `account-tag` is IMPLEMENTED and `account-notify` is
+IMPLEMENTED IN PART**, which makes the count **one of seven implemented, one
+partly implemented and five not.** The table above is the per-spec record and each
+row says which. "Partly implemented" is not a rounding of "implemented": for
+`account-notify` the two missing halves (the channel-scoped fan-out and the `FAIL`
+form) are unreachable on this node rather than merely unstarted, and design §2.5.6
+says why. Nothing else moved: `extended-join` is Phase 10.3, `away-notify` and
+`chghost` were never account-gated, and `oper-tag` and `account-extban` are blocked
+on subsystems this node does not have.
 
 ### 10.3 What P10.1 actually delivered, with evidence
 

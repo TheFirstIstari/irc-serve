@@ -594,6 +594,84 @@ job:
   `test_account.c`'s in-process case builds one with `account_store_new()` and
   releases it through `server_shutdown()` rather than a second path.
 
+#### 2.5.6 `account-notify`: WHICH ACCOUNT, SAID OUT LOUD
+
+**Added in Phase 10.2b.** `account-tag` says who sent a line; this says **which
+account a client is associated with**, as a command rather than a decoration:
+
+```
+:nick!user@host ACCOUNT <account> PASS
+:nick!user@host ACCOUNT *
+```
+
+**`account-notify` IS AVAILABLE UNCONDITIONALLY, AND THAT IS THE DIFFERENCE FROM
+`account-tag` THAT IS WORTH THE SUBSECTION.** §2.5.3 withholds `account-tag` on a
+node with no registry, because a tag that says nothing is an assertion of
+anonymity. **`ACCOUNT *` is not nothing** — it is the specification's own way of
+saying "this user is not associated with an account", and a node with no account
+system can give it truthfully. Withholding the name there would be a node keeping
+a true and useful fact from a client that asked for it. So `cap_available()` asks
+`sasl_possible()`-shaped questions about two capabilities and gets two different
+answers, and the reason is written at `cap.h` beside both.
+
+**THE COLLISION, AND WHAT WAS FOUND.** `ACCOUNT` was, in the retired draft, the
+**nickname-change** command: a client changed its nickname and supplied a password
+in one command, and `ACCOUNT <password>` is the shape every server of that era
+accepted. **This node dispatched no `ACCOUNT` at all before Phase 10.2b** — there
+was no row in the command table, so a client that sent it got `421`, and a
+nickname change was, and is, `NICK <newnick>` and nothing else. **There was
+therefore no live verb to collide with**, and the reason this is written down at
+length is that it is the kind of thing a reader of the protocol assumes IS a live
+collision.
+
+The **shapes are disjoint** as well, which is what makes the cost zero rather than
+merely zero today:
+
+| form | parameters | meaning now |
+|---|---|---|
+| `ACCOUNT <password>` | one | **retired.** 461 |
+| `ACCOUNT` | none | the query, answered with the current association |
+
+**THE IRCv3 POSITION IS THAT THE NICK-CHANGE MEANING IS GONE**, not merely
+unfashionable: an account association changed through the account service, not
+through the server, and a server that took a password on a nickname change was
+asking for a credential it had no way to verify. What survives is the word, reused
+by `account-notify` for an unrelated fact — so a future phase that wanted a
+one-parameter `ACCOUNT` would have to decide to take it back deliberately rather
+than find it already spoken for.
+
+**WHERE THE NOTIFICATION GOES, AND THE LIMIT THAT IS LOAD-BEARING HERE.** The
+specification says the line goes to clients on common channels with the user,
+**including the user**. **On this node the second half is the only half there is,
+and that follows from the account lifecycle rather than from a choice.** The
+association is established by `account_set()`, which SASL runs *before*
+registration: at the moment it becomes true the connection has no nickname, no
+publishable hostmask and no channel. By the time a client has channels the
+association has been fixed for its whole life, and there is no later transition to
+report. A subscriber-style fan-out would have exactly one member to address and no
+reachable path to a second.
+
+*The cost, named:* **two users in a channel do not learn each other's account from
+this line.** They learn it from `extended-join` (Phase 10.3) or from `330
+RPL_WHOISACCOUNT`, and a client whose channel-mates logged in before it joined
+learns neither without asking. Making the channel-scoped half reachable needs a
+services layer with a real logout.
+
+**`ACCOUNT <account> FAIL` IS NOT EMITTED, AND SAYS WHY.** There is no logout on
+this node: SASL PLAIN has none, there is no account service to log out of, and
+`account_clear()` runs only from `server_close_conn()`, where the connection is
+already gone and there is nobody left to tell. **There is no event the form
+describes**, so a test that asserted its presence would be asserting a feature.
+`account_notify_current()` is the single emitter and the comment on it says where
+an emitter for `FAIL` goes when a phase adds one — which is a services layer, not
+a line.
+
+**IT IS NOT SOLICITED TO A CLIENT THAT DID NOT NEGOTIATE IT**, and it is not
+refused to one that asks: the capability governs the unsolicited line at the end of
+the welcome burst, and a question a client put on the wire is answered whatever it
+negotiated. A node that knows the answer and will not give it because of a
+negotiation bit is being unhelpful on purpose.
+
 ---
 
 ## 3. Message path
@@ -1648,8 +1726,14 @@ from a node with no registry — and the capability went into `cap.c`'s table **
 the same pass**, which is what resolves rather than overturns the argument 10.1
 made for leaving it out.
 
-**The remaining order, unchanged by 10.1:** 10.2 `account-notify`;
-10.3 `extended-join`, `away-notify`, `chghost`; then the nine with no dependencies —
+**Phase 10.2b — `account-notify` (issue #117). COMPLETE.** §2.5.6: the
+`ACCOUNT <account> PASS` / `ACCOUNT *` line, gated on the recipient's own
+negotiation, with the capability available unconditionally because "you have no
+account" is an answer this node can give truthfully. The retired nickname-change
+meaning of the word is documented and refused on arity, and `NICK` is unaffected.
+
+**The remaining order, unchanged by 10.1:** 10.3 `extended-join`, `away-notify`,
+`chghost`; then the nine with no dependencies —
 `extended-isupport`, `userhost-in-names`, `setname`, `echo-message`,
 **standard-replies** (which §2.5.2 is waiting on), `labeled-response` +
 `client-batch`, `invite-notify`, `read-marker`. `client-tags`/`channel-context`,
@@ -1779,6 +1863,18 @@ Federated:
       is per node and per operator and a peer cannot check the claim. The same
       subsection states that limit as a cost rather than leaving it to be
       discovered.
+- [x] *Phase 10.2b:* **`account-notify` answers, and only to a client that asked.**
+      A client that negotiated it is told `ACCOUNT <account> PASS` or `ACCOUNT *`
+      at the end of its own registration burst; a client that negotiated nothing is
+      sent nothing; a client that *asks* is answered whatever it negotiated. The
+      capability is available on a node with no registry **on purpose** — the `*`
+      form is an answer this node can give truthfully — which is the opposite of
+      `account-tag`'s store check and is why §2.5.3 and §2.5.6 give different
+      answers to the same shape of question. What is **not** here is the
+      channel-scoped half of the specification: on this node the association is
+      established before the connection has a channel, so there is never a
+      shared member to notify, and `ACCOUNT <account> FAIL` has no event either
+      because there is no logout. Both limits are stated where the emitter is.
 - [x] *Phase 10.1:* **`account == ""` is indistinguishable from "this node has no
       account system"**, and the invariant is structural rather than conventional:
       one writer, two stores consulted, a connection-local predicate. A

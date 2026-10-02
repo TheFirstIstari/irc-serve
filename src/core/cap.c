@@ -33,7 +33,8 @@ enum {
     CAPBIT_MESSAGE_TAGS = 1u << 1,
     CAPBIT_MESSAGE_IDS = 1u << 2,
     CAPBIT_SASL = 1u << 3,
-    CAPBIT_ACCOUNT_TAG = 1u << 4
+    CAPBIT_ACCOUNT_TAG = 1u << 4,
+    CAPBIT_ACCOUNT_NOTIFY = 1u << 5
 };
 
 /* THE BIT ORDER IS FIXED AND THE TABLE BELOW IS THE CLAIM.
@@ -60,7 +61,8 @@ static const cap_def_t k_caps[] = {
     { CAP_MESSAGE_TAGS, CAPBIT_MESSAGE_TAGS },
     { CAP_MESSAGE_IDS, CAPBIT_MESSAGE_IDS },
     { CAP_SASL, CAPBIT_SASL },
-    { CAP_ACCOUNT_TAG, CAPBIT_ACCOUNT_TAG }
+    { CAP_ACCOUNT_TAG, CAPBIT_ACCOUNT_TAG },
+    { CAP_ACCOUNT_NOTIFY, CAPBIT_ACCOUNT_NOTIFY }
 };
 
 static const size_t k_ncaps = sizeof k_caps / sizeof k_caps[0];
@@ -256,6 +258,21 @@ int cap_account_tag_enabled(const conn_t *c)
             cap_enabled(c, CAP_MESSAGE_TAGS) != 0)
                ? 1
                : 0;
+}
+
+/* account-notify: ONE GATE, and there is no second one because there is no
+ * message tag involved. The line this capability turns on is a plain IRC command,
+ * so there is no `message-tags` question to ask -- which is also why it needs no
+ * per-destination render and why it is not this file's problem at all beyond the
+ * bit.
+ *
+ * It is NOT gated on the account system, and the reason is cap.h's: `ACCOUNT *` is
+ * an answer this node can give truthfully on a node with no registry, so the
+ * availability check that account-tag has would make this node keep a true fact
+ * from a client that asked for it. */
+int cap_account_notify_enabled(const conn_t *c)
+{
+    return cap_enabled(c, CAP_ACCOUNT_NOTIFY);
 }
 
 /* --------------------------------------------------------------------------

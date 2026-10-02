@@ -122,6 +122,7 @@
 #define CAP_MESSAGE_IDS "draft/message-ids"
 #define CAP_SASL "sasl"
 #define CAP_ACCOUNT_TAG "account-tag"
+#define CAP_ACCOUNT_NOTIFY "account-notify"
 
 /* 410 ERR_INVALIDCAPSUBCOMMAND. Not in design 4.4's numeric list, which is a gap
  * in the list rather than in the protocol, for the same reason 301, 303, 417,
@@ -242,6 +243,19 @@ int cap_message_ids_enabled(const conn_t *c);
  * they want to be told who sent a message, and a tag block written once for an
  * emission would put it on the line of the one who asked for none. */
 int cap_account_tag_enabled(const conn_t *c);
+
+/* account-notify: whether this node tells THIS client, unprompted, which account
+ * it is associated with -- `ACCOUNT <account> PASS` when there is one and
+ * `ACCOUNT *` when there is not.
+ *
+ * UNCONDITIONALLY AVAILABLE, and that is the difference from account-tag which is
+ * worth spelling out. `account-tag` is withheld on a node with no registry
+ * because there is nothing the tag could SAY, and a name is the only thing that
+ * capability carries. `ACCOUNT *` is itself an answer -- "you are not associated
+ * with an account" -- so a node with no account system can still be completely
+ * honest about it, and withholding the name there would be a node that keeps a
+ * fact from a client it does have. */
+int cap_account_notify_enabled(const conn_t *c);
 
 /* Handle one `CAP` line. Returns 1 if it was handled, 0 if it was not a CAP at
  * all (which cannot happen: the caller has already dispatched on the verb). */

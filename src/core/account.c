@@ -5,7 +5,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "core/cap.h"
 #include "core/message.h"
+#include "core/reply.h"
 #include "sasl_framework.h"
 
 int account_logged_in(const conn_t *c)
@@ -124,4 +126,37 @@ size_t account_tag_block(const char *name, char *out, size_t cap)
     one[0].key = ACCOUNT_TAG_KEY;
     one[0].value = name;
     return message_tags_format(one, 1u, out, cap);
+}
+
+void account_notify_current(server_t *s, conn_t *c)
+{
+    char prefix[CONN_HOSTMASK_MAX];
+    const char *acct;
+
+    if (s == NULL || c == NULL) {
+        return;
+    }
+    if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
+        /* The same refusal conn_admit() makes for the JOIN echo, and for the same
+         * reason: a connection whose identity fields cannot be rendered has no
+         * hostmask to attribute the line to, and emitting one without would be a
+         * line no client can attribute. It is not counted as a numeric refusal
+         * because it is a CALLER bug rather than something a client did. */
+        printf("[observable] account_notify_refused: fd=%d\n", c->fd);
+        return;
+    }
+    acct = account_name(c);
+    if (acct[0] != '\0') {
+        (void)send_line(s, c, prefix, "ACCOUNT",
+                        (const char *const[]){ acct, "PASS" }, 2);
+        printf("[observable] account_notify: fd=%d nick=%s account=%s state=PASS\n",
+               c->fd, c->nick, acct);
+        return;
+    }
+    /* `*` IS THE ANSWER, not a placeholder: the specification names it precisely
+     * so that "no account" is a value a client can hold, and it is the reason
+     * this capability is available on a node with no registry. */
+    (void)send_line(s, c, prefix, "ACCOUNT", (const char *const[]){ "*" }, 1);
+    printf("[observable] account_notify: fd=%d nick=%s state=EMPTY\n", c->fd,
+           c->nick);
 }
