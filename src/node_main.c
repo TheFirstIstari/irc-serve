@@ -95,6 +95,11 @@
 #include "core/poll_loop.h"
 #include "core/server.h"
 #include "federation/link.h"
+/* Phase 9: the stats line reports the 2.1 remote-nick registry's size, which is
+ * the only way a test can tell a table that is working from one that never
+ * learned anything. */
+#include "core/resume.h"
+#include "federation/nickreg.h"
 #include "sasl_framework.h"
 
 /* The node's own name, when --name is not given. It must satisfy the 2.4 tag
@@ -618,10 +623,15 @@ int main(int argc, char **argv)
            "writeq_overflow=%llu write_error=%llu partial_writes=%llu "
            "rejected_fd=%llu pass_seen=%llu reply_refused=%llu "
            "fed_rejected=%llu fed_duplicate=%llu fed_hs_timeout=%llu "
-           "fed_dead=%llu fed_preauth_drop=%llu fed_hop_drop=%llu "
+           "fed_dead=%llu fed_retry_exhausted=%llu "
+           "fed_preauth_drop=%llu fed_hop_drop=%llu "
            "fed_own_origin=%llu fed_untagged_relay=%llu "
            "fed_unknown_verb=%llu fed_verb_deferred=%llu fed_malformed=%llu "
            "fed_dup_drop=%llu fed_dedup_dup=%llu fed_squit_self=%llu "
+           "nickreg_known=%zu nickreg_evicted=%llu "
+           "resume_noted=%llu resume_applied=%llu resume_expired=%llu "
+           "resume_rejected=%llu resume_evicted=%llu resume_swept=%llu "
+           "resume_chan_gone=%llu resume_chan_taken=%llu resume_held=%zu "
            "burst_refused=%llu burst_abandoned=%llu burst_truncated=%llu "
            "topic_cache_full=%llu sasl_ok=%llu sasl_fail=%llu\n",
            (unsigned long long)srv.n_ticks, (unsigned long long)srv.n_eintr,
@@ -638,8 +648,9 @@ int main(int argc, char **argv)
            (unsigned long long)srv.n_link_rejected,
            (unsigned long long)srv.n_link_duplicate,
            (unsigned long long)srv.n_fed_hs_timeout,
-           (unsigned long long)srv.n_fed_dead,
-           (unsigned long long)srv.n_fed_preauth_drop,
+            (unsigned long long)srv.n_fed_dead,
+            (unsigned long long)srv.n_fed_retry_exhausted,
+            (unsigned long long)srv.n_fed_preauth_drop,
            (unsigned long long)srv.n_fed_hop_drop,
            (unsigned long long)srv.n_fed_own_origin,
            (unsigned long long)srv.n_fed_untagged_relay,
@@ -649,6 +660,17 @@ int main(int argc, char **argv)
            (unsigned long long)srv.n_fed_dup_drop,
            (unsigned long long)srv.n_fed_dedup_dup,
            (unsigned long long)srv.n_fed_squit_self,
+            (size_t)fed_nickreg_count(&srv),
+            (unsigned long long)srv.n_rnick_evicted,
+            (unsigned long long)srv.n_resume_noted,
+            (unsigned long long)srv.n_resume_applied,
+            (unsigned long long)srv.n_resume_expired,
+            (unsigned long long)srv.n_resume_rejected,
+            (unsigned long long)srv.n_resume_evicted,
+            (unsigned long long)srv.n_resume_swept,
+            (unsigned long long)srv.n_resume_chan_gone,
+            (unsigned long long)srv.n_resume_chan_taken,
+            (size_t)resume_count(&srv),
            (unsigned long long)srv.n_burst_refused,
            (unsigned long long)srv.n_burst_abandoned,
            (unsigned long long)srv.n_burst_truncated,

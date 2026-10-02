@@ -84,15 +84,35 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
     if (fanout_resolve(s, c, m->params[0], FANOUT_MESSAGE, &t) == 0) {
         return; /* 401 or 403 already sent */
     }
+    /* A `nick@server` target: 3.1's LAST ROW, and it used to be refused here with
+     * 401 because fanout_resolve() recognised the SHAPE and had no registry to
+     * resolve it against -- fanout.h's FANOUT_REMOTE_USER is documented as "a row
+     * deliberately not implemented" and this was the refusal that documented it.
+     *
+     * IT IS NOT REFUSED NOW, and the reason is that resolution now ANSWERS: a
+     * target of this kind only survives fanout_resolve() when the registry says
+     * that server holds the nick AND there is an ESTABLISHED link to it, so
+     * everything the 401 used to cover is now covered by the two refusals inside
+     * resolution, where they are precise about WHY. What is left here is a
+     * `message`-class target with a route, and 3.1's row for it is "forward to
+     * that server".
+     *
+     * THE NUMERIC STAYS OUT OF fanout_deliver(), which is the separation 3's
+     * reply-path paragraph requires and the reason this deletion is safe rather
+     * than a numeric that leaked onto a peer link: a numeric is a reply, a
+     * forward is not, and the two live in different files so a future verb cannot
+     * reach one through the other. */
     if (t.kind == FANOUT_REMOTE_USER) {
-        /* A `nick@server` target: 3.1's last row, with no peer to forward it to
-         * (fanout.h, on FANOUT_REMOTE_USER). 401 is the honest single-node
-         * answer -- this node holds no such user. It is sent HERE and not from
-         * inside fanout_deliver() because a numeric is a reply-path concern (3)
-         * and forwarding is not; keeping them apart is what lets Phase 6 add a
-         * forward without a numeric ever reaching a link. */
-        (void)reply(s, c, "401", (const char *const[]){ t.name }, 1,
-                    "No such nick/channel");
+        /* The parameter list is the TEXT ALONE, with the target left to
+         * fanout_deliver(): a target is a parameter of a PRIVMSG to a USER, not
+         * of the forward. 3.1's row and 3.2's formatter agree on this -- the
+         * S-verb's first parameter IS the target, and fanout_forward_link() puts
+         * t->name there -- so passing the client's own parameters through
+         * unchanged would render SPRIVMSG with the target twice. */
+        const char *textp[1];
+
+        textp[0] = text;
+        fanout_deliver(s, &t, prefix, verb, textp, 1, NULL, NULL);
         return;
     }
 

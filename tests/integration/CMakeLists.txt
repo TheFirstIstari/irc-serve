@@ -46,6 +46,16 @@ function(irc_ctest_name name out)
     set(${out} "CapNegotiation" PARENT_SCOPE)
   elseif(${name} STREQUAL "test_multi_prefix")
     set(${out} "MultiPrefix" PARENT_SCOPE)
+  elseif(${name} STREQUAL "test_failover_reconnect")
+    set(${out} "FailoverReconnect" PARENT_SCOPE)
+  elseif(${name} STREQUAL "test_sync_state")
+    set(${out} "SyncState" PARENT_SCOPE)
+  elseif(${name} STREQUAL "test_peer_discovery")
+    set(${out} "PeerDiscovery" PARENT_SCOPE)
+  elseif(${name} STREQUAL "test_reconnect")
+    set(${out} "Reconnect" PARENT_SCOPE)
+  elseif(${name} STREQUAL "test_autoscale")
+    set(${out} "AutoScale" PARENT_SCOPE)
   else()
     set(${out} "${name}" PARENT_SCOPE)
   endif()
@@ -336,3 +346,94 @@ irc_add_integration_test(test_fed_guards test_fed_guards.c)
 # the only link. The last case owns one end of a link, like test_fed_guards.c,
 # because no second node built from this code will send the line.
 irc_add_integration_test(test_fed_resync test_fed_resync.c)
+
+# 7/Phase 9: the reconnect POLICY -- exponential backoff, a cap, and a retry
+# budget that is SPENT and reported rather than retried for ever. Two nodes, a
+# frozen peer (SIGSTOP, not a kill: a killed peer sends a FIN and the survivor
+# would observe a closed connection rather than the silence T4 exists to
+# notice), and the ladder read out of the node's own delay_ms= reports. The
+# ladder is scaled down per process through fed_set_retry(), because the shipped
+# base is 90 s and a test that waited out even the first rung would be a slow
+# test rather than a test.
+irc_add_integration_test(test_failover_reconnect test_failover_reconnect.c)
+
+# 7/Phase 9: the 4.3 resync being DRIVEN by a reconnect, which is 8's
+# "Link loss and reconnect re-syncs channel state via SBURST". Phase 6 proved
+# both halves either side of this and explicitly declined the middle: nothing in
+# the node decided to reconnect, so a test's own signal was doing it. This case
+# asserts the node recovers on its own AND that the resync it drives REPLACES
+# rather than merges -- checked on the wire, with a member who parts and one who
+# joins WHILE the link is down, which is the only way to produce state the mesh
+# cannot have seen. The retry scale is shortened per process; the policy's shape
+# is test_failover_reconnect's claim, not this one's.
+irc_add_integration_test(test_sync_state test_sync_state.c)
+
+# 2.1: the remote-nick registry, the scoped `nick@server` being ROUTED rather
+# than recognised, and rename-the-loser. Its own file because it is the only
+# feature whose claim is visible in FOUR places at once -- the renamed client's
+# own NICK line, the other members of its channels, the peer's rekeyed roster,
+# and the winner's non-rename -- and a test that checked one of them would pass
+# against a mesh that had resolved the duplicate in only one.
+irc_add_integration_test(test_nick_duplicate test_nick_duplicate.c)
+
+# 2.1/2.2/8: a client whose TCP session is LOST and who comes back gets its
+# channel set, with the per-channel prefix flags re-derived rather than copied.
+# Its own file because the claim is a SEQUENCE over a real socket -- register,
+# join, become op, CLOSE THE SOCKET, wait for the node to reap it, connect a
+# second real socket -- and every step of that sequence is a place a test can
+# stop being real. A unit test could assert that a window was recorded and
+# nothing else, and the placeholder this file replaced said exactly why that was
+# not enough: "honest CTest skip rather than SIMULATED RECONNECT STATE".
+#
+# IT MOVED HERE FROM tests/loadbal/, where the phase table put it because it was
+# one of five skips 7/Phase 9 owned. That was a classification by the skip's name
+# rather than by the feature: peer discovery and auto-scale are about a mesh, and
+# a client reconnecting is a single node's business with no peer in the file.
+# The CTest NAME is unchanged (Reconnect) -- see irc_ctest_name() for why, and
+# tests/loadbal/CMakeLists.txt for what is left of the three.
+irc_add_integration_test(test_reconnect test_reconnect.c)
+
+# 7/Phase 9: 2.3's peer discovery -- ADVERTISE (a load figure, and a dial hint
+# this node records and NEVER dials) and SHUTDOWN (a goodbye that must not spend
+# a retry budget). Its own file because the SSRF claim is not observable on the
+# node that holds the hint: the placeholder this file replaced could only have
+# asserted that the node said `dialed=NO`, and a guard that prints its own
+# verdict and then dials anyway passes that. So it needs a THIRD node for the
+# hint to point at -- the same shape test_nick_duplicate.c documents, and the same
+# trap.
+#
+# IT MOVED HERE FROM tests/loadbal/, where the phase table put it because it was
+# one of five skips 7/Phase 9 owned. That was a classification by the skip's name
+# rather than by the feature: peer discovery and auto-scale are about a mesh over
+# real sockets, and a target in that directory links irc_core and nothing else --
+# it cannot spawn a node, cannot own one end of a link and cannot read a dial it
+# did not make. The CTest NAME is unchanged (PeerDiscovery) -- see
+# irc_ctest_name() above for why, and tests/loadbal/CMakeLists.txt for what is
+# left of the five.
+irc_add_integration_test(test_peer_discovery test_peer_discovery.c)
+
+# 7/Phase 9: 2.3's auto-scale, SCOPED TO WHAT A NODE CAN HONESTLY DO. Its own file
+# and its own CTest name because the scoping decision is the deliverable as much as
+# the code is: a node does NOT spawn or stop nodes (that is a supervisor's job, and
+# a node that cannot measure its own load has nothing honest to decide a spawn on),
+# so the placeholder this file replaced asserted nothing. What it asserts instead is
+# the half that IS a node's business -- a node announces its own departure on the
+# wire before it goes, its peers treat that as terminal rather than as a failure, and
+# a peer that advertises itself as busy is reported to whoever can act on it without
+# anything being moved.
+#
+# IT IS A SEPARATE FILE FROM test_peer_discovery.c AND NOT AN EXTENSION OF IT,
+# because the two assert opposite halves of the same verbs. That file writes its own
+# SHUTDOWN and its own ADVERTISE onto a socket, because at the time no node in this
+# build ORIGINATED either. This one uses two real forked nodes, because
+# fed_send_shutdown() now has a caller (server_shutdown()) and a departure that can
+# only be produced by writing the line by hand proves nothing about whether a node
+# produces one. Same reasoning the SSRF claim forced a third node there, applied to
+# the origination question here.
+#
+# IT MOVED HERE FROM tests/loadbal/, where the phase table put it because it was one
+# of five skips 7/Phase 9 owned -- a classification by the skip's NAME rather than by
+# the feature, since auto-scale as this codebase implements it is a property of a mesh
+# over real sockets. The CTest NAME is unchanged (AutoScale) -- see irc_ctest_name()
+# above for why, and tests/loadbal/CMakeLists.txt for what is left of the five.
+irc_add_integration_test(test_autoscale test_autoscale.c)

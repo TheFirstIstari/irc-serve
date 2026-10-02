@@ -1,110 +1,100 @@
-# Auto-Scaling Observable Design Spec
+# Auto-Scaling — design spec, and the record of why it was not built as written
 
-Reference: docs/ARCHITECTURE.md design goal —
-"Nodes can spawn/shutdown based on connection load; federation protocol propagates state."
+**Status: the contracts in this document are NOT the shipped feature, and never will
+be as written.** Phase 9 (`#83`) implemented auto-scale within the boundary below.
+This file is kept because it is the clearest statement of what was *proposed*, and a
+reader who finds `AutoScale` in `tests/known_skips.txt`'s history deserves to see the
+proposal that was declined rather than only the decision.
 
-Status: Design target (not yet observable implemented in source).
-Remaining per docs/SPEC_TRACKING.md.
-Constraints: C11 (`-Wall -Wextra -Werror -Wpedantic -std=c11`). Observable contracts only — return values + observable prints; no plumbing assertions (`assert` on internal plumbing forbidden). No GitHub tracking references in code.
-
----
-
-## 1. Spawn Observable Contract
-
-Observable function: `int node_spawned(void);`
-Behavior: When connection load exceeds a configured threshold (e.g., observed connection count > load_threshold), the node spawn is observable.
-
-Observable print contract:
-```
-[observable] node_spawned: load_before=X load_after=Y spawned=1 state=SPAWNED
-```
-
-Observable return contract:
-- `node_spawned() == 1` after spawn completes.
-- Before spawn: `node_spawned() == 0`, observable load metric > threshold.
-- After spawn: load metric reduced (new node absorbs load), `node_spawned() == 1`.
-
-No plumbing assertions (no `assert` on connection count internals). Observable load metric: integer count of active connections, printed and returned via observable accessor `int get_connection_load(void);`.
+The original draft of this document specified five observable functions. **None of
+them exists, and the reasons are structural rather than a matter of effort.**
 
 ---
 
-## 2. Shutdown Observable Contract
+## 1. What was proposed, and what happened to each contract
 
-Observable function: `int node_shutdown(void);`
-Behavior: When load drops below threshold (e.g., `get_connection_load() < shutdown_threshold`), graceful shutdown is observable.
-
-Observable print contract:
-```
-[observable] node_shutdown: load_before=X state=SHUTTING_DOWN graceful=1
-[observable] node_shutdown: shutdown_complete=1 state=STOPPED
-```
-
-Observable return contract:
-- `node_shutdown() == 1` after graceful shutdown completes.
-- `node_shutdown() == 0` during operation and before shutdown initiation.
-- Graceful shutdown: no state loss observable; existing state preserved and propagated before shutdown completes.
-
-No plumbing assertions on internal listener fd or signal state. Observable state: `node_shutdown()` return value; `get_connection_load()` metric before/after.
+| Proposed | Shipped | Why |
+|---|---|---|
+| `int node_spawned(void)` — spawn when `get_connection_load() > threshold` | **never built** | Node lifecycle is a **supervisor's** job (systemd, an orchestrator, a replica controller), not a peer's. And the input does not exist: see §2 below. |
+| `int node_shutdown(void)` — graceful stop when load drops | **not built as a contract**; the *graceful leave* half is built and observable | A node shutting **itself** down on a threshold is node lifecycle again. A node **announcing** that it is going away is a different thing, it is a protocol behaviour, and it is what `server_shutdown()` now does. |
+| `int get_connection_load(void)` — an observable load metric | **replaced by `fed_set_load()`** | This node measures no load. See §2. |
+| `int federation_propagate_state(void)` — hash-equal propagation to a new node | **never built** | Propagation to a node that does not exist yet is spawn again. What exists is propagation to a node that is **already a peer**. |
+| `double mean_rss_mb(void)` after a spawn/shutdown cycle | **kept, in `tests/benchmark/footprint.c`** | The footprint bound is real and is tested; the *cycle* it was to be measured around is the part that was declined. |
 
 ---
 
-## 3. Federation State Propagation Observable
+## 2. The load argument, which is the whole decision
 
-Observable function: `int federation_propagate_state(void);`
-Behavior: When a node spawns or shuts down, federation protocol propagates state to the new/shutdown node. Observable equality of propagated state.
+**`load_pct` is an operator's value, not a measurement.** `fed_set_load(s, pct)` sets
+it; nothing measures it, because there is no measurement in this codebase to make.
+The placeholder test's reason for existing said so directly — "honest CTest skip
+rather than fabricated node lifecycle / 'RSS' claims" — and that was a statement about
+a boundary, not about missing work.
 
-Observable print contract:
-```
-[observable] federation_propagate_state: propagated=1 target_node=NEW_NODE hash_before=ABC hash_after=ABC state_equal=1
-```
+The consequence is exact rather than a matter of taste: **a node that spawned or
+stopped another node on a load signal would be deciding on a number it does not
+believe**, and on a mesh the failure mode is a fork bomb. There is no threshold that
+fixes this, because the problem is the *provenance* of the number and no threshold
+changes where a percentage comes from.
 
-Observable return contract:
-- `federation_propagate_state() == 1` when propagation completes successfully.
-- Propagated state equality: `int state_hash_equal(const char* state_before, const char* state_after);` returns 1 when hashes/state representations match (observable equality, not plumbing equality of internal pointers).
-- Before/after observable state printed; no plumbing assertions on internals.
+So the honest load feature is **propagation**, and it propagates what a peer *says*
+about itself rather than anything this node inferred:
 
-State observable representation: serialized observable hash/state string, not internal pointer comparison. This aligns with `tests/federation/test_sync_state.c` design (hash equality contract) and `tests/loadbal/test_peer_discovery.c` (advertise/graceful_leave observable).
+- A peer publishes its figure in an `ADVERTISE`; this node records it and reports it.
+- `fed_set_shed_pct(s, pct)` sets the level at or above which this node reports a
+  peer as shedding. **The default is 0 = no opinion**, because the level at which a
+  peer's load matters is a deployment's judgement and a shipped constant would be
+  inventing a figure this codebase cannot justify.
+- The report is one line per **crossing**, not per tick:
+  ```
+  [observable] fed_shed: peer=<name> load=42% threshold=30% action=REPORT_ONLY rebalance=NO reason=NO_MOVE_MECHANISM
+  ```
+  The `action=` and `reason=` tokens are load-bearing rather than documentation:
+  "and then what?" is the question every reader of a mesh-load feature asks, and the
+  answer being "nothing, and here is why" belongs **on the wire**.
 
----
+## 3. Why propagation stops at reporting, specifically
 
-## 4. Memory Footprint Observable (< 10MB)
+Two structural reasons, not caution:
 
-Observable function: `double mean_rss_mb(void);`
-Behavior: After spawn/shutdown cycle, mean RSS remains < 10.0 MB.
+- **§2.2 of `docs/SERVER_DESIGN.md` makes a channel's origin immutable** and fails
+  closed when it dies. Re-homing a channel to a quieter node *is* origin re-election,
+  which §9's risk table records as not to be begun without re-opening §2.4's dedup
+  key. There is no "move the channel" call to make.
+- **A client's session belongs to the node its socket is connected to.** §4.3 has no
+  session-transfer verb and no client-visible redirect, so "send the load elsewhere"
+  has no mechanism on either end.
 
-Observable print contract:
-```
-[observable] memory_footprint: mean_rss_mb=3.5 (post_spawn_shutdown_cycle) <10.0=PASS
-```
+A third reason is about scope rather than structure, and is recorded here because the
+first two are the ones that will stop a future attempt: **there is no supervisor in
+this repository**, so there is nothing that *could* act on a report even if the node
+were willing to.
 
-Observable return contract:
-- `mean_rss_mb()` returns observable mean RSS value.
-- Contract defense: mean value < 10.0 observable (same pattern as `tests/benchmark/footprint.c`: `assert(mean_rss_mb < 10.0)` — note: benchmark uses assert on observable value, which is permissible as observable contract defense, not plumbing assertion on internals).
-- After spawn/shutdown cycle: footprint observable does not grow unbounded; remains below threshold.
+## 4. What was built instead — the graceful leave
 
-No plumbing assertions on internal memory allocations. Observable only: `mean_rss_mb()` return value + observable print.
+The half of this document that turned out to be a node's business:
 
----
+- `server_shutdown()` calls `fed_send_shutdown()` **before** it closes anything, so a
+  `SIGTERM`'d node puts `SHUTDOWN` on the wire on its way out. Until Phase 9 that
+  function had **no caller anywhere in `src/`** — so no node ever announced anything,
+  and every peer discovered a departure by timeout and spent a retry budget on it.
+- A peer that receives one marks the link **cleanly departed**, purges that origin's
+  roster, relays a `SQUIT` onward to a node two hops away, and **arms no retry**.
+- Two defects in `core/poll_loop.c` had to be fixed for that goodbye to survive its own
+  journey, and both are documented at the site: a node that wrote its last line and
+  closed in the same breath had that line **discarded** (the end-of-stream arm returned
+  without framing what it had already read — and "send the line, then go" *is* the
+  graceful leave), and a departing node had to **drain** each peer socket before
+  closing, because a `close()` with unread data in the receive queue makes the kernel
+  send `RST` rather than `FIN`, and an `RST` discards the goodbye in flight.
 
-## 5. Integration with Existing Observables
+## 5. Where the acceptance lives
 
-Existing observable patterns reused (no plumbing assertions added):
-- `src/federation_handshake.c`: INIT→HANDSHAKE_SENT→ESTABLISHED (state machine observable, return value + no plumbing asserts on internals). Auto-scaling adds SPWANED/SHUTTING_DOWN/STOPPED states to observable contract, not to plumbing enum.
-- `src/node_main.c`: TCP listener observable (`bind`, `listen`, graceful shutdown via `running` signal flag observable via print). Auto-scaling uses same graceful shutdown observable (`state=STOPPED` print, `running` state observable).
-- `tests/loadbal/test_peer_discovery.c`: `advertise()` / `graceful_leave()` observable contracts. Auto-scaling uses same observable return-value pattern (`node_spawned() == 1`, `node_shutdown() == 1`).
-- `tests/loadbal/test_reconnect.c`: reconnect preserves nick/memberships/capabilities observable. Auto-scaling uses same preservation observable for state propagated (`federation_propagate_state()` equality observable).
-- `tests/benchmark/footprint.c`: `mean_rss_mb < 10.0` observable contract. Auto-scaling reuses same observable metric before/after spawn/shutdown cycle.
+`tests/integration/test_autoscale.c`, over real nodes and real sockets, asserting
+observable wire lines only. No payload in it is written by the test except the third
+case's, which exists precisely to reach the framing defect that the (correctly robust)
+shipped departure path hides. The CTest name is `AutoScale` and it is **not a skip**:
+`tests/known_skips.txt` is empty and `scripts/check-skips.sh` enforces that.
 
----
-
-## 6. Observable Contracts Summary (No Plumbing Assertions)
-
-| Observable | Return Contract | Print Contract | Constraint |
-|---|---|---|---|
-| `node_spawned()` | `== 1` when spawned; `== 0` before | `[observable] node_spawned: ...` | C11, no plumbing asserts |
-| `node_shutdown()` | `== 1` when shutdown complete; `== 0` before | `[observable] node_shutdown: ...` | Graceful, no state loss |
-| `get_connection_load()` | Integer load metric observable | `[observable] load_metric=...` | Threshold observable |
-| `federation_propagate_state()` | `== 1` when propagated; state equality `== 1` | `[observable] federation_propagate_state: ... hash_before=... hash_after=...` | Observable hash equality |
-| `mean_rss_mb()` | Double < 10.0 after cycle | `[observable] memory_footprint: mean_rss_mb=... <10.0=PASS` | < 10MB observable |
-
-No GitHub tracking references. No plumbing assertions on internals. Observable contracts only.
+See `docs/SERVER_DESIGN.md` §2.3 and §7/Phase 9 for the same decision stated where a
+reader of the design will find it before they find this file.

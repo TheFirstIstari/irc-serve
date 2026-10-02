@@ -106,6 +106,25 @@ struct sasl_store;
  * server_t has to understand. */
 struct chan_topic;
 
+/* Phase 9 item 4: one peer's ADVERTISE, as OBSERVED. The whole structure is
+ * OBSERVATIONAL: it is read by logs, by the stats line and by the name-collision
+ * check, and it is never read by the dial path. See the comment on
+ * server_t::advs for why that separation is a security property rather than an
+ * omission, and what a future reader would have to write down before changing it. */
+struct fed_advert;
+
+/* Phase 9's remote-nick registry: 2.1's "which server holds the user called X",
+ * the table that makes 3.1's `nick@server` row RESOLVABLE rather than merely
+ * routable. The layout and its least-recently-used ordering are
+ * federation/nickreg.c's, for the same reason the dedup entry's are
+ * federation/dedup.h's and the topic cache's are core/channel.c's: the GEOMETRY
+ * of a table is one module's business rather than a fourth thing every reader of
+ * this struct has to understand. The three counters below are NOT here for that
+ * reason -- they are properties of the NODE, which is what this struct is, and a
+ * counter in the module would be a counter a second node in the same process
+ * could not have. */
+struct fed_rnick;
+
 /* The version string this build reports in 002, 004 and PONG.
  *
  * It lives here, and not in the node's own banner, so that there is exactly
@@ -247,6 +266,106 @@ typedef struct server_link {
      * on a timer: a link that reconnects needs a fresh burst even if its peer
      * never went away. */
     int      burst_done;
+
+    /* ------------------------------------------------------------------------
+     * THE RECONNECT SCHEDULE -- Phase 9. Three fields, one policy, and the
+     * reason they are HERE rather than in a module-global table is the same
+     * reason the link itself is: the policy is per PEER, and a table keyed by
+     * name is a second place to look up a name. federation/link.h carries the
+     * derivations for the three intervals they are compared against.
+     * ------------------------------------------------------------------------
+     *
+     * retry_at_ms is the earliest stamp at which fed_tick()'s T7 may dial this
+     * link. 0 means DUE NOW, which is the state a freshly configured link is in
+     * -- so the FIRST dial is immediate and only a FAILED one waits, which is
+     * what keeps a healthy mesh from acquiring a start-up delay. The zero is
+     * therefore load-bearing rather than a "never stamped" sentinel, and it is
+     * the reason a dead link's dump does not read 0 as "unreachable".
+     *
+     * retries is CONSECUTIVE failed attempts. It is reset to 0 by
+     * fed_link_established(), so a peer that flaps gets a fresh budget on every
+     * success while a peer that is simply dead runs the budget down. That
+     * asymmetry is deliberate: a budget that were a lifetime cap would be a
+     * link ban, and a mesh needs a link policy more than it needs a ban.
+     *
+     * gave_up is the budget SPENT, and it is terminal for the life of the
+     * process unless fed_link_reset() clears it. Nothing in the shipped binary
+     * calls fed_link_reset() -- there is no operator door -- and that gap is
+     * recorded in docs/SERVER_DESIGN.md's Phase 9 block rather than papered
+     * over here, because the alternative (a silent give-up) is exactly the
+     * failure the budget's report exists to prevent. The field is here because
+     * a terminal state with no door is still better than an unbounded retry
+     * loop, and the door is one call away.
+     *
+     * THE COST, in one number: three integers per link, so 48 bytes on a
+     * 16-link vector. The alternative -- a module-global side table keyed by
+     * server name -- is the same 48 bytes plus a hash lookup on every T7 and a
+     * second place where a link's identity is spelled.
+     */
+    uint64_t retry_at_ms;
+    unsigned retries;
+    int      gave_up;
+
+    /* PHASE 9 ITEM 4: THIS PEER SAID IT IS LEAVING. It is a FIELD rather than a
+     * fifth handshake state because the FSM is 2.1's and has exactly four states,
+     * and adding one would be a change to a specification this phase does not own.
+     * The distinction it carries needs no new state, either: a departing peer is a
+     * link that must not be dialled rather than a link in a new place.
+     *
+     * WHAT IT SUPPRESSES IS EXACTLY ONE THING: the T7 arm's dial. Not the
+     * keepalive, not the dump, not the handshake -- the link stays ESTABLISHED
+     * until the peer's own teardown closes its socket, and everything this node
+     * knows about the peer stays readable.
+     *
+     * IT IS A SEPARATE FLAG FROM `gave_up` BECAUSE THE TWO SAY OPPOSITE THINGS, and
+     * overloading one for both would make a peer that left on purpose look like a
+     * peer that was flaky: `gave_up` is this node's budget SPENT and its counter
+     * is a finding about a link an operator should investigate, while this is the
+     * peer ANSWERING and there is nothing to investigate. The same reasoning
+     * server.h's own comment about the three integers makes, one level up: a
+     * number that means two things is a number nobody can act on.
+     *
+     * IT IS CLEARED BY fed_link_reset() ONLY, because that is the OPERATOR's door:
+     * an operator who resets a link is saying "I want this peer back", and a peer
+     * that left cleanly comes back if an operator asks for it. Nothing else clears
+     * it -- not a tick, not a sweep, not the link's own socket closing -- so a
+     * clean leave is not undone by a later event on the same link. */
+    int      clean_leave;
+
+    /* PHASE 9 ITEM 4, THE PROPAGATION HALF: the load figure this link's peer last
+     * ADVERTISED, and whether T8 has already reported it as shedding.
+     *
+     * THE FIGURE IS HERE AS WELL AS IN server_t::advs, and the duplication is
+     * deliberate and is the reason this is a FIELD rather than a lookup. The store
+     * is the OBSERVATIONAL one (the advs block below: reports, logs and a collision
+     * check, never a dial target) and this is the ROUTING one -- it is what T8
+     * compares against server_t::shed_pct. Keeping the number where the policy
+     * reads it means the tick's decision does not depend on the store having been
+     * allocated, costs no linear probe per link per tick, and cannot be perturbed by
+     * anything that touches the store. Both are written from one statement sequence
+     * when an ADVERTISE is applied, so they cannot disagree.
+     *
+     * `load_seen_ok` IS SEPARATE FROM `load_seen` rather than encoded in it, because a
+     * peer that has never advertised is a DIFFERENT FACT from a peer that advertised
+     * 0%, and the field says which one this is.
+     *
+     * IT IS NOT, HOWEVER, WHAT PREVENTS THE ARM FROM REPORTING A PEER IT HAS NEVER
+     * HEARD FROM, and the field does not claim to be. An unset figure reads as 0, and
+     * 0 cannot reach a non-zero threshold (`0 >= shed_pct` is false for every shed_pct
+     * the operator can set), so the arithmetic already prevents it. The flag states
+     * the intent where the decision is made rather than making it; see link.c's T8 for
+     * why that is a real reason to keep it and NOT a claim a test can check.
+     *
+     * `shed_reported` is the EDGE LATCH, and it exists so the tick reports a
+     * crossing rather than a state: without it a peer sitting at 95% would print a
+     * line every POLL_TICK_MS for the life of the link, which is 20 lines a second
+     * per peer on a mesh where somebody is busy -- the opposite of reporting. One
+     * line per transition up is what an operator reading the log wants, and the
+     * latch is cleared when the figure comes back down and by fed_link_reset(), so a
+     * peer that sheds twice says so twice. */
+    unsigned  load_seen;
+    int       load_seen_ok;
+    int       shed_reported;
 } server_link_t;
 
 /* The initial capacity of server_t::links, and a bound on the PEER DESCRIPTORS
@@ -440,6 +559,63 @@ struct server {
     uint64_t  n_fed_hs_timeout; /* links that reached no answer within T2 */
     uint64_t  n_fed_dead;       /* ESTABLISHED links that went silent (T4) */
 
+    /* Phase 9: the node has spent a link's retry budget and stopped dialling
+     * it. federation/link.c's fed_retry_arm() is the only writer.
+     *
+     * IT IS A FINDING AND NOT A METRIC, and that is the whole reason it is on
+     * this struct rather than only in the log. A non-zero value says this node
+     * has decided a peer is gone and is not going to ask again, which is a
+     * correct decision and an OPERATIONAL one: nothing in the shipped binary
+     * clears it, so the peer stays unreachable from here until somebody restarts
+     * this node or reaches fed_link_reset(). A dashboard that showed
+     * reconnects per second would show a healthy number while the mesh was
+     * quietly partitioned, and this is the number that would not.
+     *
+     * It is not n_fed_dead: that counts a peer going silent, which is an event,
+     * and this counts a DECISION, of which there is at most one per link per
+     * streak of failures. A peer that flaps contributes many of the first and
+     * none of the second. */
+    uint64_t  n_fed_retry_exhausted; /* links whose retry budget ran out */
+
+    /* Phase 9: the remote-nick registry's one event, and a real loss.
+     *
+     * A count of remote users this node was told about and then had no room for.
+     * It is a finding rather than a statistic: a node whose counter climbs is a
+     * node being told about more remote users than IRC_FED_MAX_REMOTE_NICKS can
+     * hold, and every eviction is a `nick@server` that resolves to nothing until
+     * the next resync. The eviction is never a refusal -- the entry that went is
+     * the LEAST RECENTLY LEARNED, and the next resync from that peer will supply
+     * it again -- so the cost of a high count is latency on routing, not lost
+     * state.
+     *
+     * It is not n_fed_malformed and not n_fed_squit_self, for the same reason
+     * those are separate: a malformed line is a peer that does not implement
+     * 4.3, and this is a peer that implements it perfectly about a mesh larger
+     * than this node's cache. */
+    uint64_t  n_rnick_evicted;
+
+    /* The registry itself: a vector of entries, ordered least-recently-LEARNED
+     * first (so index 0 is the eviction candidate), LAZILY allocated so a node
+     * with no peers pays nothing, and released by fed_nickreg_close() from
+     * server_shutdown().
+     *
+     * `nrnicks` is the ALLOCATED length and `nrnick_used` is how much of it holds
+     * an entry, which is a distinction worth making explicit: the eviction policy
+     * is a bound on USED entries, not on the allocation, and a node that has
+     * learned one nick and then forgotten it still holds the whole 86 KiB. That
+     * is deliberate -- freeing and reallocating a table on a quiet mesh would put
+     * an allocator call on the path a burst takes, and 86 KiB of untouched heap is
+     * cheaper than that.
+     *
+     * `nrnick_swept_ms` is the sweep throttle and 0 means "never swept", which is
+     * also the state of a node that has just learned its first nick, so the first
+     * sweep is immediate rather than being delayed by an interval measured from
+     * zero. */
+    struct fed_rnick *rnicks;
+    size_t    nrnicks;   /* allocated entries */
+    size_t    nrnick_used; /* entries in use */
+    uint64_t  nrnick_swept_ms;
+
     /* ------------------------------------------------------------------------
      * Phase 6 C3: the INBOUND guard chain, one counter per guard that can drop
      * a line. federation/verbs.c's fed_dispatch() is the only writer.
@@ -566,6 +742,219 @@ struct server {
     uint64_t  n_topic_cache_full;
 
     /* ------------------------------------------------------------------------
+     * Phase 9: the client session window. core/resume.c owns the records; this
+     * struct holds the table pointer and the count, for the same reason the
+     * dedup table's does -- so that the function which ends every other
+     * allocation on this struct can also end this one, visibly.
+     * ------------------------------------------------------------------------
+     *
+     * `resume_windows` is a flat array of IRC_RESUME_MAX fixed-size records,
+     * LAZILY allocated on the first client that drops without a QUIT, and
+     * `nresume_used` is how much of it is live. The array is allocated at its
+     * FULL bound rather than grown: the bound is about 85 KiB, a growable
+     * vector would be a second thing to keep in step with the count, and a
+     * partially filled array is the simplest thing to sweep and to index.
+     *
+     * IT IS NOT A MEMBER-BY-MEMBER LIST, and the reason is the same one the
+     * channel set is a list but this is not: a window is about a client, and the
+     * thing a client owns is a fixed-size key plus a bounded array of channel
+     * names, so a variable-size record per user would make the table's size a
+     * function of how many channels users are in -- a number a client
+     * controls. See core/resume.h. */
+    struct resume_window *resume_windows;
+    size_t    nresume_used;
+    /* THE SWEEP THROTTLE, and 0 means "never swept", which is also the state of
+     * a node that has just recorded its first window -- so the first sweep is
+     * immediate rather than being delayed by an interval measured from zero. */
+    uint64_t  resume_swept_ms;
+
+    /* THE RESUME COUNTERS, and they are the ones an operator actually reads.
+     * Four of them are events rather than statistics, and the distinctions are
+     * the point:
+     *
+     *   n_resume_noted        a window was recorded: a client dropped with no
+     *                         QUIT, was registered, and had joined something.
+     *   n_resume_applied      a window was consumed by a returning client. The
+     *                         PAIR (noted, applied) is the feature working; a
+     *                         node where noted climbs and applied does not is a
+     *                         node whose clients are not coming back, or whose
+     *                         windows are being missed for another reason.
+     *   n_resume_expired      a window aged out, whether by the sweep or by the
+     *                         miss at restore time. This is the number that says
+     *                         "the bound is too short for this node's clients",
+     *                         and it is separated from n_resume_chan_gone because
+     *                         an expired window and a vanished channel are
+     *                         different problems with different fixes.
+     *   n_resume_rejected     a window was refused outright: the table could not
+     *                         be allocated, or the client had no channels to
+     *                         record. Zero on any healthy node, so a non-zero
+     *                         value is a finding.
+     *   n_resume_evicted      the table was FULL and the oldest window went. A
+     *                         node whose counter climbs is a node where clients
+     *                         are dropping faster than IRC_RESUME_MAX can hold
+     *                         them, which is the number that says "raise the
+     *                         bound".
+     *   n_resume_chan_gone    a channel in the window no longer exists. Expected
+     *                         after a restart of the client, common after a
+     *                         channel was disposed while the client was away, and
+     *                         the client is told each time.
+     *   n_resume_chan_taken   a channel in the window now has a DIFFERENT local
+     *                         member under the same nickname -- another client
+     *                         claimed the nick inside the window and joined. The
+     *                         restore is refused for that channel rather than
+     *                         putting two members with one nickname in a roster.
+     *   n_resume_alloc_failed the table could not be allocated. A node that
+     *                         cannot remember cannot resume, and saying so is
+     *                         better than a feature that silently did not record.
+     *   n_resume_swept        windows dropped by the sweep, cumulatively. The
+     *                         total, where the others are per-window events. */
+    uint64_t  n_resume_noted;
+    uint64_t  n_resume_applied;
+    uint64_t  n_resume_expired;
+    uint64_t  n_resume_rejected;
+    uint64_t  n_resume_evicted;
+    uint64_t  n_resume_chan_gone;
+    uint64_t  n_resume_chan_taken;
+    uint64_t  n_resume_alloc_failed;
+    uint64_t  n_resume_swept;
+
+    /* ------------------------------------------------------------------------
+     * Phase 9 item 4: what a peer ADVERTISES about itself. OBSERVATIONAL ONLY, and
+     * that is the load-bearing word in the whole structure.
+     * ------------------------------------------------------------------------
+     *
+     * A peer on an established link may tell this node its own name, its own
+     * dial hint (host and port) and a load percentage. This node records all
+     * three, reports them, and -- this is the security property, and it is
+     * STRUCTURAL rather than a check somebody has to remember -- NEVER uses them
+     * as a dial target.
+     *
+     * WHY THAT MATTERS ENOUGH TO SHAPE THE DATA STRUCTURE. `FEDERATE` carries
+     * the shared federation secret, so anything this node accepts as a peer is
+     * something that knows the secret. A store of learned addresses that fed the
+     * dial path would let a peer -- or anything that has obtained the secret, or
+     * a misconfigured peer on the far side of a compromised host -- hand this
+     * node an arbitrary host:port and make it open a connection there. That is a
+     * server-side request forgery primitive wearing a protocol, and the address
+     * it would connect to is exactly the thing an SSRF wants: a host that is not
+     * reachable from outside, reached from inside, on a port the attacker chose.
+     *
+     * SO THE STORE IS NOT `server_t::links` AND NOT `server_t::dials`, and that
+     * separation is the enforcement. The only writer of a link's dial address is
+     * fed_link_configure(), which takes it from the OPERATOR's command line
+     * (3.4: "HOST and PORT are resolved to a address ONCE, at startup, and never
+     * inside the event loop"). The tick's T7 arm dials only a link that has
+     * `initiator != 0` AND `addrlen != 0`, and both of those are set by that one
+     * function. A learned advertisement cannot reach either field because there
+     * is no API that would let it, and `fed_advertised_*` below returns TEXT for
+     * logs and counters and nothing else.
+     *
+     * A future reader who wants to dial from this store is about to introduce an
+     * SSRF and must first write the threat model that makes it acceptable: which
+     * peers are trusted to name which addresses, what stops a compromised peer
+     * from naming an internal one, and what an operator does when a peer names an
+     * address this node is not allowed to reach. None of those questions has an
+     * answer in this build, and "the secret is shared" is not one. */
+    struct fed_advert *advs;
+    size_t    nadv;      /* live entries; the array is allocated at its bound */
+    /* THIS NODE'S OWN LOAD, which is what an outbound ADVERTISE carries. A knob
+     * rather than a metric, because this node has no load measurement: the
+     * honest thing to put on the wire from a node that cannot measure its own
+     * load is a value an operator set, and a fabricated 0% would be a number this
+     * node does not believe. */
+    unsigned  load_pct;
+    uint64_t  advert_sent_ms; /* the per-node advertisement interval stamp */
+    /* At or above this percentage, a PEER's advertised load is REPORTED as
+     * shedding (link.c's T8 arm). AN OPERATOR KNOB AND NOT A POLICY, for the same
+     * reason load_pct above is one: this node measures no load -- not its own and
+     * certainly not anybody else's -- so it has no opinion about what figure is too
+     * high, and "100%" as a shipped constant would be a threshold this codebase
+     * invented and then called a finding. Zero means no opinion, which is the
+     * shipped state.
+     *
+     * WHAT THE ARM IS ALLOWED TO DO WITH IT, and the whole of the value: REPORT.
+     * It prints one line per crossing and counts it. It does not route around the
+     * busy peer, does not refuse it new channels, does not move anybody anywhere,
+     * and does not touch the dial path. Two reasons, both structural rather than
+     * cautious:
+     *
+     *   2.2 makes a channel's origin IMMUTABLE and fails closed when it dies, so
+     *       there is no "move the channel to a quieter node" operation to call --
+     *       re-homing a channel is origin re-election, which 9's risk table
+     *       records as NOT STARTED and not to be begun without re-opening 2.4.
+     *   A client's session belongs to the node its socket is connected to. This
+     *       codebase has no session-transfer verb and no client-visible redirect,
+     *       so "send the load elsewhere" has no mechanism at all: there is nothing
+     *       to send and nothing that would accept it.
+     *
+     * So the honest reaction to a busy peer is to make the fact VISIBLE to whoever
+     * can act on it -- an operator, or a supervisor above this codebase, which is
+     * where node lifecycle lives. That is the whole of propagation here, and the
+     * line says so with action=REPORT_ONLY rather than leaving a reader to guess
+     * whether something further happened. */
+    unsigned  shed_pct;
+
+    /* THE ADVERTISEMENT COUNTERS. Four, and the distinctions are the point:
+     *
+     *   n_fed_advertise        ADVERTISE lines applied. An advertisement the node
+     *                         did not understand is not this.
+     *   n_fed_advertise_bad    ADVERTISE lines REFUSED for a payload that is not
+     *                         one: a load outside 0..100, a name that is not a
+     *                         legal 2.4 server name, a port outside 1..65535, a
+     *                         hint that is not three parameters. Zero on a
+     *                         healthy mesh, so a non-zero value is a peer running
+     *                         something this build does not speak.
+     *   n_fed_advertise_collision
+     *                         A peer advertised a name this node already has a
+     *                         LINK to, or its own. 2.3 makes two nodes with one
+     *                         name "catastrophic and undetectable later", and an
+     *                         advertisement is the cheapest way to detect it --
+     *                         which is one of the three things this store is
+     *                         allowed to be used for. It is a FINDING: the
+     *                         handshake refuses the second node, so this counter
+     *                         is how an operator finds out that two of their
+     *                         peers are about to fight over a name.
+     *   n_fed_shutdown         SHUTDOWN lines applied: a peer said it is leaving
+     *                         deliberately.
+     *   n_fed_shutdown_relayed SHUTDOWNs this node passed ONWARD as a SQUIT for
+     *                         the departing server, so a node two hops away
+     *                         learns about it. Separate from the first because a
+     *                         node that received a SHUTDOWN and did not relay it
+     *                         is a node whose third neighbours keep a roster for a
+     *                         server that is gone.
+     *   n_fed_shutdown_refused
+     *                         SHUTDOWN lines refused for a bad payload, and SHUTDOWN
+     *                         that arrived from a link that was not ESTABLISHED
+     *                         (the guard chain drops those at G1 and counts them
+     *                         on n_fed_preauth_drop, so this is only the arity
+     *                         half).
+     *   n_fed_shutdown_announced
+     *                         SHUTDOWNs this node SENT on its own way out, and the
+     *                         reason it is counted here rather than being a bare
+     *                         observable is that a graceful leave that nobody
+     *                         received is indistinguishable from a crash. */
+    uint64_t  n_fed_advertise;
+    uint64_t  n_fed_advertise_bad;
+    uint64_t  n_fed_advertise_collision;
+    uint64_t  n_fed_shutdown;
+    uint64_t  n_fed_shutdown_relayed;
+    uint64_t  n_fed_shutdown_refused;
+    uint64_t  n_fed_shutdown_announced;
+    /* A PEER REPORTED AS SHEDDING, counted once per threshold CROSSING rather than
+     * once per tick -- the latch is server_link_t::shed_reported and server.h's
+     * shed_pct block gives the whole argument for why the count is of crossings.
+     * Zero on every node with no threshold set, which is the shipped state, so a
+     * non-zero value means an operator asked for this and a peer crossed the line
+     * they set.
+     *
+     * It is counted rather than inferred from the `fed_shed:` lines because a log is
+     * not a number an operator can watch, and this is the one that answers "has
+     * anything on my mesh been busy, and how often". What it does NOT count is any
+     * movement of clients or channels, because this node moves none: see
+     * shed_pct's block, where the two structural reasons are stated. */
+    uint64_t  n_fed_shed;
+
+    /* ------------------------------------------------------------------------
      * Phase 8: authentication. Both counters are events, not derived guesses.
      * ------------------------------------------------------------------------
      *
@@ -613,7 +1002,42 @@ int server_init(server_t *s, const char *name);
  * federation/burst.c, so the owner has to do it. It sits with the dedup free
  * because both are "a federation module's memory, released here", and both are
  * ASSERTED NOT VERIFIED on Darwin -- LeakSanitizer does not run on this platform,
- * so the Linux CI job is what proves either free. */
+ * so the Linux CI job is what proves either free.
+ *
+ * ---------------------------------------------------------------------------
+ * THE FIRST THING IT DOES, AND IT IS NOT A FREE: IT SAYS GOODBYE
+ * ---------------------------------------------------------------------------
+ * fed_send_shutdown() runs BEFORE the by_fd walk, because the walk is what closes
+ * the sockets a goodbye would have to travel on. This is the ONLY caller of
+ * fed_send_shutdown() in the tree (link.h says so, and this is where that claim is
+ * kept true), and it is the difference between a planned restart and a crash on
+ * every peer of the mesh:
+ *
+ *   without it  this node's peers discover the departure by TIMEOUT. T4 declares
+ *               the link dead, fed_retry_arm() spends budget, T7 dials three times
+ *               and gives up -- and the departing node's name stays in the roster
+ *               of every node until a SQUIT arrives, which it never will, because
+ *               the node that would have sent it is the one that went away.
+ *   with it     each peer gets a SHUTDOWN, marks the link CLEANLY departed
+ *               (link.c's T7 arm refuses a link with clean_leave set), purges that
+ *               origin's roster, and tells its own peers onward as a SQUIT.
+ *
+ * IT IS BEST EFFORT and the limit is real: the line is queued and drained by one
+ * conn_pump() per link, and everything after this point in the function closes the
+ * descriptors it was queued on. On a lossy path a goodbye can therefore be lost,
+ * and that degradation is CORRECT rather than a defect -- the peer that does not
+ * hear it applies its retry policy and finds the node gone. The cost of sending it
+ * is that a clean leave occasionally reads as a failure; the cost of not sending it
+ * is that EVERY clean leave reads as one.
+ *
+ * IT IS SAFE ON A server_t THAT NEVER FEDERATED, and on one whose links were never
+ * established, because the sender counts ESTABLISHED links with a live conn first
+ * and returns 0 when there are none -- so the four early server_shutdown() calls in
+ * node_main.c (fed_open() failed, a peer would not resolve, listen() failed) cost
+ * one pass over a link vector that is empty or has no ESTABLISHED entry. Those four
+ * paths are why this cannot sit behind "only if we federated": each of them is a
+ * startup failure with a partially built node, and a guard that asked a question of
+ * a half-built node would be a new way to fail during startup. */
 void server_shutdown(server_t *s);
 
 /* Bind and listen on `port` (host 0.0.0.0), nonblocking, with SO_REUSEADDR.

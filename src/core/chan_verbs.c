@@ -615,7 +615,6 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
         char canonical[CHAN_MAX_NAME + 1];
         chan_t *ch;
         int created = 0;
-        char prefix[CONN_HOSTMASK_MAX];
         chan_verdict_t verdict;
 
         if (!canonical_channel(s, c, names[i], canonical, sizeof canonical)) {
@@ -715,58 +714,86 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
             continue;
         }
 
-        /* The member goes on the channel and the channel goes on the
-         * connection. Neither derives from the other: a channel outlives a
-         * connection, and a connection outlives a channel.
-         *
-         * The CREATOR gets +o. This is not a convenience: RFC 1459 2.3.1 grants
-         * the creator channel-operator status, and without it a channel on this
-         * node would have no operator at all until an operator granted one -- and
-         * nobody could, because every MODE +o requires an operator. A channel
-         * with no reachable operator is a channel nobody can manage, so the
-         * creator's privilege is what makes +o, KICK and MODE reachable at all.
-         * It is the degenerate single-node case of 2.2's "first server to see a
-         * channel owns it": locally, the creator is the one with authority. */
-        if (chan_add_member(ch, c,
-                            (created != 0) ? CHAN_MEMBER_OP : 0u) != 0) {
-            (void)reply(s, c, "437", (const char *const[]){ ch->name }, 1,
-                        "Cannot join channel");
-            continue;
+        /* The member goes on the channel, the channel goes on the connection,
+         * and the mesh is told. All three are ONE function -- chan_admit() --
+         * and Phase 9 is why that matters: core/resume.c re-joins a client to
+         * its channels from a window, and a restore that had its own copy of
+         * this sequence would be a second place deciding what "this client is
+         * now a member" means. See chan_admit() for the extraction. */
+        if (chan_admit(s, c, ch, (created != 0) ? CHAN_MEMBER_OP : 0u) == 0) {
+            printf("[observable] chan_join: channel=%s nick=%s members=%zu "
+                   "origin=%s\n",
+                   ch->name, c->nick, ch->nmembers, ch->origin);
         }
-        if (chan_attach_conn(c, ch) != 0) {
-            /* Roll the membership back. A member record with no matching entry
-             * in conn_t::chans would never be removed on teardown -- a leak and a
-             * dangling pointer, and the two indexes disagreeing is the failure
-             * mode the comment in server.h warns about. */
-            (void)chan_remove_member(ch, c);
-            (void)reply(s, c, "437", (const char *const[]){ ch->name }, 1,
-                        "Cannot join channel");
-            continue;
-        }
-        printf("[observable] chan_join: channel=%s nick=%s members=%zu origin=%s\n",
-               ch->name, c->nick, ch->nmembers, ch->origin);
-
-        /* The echo goes to every member INCLUDING the joiner, and BEFORE the
-         * joiner's own numerics, so a client watching the channel sees the join
-         * arrive before the roster that includes it. */
-        if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
-            (void)reply(s, c, "437", (const char *const[]){ ch->name }, 1,
-                        "Cannot join channel");
-            continue;
-        }
-        /* Through 3.1's table rather than through broadcast(): on an OWNED
-         * channel this writes to the members and forwards to servers[] UNION the
-         * ESTABLISHED links, and on a non-owned one it forwards to the owner
-         * without a second local write -- the local one already happened above,
-         * and the non-owned row is "forward ONLY" precisely so that the ORIGIN
-         * is the node that emits to its members. */
-        deliver_state_change(s, c, ch, "JOIN", prefix, NULL, 0);
-
-        send_topic(s, c, ch);
-        send_names_list(s, c, ch);
-        send_creation_time(s, c, ch);
-        send_end_of_names(s, c, ch->name);
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * chan_admit() -- the ONE definition of "this client is now a member here"
+ * ---------------------------------------------------------------------------
+ *
+ * Four things, in this order, and the order is the correctness argument:
+ *
+ *   1. THE MEMBER RECORD AND THE CONNECTION'S OWN LIST. Neither derives from the
+ *      other -- a channel outlives a connection and a connection outlives a
+ *      channel -- so both are written, and a failure of the second ROLLS BACK
+ *      the first. A member record with no matching entry in conn_t::chans would
+ *      never be removed on teardown: a leak and a dangling pointer, and the two
+ *      indexes disagreeing is the failure mode server.h warns about.
+ *
+ *   2. THE JOIN ECHO, to every member INCLUDING the joiner and BEFORE the
+ *      joiner's own numerics, so a client watching the channel sees the join
+ *      arrive before the roster that includes it. It goes through 3.1's table
+ *      rather than through broadcast(): on an OWNED channel this writes to the
+ *      members and forwards to servers[] UNION the ESTABLISHED links, and on a
+ *      non-owned one it forwards to the owner without a second local write --
+ *      the local one already happened, and the non-owned row is "forward ONLY"
+ *      precisely so that the ORIGIN is the node that emits to its members.
+ *
+ *   3. THE JOINER'S OWN FOUR NUMERICS, in the order a client parses them:
+ *      topic, names, creation time, end of names. This is what makes a JOIN
+ *      self-describing, and it is why a restore can hand a client back its
+ *      channels without the client having to ask for anything.
+ *
+ * RETURNS 0 when the member is on the channel and has been told about it, and
+ * -1 with a 437 already sent otherwise. A caller that wants to count its own
+ * successes uses the return value rather than re-deriving it.
+ *
+ * WHY IT IS EXPOSED. core/resume.c's restore is a JOIN that nobody typed, and
+ * the alternative -- a resume that re-implemented the sequence -- would be a
+ * second definition of local membership, with its own ban check to forget and
+ * its own idea of which mesh to tell. Both callers ask the same question of the
+ * same channel, so both ask it here. */
+int chan_admit(server_t *s, conn_t *c, chan_t *ch, unsigned flags)
+{
+    char prefix[CONN_HOSTMASK_MAX];
+
+    if (s == NULL || c == NULL || ch == NULL) {
+        return -1;
+    }
+    if (chan_add_member(ch, c, flags) != 0) {
+        (void)reply(s, c, "437", (const char *const[]){ ch->name }, 1,
+                    "Cannot join channel");
+        return -1;
+    }
+    if (chan_attach_conn(c, ch) != 0) {
+        (void)chan_remove_member(ch, c);
+        (void)reply(s, c, "437", (const char *const[]){ ch->name }, 1,
+                    "Cannot join channel");
+        return -1;
+    }
+    if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
+        (void)reply(s, c, "437", (const char *const[]){ ch->name }, 1,
+                    "Cannot join channel");
+        return -1;
+    }
+    deliver_state_change(s, c, ch, "JOIN", prefix, NULL, 0);
+
+    send_topic(s, c, ch);
+    send_names_list(s, c, ch);
+    send_creation_time(s, c, ch);
+    send_end_of_names(s, c, ch->name);
+    return 0;
 }
 
 /* ---------------------------------------------------------------------------
