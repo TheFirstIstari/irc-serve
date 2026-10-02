@@ -789,7 +789,7 @@ saying otherwise is exactly the failure this document is written to prevent.
 | Spec | Unblocked by P10.1? | What is still missing, and where it lands |
 |---|---|---|
 | `account-registration` | **Yes, and REFUSED rather than implemented.** The identity it would describe exists and `330` reports it. | `REGISTER`/`UNREGISTER` answer `482`; the draft's own header says not to implement it in production and says to use `draft/account-registration`, and its wire form is `FAIL ACCOUNT_REGISTER`, which needs **standard-replies** (Phase 10 item 8). Design §2.5.2 gives four independent reasons. |
-| `account-tag` | **Yes — the identity it carries now exists.** | **The emission.** The capability is deliberately **withheld from `CAP LS`**, because the specification says the tag MUST NOT be sent for an unidentified user, so absence is an assertion and advertising without emitting tells every client that every logged-in user here is anonymous. Phase 10.2. Design §2.5.3. |
+| `account-tag` | **Yes — the identity it carries now exists.** | **Nothing.** **IMPLEMENTED in Phase 10.2a.** The tag is stamped once per emission in `fanout.c`, per destination on the recipient's own `account-tag` (plus `message-tags`), withheld from an unidentified sender, withheld from a node with no registry, and **not** forwarded across a link. Design §2.5.3. |
 | `account-notify` | **Yes.** | The unsolicited `ACCOUNT` line on login and logout, which is a *delivery* decision — it fans out to the user's own channels and needs `account-tag`'s emission settled first. Phase 10.2. |
 | `extended-join` | **Yes.** | The `JOIN` extension carrying account **and** realname, plus `cap 302`-style availability and a client that asks for it. Phase 10.3. |
 | `away-notify` | **Yes — and it needed nothing from this phase at all.** | The unsolicited `AWAY` on state change. It was never account-gated; it was simply not started. Listed here because issue #117 groups it with the account family, and the honest answer is that this phase unblocked **nothing** for it. Phase 10.3. |
@@ -797,11 +797,17 @@ saying otherwise is exactly the failure this document is written to prevent.
 | `oper-tag` | **Yes.** | The `+` tag on `PRIVMSG`/`NOTICE` — which needs **operator flags**, and **this node has no operator concept at all** (`CHOPER` answers `464` for every request). So `oper-tag` is now unblocked *as far as the account is concerned* and blocked *on a subsystem that does not exist*. Phase 10.8. |
 | `account-extban` | **Yes.** | `~&account:name` match types, which need the account **and** a ban-expression evaluator — and this node evaluates **no** channel modes beyond the ones §4.4 advertises. Phase 10.8. |
 
-**Summary: all seven are unblocked as far as the ACCOUNT is concerned; zero are
-implemented.** One (`away-notify`) was never account-gated at all. One (`oper-tag`)
-is blocked on operator flags rather than on accounts. One (`account-registration`)
-is delivered as a **refusal**, which is a decision rather than an implementation
-and is recorded as such.
+**Summary as of Phase 10.1: all seven are unblocked as far as the ACCOUNT is
+concerned; zero are implemented.** One (`away-notify`) was never account-gated at
+all. One (`oper-tag`) is blocked on operator flags rather than on accounts. One
+(`account-registration`) is delivered as a **refusal**, which is a decision rather
+than an implementation and is recorded as such.
+
+**Updated as of Phase 10.2a: `account-tag` is IMPLEMENTED**, which makes the count
+**one of seven implemented and six not.** The table above is the per-spec record and
+each row says which. Nothing else moved: `account-notify` and `extended-join` are
+Phase 10.2b and 10.3, `away-notify` and `chghost` were never account-gated, and
+`oper-tag` and `account-extban` are blocked on subsystems this node does not have.
 
 ### 10.3 What P10.1 actually delivered, with evidence
 
@@ -814,23 +820,28 @@ and is recorded as such.
 | `account == ""` indistinguishable from no account system | `account_logged_in()`, one writer, two stores | `test_account.c` runs **one** assertion set over a node with a registry and a node without |
 | Two operator files disagreeing ⇒ not identified | `account_set()`'s registry check | `test_account.c`: `reason=NOT_IN_REGISTRY`, then the not-identified path byte-for-byte |
 | `REGISTER`/`UNREGISTER` refused with `482`, never `421` | `core/commands.c` | `test_account.c`, with the 421 absence asserted |
-| **`account-tag` NOT advertised** | `src/core/cap.h` (the argument is in the header) | `test_account.c`: absent from `CAP LS`, NAKed by `CAP REQ`, and the whole list compared byte-for-byte on a default node |
+| **`account-tag` advertised only where it is emitted** | `src/core/cap.h` (the argument is in the header), `cap.c`'s `account_possible()` | `test_account.c`: in `CAP LS` and ACKed with a registry; absent and NAKed without one; the whole list compared byte-for-byte on a default node |
 | The one wire surface: `330 RPL_WHOISACCOUNT` | `src/core/msg_verbs.c` | `test_account.c`, from the client **and from a second client** |
 | The teardown arm | `server_shutdown()`, `[observable] account_store_close: store=OPEN|NONE` | asserted on both states; the `free` itself asserted by source inspection (`tf_calls`), because a line with no free behind it satisfies the line |
 
 ### 10.4 The honest limits of this phase
 
-- **The identity is visible in exactly one numeric.** `330`, on a `WHOIS`, by
-  number. It is not on any message a client sends, which is what `account-tag` is
-  for and is Phase 10.2.
+- **The identity is visible on ordinary traffic for LOCAL senders only.**
+  `account-tag` (Phase 10.2a) stamps it on every line an identified client emits
+  to a client that negotiated the capability, and `330 RPL_WHOISACCOUNT` still
+  answers a `WHOIS` about a person the client named. Neither reaches a message
+  this node **relayed**, and neither reaches a numeric — the tag on numerics is
+  the specification's SHOULD, not its MUST. Design §2.5.3 names all three.
 - **No client can create or delete an account.** By decision (§2.5.2), and the
   cost is stated: a deployment wanting open registration must not use this node.
-- **Accounts do not federate.** A registry is per node and per operator, exactly as
-  `sasl_store_t` is — design §2.1.1's second axis is not propagated over §2.3's
-  links, and a two-node mesh with two registries will disagree about who somebody
-  is. That is the same limitation `sasl_framework.h` states for credentials and
-  the same unresolved question §9's risk table points at; nothing here pretends
-  otherwise.
+- **Accounts do not federate, and that is now a WIRE decision rather than only a
+  limitation of the subsystem.** A registry is per node and per operator, exactly
+  as `sasl_store_t` is — a two-node mesh with two registries will disagree about
+  who somebody is. Phase 10.2a therefore **does not** put `+account` on a relayed
+  message (§2.5.3), so per-message identity stops at the node that verified the
+  credential; the account reaches a peer as **membership** state instead, through
+  `extended-join` (Phase 10.3). Closing the per-message gap needs an account
+  authority both nodes trust, and this node has none.
 - **`account-extban` and `oper-tag` are unblocked by accounts and blocked by
   subsystems that do not exist** (no channel-mode evaluator, no operator flags).
 - **Compliance is hand-written tests against spec text**, not a third-party runner:

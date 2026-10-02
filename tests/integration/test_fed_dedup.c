@@ -828,7 +828,17 @@ int main(void)
      * refuses it, and then one byte more is offered. Charged at 3.2's worst-case
      * tag overhead, which is why a body this node accepted from a client can
      * still be unforwardable: the tag block is added on the RELAY path, so a
-     * message sized for today would become undeliverable in Phase 6. */
+     * message sized for today would become undeliverable in Phase 6.
+     *
+     * THE BOUNDARY IS FOUND WITH fanout_line_fits_n(), NOT WITH
+     * fanout_line_fits(), and that is this phase making the distinction load
+     * bearing rather than cosmetic. fanout_line_fits() is the CLIENT-facing cap
+     * and charges the largest block this node may write to a MEMBER -- `msgid`
+     * and `account` -- because a member's line is the one that carries it. The
+     * forward here is a RELAY: what it carries is 2.4's internal block, which
+     * IRC_MAX_RELAY_LINE already excludes by construction, and charging a second
+     * block for it would make this cap reject lines it can actually send. Ask
+     * the peer-facing predicate the question about the peer-facing limit. */
     {
         size_t lo = 0;
         size_t hi = (size_t)IRC_MAX_LINE;
@@ -840,7 +850,7 @@ int main(void)
 
             memset(body, 'x', mid + 1u);
             body[mid] = '\0';
-            if (fanout_line_fits(NODE_NAME, "SPRIVMSG", CHAN, body) != 0) {
+            if (fanout_line_fits_n(NODE_NAME, "SPRIVMSG", strlen(CHAN), mid) != 0) {
                 lo = mid;
             } else {
                 hi = mid - 1u;

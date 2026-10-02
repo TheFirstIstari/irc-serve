@@ -17,6 +17,7 @@
 
 #include "core/commands.h"
 #include "core/reply.h"
+#include "account_store.h"
 #include "sasl_framework.h"
 
 /* --------------------------------------------------------------------------
@@ -31,7 +32,8 @@ enum {
     CAPBIT_MULTIPREFIX = 1u << 0,
     CAPBIT_MESSAGE_TAGS = 1u << 1,
     CAPBIT_MESSAGE_IDS = 1u << 2,
-    CAPBIT_SASL = 1u << 3
+    CAPBIT_SASL = 1u << 3,
+    CAPBIT_ACCOUNT_TAG = 1u << 4
 };
 
 /* THE BIT ORDER IS FIXED AND THE TABLE BELOW IS THE CLAIM.
@@ -57,7 +59,8 @@ static const cap_def_t k_caps[] = {
     { CAP_MULTIPREFIX, CAPBIT_MULTIPREFIX },
     { CAP_MESSAGE_TAGS, CAPBIT_MESSAGE_TAGS },
     { CAP_MESSAGE_IDS, CAPBIT_MESSAGE_IDS },
-    { CAP_SASL, CAPBIT_SASL }
+    { CAP_SASL, CAPBIT_SASL },
+    { CAP_ACCOUNT_TAG, CAPBIT_ACCOUNT_TAG }
 };
 
 static const size_t k_ncaps = sizeof k_caps / sizeof k_caps[0];
@@ -80,6 +83,33 @@ static int sasl_possible(const server_t *s)
     return (s != NULL && sasl_store_count(s->sasl_store) > 0u) ? 1 : 0;
 }
 
+/* Is this node able to say WHO somebody is? `account-tag`, and the question is
+ * asked of the REGISTRY rather than of the credential store, because the two files
+ * answer different things and only one of them is about identity: --sasl-store
+ * says who may AUTHENTICATE, --account-store says which accounts EXIST (design
+ * 2.5.1).
+ *
+ * IT IS sasl_possible()'s SHAPE AND sasl_possible()'s REASON. A node with no
+ * registry cannot establish an account on ANY connection -- account_set()'s
+ * second check consults it and a missing registry fails that check -- so a CAP LS
+ * that listed `account-tag` there would be a client switching on a tag this node
+ * will never write, and the specification's "the tag MUST NOT be sent" for an
+ * unidentified user means the only lines it could ever see are ones whose silence
+ * it would read as "anonymous". Withholding the name is the same answer as
+ * withholding `sasl` with no credential store.
+ *
+ * THE COST, stated rather than implied: an operator who loads a registry and
+ * whose credential store FAILED to load has accounts nobody can log in to, so
+ * nobody is ever identified, so this returns 1 and the tag is advertised -- and
+ * every client that negotiates it correctly sees no tag. That is the truth about
+ * the node, and the alternative (refusing the name because a different file
+ * failed) would be a capability gated on something that does not decide whether
+ * this one is real. */
+static int account_possible(const server_t *s)
+{
+    return (s != NULL && account_store_count(s->account_store) > 0u) ? 1 : 0;
+}
+
 int cap_known(const char *name)
 {
     if (name == NULL || name[0] == '\0') {
@@ -100,6 +130,9 @@ int cap_available(const server_t *s, const char *name)
     }
     if (strcasecmp(name, CAP_SASL) == 0) {
         return sasl_possible(s);
+    }
+    if (strcasecmp(name, CAP_ACCOUNT_TAG) == 0) {
+        return account_possible(s);
     }
     return 1;
 }
@@ -198,6 +231,28 @@ int cap_message_ids_enabled(const conn_t *c)
      * the client opted out of tags -- and the alternative (stamping anyway) is a
      * node that lies about a negotiated protocol. */
     return (cap_enabled(c, CAP_MESSAGE_IDS) != 0 &&
+            cap_enabled(c, CAP_MESSAGE_TAGS) != 0)
+               ? 1
+               : 0;
+}
+
+/* account-tag: BOTH GATES, and the second for the same reason as above -- the
+ * `account` tag is a message tag, and 3.2's parser reads a block or it does not.
+ *
+ * THE FIRST GATE IS THE ONE THE SPECIFICATION IS ABOUT. `account-tag` names the
+ * account of the SENDER, so a client that did not ask must not be told: the tag is
+ * not decoration, its ABSENCE is the assertion that a sender is anonymous, and
+ * writing it to a client that declined to negotiate tags is a node putting a block
+ * on a line the client has said it does not want to parse.
+ *
+ * THE COST, stated because it is a cost: a client that sends
+ * `CAP REQ :account-tag` without `message-tags` gets an ACK for account-tag and no
+ * tag on any line. That is the honest answer -- the REQ said it wanted one tag
+ * inside a tag support it declined -- and it is the same answer
+ * cap_message_ids_enabled() gives for the same reason. */
+int cap_account_tag_enabled(const conn_t *c)
+{
+    return (cap_enabled(c, CAP_ACCOUNT_TAG) != 0 &&
             cap_enabled(c, CAP_MESSAGE_TAGS) != 0)
                ? 1
                : 0;

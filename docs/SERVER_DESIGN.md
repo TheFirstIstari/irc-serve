@@ -117,8 +117,9 @@ is not an operator flag, not channel privilege, not an exemption from a mode
 change and not a mode any consumer reads yet. §5's Phase 8 entry says SASL
 "grants nothing: no operator flag, no channel privilege, no service, no exemption
 from a mode change", and the account identity is on the same footing. What it
-buys is **visibility** — `330 RPL_WHOISACCOUNT` reports it and §2.1.2's
-`account-tag` will stamp it — and visibility is not authority. A later phase that
+buys is **visibility** — `330 RPL_WHOISACCOUNT` reports it when a client asks, and
+`account-tag` stamps it on every line an identified sender emits (§2.5.3) — and
+visibility is not authority. A later phase that
 wants `logged_in` to mean a *privilege* is making a different decision and owes a
 threat model for it.
 
@@ -475,42 +476,97 @@ standard-replies.
 not heard of it, which is true, and a capability this node refuses is a `421`
 rather than a `NAK`.
 
-#### 2.5.3 WHY `account-tag` IS **NOT** IN `k_caps[]`
+#### 2.5.3 `account-tag`: THE EMISSION, AND WHERE IT STOPS
 
-**The capability entry is NOT in the table, and this is a decision rather than an
-omission.** The task of adding it was available and was declined, and the reason
-is the specification's own sentence:
+**Added in Phase 10.2.** Phase 10.1 built the identity and deliberately left the
+capability **out** of `cap.c`'s table. Both halves are now on, and this subsection
+is the argument for where the tag is emitted and where it stops.
+
+**WHY 10.1 WAS RIGHT TO WITHHOLD IT, AND WHY WITHHOLDING IT IS NO LONGER THE
+ANSWER.** The specification's own sentence is the whole of it:
 
 > The tag MUST be named `account`… If the user is not identified to any services
 > account, the tag MUST NOT be sent.
 
-**The tag's ABSENCE is an assertion.** A client reads "no `account` tag" as "this
-user is anonymous". So advertising `account-tag` on a node that does not emit the
-tag would not merely fail to help — it would tell every client that **every
-logged-in user on this node is anonymous**. This node *has* logins now, so that
-is the subsystem's entire observable purpose inverted by its own advertisement.
+The tag's **absence is an assertion**. A client reads "no `account` tag" as "this
+user is anonymous", so advertising `account-tag` on a node that never emits the
+tag tells every client that **every logged-in user on this node is anonymous** —
+which, once a registry exists, is the subsystem's entire observable purpose
+inverted by its own advertisement. A **missing** capability is a client that
+carries on; a **listed** one is a client that draws the wrong conclusion from
+every line. That reasoning was correct, and the resolution was never to overturn
+it: **the name went in at the same moment as the emission**, so the advertisement
+is a claim about something real rather than about an absence.
 
-The same rule `cap.c` exists for applies with the sign flipped: a **missing**
-capability is a client that carries on; a **listed** one is a client that draws
-the wrong conclusion from every line it receives. And a store check would not
-save it — the check `sasl_possible()` makes asks whether there is anything to
-**say**, and with no emission there is nothing to say however many accounts exist.
+**THE AVAILABILITY CHECK IS `account_possible()`, BESIDE `sasl_possible()`.** A
+node with no `--account-store` can never establish an account on any connection —
+`account_set()`'s second check consults the registry and an absent registry fails
+it — so listing `account-tag` there would be a client switching on a tag this node
+will never write. `CAP LS` on such a node is byte-for-byte what it was before this
+phase, and that invariant has a test of its own (`test_default_node`).
 
-It lands with the emission, with the availability check beside `sasl_possible()`.
+**WHERE THE TAG IS STAMPED, AND WHY THAT IS THE ONLY CORRECT POINT.**
+`fanout_deliver()`, **once per emission**, above the routing switch:
 
-**What *is* on the wire, and why it is not `account-tag`:** `330
-RPL_WHOISACCOUNT` in `WHOIS` (§4.4's sixth added numeric). It answers a question
-a client **asked**, on a connection that already registered, about a person it
-named; nothing is stamped on anybody's traffic, and no capability negotiates it.
-It is in this phase for one further reason: without it, §2.1.1's invariant has
-**no wire proof at all**, because "a node with accounts and a node without answer
-a not-logged-in client identically" is only checkable if a logged-in client
-produces something *different* — and `test_account.c` runs one set of assertions
-over both configurations for exactly that reason. The cost is stated at the
-emission: one more line in a WHOIS, so a client must find `330` by number rather
-than by offset, and it is the only place a person's account name is revealed to
-another user, so an operator who does not want that has no way to switch it off
-short of not loading a registry.
+- **The account NAME is resolved once**, in `fanout_emitter_account()`, from the
+  emission's own `prefix`. Every line this node originates carries the acting
+  client's hostmask (RFC 2812 3.3.1), so the prefix **is** the identity the
+  emission is about; the local nick registry answers it, and a prefix naming
+  nobody local resolves to `""`. It has the same shape as 2.4's `(origin, epoch,
+  id)`, computed by `fanout_stamp()` at the same point, for the same reason: an
+  identity is a property of one emission.
+- **The DECISION to render it is per destination**, in `fanout_tag_block()`,
+  because the capability is per connection. Two members of one channel are free to
+  disagree about whether they want to be told who sent a message, and a block
+  written once for the emission would put it on the line of the one who asked for
+  none.
+- **Resolving the name per forward target is the `msgid` bug again.** It looks up
+  "whoever is at the other end" instead of "who sent this", which on a relayed
+  `SPRIVMSG` resolves to nothing and drops the tag for exactly the messages whose
+  sender identity is in question.
+
+**`message-tags` IS REQUIRED AS WELL, and the reason is `draft/message-ids`'s.**
+`account` is a tag, and 3.2's parser reads a block or it does not; a client that
+asked for `account-tag` inside a support it declined does not get one. The cost is
+stated at the emission: a client whose `CAP REQ` lists `account-tag` alone gets an
+ACK and no tag.
+
+**`+account` DOES NOT CROSS TO A PEER — a deliberate decision.** An account
+registry is **per node and per operator**: §2.1.1 says two nodes with two
+registries will disagree about who somebody is, with nothing to arbitrate.
+Forwarding one node's claim would hand the far side's clients an identity no
+registry they can consult holds, and a client has no way to check it — the tag is
+precisely the assertion a client trusts. **This node asserts only what it
+verified**, and the relay arm of `fanout_emitter_account()` is one branch on
+`relayed` rather than a property of the prefix's bytes.
+
+*The cost, named:* a member of a shared channel on a peer sees **no** `account`
+tag on the peer's messages, so per-message identity stops at the node that
+authenticated the sender. `extended-join` (Phase 10.3) carries the account as
+**membership** state, which is the claim federation does have a channel for.
+Closing the per-message gap needs an **account authority both nodes trust** — a
+services registry, not a tag — and this node has none.
+
+**`330 RPL_WHOISACCOUNT` IS STILL WORTH HAVING** (§4.4), because a `WHOIS`
+answers a question a client asked **about a person it named** — which is how a
+client learns an account for somebody who has said nothing since joining, and
+which the tag cannot answer at all.
+
+**WHAT THE LINE BUDGET COSTS.** 3.2 reserves `IRC_MAX_TAG_OVERHEAD` (179 bytes)
+for whatever block an outbound line carries. A client-facing line may now carry
+`msgid` **and** `account`, whose worst case is larger, so `fanout_line_fits()`
+charges the largest client-visible block against `IRC_MAX_RELAY_LINE` rather than
+leaving the overflow to be discovered when `message_format()` refuses the line. The
+cost is a **250-byte shorter maximum `PRIVMSG`**; the alternative is losing a
+user's message to a decoration at the cap. The peer-facing predicate
+(`fanout_line_fits_n()`) is unchanged, because a forwarded line carries 2.4's
+internal block and `IRC_MAX_RELAY_LINE` already excludes it by construction.
+
+**AND WHAT IS STILL NOT HERE.** `account-tag` does not reach **numerics** ("directly
+caused by the sender"). The specification says **SHOULD**, not MUST, and an
+erratum relaxed it precisely because it was widely not implemented; adding it would
+mean the numeric path grows a tag block of its own, and this node's numerics carry
+a client's own reply rather than a message.
 
 #### 2.5.4 WHERE IT IS FREED, for LeakSanitizer
 
@@ -1098,11 +1154,13 @@ Phase 10.1 added a sixth of the same kind, and the gap is the same shape:
   **sent only when there is an account**. RFC 1459 3.3.4 defines it and §2.1.1's
   account identity is what finally gives it a second parameter to carry: before
   Phase 10.1 this tree had no `<account>` value to put in it. Its absence means
-  "not identified", which on this node is exactly and only true. §2.5.3 carries
-  the whole argument for why it is sent while `account-tag` is withheld, and that
-  argument is **not** "330 is safer than a tag" — it is that a `WHOIS` answers a
-  question the client asked about a person it named, while a tag is stamped on
-  traffic whether the client wants it or not.
+  "not identified", which on this node is exactly and only true.
+  It is still worth having **now that `account-tag` exists**, and the two are not
+  redundant: a `WHOIS` answers a question a client asked **about a person it
+  named**, which is how a client discovers an account for somebody who has said
+  nothing since joining, and a tag answers "who sent *this line*" for a client that
+  negotiated it. §2.5.3 says when each is asked for, and it is also the only place
+  a person's account name is revealed to a user who negotiated nothing at all.
 
 `432` `ERR_ERRONEUSNICKNAME` is for a nickname that is **malformed** — illegal
 under §2.1. It is distinct from `433` `ERR_NICKNAMEINUSE`, which is for a legal
@@ -1573,17 +1631,24 @@ know who is logged in on *every* message and `extended-join` needs the account o
 What landed: §2.1.1's second axis on `conn_t`; §2.5's registry as a separate
 operator file; §2.5.2's refusal of `REGISTER`/`UNREGISTER`; and §2.5.3's
 deliberate **absence** of `account-tag` from `cap.c`'s table. The one wire
-surface is `330 RPL_WHOISACCOUNT` (§4.4).
+surface was `330 RPL_WHOISACCOUNT` (§4.4).
 
-**What is NOT in Phase 10.1, and why each was left:** `account-tag` **emission**,
+**What was NOT in Phase 10.1, and why each was left:** `account-tag` **emission**,
 `account-notify`, `extended-join`, `oper-tag`, `chghost`, `account-extban` and
-`away-notify` all **consume** this subsystem and are P10.2/P10.3/P10.8. chathistory
-and websocket/sts/SASL-SCRAM are **decisions for the user, not implementation
-tasks** — chathistory because this design's posture is fail-closed with no
-buffered state, and that is a genuine conflict with §2.2's disposal rules rather
-than an omission.
+`away-notify` all **consume** this subsystem and were P10.2/P10.3/P10.8.
+chathistory and websocket/sts/SASL-SCRAM are **decisions for the user, not
+implementation tasks** — chathistory because this design's posture is fail-closed
+with no buffered state, and that is a genuine conflict with §2.2's disposal rules
+rather than an omission.
 
-**The remaining order, unchanged by 10.1:** 10.2 `account-tag` + `account-notify`;
+**Phase 10.2a — `account-tag` (issue #117). COMPLETE.** §2.5.3's emission: the tag
+is stamped once per emission in `fanout.c`, gated per destination on the
+recipient's own `account-tag`, withheld from an unidentified sender and withheld
+from a node with no registry — and the capability went into `cap.c`'s table **in
+the same pass**, which is what resolves rather than overturns the argument 10.1
+made for leaving it out.
+
+**The remaining order, unchanged by 10.1:** 10.2 `account-notify`;
 10.3 `extended-join`, `away-notify`, `chghost`; then the nine with no dependencies —
 `extended-isupport`, `userhost-in-names`, `setname`, `echo-message`,
 **standard-replies** (which §2.5.2 is waiting on), `labeled-response` +
@@ -1707,11 +1772,13 @@ Federated:
       for the four reasons in §2.5.2, so this criterion is only reachable by an
       operator editing a file. (b) An account **cannot be left**, and `UNREGISTER`
       is refused for the same family of reasons (§2.5.2 reason 4), so an account's
-      lifetime is entirely the operator's business. (c) The identity is **not yet
-      visible on ordinary traffic**: `account-tag` emission is Phase 10.2 and the
-      capability is deliberately **withheld** from `CAP LS` until then, because the
-      tag's absence is an assertion (§2.5.3). What exists is a subsystem and one
-      reporting numeric, not a network-visible identity.
+      lifetime is entirely the operator's business. (c) The identity **is now
+      visible on ordinary traffic** for a client that negotiated `account-tag` on a
+      node with a registry (§2.5.3), and **not at all across a link** — the tag
+      stops at the node that verified the credential, because an account registry
+      is per node and per operator and a peer cannot check the claim. The same
+      subsection states that limit as a cost rather than leaving it to be
+      discovered.
 - [x] *Phase 10.1:* **`account == ""` is indistinguishable from "this node has no
       account system"**, and the invariant is structural rather than conventional:
       one writer, two stores consulted, a connection-local predicate. A
@@ -1788,6 +1855,7 @@ Quality:
 | Nick charset left unvalidated | `nick@server` ambiguous; scoped identity unsound | `valid_nick()` in Phase 1 (§5) |
 | Vector clocks reopened | scope creep | Deliberately rejected in §2.4; explicitly not a Phase 9 item |
 | **An account name becomes a claimable string** (Phase 10.1) | impersonation: `account-tag` stamps the name on every message, so a name anybody can take is a name that proves nothing — and is a tool against the people who chose theirs | **Registration is operator-side only.** `REGISTER` is refused (§2.5.2), so the name space changes only when an operator edits a file, and only ONE writer of `conn_t::account` exists and it requires a credential verified against *two* operator stores. The cost is stated: no client may create an account, so a deployment that wants open registration must not use this node. |
-| **Advertising `account-tag` before emitting it** (Phase 10.1) | every client concludes every logged-in user is anonymous — the tag's absence is an assertion | **The capability is not in `cap.c`'s table**, with the full argument in §2.5.3, and the teeth include the inverted rule: adding the name with a store check still fails the suite. |
+| **Advertising `account-tag` without emitting it** (Phase 10.1) | every client concludes every logged-in user is anonymous — the tag's absence is an assertion | **RESOLVED in Phase 10.2, and by doing the thing 10.1 declined rather than by reversing it.** The capability is now in `cap.c`'s table *and* the tag is emitted (§2.5.3), so the advertisement is a claim about something real. The whole argument is still written down at §2.5.3 and at `cap.h`, because the incoherent version is one table line away. |
+| **Stamping `+account` on a relayed message** (Phase 10.2) | a client is shown an account name no registry it can consult holds, and cannot check it — the tag is exactly the assertion a client trusts | **The relay arm resolves nothing** (`fanout_emitter_account()` branches on `relayed`), because an account registry is per node and per operator. The cost is named at §2.5.3: per-message identity stops at the authenticating node. |
 | **Account identity treated as authority** (Phase 10.1) | a future phase reads `logged_in` as a privilege and every access-control rule silently inherits it | `logged_in` is documented at the struct and at the module as a NAME plus a VERIFICATION and grants nothing (§2.1.1), and the "what none of them grant" block in `connection.h` says so where a future editor will read it |
 | **The account store drifting from the credential store** (Phase 10.1) | a client authenticates and is not identified, or is identified for a name the operator removed | Both must agree or authentication stops (§2.5.1), the refusal is counted on `n_account_refused` and named on the node's own output, and `test_account.c` runs the not-identified path against a node whose two files **disagree** — byte-identical to a node with no registry at all |

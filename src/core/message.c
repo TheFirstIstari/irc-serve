@@ -937,8 +937,6 @@ int irc_serve_tags_parse(const message_t *m, irc_serve_tags_t *out)
  * true.
  * ------------------------------------------------------------------------ */
 
-static const char TAG_MSGID[] = "msgid";
-
 /* The '_' that separates the three fields. Spelled as a constant rather than
  * written into the format string because it is the load-bearing byte of the
  * whole format: message.h's argument is that 2.4's origin grammar excludes it,
@@ -1013,7 +1011,7 @@ size_t irc_serve_msgid_tag(const irc_serve_tags_t *t, char *out, size_t cap)
     if (vlen == 0u) {
         return 0;
     }
-    const message_tag_t one[1] = { { TAG_MSGID, value } };
+    const message_tag_t one[1] = { { IRCV3_TAG_MSGTAG, value } };
 
     return message_tags_format(one, 1, out, cap);
 }

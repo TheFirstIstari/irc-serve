@@ -51,25 +51,33 @@
  *     registry disagree is not "no opinion": the client authenticates and is not
  *     identified, which is byte-identical to case 3. That is the whole of
  *     account_set()'s second check.
- *  5. **`account-tag` IS NOT ADVERTISED, EVEN WITH A REGISTRY LOADED.** This is
- *     "advertise only what is real" in the sharpest form available: the tag's
- *     ABSENCE is meaningful to a client (the specification says it MUST NOT be
- *     sent for an unidentified user), so advertising the capability without
- *     emitting the tag tells every client that every logged-in user here is
- *     anonymous. A `CAP REQ :account-tag` is NAKed.
- *  6. **NOTHING IN THIS PHASE EMITS THE TAG.** `@account=` and `+account` appear
- *     nowhere on the wire, from a client that negotiated nothing and from a node
- *     with a full registry.
- *  7. **REGISTER AND UNREGISTER ARE REFUSED WITH 482, NOT 421.** A client that
+ *  5. **`account-tag` IS ADVERTISED ONLY WHERE IT IS EMITTED.** With a registry
+ *     loaded it is in `CAP LS` and a `CAP REQ` ACKs it; with NO registry it is
+ *     absent from `CAP LS` and NAKed, byte for byte the list a node configured
+ *     with neither option advertises. That is Phase 10.2's whole argument: the
+ *     tag's ABSENCE is meaningful to a client, so the capability and the emission
+ *     have to appear together or not at all.
+ *  6. **THE TAG IS PER DESTINATION.** A client that negotiated
+ *     `message-tags account-tag` gets `account=` on the lines a logged-in sender
+ *     emits to it; a client that negotiated `message-tags` alone gets a block
+ *     with a `msgid` and NO `account`; a client that negotiated nothing gets no
+ *     block at all. And an ANONYMOUS sender's lines carry no `account` even for
+ *     the client that asked, which is the half the specification's "MUST NOT be
+ *     sent" is about.
+ *  7. **THE TAG DOES NOT CROSS TO A PEER.** Two linked nodes, a logged-in client
+ *     on one and a client that asked for `account-tag` on the other: the far side
+ *     receives the message with a `msgid` and with no `account`. The decision and
+ *     its cost are at fanout.c's fanout_emitter_account().
+ *  8. **REGISTER AND UNREGISTER ARE REFUSED WITH 482, NOT 421.** A client that
  *     got 421 would read "this server has never heard of REGISTER"; this node
  *     has heard of it and has decided.
- *  8. **THE STORE IS A SECRET FILE.** A world-readable registry, a malformed
+ *  9. **THE STORE IS A SECRET FILE.** A world-readable registry, a malformed
  *     record and a path that does not exist are each REFUSED, and each refusal
  *     lands the node in exactly the state case 3 asserts.
- *  9. **AN ACCOUNT PASSWORD IS NEVER LOGGED.** The password is handed to
+ * 10. **AN ACCOUNT PASSWORD IS NEVER LOGGED.** The password is handed to
  *     account_set() and there is no variable holding it afterwards, so the
  *     node's own output is read and checked.
- * 10. **THE TEARDOWN ARM RAN**, with the state it found.
+ * 11. **THE TEARDOWN ARM RAN**, with the state it found.
  *
  * ---------------------------------------------------------------------------
  * NO sleep() ANYWHERE (6.3), AND NO PORT COLLISION
@@ -88,6 +96,9 @@
 #include <unistd.h>
 
 #include "core/account.h"
+#include "core/channel.h"
+#include "core/fanout.h"
+#include "core/message.h"
 #include "harness/irc_client.h"
 #include "harness/node_fixture.h"
 #include "harness/test_util.h"
@@ -236,6 +247,36 @@ static size_t drain(client_t *cl)
     return (at != NULL) ? (size_t)(at - tc_buffer(&cl->c)) : 0u;
 }
 
+/* drain() FOR A NODE WHOSE NAME IS NOT BIN_NAME, and the reason it cannot be
+ * drain() is the whole of what the two-node case does differently.
+ *
+ * A PONG is `:\<server> PONG \<server> <token>`, so it carries the NAME of the
+ * node that answered it. drain() builds its needle from BIN_NAME, which is right
+ * for every single-node case here and wrong for this one: waiting for
+ * `PONG irc.test q27` on a node called irc.a waits fifteen seconds for a PONG the
+ * node already sent, and reports it as "the node stopped answering".
+ *
+ * It is a second function rather than a parameter because the name is a property
+ * of the NODE and every other helper in this file takes the client -- a
+ * client-side `server` field would be one more fact a test could set wrong
+ * silently, and the one thing worth being explicit about here is that the name is
+ * NOT the client's to choose. */
+static size_t drain_on(client_t *cl, const char *server)
+{
+    char line[64];
+    char needle[96];
+    const char *at;
+
+    g_drain_seq++;
+    (void)snprintf(line, sizeof line, "PING :q%u", g_drain_seq);
+    (void)snprintf(needle, sizeof needle, "PONG %s q%u\r\n", server, g_drain_seq);
+    TF_CHECK_MSG(tc_send(&cl->c, line) == 0, "drain PING send failed");
+    TF_CHECK_MSG(tc_expect(&cl->c, needle, T_IO_MS) == 0, "no PONG for %s", line);
+    at = strstr(tc_buffer(&cl->c), needle);
+    TF_CHECK_MSG(at != NULL, "the drain PONG vanished from the buffer");
+    return (at != NULL) ? (size_t)(at - tc_buffer(&cl->c)) : 0u;
+}
+
 static void expect_in_window(client_t *cl, size_t from, size_t end,
                              const char *what, const char *want)
 {
@@ -254,6 +295,24 @@ static void expect_in_window(client_t *cl, size_t from, size_t end,
                  what, want);
     TF_CHECK_MSG(at == base + from || at[-1] == '\n',
                  "%s: \"%s\" is not at the start of a line", what, want);
+}
+
+/* A needle ANYWHERE in the window, with no line-start requirement.
+ *
+ * It exists for exactly one shape: a delivered line that carries BOTH `msgid` and
+ * `account`, where the value under test is the SECOND pair and the bytes before it
+ * are a msgid whose epoch and id this test cannot spell. Asserting from the start
+ * of that line would mean asserting a number the node chooses, and asserting a
+ * substring of it is still an assertion about the account tag's own spelling and
+ * its position after the prefix. */
+static void expect_text_in_window(client_t *cl, size_t from, size_t end,
+                                  const char *what, const char *needle)
+{
+    const char *base = tc_buffer(&cl->c);
+
+    TF_CHECK_MSG(end > from, "%s: the window was never closed", what);
+    TF_CHECK_MSG(strstr(base + from, needle) != NULL,
+                 "%s: expected \"%s\" somewhere in the window", what, needle);
 }
 
 static void expect_absent_in_window(client_t *cl, size_t from, size_t end,
@@ -524,26 +583,65 @@ static void expect_account_name_never_empty(const nf_node_t *node)
 }
 
 /* --------------------------------------------------------------------------
- * ASSERT THAT NO account TAG REACHED THE WIRE, in either direction.
+ * A LINE IN A WINDOW, AND WHAT IS OR IS NOT ON IT
  * --------------------------------------------------------------------------
- * `account-tag` is P10.2's emission and this phase does not do it. The check
- * has to be a CHECK and not an omission, because "the code has no +account
- * anywhere" is exactly the kind of claim that a future edit can invalidate
- * silently.
+ * Two shapes of assertion the tag needs and neither of which the primitives
+ * above can express, so both are here rather than spelled out at each call site:
  *
- * BOTH DIRECTIONS, and the distinction is worth recording: this node never
- * echoes a client's inbound tag block on an outgoing line (fanout's local write
- * is driven by the parameters and the internal 2.4 stamp, not by what the client
- * tagged), so `@account=` cannot appear either -- and if it ever did, a client
- * would be able to ASSERT its own account to another, which is the impersonation
- * primitive the specification exists to close. */
-static void expect_no_account_tag_on_the_wire(const test_client_t *cl)
+ *   expect_tag_block_present()  -- some line in the window begins with `@`, which
+ *     is what proves the DESTINATION was written to with a block at all. Without
+ *     it "no `account` tag" is also satisfied by a node that wrote no tags to
+ *     anybody, which is a different bug with the same symptom.
+ *   expect_no_tag_block()        -- no line in the window begins with `@`, so
+ *     "no `account` tag" cannot be satisfied by there having been no block to
+ *     put one in.
+ *
+ * BOTH WALK LINES rather than searching for a byte, because a `@` inside a
+ * message body is not a tag block and a test that cannot tell the difference is a
+ * test that will fail the day somebody says PRIVMSG to a channel about an email
+ * address. */
+/* Does any LINE in the window begin with `c`? A tag block always starts a line
+ * and a '@' anywhere else is a character in somebody's message, so this is a
+ * line-start walk rather than a strstr(). */
+static int window_line_starts_with(const client_t *cl, size_t from, size_t end,
+                                   char c)
 {
-    TF_CHECK_MSG(strstr(tc_buffer(cl), "@account=") == NULL,
-                 "an `account` tag was written onto the wire; that is P10.2's "
-                 "emission and this phase does not do it");
-    TF_CHECK_MSG(strstr(tc_buffer(cl), "+account") == NULL,
-                 "an `account` tag reached the wire from the inbound direction");
+    const char *base = tc_buffer(&cl->c);
+
+    if (end <= from) {
+        return 0;
+    }
+    for (const char *p = base + from; p < base + end; p++) {
+        if ((p == base + from || p[-1] == '\n') && *p == c) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void expect_tag_block_present(client_t *cl, size_t from, size_t end,
+                                     const char *what)
+{
+    TF_CHECK_MSG(end > from, "%s: the window was never closed", what);
+    /* The window is DUMPED on failure, and that is not decoration: this is the one
+     * assertion in the file whose failure has two quite different causes -- a node
+     * that wrote no block, and a window that was closed before the message was
+     * delivered -- and the bytes tell them apart immediately. */
+    if (window_line_starts_with(cl, from, end, '@') == 0) {
+        TF_CHECK_MSG(0, "%s: no line in the window carries a tag block at all, so "
+                        "\"the account tag is absent\" would be satisfied by a node "
+                        "that wrote no tags to anybody\n  nick=%s\n  window=[%s]",
+                     what, cl->nick, tc_buffer(&cl->c) + from);
+    }
+}
+
+static void expect_no_tag_block(client_t *cl, size_t from, size_t end,
+                                const char *what)
+{
+    TF_CHECK_MSG(end > from, "%s: the window was never closed", what);
+    TF_CHECK_MSG(window_line_starts_with(cl, from, end, '@') == 0,
+                 "%s: a tag block was written to a connection that negotiated "
+                 "nothing", what);
 }
 
 /* ==========================================================================
@@ -635,29 +733,39 @@ static void test_logged_in(const char *sasl, const char *registry)
 
     client_connect(&alice, &node, "alice");
 
-    /* ---- `account-tag` IS NOT ADVERTISED, EVEN THOUGH THERE ARE ACCOUNTS ----
+    /* ---- `account-tag` IS ADVERTISED, AND IT IS EMITTED (below) --------------
      *
-     * Checked in three forms so that no single one of them can be the thing doing
-     * the work: absent from LS, NAKed by REQ, and not granted by the refusal. The
-     * reason is the specification's own sentence -- an absent `account` tag means
-     * "not identified" -- so advertising this without emitting the tag would
-     * tell every client that every logged-in user on this node is anonymous. */
+     * Phase 10.1 deliberately withheld this name, and the reason -- the tag's
+     * ABSENCE is an assertion, so advertising without emitting tells every client
+     * that every logged-in user here is anonymous -- is the reason it may be
+     * advertised now: the emission is in the same pass. Both halves at once is
+     * the whole of the requirement, so the advertisement is asserted here and the
+     * tag is asserted on the wire in the case below rather than by a comment.
+     *
+     * Checked in three forms so no single one can be the thing doing the work:
+     * present in LS, ACKED by REQ, and -- the one that would catch a node that
+     * ACKed it and then wrote nothing -- the tag itself, asserted exactly on a
+     * delivered line. */
     TF_CHECK_MSG(tc_send(&alice.c, "CAP LS") == 0, "CAP LS send failed");
     TF_CHECK_MSG(tc_expect(&alice.c, " CAP * LS :", T_IO_MS) == 0, "no CAP LS");
-    TF_CHECK_MSG(strstr(tc_buffer(&alice.c), "account-tag") == NULL,
-                 "CAP LS advertised account-tag on a node that does not emit the "
-                 "tag");
+    TF_CHECK_MSG(strstr(tc_buffer(&alice.c), "account-tag") != NULL,
+                 "CAP LS did not advertise account-tag on a node with a loaded "
+                 "registry; the tag is emitted, so the name must be listed");
     TF_CHECK_MSG(tc_send(&alice.c, "CAP REQ :account-tag") == 0,
                  "CAP REQ send failed");
-    TF_CHECK_MSG(tc_expect(&alice.c, " CAP * NAK :account-tag\r\n", T_IO_MS) == 0,
-                 "account-tag was not NAKed");
-    TF_CHECK_MSG(strstr(tc_buffer(&alice.c), " ACK :account-tag") == NULL,
-                 "the node ACKed a capability it does not implement");
-    /* And the advertised set is otherwise exactly what a node with a credential
-     * store and a registry advertised before this phase: `sasl` is present
-     * because the credential store loaded. */
-    TF_CHECK_MSG(strstr(tc_buffer(&alice.c), "sasl") != NULL,
-                 "a node with a loaded credential store did not advertise sasl");
+    TF_CHECK_MSG(tc_expect(&alice.c, " CAP * ACK :account-tag\r\n", T_IO_MS) == 0,
+                 "account-tag was not ACKed on a node that implements it");
+    TF_CHECK_MSG(strstr(tc_buffer(&alice.c), " CAP * NAK :account-tag") == NULL,
+                 "the node NAKed a capability it implements");
+    /* `sasl` is present because the credential store loaded, and the WHOLE list
+     * is spelled out rather than spot-checked: this is the one node in this file
+     * where every capability is available, so it is the one place a capability
+     * can be missing from the assertion and still pass. */
+    TF_CHECK_MSG(strstr(tc_buffer(&alice.c),
+                        " CAP * LS :multi-prefix message-tags draft/message-ids "
+                        "sasl account-tag\r\n") != NULL,
+                 "the advertised list on a node with BOTH stores is not the five "
+                 "capabilities this node implements: %s", tc_buffer(&alice.c));
 
     /* ---- the credential, and the identity it establishes ---- */
     authenticate("alice", "correct horse");
@@ -690,8 +798,6 @@ static void test_logged_in(const char *sasl, const char *registry)
      * need is present except the decision. */
     expect_account_commands_refused(&alice);
 
-    expect_no_account_tag_on_the_wire(&alice.c);
-    expect_no_account_tag_on_the_wire(&watcher.c);
     expect_account_name_never_empty(&node);
     expect_account_password_never_logged(&node);
 
@@ -724,12 +830,54 @@ static void test_no_registry(const char *sasl, const char *label)
 {
     nf_node_t node;
     client_t alice;
+    char ls[128];
+    char nak[128];
 
     spawn_node(&node, sasl, NULL, label);
     TF_CHECK_MSG(nf_expect(&node, "accounts=none", T_READY_MS) == 0,
                  "%s: a node with no registry did not say so at start-up", label);
 
     client_open(&alice, &node, "alice", NULL);
+
+    /* ---- AND THE CAPABILITY IS WITHHELD, WHICH IS THE POINT OF THE REGISTRY
+     * CHECK ----
+     *
+     * This node has accounts configured to LOAD and loaded -- `accounts=loaded` is
+     * asserted above -- and it cannot put a name on a tag, because account_set()'s
+     * second check has nothing to consult. So `account-tag` is absent from LS and
+     * NAKed, for exactly the reason `sasl` is withheld on a node with no
+     * credential store: a listed capability is a client switching the feature on
+     * and then drawing the wrong conclusion from every line it receives.
+     *
+     * The list is compared WHOLE, because the two absences are different and a
+     * spot check cannot tell them apart -- which is correct, because a client
+     * cannot either.
+     *
+     * THE TARGET IS THE NICKNAME AND NOT `*`, and that is not a detail this test
+     * invents: it asks AFTER registration, so cap.c's cap_target() has a nickname
+     * to answer with. The other cases here negotiate before NICK, which is what
+     * every real client does, and they see `*`. A test that spelled `*` here would
+     * be asserting about a moment this node is never in, and it would fail for a
+     * reason that has nothing to do with accounts. */
+    (void)snprintf(ls, sizeof ls, " CAP %s LS :", alice.nick);
+    (void)snprintf(nak, sizeof nak, " CAP %s NAK :account-tag\r\n", alice.nick);
+    TF_CHECK_MSG(tc_send(&alice.c, "CAP LS") == 0, "CAP LS send failed");
+    TF_CHECK_MSG(tc_expect(&alice.c, ls, T_IO_MS) == 0, "%s: no CAP LS", label);
+    TF_CHECK_MSG(strstr(tc_buffer(&alice.c),
+                        " CAP " "alice" " LS :multi-prefix message-tags "
+                        "draft/message-ids sasl\r\n") != NULL,
+                 "%s: the advertised list on a node with a credential store and "
+                 "NO registry is not exactly the four capabilities it really "
+                 "has; a client would read an account-tag here as an identity it "
+                 "can never get", label);
+    TF_CHECK_MSG(strstr(tc_buffer(&alice.c), "account") == NULL,
+                 "%s: a capability mentioning accounts is advertised by a node "
+                 "with no account registry", label);
+    TF_CHECK_MSG(tc_send(&alice.c, "CAP REQ :account-tag") == 0,
+                 "CAP REQ send failed");
+    TF_CHECK_MSG(tc_expect(&alice.c, nak, T_IO_MS) == 0,
+                 "%s: account-tag was ACKed by a node that can never write the "
+                 "tag", label);
 
     /* ---- the credential still verifies, because --sasl-store is untouched ----
      *
@@ -753,6 +901,13 @@ static void test_no_registry(const char *sasl, const char *label)
 
     /* ---- and the WHOIS is exactly what it was before this phase existed ---- */
     whois_and_check(&alice, "alice", NULL);
+    /* And nothing this connection has been sent carries an account VALUE: the
+     * connection authenticated, so the credential verified, and the only thing
+     * that did NOT happen is the registry check -- which is precisely the state
+     * that must be indistinguishable from having no account system at all. */
+    TF_CHECK_MSG(strstr(tc_buffer(&alice.c), "account=") == NULL,
+                 "%s: an `account` tag reached a client on a node with no "
+                 "registry, and no client there can be identified", label);
     expect_account_name_never_empty(&node);
     TF_CHECK_MSG(tf_count(node.out, "verified=1") == 0,
                  "%s: the node verified an account on a node with no registry",
@@ -954,6 +1109,545 @@ static void test_registry_without_credentials(const char *registry)
     nf_stop(&node);
     nf_free(&node);
     tc_close(&alice.c);
+}
+
+/* ==========================================================================
+ * CASE 7: THE `account` TAG, PER DESTINATION
+ * ==========================================================================
+ * Five clients on one node with a registry, chosen so that each row of the
+ * capability question has a subject:
+ *
+ *   alice   logged in, asks for message-tags + account-tag
+ *   bob     anonymous, asks for message-tags + account-tag
+ *   carol   anonymous, asks for message-tags + draft/message-ids
+ *   dave    anonymous, asks for NOTHING
+ *   erin    anonymous, asks for message-tags + account-tag, and SPEAKS
+ *
+ * So there are three recipient capabilities and two sender states, which is the
+ * whole grid the tag has an answer for. Every assertion below is on a WIRE LINE
+ * inside a closed window.
+ */
+static void join_chan(client_t *cl, const char *chan)
+{
+    char line[128];
+
+    (void)snprintf(line, sizeof line, "JOIN %s", chan);
+    TF_CHECK_MSG(tc_send(&cl->c, line) == 0, "%s JOIN send failed", cl->nick);
+    /* 366 is the end of the JOIN's own numerics, so it proves the membership
+     * exists -- which is what the message below needs, and what makes a
+     * "delivered" assertion mean anything. */
+    TF_CHECK_MSG(tc_expect(&cl->c, " 366 ", T_IO_MS) == 0,
+                 "%s never completed its JOIN", cl->nick);
+}
+
+/* The whole opening, in the ONE order the protocol allows: CAP, then SASL, then
+ * CAP END, then registration. SASL between the REQ and the END is not a choice --
+ * account_set() requires a COMPLETED exchange, so a client that registered first
+ * and authenticated afterwards would be in a state no client is meant to be in.
+ *
+ * THE ACK IS WAITED FOR rather than skipped, because a test that asserts a tag
+ * later and never checked the grant is a test that would pass against a node
+ * which NAKed and then wrote nothing -- as long as only the "no tag" rows ran. */
+static void client_open_logged_in(client_t *cl, nf_node_t *node, const char *nick,
+                                  const char *cap_req, const char *authcid,
+                                  const char *passwd, const char *label)
+{
+    client_connect(cl, node, nick);
+    if (cap_req != NULL) {
+        TF_CHECK_MSG(tc_send(&cl->c, "CAP LS") == 0, "%s: CAP LS send failed",
+                     label);
+        TF_CHECK_MSG(tc_expect(&cl->c, " CAP * LS :", T_IO_MS) == 0,
+                     "%s: no CAP LS", label);
+        TF_CHECK_MSG(tc_send(&cl->c, cap_req) == 0, "%s: CAP REQ send failed",
+                     label);
+        TF_CHECK_MSG(tc_expect(&cl->c, " CAP * ACK :", T_IO_MS) == 0,
+                     "%s: CAP REQ of \"%s\" was not granted: %s", label, cap_req,
+                     tc_buffer(&cl->c));
+    }
+    if (authcid != NULL) {
+        CUR_CLIENT = cl;
+        authenticate(authcid, passwd);
+    }
+    TF_CHECK_MSG(tc_send(&cl->c, "CAP END") == 0, "%s: CAP END send failed",
+                 label);
+    client_register(cl);
+}
+
+#define CHAN_TAGGED "#TAGGED"
+
+/* THE BARRIER IS THE SENDER'S OWN PONG, and getting this wrong is a test that
+ * passes or fails by accident rather than one that passes.
+ *
+ * The windows below are opened by a PING on each RECIPIENT's connection, and two
+ * connections have no order between them: a node that reads carol's PING before
+ * it reads erin's PRIVMSG answers carol first, and a window closed by carol's
+ * PONG then contains no message at all. A negative assertion over such a window
+ * passes for the wrong reason and a positive one fails for the wrong reason --
+ * and both look like the feature being broken.
+ *
+ * So the SENDER's PING is the barrier. The node reads one socket in order, and it
+ * delivers to every member inside the PRIVMSG handler, so a PONG on the SENDER's
+ * connection after the message proves the deliveries were already queued before
+ * any recipient's window is closed. Nothing here is a sleep, and nothing depends
+ * on which socket the kernel hands over first.
+ *
+ * EVERY WINDOW IS OPENED BEFORE THE SEND, because a window opened afterwards
+ * covers nothing: the drain PONG that closes it would be the first thing in it. */
+static size_t speak_and_close(client_t *from, const char *line,
+                              client_t *const *watched, size_t nwatched,
+                              size_t *ends)
+{
+    size_t i;
+    size_t sender_end;
+
+    TF_CHECK_MSG(tc_send(&from->c, line) == 0, "%s could not send \"%s\"",
+                 from->nick, line);
+    /* The barrier. See above: this is what makes the recipients' windows mean
+     * anything at all. */
+    sender_end = drain(from);
+    for (i = 0; i < nwatched; i++) {
+        ends[i] = drain(watched[i]);
+    }
+    return sender_end;
+}
+
+static void test_account_tag_on_the_wire(const char *sasl, const char *registry)
+{
+    nf_node_t node;
+    client_t alice;
+    client_t bob;
+    client_t carol;
+    client_t dave;
+    client_t erin;
+    client_t *watched[3];
+    size_t ends[3];
+    char want[256];
+    char line[160];
+    size_t ab;
+    size_t ae;
+    size_t bb;
+    size_t cb;
+    size_t db;
+
+    spawn_node(&node, sasl, registry,
+               "the account tag, on a node with a registry");
+    TF_CHECK_MSG(nf_expect(&node, "accounts=loaded", T_READY_MS) == 0,
+                 "the registry did not load, so nothing below could be about an "
+                 "account");
+
+    client_open_logged_in(&alice, &node, "alice",
+                          "CAP REQ :message-tags account-tag", "alice",
+                          "correct horse", "alice");
+    TF_CHECK_MSG(nf_expect(&node, "account=alice verified=1", T_IO_MS) == 0,
+                 "alice did not establish an account, so nothing below is about a "
+                 "logged-in sender");
+    client_open_logged_in(&bob, &node, "bob", "CAP REQ :message-tags account-tag",
+                          NULL, NULL, "bob");
+    client_open_logged_in(&carol, &node, "carol",
+                          "CAP REQ :message-tags draft/message-ids", NULL, NULL,
+                          "carol");
+    client_open_logged_in(&dave, &node, "dave", NULL, NULL, NULL, "dave");
+    client_open_logged_in(&erin, &node, "erin", "CAP REQ :message-tags account-tag",
+                          NULL, NULL, "erin");
+
+    join_chan(&alice, CHAN_TAGGED);
+    join_chan(&bob, CHAN_TAGGED);
+    join_chan(&carol, CHAN_TAGGED);
+    join_chan(&dave, CHAN_TAGGED);
+    join_chan(&erin, CHAN_TAGGED);
+
+    watched[0] = &bob;
+    watched[1] = &carol;
+    watched[2] = &dave;
+
+    /* ---- A LOGGED-IN SENDER SPEAKS TO A CHANNEL ---- */
+    ab = drain(&alice);
+    bb = drain(&bob);
+    cb = drain(&carol);
+    db = drain(&dave);
+    (void)snprintf(line, sizeof line, "PRIVMSG " CHAN_TAGGED " hello");
+    ae = speak_and_close(&alice, line, watched, 3u, ends);
+
+    /* ---- BOB ASKED, AND GETS THE TAG, AS A WHOLE LINE ----
+     *
+     * The WHOLE line, not a substring, and that is the assertion with the most
+     * teeth in this case: bob's block is `@account=alice ` and nothing else,
+     * because bob asked for `message-tags account-tag` and NOT for msgids. A node
+     * that stamped the tag, kept a msgid bob never asked for, or put the tag
+     * after the prefix fails this line three different ways. */
+    (void)snprintf(want, sizeof want,
+                   "@account=alice :alice!alice@127.0.0.1 PRIVMSG " CHAN_TAGGED
+                   " hello\r\n");
+    expect_in_window(&bob, bb, ends[0],
+                     "the account tag for a recipient that asked for it", want);
+    /* And the sender hears her own PRIVMSG the same way, because the sender is
+     * also a destination and the capability that decides is the RECIPIENT's.
+     * Her window is the one closed by the barrier, so it is the one line of this
+     * message that is certainly inside it. */
+    expect_in_window(&alice, ab, ae, "the account tag on the sender's own copy",
+                     want);
+
+    /* ---- CAROL ASKED FOR TAGS AND NOT FOR THIS ONE ----
+     *
+     * Two assertions, and the first is what makes the second mean anything: carol
+     * IS given a block -- `msgid`, because she asked for that one -- so "no
+     * account" is a statement about which tags she negotiated rather than about a
+     * node that wrote her nothing at all. */
+    expect_tag_block_present(&carol, cb, ends[1],
+                             "carol, who asked for draft/message-ids");
+    expect_absent_in_window(&carol, cb, ends[1],
+                            "an account tag for a recipient that did not negotiate "
+                            "account-tag", "account=");
+
+    /* ---- DAVE ASKED FOR NOTHING ---- */
+    expect_no_tag_block(&dave, db, ends[2], "a connection that negotiated nothing");
+    expect_absent_in_window(&dave, db, ends[2],
+                            "an account tag for a connection that negotiated "
+                            "nothing", "account=");
+
+    /* ---- AND THE SAME, TO A NICK RATHER THAN A CHANNEL ----
+     *
+     * 3.1's first row is a different arm of fanout_deliver() from the channel
+     * ones, with its own render, and a feature that only works on one of them is
+     * a feature a client discovers as a bug. */
+    bb = drain(&bob);
+    (void)snprintf(line, sizeof line, "PRIVMSG bob direct");
+    ae = speak_and_close(&alice, line, watched, 1u, ends);
+    (void)snprintf(want, sizeof want,
+                   "@account=alice :alice!alice@127.0.0.1 PRIVMSG bob direct\r\n");
+    expect_in_window(&bob, bb, ends[0], "the account tag on a direct message", want);
+
+    /* ---- AN ANONYMOUS SENDER, TO A RECIPIENT THAT ASKED ----
+     *
+     * The other half of the specification's rule, and the one that is easy to get
+     * wrong by stamping the tag whenever the DESTINATION asked: erin negotiated
+     * `account-tag`, so a node that gates on the recipient alone would tell bob
+     * that erin is somebody. The assertion is made on carol as well -- who is
+     * receiving a block and can therefore show that the tag was OMITTED from a
+     * block rather than that no block existed. */
+    cb = drain(&carol);
+    bb = drain(&bob);
+    (void)snprintf(line, sizeof line, "PRIVMSG " CHAN_TAGGED " anonymous");
+    ae = speak_and_close(&erin, line, watched, 2u, ends);
+    TF_CHECK_MSG(ae > 0u, "the anonymous sender's barrier PONG did not arrive");
+    expect_tag_block_present(&carol, cb, ends[0],
+                             "carol, for a message from an anonymous sender");
+    expect_absent_in_window(&carol, cb, ends[0],
+                            "an account tag for an ANONYMOUS sender", "account=");
+    expect_absent_in_window(&bob, bb, ends[1],
+                            "an account tag for an anonymous sender, to the "
+                            "recipient that asked hardest for one", "account=");
+
+    /* ---- AND A CLIENT CANNOT ASSERT ITS OWN ACCOUNT TO ANOTHER ONE ----
+     *
+     * The other direction entirely, and the one the specification exists to
+     * close: erin sends a line carrying an `account` tag of her own, and the tag
+     * must not come back on the delivered copies. fanout's local write is driven
+     * by the parameters and by the two tags this node COMPUTES, never by what the
+     * client tagged -- and this is the only assertion in the file that would
+     * notice if that ever stopped being true, because an echoed inbound tag
+     * looks exactly like a tag the node wrote.
+     *
+     * Both recipients are watched: bob, who would see `@account=spoofed` if the
+     * node echoed it, and carol, who is checked because her copy is the one that
+     * proves the omission happened inside a block rather than that no block
+     * existed. */
+    cb = drain(&carol);
+    bb = drain(&bob);
+    (void)snprintf(line, sizeof line,
+                   "@account=spoofed PRIVMSG " CHAN_TAGGED " spoof");
+    ae = speak_and_close(&erin, line, watched, 2u, ends);
+    TF_CHECK_MSG(ae > 0u, "the barrier PONG after the spoofed tag did not arrive");
+    expect_absent_in_window(&carol, cb, ends[0],
+                            "an echoed `account` tag from the INBOUND direction",
+                            "account=");
+    expect_absent_in_window(&bob, bb, ends[1],
+                            "an echoed `account` tag from the inbound direction, "
+                            "to the recipient that asked hardest for one",
+                            "account=");
+    /* ...and the text went through, as a WHOLE UNTAGGED LINE, so the case above is
+     * about the tag rather than about a message that silently vanished. It is
+     * untagged because erin is anonymous and asked for no msgid, which is the
+     * same rule the two rows above are about -- stated here as a rendering rather
+     * than as an absence, so the line's bytes are pinned. */
+    (void)snprintf(want, sizeof want,
+                   ":erin!erin@127.0.0.1 PRIVMSG " CHAN_TAGGED " spoof\r\n");
+    expect_in_window(&bob, bb, ends[1],
+                     "the message carrying the spoofed tag", want);
+
+    TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not stop cleanly");
+    nf_free(&node);
+    tc_close(&alice.c);
+    tc_close(&bob.c);
+    tc_close(&carol.c);
+    tc_close(&dave.c);
+    tc_close(&erin.c);
+}
+
+/* ==========================================================================
+ * CASE 8: THE TAG DOES NOT CROSS TO A PEER
+ * ==========================================================================
+ * Two SHIPPED binaries over real TCP, linked, both configured with a registry --
+ * so `account-tag` is available on both and bob's request for it is granted. bob
+ * then receives alice's message and it carries a `msgid` and NOT an `account`.
+ *
+ * WHY IT NEEDS TWO NODES rather than an inspection of the code. The decision is
+ * one branch -- fanout.c's fanout_emitter_account() returns "" when the emission
+ * was RELAYED -- and the way that branch is reached in practice is federation/
+ * verbs.c handing a received stamp to fanout_deliver(). A one-node test cannot
+ * produce a relayed emission at all, so it can only assert the absence of the
+ * feature; this asserts that the feature is present on both sides and stops at
+ * the link.
+ *
+ * THE `msgid` ON BOB'S COPY IS WHAT MAKES IT MEANINGFUL. bob negotiated
+ * draft/message-ids, so the far side IS writing a tag block to him, from the
+ * carried 2.4 identity -- and the `account` is absent from a block that exists.
+ * Without that, "no account tag" would also be satisfied by a node that wrote bob
+ * nothing tagged at all, which is a different failure with the same symptom.
+ */
+#define SECRET_FED "irc-serve-federation-secret-a"
+#define CHAN_FED   "#FEDTAG"
+
+static void spawn_fed_node(nf_node_t *node, const char *name, const char *sasl,
+                           const char *registry, const char *peer,
+                           const char *label)
+{
+    char name_buf[64];
+    char secret_buf[96];
+    char sasl_buf[PATH_MAX_TEST];
+    char reg_buf[PATH_MAX_TEST];
+    char peer_buf[128];
+    char *argv[16];
+    size_t n = 0;
+
+    /* Copied into writable buffers for the reason spawn_node() gives: a `char *`
+     * argv slot holding a `const char *` needs a cast, and upstream clang's
+     * -Weverything turns -Wcast-qual into an error. */
+    name_buf[0] = '\0';
+    secret_buf[0] = '\0';
+    sasl_buf[0] = '\0';
+    reg_buf[0] = '\0';
+    peer_buf[0] = '\0';
+    (void)snprintf(name_buf, sizeof name_buf, "%s", name);
+    (void)snprintf(secret_buf, sizeof secret_buf, "%s", SECRET_FED);
+    if (sasl != NULL) {
+        (void)snprintf(sasl_buf, sizeof sasl_buf, "%s", sasl);
+    }
+    if (registry != NULL) {
+        (void)snprintf(reg_buf, sizeof reg_buf, "%s", registry);
+    }
+    if (peer != NULL) {
+        (void)snprintf(peer_buf, sizeof peer_buf, "%s", peer);
+    }
+    argv[n++] = (char *)"irc-serve";
+    argv[n++] = (char *)"--name";
+    argv[n++] = name_buf;
+    argv[n++] = (char *)"--secret";
+    argv[n++] = secret_buf;
+    if (sasl != NULL) {
+        argv[n++] = (char *)"--sasl-store";
+        argv[n++] = sasl_buf;
+    }
+    if (registry != NULL) {
+        argv[n++] = (char *)"--account-store";
+        argv[n++] = reg_buf;
+    }
+    if (peer != NULL) {
+        argv[n++] = (char *)"--peer";
+        argv[n++] = peer_buf;
+    }
+    argv[n++] = (char *)"0";
+    argv[n] = NULL;
+    TF_CHECK_MSG(n < 16u, "%s: the argument vector overflowed", label);
+    TF_CHECK_MSG(nf_spawn_binary_argv(node, argv) == 0,
+                 "%s: could not spawn a node", label);
+}
+
+static void test_account_tag_does_not_cross_to_peers(const char *sasl,
+                                                     const char *registry)
+{
+    nf_node_t a;
+    nf_node_t b;
+    client_t alice;
+    client_t bob;
+    char peer_arg[128];
+    size_t ab;
+    size_t ae;
+    size_t bb;
+    size_t be;
+
+    /* A first, and with no --peer: a node configured with BOTH ends of a pair
+     * dials from both and the pair never comes up, so each pair is configured in
+     * ONE direction (federation/link.h). B then dials A, which is also the
+     * assertion that the address was resolved before the loop was armed -- 3.4's
+     * no-name-lookup-in-the-loop rule, held by construction rather than by
+     * inspection. */
+    spawn_fed_node(&a, "irc.a", sasl, registry, NULL, "node A");
+    TF_CHECK_MSG(nf_expect(&a, "accounts=loaded", T_READY_MS) == 0,
+                 "node A did not load the registry, so nothing below is about an "
+                 "account identity");
+    (void)snprintf(peer_arg, sizeof peer_arg, "irc.a,127.0.0.1,%d", a.port);
+    spawn_fed_node(&b, "irc.b", sasl, registry, peer_arg, "node B");
+    TF_CHECK_MSG(nf_expect(&a, "link_established: peer=irc.b", T_READY_MS) == 0,
+                 "the link never came up on A, so nothing below crosses a link: %s",
+                 a.out);
+    TF_CHECK_MSG(nf_expect(&b, "link_established: peer=irc.a", T_READY_MS) == 0,
+                 "the link never came up on B: %s", b.out);
+
+    /* alice LOGGED IN on A. bob on B, asking for the tag and for msgids, and not
+     * logged in -- which is the whole point: even a client that logged in on its
+     * OWN node gets no account claim about somebody else's user. */
+    client_open_logged_in(&alice, &a, "alice",
+                          "CAP REQ :message-tags draft/message-ids account-tag",
+                          "alice", "correct horse", "alice on A");
+    TF_CHECK_MSG(nf_expect(&a, "account=alice verified=1", T_IO_MS) == 0,
+                 "alice did not establish an account on A");
+    client_open_logged_in(&bob, &b, "bob",
+                          "CAP REQ :message-tags draft/message-ids account-tag",
+                          NULL, NULL, "bob on B");
+    /* bob's own `account-tag` request was GRANTED on his node -- asserted by
+     * client_open_logged_in()'s wait for the ACK -- so the absence below cannot
+     * be explained by his side withholding the capability. */
+    TF_CHECK_MSG(strstr(b.out, "account-tag") != NULL,
+                 "node B did not advertise account-tag even with a registry, so "
+                 "the case below would pass for the wrong reason");
+
+    join_chan(&alice, CHAN_FED);
+    join_chan(&bob, CHAN_FED);
+
+    /* THE BARRIER IS ALICE'S OWN PONG, and it is alice's rather than bob's for
+     * the reason test_account.c's case 7 states at length: two connections have
+     * no order between them, and this message crosses a link before it reaches
+     * bob, so a window closed by bob's PING would be asserting about the order two
+     * sockets arrived in. alice's PONG is answered only after the node has
+     * processed her PRIVMSG, and processing it queues the forward -- so the
+     * forward is already on the wire's queue when bob's window is closed. */
+    ab = drain_on(&alice, "irc.a");
+    bb = drain_on(&bob, "irc.b");
+    TF_CHECK_MSG(tc_send(&alice.c, "PRIVMSG " CHAN_FED " federated") == 0,
+                 "alice's PRIVMSG could not be sent");
+    ae = drain_on(&alice, "irc.a");
+    be = drain_on(&bob, "irc.b");
+
+    /* ---- ON B, THE LINE CROSSED AND THE TAG DID NOT ---- */
+    expect_tag_block_present(&bob, bb, be,
+                             "the relayed line on the far side of the link");
+    expect_absent_in_window(&bob, bb, be,
+                            "an account tag for a message this node did not "
+                            "authenticate the sender of", "account=");
+
+    /* ---- ON A, THE LOCAL DELIVERY HAS IT, WHICH IS THE CONTRAST ----
+     *
+     * The same message, the same sender, the same requested capability, on the
+     * node that verified the credential and not on the node that did not. If
+     * this row were absent, "no tag on B" would also be satisfied by a node that
+     * emits no tags anywhere -- and case 7 already covers that, but it covers it
+     * on a different message, and a contrast is cheaper to read than a memory. */
+    /* A SUBSTRING rather than a whole line, and the reason is in
+     * expect_text_in_window(): alice negotiated msgids as well, so her copy
+     * carries `msgid=irc.a_<epoch>_<id>;account=alice ` and the first pair holds
+     * two numbers this test cannot spell. Everything the assertion is about --
+     * the account name, and its position after the msgid and before the prefix --
+     * is inside it. */
+    expect_text_in_window(&alice, ab, ae,
+                          "the local delivery of the very same message",
+                          "account=alice :alice!alice@127.0.0.1 PRIVMSG " CHAN_FED
+                          " federated");
+
+    TF_CHECK_MSG(nf_stop(&a) == 0, "node A did not stop cleanly");
+    TF_CHECK_MSG(nf_stop(&b) == 0, "node B did not stop cleanly");
+    nf_free(&a);
+    nf_free(&b);
+    tc_close(&alice.c);
+    tc_close(&bob.c);
+}
+
+/* ==========================================================================
+ * THE TAG BLOCK AND THE LINE CAP MUST STILL AGREE, AS A DERIVATION
+ * ==========================================================================
+ * `fanout_line_fits()` is the node's own answer to "is this message too long to
+ * relay", and Phase 10.2 changed it: the client-facing form now charges the
+ * LARGEST CLIENT-VISIBLE TAG BLOCK, because a member's line carries `msgid` and
+ * `account` while a forwarded line carries only 2.4's internal block.
+ *
+ * WHY THIS IS A DERIVATION AND NOT A WIRE TEST. Every wire version of this
+ * property runs from a test client on loopback, whose hostmask is 25 bytes --
+ * which leaves about 280 bytes of slack between what the cap charges and what the
+ * line actually occupies. A cap that had stopped charging the tag would therefore
+ * pass every wire test and still lose a message: `fanout_line_fits_n()` charges
+ * the prefix and target at their MAXIMUM widths, so the real envelope is far
+ * smaller than the charge, and a client whose host is a long FQDN is exactly the
+ * case where the two meet. `conn_t::host` is 128 bytes wide and this node records
+ * what accept() OBSERVED, so such a client is not hypothetical.
+ *
+ * So the assertion is the property itself: take the largest body the node's cap
+ * accepts for the widest possible hostmask, add the widest possible tag block and
+ * the envelope the formatter will really write, and require the result to be a
+ * legal line. It is in process and on a return value, like the account_set() rules
+ * below, for the same reason they are: no sequence of client input reaches this
+ * state, because a test cannot make its own hostmask 255 bytes long.
+ */
+static void expect_the_tag_charge_is_real(void)
+{
+    /* The widest hostmask conn_hostmask() can build: the three field widths and
+     * the three separators, which is CONN_HOSTMASK_MAX rather than a guess. */
+    char hostmask[CONN_HOSTMASK_MAX];
+    const size_t tags_max = 1u /* '@' */ + IRC_MAX_MSGTAG + 1u /* ';' */
+                            + ACCOUNT_TAG_MAX + 1u /* NUL */ - 1u;
+    size_t lo = 0;
+    size_t hi = (size_t)IRC_MAX_LINE;
+    char *body = NULL;
+    size_t rendered;
+
+    memset(hostmask, 'h', sizeof hostmask - 1u);
+    hostmask[sizeof hostmask - 1u] = '\0';
+    body = (char *)malloc(hi + 1u);
+    TF_CHECK_MSG(body != NULL, "could not allocate the probe body");
+    if (body == NULL) {
+        return;
+    }
+    /* The largest body THIS node accepts, found with the node's own predicate
+     * rather than by re-deriving the arithmetic: a second derivation is a second
+     * opinion about code that already exists. */
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo + 1u) / 2u;
+
+        memset(body, 'x', mid + 1u);
+        body[mid] = '\0';
+        if (fanout_line_fits(hostmask, "PRIVMSG", "#TAGGED", body) != 0) {
+            lo = mid;
+        } else {
+            hi = mid - 1u;
+        }
+    }
+    TF_CHECK_MSG(lo > 0u, "fanout_line_fits() refuses every body length, so the "
+                 "cap this checks does not exist");
+    memset(body, 'x', lo + 1u);
+    body[lo] = '\0';
+
+    /* What the formatter will really write, in the order message_format_ex()
+     * writes it: the tag block, then ':' + prefix, then the verb, the target and
+     * the text, then the CRLF reply.c adds. */
+    rendered = tags_max + 1u /* ' ' */ + 1u /* ':' */ + strlen(hostmask) + 1u
+              + strlen("PRIVMSG") + 1u + strlen("#TAGGED") + 1u + strlen(body)
+              + 2u /* CRLF */;
+    TF_CHECK_MSG(rendered <= (size_t)IRC_MAX_LINE,
+                 "the largest body this node accepts renders to %zu bytes once "
+                 "the widest client tag block (%zu) and the widest hostmask "
+                 "(%zu) are on it, which is over IRC_MAX_LINE (%d): a client "
+                 "with a long host would lose the message to a decoration. The "
+                 "cap must charge the tag block it may actually write.",
+                 rendered, tags_max, strlen(hostmask), IRC_MAX_LINE);
+
+    /* AND ONE BYTE MORE IS REFUSED, so the assertion above is about the CAP and
+     * not about a predicate that refuses everything. */
+    memset(body, 'x', lo + 2u);
+    body[lo + 1u] = '\0';
+    TF_CHECK_MSG(fanout_line_fits(hostmask, "PRIVMSG", "#TAGGED", body) == 0,
+                 "fanout_line_fits() accepted a body one byte longer than the "
+                 "longest it accepted, so the measurement above is off the "
+                 "boundary");
+    free(body);
 }
 
 /* ==========================================================================
@@ -1205,9 +1899,14 @@ int main(void)
 
     /* ---- the rules no wire sequence can reach, asserted on return values ---- */
     expect_account_set_refuses();
+    expect_the_tag_charge_is_real();
 
     /* ---- the positive case, first: everything below is a contrast with it -- */
     test_logged_in(sasl_good, acct_good);
+
+    /* ---- the tag, per destination, and then not across a link ---- */
+    test_account_tag_on_the_wire(sasl_good, acct_good);
+    test_account_tag_does_not_cross_to_peers(sasl_good, acct_good);
 
     /* ---- the regression cases ---- */
     test_no_registry(sasl_only, "a credential store and no registry");
