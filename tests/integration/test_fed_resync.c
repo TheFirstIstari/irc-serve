@@ -235,6 +235,83 @@
 #define TEST_HS_MS 12000
 
 /* ---------------------------------------------------------------------------
+ * THE RETRY LADDER'S SCALE, AND WHY IT CANNOT BE THE SHIPPED ONE
+ * ---------------------------------------------------------------------------
+ * THE BUG THIS FIXES, in one sentence: this file called fed_set_timeouts() and
+ * never fed_set_retry(), so every node in it ran the SHIPPED ladder -- and the
+ * shipped base is IRC_FED_RETRY_BASE_MS, which is IRC_FED_DEAD_MS, a
+ * COMPILE-TIME constant. fed_set_timeouts() changes the RUNTIME g_dead_ms, so the
+ * override above set this mesh's dead window to 750 ms while its retry base stayed
+ * at 3 * 30000 = 90000 ms. One hundred and twenty times the window it was
+ * configured with, and a scale this test never asked for.
+ *
+ * WHAT THAT COSTS, and it is arithmetic rather than bad luck. The CI failure was a
+ * link that connected and then missed TEST_HS_MS, so T2 armed a schedule of
+ * delay_ms=90000. T7 dials only when now_ms >= retry_at_ms (link.c's INIT arm), so
+ * the link was dead for the REST OF THE PROCESS: one transient handshake miss on a
+ * loaded two-core runner was unrecoverable inside T_IO_MS, and raising the budget
+ * from 15000 to 30000 could not have fixed it, because at any budget below 90000
+ * the second attempt still does not happen. That is why the budget was raised twice
+ * and the flake survived both raises.
+ *
+ * ---------------------------------------------------------------------------
+ * THE TWO CONSTRAINTS, AND THEY ARE BOTH REAL
+ * ---------------------------------------------------------------------------
+ * RECOVERY has to fit. A bring-up miss costs TEST_HS_MS before T2 even fires, and
+ * then the first rung, and then a second handshake. With TEST_HS_MS = 12000 that
+ * puts the second attempt at 12000 + TEST_RETRY_BASE_MS, and T_IO_MS = 30000 has to
+ * be larger than that or the fix buys nothing. At 4000 the second attempt happens
+ * at 16000 and a healthy handshake is over by ~16100, leaving 13900 ms of the
+ * window -- a margin the 90000 base never had at ANY budget.
+ *
+ * INERTNESS has to hold too, and this is the constraint that is easy to miss.
+ * Cases 1 and 2 assert an EXACT `link_dial:` count (== 1 and == 2), and both freeze
+ * a peer with SIGSTOP, which is T4, which ARMS THE LADDER. A rung that fires inside
+ * either case's window is a socket this test did not ask for, and case 2's second
+ * `link_established:` would then be satisfied by the ladder rather than by the
+ * fed_link_reset() it exists to test -- the pass-for-the-wrong-reason shape this
+ * file warns about three separate times. So the base has to be longer than the
+ * window between T4 firing and the assertion, and that window is NOT a guess: it
+ * was measured over 30 consecutive runs of this file and is 101 ms median, 898 ms
+ * worst, and BIMODAL -- about 30% of runs take ~890 ms, because a SIGSTOPped node
+ * reads the keepalives its peer queued while it was stopped and restarts its
+ * silence clock from the moment it resumes. 4000 is 4.4x the worst window
+ * measured and ~40x the median.
+ *
+ * MEASURED, NOT ASSUMED, IN THE OTHER DIRECTION: at a 400 ms base this file fails
+ * 7 runs in 25, every one of them at case 2's `link_dial: == 2` and none anywhere
+ * else. That is the teeth of the inertness constraint -- the ladder is not free, and
+ * a base chosen to be merely "short" breaks this test rather than fixing it.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THE SHAPE SURVIVES
+ * ---------------------------------------------------------------------------
+ * Three rungs and a ceiling, and the ceiling is reached INSIDE the budget on
+ * purpose: 4000, 8000, 8000, then link_retry_exhausted: attempts=3 budget=3. So the
+ * ladder still doubles per attempt, still caps, still has a budget that is spent
+ * and reported, and the whole of it -- all three rungs AND the exhaustion -- costs
+ * 16000 ms, which fits inside T_IO_MS rather than needing a window nobody has. A
+ * ceiling of 16 * base (the shipped multiple) would put the cap outside a
+ * three-attempt budget and the cap would be unreachable in this test.
+ *
+ * The limits are stated rather than hidden. This file drives at most ONE rung, in
+ * case 1, because cases 1 and 2 assert an exact dial count and case 3's peer is
+ * frozen for the rest of the case; and a ceiling LOOSER than the one rung this file
+ * reaches would go unnoticed, because a rung is rung 0 either way. So what
+ * check_ladder_scale() below can prove is that every rung is a number the
+ * configured ladder could produce -- which catches the shipped 90000 and any ladder
+ * that grew past its own ceiling, and cannot catch a ceiling that is never reached.
+ * The DEEPER ladder, and the equality of the last two rungs that IS the cap, is
+ * test_failover_reconnect.c's claim.
+ *
+ * NOTHING HERE EDITS THE PRODUCT. IRC_FED_HS_TIMEOUT_MS, IRC_FED_RETRY_BASE_MS,
+ * IRC_FED_RETRY_MAX_MS and IRC_FED_RETRY_BUDGET are all left exactly as shipped; the
+ * test overrides the scale, which is what fed_set_retry() is for. */
+#define TEST_RETRY_BASE_MS 4000
+#define TEST_RETRY_MAX_MS (2 * TEST_RETRY_BASE_MS)
+#define TEST_RETRY_BUDGET 3
+
+/* ---------------------------------------------------------------------------
  * PRE-FORK STATE
  * ---------------------------------------------------------------------------
  * A forked child inherits the parent's memory as of fork(), and 6.2's harness is
@@ -312,6 +389,7 @@ static void child_setup(server_t *s)
     s->trace = g_trace;
     s->on_tick = child_tick;
     fed_set_timeouts(TEST_DIAL_MS, TEST_HS_MS, TEST_KEEPALIVE_MS, TEST_DEAD_MS);
+    fed_set_retry(TEST_RETRY_BASE_MS, TEST_RETRY_MAX_MS, TEST_RETRY_BUDGET);
 
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_retry_signal;
@@ -451,6 +529,55 @@ static size_t ask_names(test_client_t *c, int port, const char *nick,
                  "truncated list and a name missing from it proves nothing: %s",
                  nick, chan, tc_buffer(c));
     return mark;
+}
+
+/* ---------------------------------------------------------------------------
+ * READING THE LADDER BACK OUT OF A NODE
+ * ---------------------------------------------------------------------------
+ * Every rung a node armed, checked against the two rungs this test configured.
+ *
+ * A SCAN rather than a wait, and the reason is what the claim is: the claim is
+ * about EVERY `delay_ms=` the node printed, not about one of them. nf_expect()
+ * can only ask whether a needle is present, so a ladder that armed one correct
+ * rung and then grew without bound would satisfy any single wait in this file.
+ * Scanning the accumulated buffer is what makes the assertion universal.
+ *
+ * VACUOUS BY CONSTRUCTION when nothing armed, which is the normal case, and that
+ * is why it is a CHECK rather than the claim: case 1 asserts that a rung was
+ * armed at all, and this is what keeps the rest of the file honest about it. The
+ * two faults it has teeth against are the two that cannot be reached by waiting --
+ * a ladder whose base is the shipped 90000 (which is what a missing
+ * fed_set_retry() leaves behind, and the CI failure itself) and a ladder that
+ * doubled past its own ceiling.
+ *
+ * `hay` may be NULL, because a node that said nothing has armed nothing, and the
+ * loop below is written to say so rather than to dereference it. */
+static void check_ladder_scale(const char *label, const char *hay)
+{
+    const char *p = hay;
+
+    while (p != NULL && (p = strstr(p, "delay_ms=")) != NULL) {
+        const char *digits = p + strlen("delay_ms=");
+        char       *end = NULL;
+        unsigned long v;
+
+        v = strtoul(digits, &end, 10);
+        /* A key with no number is a different format, and stopping is the safe
+         * reading of one: looping on it would never terminate. */
+        if (end == NULL || end == digits) {
+            return;
+        }
+        TF_CHECK_MSG(v == (unsigned long)TEST_RETRY_BASE_MS ||
+                         v == (unsigned long)TEST_RETRY_MAX_MS,
+                     "node %s armed a retry of %lu ms, which is neither of the two "
+                     "rungs this test configured (%lu and %lu). The shipped base is "
+                     "90000 ms, which is 3x this file's entire T_IO_MS and therefore "
+                     "a link that can never be retried inside the test -- the defect "
+                     "this scale was added to remove.\n  node said: %s",
+                     label, v, (unsigned long)TEST_RETRY_BASE_MS,
+                     (unsigned long)TEST_RETRY_MAX_MS, hay);
+        p = end;
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -659,6 +786,64 @@ static void case_link_down_fails_closed(void)
                  "died it would pass against a node that re-dials every tick, "
                  "because that tick has not run yet.",
                  (unsigned long)tf_count(b.out, "link_dial: peer=" NAME_A));
+    /* ONE THING THE COMMENT ABOVE NO LONGER SAYS QUIETLY. The backoff is not
+     * only "behind fed_link_reset()" any more: T4 has armed a schedule on this
+     * link, and T7 will dial it when the schedule comes due. What makes this
+     * count still true is the SCALE, not the absence of a policy -- the rung is
+     * TEST_RETRY_BASE_MS long and the check below runs about a millisecond after
+     * the link died. That is why the base is not as short as "short", and the
+     * measurement behind that is at the top of this file. */
+
+    /* CLAIM 3b: THE LADDER THAT WAS ARMED IS THIS TEST'S LADDER, AND THE CLAIM IS
+     * THE DELAY, NOT THE PRESENCE OF A LINE.
+     *
+     * WHY A `link_retry:` LINE IS ALREADY HERE WITHOUT ANYTHING HAVING WAITED FOR
+     * IT. fed_dead() arms the schedule BEFORE fed_link_down() tears the link down,
+     * and the arm is printed in the same tick as the `link_dead:` this case has
+     * already waited for -- so this is a line that has happened. The wait is the
+     * harness's read schedule rather than a second event, and it is a DEADLINE wait
+     * because the pump may have read `link_dead:` and stopped before the line after
+     * it, and because a wait is what makes a MISSING arm fail loudly instead of
+     * being satisfied by nothing.
+     *
+     * WHY THIS IS THE ASSERTION THAT MATTERS, and it is the one this file's retry
+     * scale exists to support. A rung LONGER THAN THE WHOLE WINDOW is a link this
+     * test cannot retry, so the second attempt the raised budget was reaching for
+     * never happens: T7 dials only once now_ms reaches retry_at_ms. Under the
+     * shipped base that delay is 90000 against a T_IO_MS of 30000, so a single
+     * transient handshake miss on a loaded runner was terminal -- which is exactly
+     * the CI failure, and it is why raising 15000 to 30000 did not fix it.
+     *
+     * WHY attempt=1/3 IS IN THE NEEDLE rather than left to the scale check. The
+     * budget is the other half of "bounded", and `1/3` says both that this node
+     * spent a real attempt and that the ladder has three of them: a node that kept
+     * knocking for ever would print 1/1000000000 here, or nothing at all.
+     *
+     * The needle is BUILT from the two macros rather than written out, so the
+     * number in the assertion and the number fed_set_retry() is handed cannot drift
+     * apart silently. The check_ladder_scale() calls underneath still pin the
+     * values themselves, so a macro that moved without this case being re-derived
+     * fails here rather than quietly agreeing with itself. */
+    {
+        char rung[128];
+
+        (void)snprintf(rung, sizeof rung,
+                       "link_retry: peer=" NAME_A " attempt=1/%u delay_ms=%d after=DEAD",
+                       (unsigned)TEST_RETRY_BUDGET, (int)TEST_RETRY_BASE_MS);
+        TF_CHECK_MSG(nf_expect(&b, rung, T_IO_MS) == 0,
+                     "the link went dead and this node did not arm a retry as short "
+                     "as the one the test configured (%d ms, budget %u), so the "
+                     "schedule this mesh runs is not the one the test asked for -- and "
+                     "a schedule longer than T_IO_MS is a link that is never retried "
+                     "inside this test.\n  node said: %s",
+                     (int)TEST_RETRY_BASE_MS, (unsigned)TEST_RETRY_BUDGET, b.out);
+    }
+    /* And every rung on both nodes of this case is one of the two configured
+     * rungs, which is the claim that does not depend on the arm above having
+     * happened. Node A is included and is checked BEFORE the SIGCONT below on
+     * purpose: it is the frozen peer, so until it resumes it has armed nothing. */
+    check_ladder_scale(NAME_A, a.out);
+    check_ladder_scale(NAME_B, b.out);
 
     /* A is resumed before the teardown rather than killed: a STOPPED process
      * does not run its signal handler, so SIGTERM would sit queued on it and
@@ -801,6 +986,15 @@ static void case_relink_resurrects(void)
                  "this case asked for and no more, and a third would be the "
                  "auto-redial Phase 9 owns",
                  (unsigned long)tf_count(b.out, "link_dial: peer=" NAME_A));
+
+    /* THE LADDER'S SCALE, on both nodes, and here it is doing a second job rather
+     * than repeating case 1's. T4 armed a rung on this link when the peer went
+     * silent, and the count above is only a count of the test's OWN retry if that
+     * armed rung has not fired -- which is the inertness constraint the base of
+     * 4000 is chosen to satisfy. If it ever does fire, the count catches it; this
+     * says what it would have fired WITH. */
+    check_ladder_scale(NAME_A, a.out);
+    check_ladder_scale(NAME_B, b.out);
 
     /* CLAIM 4, PART ONE: the same command from the same client is no longer
      * refused. The 437 from the orphaned half is on erin's buffer already, so
@@ -1104,6 +1298,16 @@ static void case_squit_is_observed_and_per_origin(void)
                  CHAN_D, since(&last, mark));
 
     TF_CHECK_MSG(kill(b.pid, SIGCONT) == 0, "could not resume node B");
+    /* THE LADDER'S SCALE ON ALL FOUR NODES, and this is the case where that check
+     * earns its keep: it is the four-node mesh, so it has the most links and the
+     * most ways for one of them to fail, and it is the case whose bring-up is
+     * expensive enough that a rung longer than T_IO_MS costs the whole test rather
+     * than one wait. Every rung any of the four armed is one of the two this test
+     * configured. */
+    check_ladder_scale(NAME_A, a.out);
+    check_ladder_scale(NAME_B, b.out);
+    check_ladder_scale(NAME_C, c.out);
+    check_ladder_scale(NAME_D, d.out);
     TF_CHECK_MSG(nf_stop(&a) == 0, "node A did not exit cleanly");
     TF_CHECK_MSG(nf_stop(&b) == 0, "node B did not exit cleanly");
     TF_CHECK_MSG(nf_stop(&c) == 0, "node C did not exit cleanly");
@@ -1413,6 +1617,11 @@ static void case_self_squit_refused(void)
     }
 
     TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
+    /* This node owns one end of a link to a RAW SOCKET the test drives by hand,
+     * which is the only link in this file with no peer process on the far side --
+     * so it is the one link whose failure modes are entirely the test's making.
+     * Its ladder is held to the same two rungs as the rest of the mesh. */
+    check_ladder_scale("irc.b", node.out);
     if (peer_fd >= 0) {
         close(peer_fd);
     }
