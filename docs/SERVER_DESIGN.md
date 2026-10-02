@@ -1371,6 +1371,22 @@ Federated:
       checked on the wire with a member who parts and one who joins *while the link is
       down*, which is the only way to produce state the mesh cannot already have seen.
       Both shorten the ladder's SCALE per process and neither shortens its rules.
+      **A third now does, and it is the one whose absence was a CI failure.**
+      `test_fed_resync.c` called `fed_set_timeouts()` but never `fed_set_retry()`, so
+      its nodes ran the shipped base of **90 s** — a COMPILE-time constant derived
+      from the shipped `IRC_FED_DEAD_MS`, which `fed_set_timeouts()` does not touch.
+      A link that connected and then missed the handshake armed
+      `delay_ms=90000`, and T7 dials only once `now_ms` reaches `retry_at_ms`, so
+      one transient miss was **terminal for the rest of the process** and no raise of
+      `T_IO_MS` below 90 s could have helped. Measured after the fix on a ten-core
+      host: `test_fed_resync` passed **20/20** consecutive, the suite passed
+      **65/65 at `-j8` three times** and **65/65 at CI's `-j2`**, and removing the
+      override again makes it fail **0/6** on its new rung assertion. The two
+      constraints the scale has to satisfy are both real and are argued where the
+      numbers are set; the honest limit is that this file drives **one** rung, so it
+      can prove a rung is a value the configured ladder could produce and **cannot**
+      prove the ceiling was *reached* — the deeper ladder stays
+      `test_failover_reconnect.c`'s claim.
 - [x] A peer that goes away is announced and forgotten — **MET, twice over, and Phase 9
       closes the second half C5 could not reach.**
       The C5 half is unchanged and still has the topology limit C5 stated: a link
@@ -1423,6 +1439,28 @@ Quality:
   be tight on the sanitizer job. Recorded rather than dismissed: the fix is a
   wider margin in that test, and until it lands the sanitizer job can go red
   for a reason that is not a defect.
+- [x] **A wider deadline is not a fix for a starved test, and the row above
+  is the one that proves it.** `ci_macos` failed `test_fed_resync` on
+  `main` at 52d57dd — `TIMEOUT after 30000 ms waiting for
+  "link_established: peer=irc.a"` on a two-core runner at `-j 2` — and
+  Phase 9 had already answered that failure once by raising this test's
+  `T_IO_MS` from 15000 to 30000. It did not help, and the reason is
+  arithmetic rather than tuning: the node had armed a retry of **90000 ms**,
+  three times the whole budget, so the second attempt the raise was paying for
+  could not happen at ANY budget under 90 s. The defect was that this one test
+  overrode `fed_set_timeouts()` and not `fed_set_retry()`, so it ran a ladder
+  120x longer than the dead window it had itself configured. **What is measured
+  and not believed:** the fix holds `T_IO_MS` at **30000** — the window now buys
+  a genuine second attempt (miss at 12000, rung at 16000, linked by ~16100), which
+  is what the raise was reaching for and did not buy — and the same file passed
+  **20/20** consecutive on a ten-core host, **10/10** under three concurrent full
+  suites. **What is NOT measured:** the two-core CI failure itself was not
+  reproduced locally. Sustained CPU starvation was applied (up to 160 busy
+  loops taking ~460–730% of 1000%) and the **pre-fix** test still passed 12/12,
+  median 3.7 s against 3.0 s idle — this host has ten cores and the runner has
+  two, and the gap is not something more load can bridge. The evidence for the
+  fix is therefore the failing rung assertion (0/6 without the override), the
+  90000-vs-30000 arithmetic, and the CI log, not a local reproduction.
 - [ ] `SPEC_TRACKING.md` matches source, verified by reading it
 - [x] No test asserts internal plumbing
 
