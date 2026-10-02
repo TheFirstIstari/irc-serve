@@ -183,6 +183,23 @@ static void send_welcome(server_t *s, conn_t *c)
 
     printf("[observable] welcome: fd=%d nick=%s\n", c->fd, c->nick);
     send_motd(s, c);
+    /* AND THE account-notify LINE, AFTER 376 AND NOT BEFORE IT.
+     *
+     * This is the first moment on this node at which a client can be told which
+     * account it is associated with: SASL ran before registration, so before 001
+     * the connection had no hostmask to attribute the line to and no nickname to
+     * put in the prefix. It is after the MOTD rather than interleaved with the
+     * numerics because a client parses the registration burst as one thing and an
+     * extra verb in the middle of it is a line it does not expect yet.
+     *
+     * IT IS GATED ON THE CAPABILITY AND NOT ON WHETHER THERE IS AN ACCOUNT, which
+     * is the whole of what account-notify's unconditional availability means: a
+     * client that asked is told `ACCOUNT *` on a node with no registry, because
+     * "you are not associated with an account" is a true and useful answer rather
+     * than an absence. */
+    if (cap_account_notify_enabled(c) != 0) {
+        account_notify_current(s, c);
+    }
 }
 
 /* Recompute the state from the two facts, and emit the welcome burst on the
@@ -1039,6 +1056,59 @@ static void handle_register(server_t *s, conn_t *c, const message_t *m)
                    "by its operator in a registry file");
 }
 
+/* ---------------------------------------------------------------------------
+ * ACCOUNT -- the account-notify query, and the collision that had to be resolved
+ * deliberately rather than by accident
+ * ---------------------------------------------------------------------------
+ * `ACCOUNT` was, in the retired draft, the NICKNAME-CHANGE command: a client
+ * changed its nick and supplied a password in one command, and `ACCOUNT
+ * <password>` is the shape every server of that era accepted.
+ *
+ * **WHAT THIS NODE DISPATCHED BEFORE THIS PASS: NOTHING.** There was no
+ * `ACCOUNT` row in k_commands[] at all, so a client that sent it got 421 -- "I
+ * have never heard of this verb" -- and a nickname change was, and still is, `NICK
+ * <newnick>` and nothing else (handle_nick(), above). So there was no live
+ * nick-change verb to collide with, and adding this row cannot break a nick
+ * change: the two words have never reached the same switch.
+ *
+ * The IRCv3 position is that the nick-change MEANING is gone rather than merely
+ * unfashionable: an account association changed through the account service, not
+ * through the server, and a server that took a password on a nickname change was
+ * a server asking for a credential it had no way to verify. What survives is the
+ * name, reused by `account-notify` for a completely different fact.
+ *
+ * THE TWO SHAPES ARE ALSO DISJOINT, which is worth saying because it is the reason
+ * the collision costs nothing rather than merely nothing today:
+ *
+ *   the retired nick-change form  ACCOUNT <password>   ONE parameter
+ *   the query below               ACCOUNT              ZERO parameters
+ *
+ * So a client still speaking the retired dialect gets 461 for a verb with a
+ * parameter, not a nickname change. That is the right answer and it is also the
+ * reason a future phase that wanted a one-parameter ACCOUNT would have to decide
+ * to take it back rather than find it already spoken for.
+ *
+ * WHAT IS *NOT* HERE, and is the honest limit of this implementation:
+ * `ACCOUNT <account> FAIL`. There is no logout on this node -- SASL PLAIN has no
+ * logout and there is no account service to log out of, and account_clear() runs
+ * only from server_close_conn(), where the connection is already gone -- so there
+ * is no event the form describes. account.h says where an emitter would go if a
+ * phase adds one. */
+static void handle_account(server_t *s, conn_t *c, const message_t *m)
+{
+    if (m->nparams != 0) {
+        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        printf("[observable] account_cmd_refused: fd=%d nick=%s verb=ACCOUNT "
+               "reason=arity nparams=%d\n", c->fd, c->nick, m->nparams);
+        return;
+    }
+    /* ANSWERED REGARDLESS OF THE CAPABILITY, because the client ASKED. The
+     * capability governs the unsolicited line at the end of the welcome burst;
+     * refusing a question a client put on the wire would be a node that knows the
+     * answer and will not give it. */
+    account_notify_current(s, c);
+}
+
 /* UNREGISTER [password]. Refused unconditionally, for reason 4 above. */
 static void handle_unregister(server_t *s, conn_t *c, const message_t *m)
 {
@@ -1386,7 +1456,12 @@ static const command_t k_commands[] = {
      * REGISTER"; this node HAS heard of it and has decided. The distinction is
      * the whole of what a refusal is, and 421 cannot express it. */
     { "REGISTER",   handle_register,   0 },
-    { "UNREGISTER", handle_unregister, 0 }
+    { "UNREGISTER", handle_unregister, 0 },
+    /* 7/Phase 10.2b: the account-notify query. NOT `pre_reg`, because the answer
+     * carries this connection's hostmask and a pre-registration connection has no
+     * nickname to put in it -- an unregistered client sending ACCOUNT gets 451,
+     * which is the RFC's own answer for "you have not registered yet". */
+    { "ACCOUNT",    handle_account,    0 }
 };
 
 static const command_t *lookup(const char *verb)

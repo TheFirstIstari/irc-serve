@@ -215,6 +215,13 @@ static void test_negotiation(void)
                 TF_CHECK_MSG(strstr(line, "message-tags") != NULL,
                              "CAP LS does not advertise message-tags, which this "
                              "node implements");
+                /* ...and `account-tag` is NOT here on this node, which has neither
+                 * a registry nor an identity to stamp. The store check is
+                 * account_possible() and this node has no store; Phase 10.2a's
+                 * two-node and two-store cases are what cover the other side. */
+                TF_CHECK_MSG(strstr(line, "account-tag") == NULL,
+                             "CAP LS advertises account-tag on a node with no "
+                             "account registry, which can never write the tag");
                 /* NOT ADVERTISED, and each of these is a capability a client
                  * would act on: cap-notify expects unsolicited CAP NEW lines,
                  * away-notify expects an AWAY you did not ask for,
@@ -226,8 +233,16 @@ static void test_negotiation(void)
                              "CAP LS advertises away-notify");
                 TF_CHECK_MSG(strstr(line, "echo-message") == NULL,
                              "CAP LS advertises echo-message");
-                TF_CHECK_MSG(strstr(line, "account-notify") == NULL,
-                             "CAP LS advertises account-notify");
+                /* `account-notify` WAS here, and Phase 10.2b is why it is not any
+                 * more. The node emitted no ACCOUNT line, and a listed capability
+                 * is a client switching the feature on and then drawing the wrong
+                 * conclusion from every line -- which for this one means a client
+                 * whose channel-mates all appear anonymous for ever. It is now a
+                 * capability this build really does, so it belongs in the
+                 * "advertised means implemented" arm above. */
+                TF_CHECK_MSG(strstr(line, "account-notify") != NULL,
+                             "CAP LS does not advertise account-notify, which this "
+                             "node implements and answers");
                 TF_CHECK_MSG(strstr(line, "server-time") == NULL,
                              "CAP LS advertises server-time, which this node "
                              "does not stamp");

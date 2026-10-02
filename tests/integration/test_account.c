@@ -68,16 +68,22 @@
  *     on one and a client that asked for `account-tag` on the other: the far side
  *     receives the message with a `msgid` and with no `account`. The decision and
  *     its cost are at fanout.c's fanout_emitter_account().
- *  8. **REGISTER AND UNREGISTER ARE REFUSED WITH 482, NOT 421.** A client that
+ *  8. **`account-notify` IS ANSWERED AND IS NOT SOLICITED.** A client that
+ *     negotiated it is told `ACCOUNT <account> PASS` or `ACCOUNT *` at the end of
+ *     its own registration burst; a client that negotiated nothing is told
+ *     nothing; a client that ASKS with a bare `ACCOUNT` is answered; and the
+ *     retired one-parameter nickname-change dialect is refused with 461 rather
+ *     than read as a nick change.
+ *  9. **REGISTER AND UNREGISTER ARE REFUSED WITH 482, NOT 421.** A client that
  *     got 421 would read "this server has never heard of REGISTER"; this node
  *     has heard of it and has decided.
- *  9. **THE STORE IS A SECRET FILE.** A world-readable registry, a malformed
+ * 10. **THE STORE IS A SECRET FILE.** A world-readable registry, a malformed
  *     record and a path that does not exist are each REFUSED, and each refusal
  *     lands the node in exactly the state case 3 asserts.
- * 10. **AN ACCOUNT PASSWORD IS NEVER LOGGED.** The password is handed to
+ * 11. **AN ACCOUNT PASSWORD IS NEVER LOGGED.** The password is handed to
  *     account_set() and there is no variable holding it afterwards, so the
  *     node's own output is read and checked.
- * 11. **THE TEARDOWN ARM RAN**, with the state it found.
+ * 12. **THE TEARDOWN ARM RAN**, with the state it found.
  *
  * ---------------------------------------------------------------------------
  * NO sleep() ANYWHERE (6.3), AND NO PORT COLLISION
@@ -761,10 +767,14 @@ static void test_logged_in(const char *sasl, const char *registry)
      * is spelled out rather than spot-checked: this is the one node in this file
      * where every capability is available, so it is the one place a capability
      * can be missing from the assertion and still pass. */
+    /* `account-notify` IS here even on this node, and the reason is that its
+     * answer is not a name: `ACCOUNT *` is a true answer on a node with no
+     * registry, so the capability is available unconditionally. `account-tag`
+     * above is the one that is conditional. */
     TF_CHECK_MSG(strstr(tc_buffer(&alice.c),
                         " CAP * LS :multi-prefix message-tags draft/message-ids "
-                        "sasl account-tag\r\n") != NULL,
-                 "the advertised list on a node with BOTH stores is not the five "
+                        "sasl account-tag account-notify\r\n") != NULL,
+                 "the advertised list on a node with BOTH stores is not the six "
                  "capabilities this node implements: %s", tc_buffer(&alice.c));
 
     /* ---- the credential, and the identity it establishes ---- */
@@ -865,14 +875,16 @@ static void test_no_registry(const char *sasl, const char *label)
     TF_CHECK_MSG(tc_expect(&alice.c, ls, T_IO_MS) == 0, "%s: no CAP LS", label);
     TF_CHECK_MSG(strstr(tc_buffer(&alice.c),
                         " CAP " "alice" " LS :multi-prefix message-tags "
-                        "draft/message-ids sasl\r\n") != NULL,
+                        "draft/message-ids sasl account-notify\r\n") != NULL,
                  "%s: the advertised list on a node with a credential store and "
-                 "NO registry is not exactly the four capabilities it really "
+                 "NO registry is not exactly the five capabilities it really "
                  "has; a client would read an account-tag here as an identity it "
                  "can never get", label);
-    TF_CHECK_MSG(strstr(tc_buffer(&alice.c), "account") == NULL,
-                 "%s: a capability mentioning accounts is advertised by a node "
-                 "with no account registry", label);
+    /* AND ONLY account-tag, which is why this cannot be a sweep for the substring
+     * "account": `account-notify` legitimately contains it. */
+    TF_CHECK_MSG(strstr(tc_buffer(&alice.c), "account-tag") == NULL,
+                 "%s: account-tag is advertised by a node with no account "
+                 "registry, and the tag can never be written there", label);
     TF_CHECK_MSG(tc_send(&alice.c, "CAP REQ :account-tag") == 0,
                  "CAP REQ send failed");
     TF_CHECK_MSG(tc_expect(&alice.c, nak, T_IO_MS) == 0,
@@ -932,7 +944,8 @@ static void test_no_registry(const char *sasl, const char *label)
  * `sasl` is ABSENT here because there is no credential store, which is Phase
  * 8's rule and is unchanged. `account-tag` is absent for a different reason --
  * see cap.h -- and the test cannot tell those two apart, which is correct: a
- * client cannot either. */
+ * client cannot either. `account-notify` is PRESENT, because its answer is a fact
+ * rather than a name and this node has it. */
 static void test_default_node(void)
 {
     nf_node_t node;
@@ -970,13 +983,18 @@ static void test_default_node(void)
     /* The copy stops AT the CRLF rather than including it -- `n` is measured to
      * the CR -- so the expected literal has no terminator either. */
     TF_CHECK_MSG(strcmp(caps, " CAP * LS :multi-prefix message-tags "
-                              "draft/message-ids") == 0,
+                              "draft/message-ids account-notify") == 0,
                  "the advertised capability list on a node with no stores is "
-                 "\"%s\"; it must be exactly the three that need no "
+                 "\"%s\"; it must be exactly the four that need no "
                  "configuration", caps);
-    TF_CHECK_MSG(strstr(caps, "account") == NULL,
-                 "a name containing \"account\" is advertised on a node with no "
-                 "account system");
+    /* `account-notify` IS in that list and `account-tag` is NOT, and the
+     * difference is the whole of the store check. `ACCOUNT *` is an answer a node
+     * with no registry can give truthfully; an `account=` tag is a name it can
+     * never produce. The assertion names the first and says so rather than
+     * sweeping for "account", which would now be matching the wrong name. */
+    TF_CHECK_MSG(strstr(caps, "account-tag") == NULL,
+                 "account-tag is advertised on a node with no account system, and "
+                 "the tag can never be written there");
 
     TF_CHECK_MSG(tc_send(&alice.c, "CAP END") == 0, "CAP END send failed");
     client_register(&alice);
@@ -1651,6 +1669,169 @@ static void expect_the_tag_charge_is_real(void)
 }
 
 /* ==========================================================================
+ * CASE 9: `account-notify`
+ * ==========================================================================
+ * Four clients on one node with a registry, and one property each:
+ *
+ *   alice   logged in, negotiated account-notify  -> `ACCOUNT alice PASS`
+ *   bob     NOT logged in, negotiated it            -> `ACCOUNT *`
+ *   carol   logged in, negotiated NOTHING           -> nothing at all
+ *   dave    logged in, negotiated nothing but SENDS `ACCOUNT` -> answered anyway
+ *
+ * And two on the retired dialect, because that is the collision the handler's
+ * comment is about and a comment is not a check: `ACCOUNT hunter2` must be
+ * refused with 461, and NICK must still work afterwards -- because a handler that
+ * had swallowed the retired nickname-change verb would leave a client unable to
+ * change its nickname, and nothing else in this file would notice.
+ *
+ * Every window is closed by a PING on the SAME connection the command went out on,
+ * which is the only shape that is ordered; see speak_and_close()'s comment for the
+ * case where it is not.
+ */
+static void test_account_notify(const char *sasl, const char *registry)
+{
+    nf_node_t node;
+    client_t alice;
+    client_t bob;
+    client_t carol;
+    client_t dave;
+    char want[256];
+    char line[256];
+    size_t from;
+    size_t end;
+
+    spawn_node(&node, sasl, registry, "the account-notify line");
+    TF_CHECK_MSG(nf_expect(&node, "accounts=loaded", T_READY_MS) == 0,
+                 "the registry did not load, so nothing below is about an account");
+
+    /* ---- alice: the unsolicited notification, on a connection that asked ---- */
+    client_open_logged_in(&alice, &node, "alice", "CAP REQ :account-notify",
+                          "alice", "correct horse", "alice");
+    TF_CHECK_MSG(nf_expect(&node, "account=alice verified=1", T_IO_MS) == 0,
+                 "alice did not establish an account, so the PASS below would be "
+                 "about nothing");
+    /* The line is UNSOLICITED and arrives after the MOTD, so the wait is for the
+     * line itself and the drain follows it. `ACCOUNT <account> PASS` is the form
+     * the task names; the specification's older form omits the PASS, and both are
+     * rendered from one function. */
+    (void)snprintf(want, sizeof want,
+                   ":alice!alice@127.0.0.1 ACCOUNT alice PASS\r\n");
+    TF_CHECK_MSG(tc_expect(&alice.c, want, T_IO_MS) == 0,
+                 "a client that negotiated account-notify and logged in was not "
+                 "told its association at the end of its registration burst:\n  "
+                 "%s", tc_buffer(&alice.c));
+
+    /* ---- bob: the same capability, and the SAME answer with no account ---- */
+    client_open_logged_in(&bob, &node, "bob", "CAP REQ :account-notify", NULL,
+                          NULL, "bob");
+    (void)snprintf(want, sizeof want, ":bob!bob@127.0.0.1 ACCOUNT *\r\n");
+    TF_CHECK_MSG(tc_expect(&bob.c, want, T_IO_MS) == 0,
+                 "a client that negotiated account-notify and did NOT log in was "
+                 "not told `ACCOUNT *`:\n  %s", tc_buffer(&bob.c));
+    /* ...and NOT told a PASS, which is the same assertion in the other direction
+     * and is what a node that defaulted the parameter would get wrong. */
+    TF_CHECK_MSG(strstr(tc_buffer(&bob.c), "ACCOUNT alice") == NULL,
+                 "an unidentified client was told somebody ELSE's account");
+
+    /* ---- carol: an account, and no capability, and therefore SILENCE ---- */
+    client_open_logged_in(&carol, &node, "carol", NULL, "alice", "correct horse",
+                          "carol");
+    from = drain(&carol);
+    end = drain(&carol);
+    expect_absent_in_window(&carol, from, end,
+                            "an unsolicited ACCOUNT line to a connection that "
+                            "negotiated nothing", " ACCOUNT ");
+    /* ...and nothing anywhere in her whole stream, so the silence is not an
+     * artefact of the window. */
+    TF_CHECK_MSG(strstr(tc_buffer(&carol.c), "ACCOUNT") == NULL,
+                 "a connection that negotiated nothing was sent an ACCOUNT line "
+                 "at some point:\n  %s", tc_buffer(&carol.c));
+
+    /* ---- dave: no capability, but he ASKS, so he is ANSWERED ---- */
+    client_open_logged_in(&dave, &node, "dave", NULL, "alice", "correct horse",
+                          "dave");
+    from = drain(&dave);
+    (void)snprintf(line, sizeof line, "ACCOUNT");
+    TF_CHECK_MSG(tc_send(&dave.c, line) == 0, "ACCOUNT send failed");
+    end = drain(&dave);
+    (void)snprintf(want, sizeof want, ":dave!dave@127.0.0.1 ACCOUNT alice PASS\r\n");
+    expect_in_window(&dave, from, end,
+                     "the answer to a bare ACCOUNT from a client that never "
+                     "negotiated the capability", want);
+
+    /* ---- THE RETIRED DIALECT, WHICH IS THE COLLISION ----
+     *
+     * `ACCOUNT hunter2` is the old nickname-change command. This node had no
+     * ACCOUNT row in its dispatch table at all before Phase 10.2b -- it was 421 --
+     * and nickname changes are `NICK`, so the two words never reached the same
+     * switch. What is asserted here is that adding the row did not make the
+     * retired shape mean something: it is refused on ARITY, and the nickname is
+     * still changeable afterwards. */
+    from = drain(&dave);
+    (void)snprintf(line, sizeof line, "ACCOUNT hunter2");
+    TF_CHECK_MSG(tc_send(&dave.c, line) == 0, "the retired ACCOUNT form could not "
+                                              "be sent");
+    end = drain(&dave);
+    (void)snprintf(want, sizeof want,
+                   ":" BIN_NAME " 461 dave :Not enough parameters\r\n");
+    expect_in_window(&dave, from, end,
+                     "the refusal of the retired one-parameter ACCOUNT form",
+                     want);
+    expect_absent_in_window(&dave, from, end,
+                            "a nickname change from the retired ACCOUNT form",
+                            "ACCOUNT dave2");
+
+    /* ---- AND NICK STILL WORKS, WHICH IS THE WHOLE POINT ----
+     *
+     * Not a tautology: it is the assertion that fails if a future ACCOUNT handler
+     * ever takes the retired meaning, and nothing else in this file would notice
+     * that a client could no longer change its nickname.
+     *
+     * THE RENAME IS NOT OBSERVED THROUGH A `NICK` ECHO, because a client-issued
+     * rename on this node emits none -- handle_nick() reports it on the node's own
+     * output and does not fan it out, which 3.1 has never claimed otherwise. It is
+     * observed through the PREFIX of the very next line the node sends that
+     * connection, which is rendered from the nickname it now holds: the ACCOUNT
+     * answer below. One command proves both that the rename took effect and that
+     * ACCOUNT still works afterwards, which is the pair the collision is about. */
+    from = drain(&dave);
+    (void)snprintf(line, sizeof line, "NICK dave2");
+    TF_CHECK_MSG(tc_send(&dave.c, line) == 0, "NICK send failed");
+    (void)snprintf(line, sizeof line, "ACCOUNT");
+    TF_CHECK_MSG(tc_send(&dave.c, line) == 0, "the second ACCOUNT send failed");
+    end = drain(&dave);
+    (void)snprintf(want, sizeof want,
+                   ":dave2!dave@127.0.0.1 ACCOUNT alice PASS\r\n");
+    expect_in_window(&dave, from, end,
+                     "the nickname change that ACCOUNT must not have broken, seen "
+                     "in the prefix of the next line the node sends that "
+                     "connection", want);
+    TF_CHECK_MSG(nf_expect(&node, "nick_change: fd=", T_IO_MS) == 0,
+                 "the node did not report the rename at all");
+
+    /* ---- AND NO `FAIL`, BECAUSE THERE IS NO EVENT FOR IT ----
+     *
+     * Not a claim of coverage: a check that the wire form is absent, with the
+     * reason recorded. SASL PLAIN has no logout and there is no account service,
+     * so `ACCOUNT <account> FAIL` describes a transition this node cannot have --
+     * and a test that asserted the form's presence would be asserting a feature. */
+    TF_CHECK_MSG(strstr(tc_buffer(&alice.c), "FAIL") == NULL &&
+                     strstr(tc_buffer(&dave.c), "FAIL") == NULL,
+                 "an `ACCOUNT ... FAIL` line appeared, and there is no logout on "
+                 "this node for it to describe");
+
+    /* ---- AND THE ACCOUNT NAME IS NEVER RENDERED EMPTY BY ANY OF IT ---- */
+    expect_account_name_never_empty(&node);
+
+    TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not stop cleanly");
+    nf_free(&node);
+    tc_close(&alice.c);
+    tc_close(&bob.c);
+    tc_close(&carol.c);
+    tc_close(&dave.c);
+}
+
+/* ==========================================================================
  * THE REFUSAL RULES OF account_set(), IN PROCESS, ON RETURN VALUES
  * ==========================================================================
  * These are the assertions CONTRIBUTING.md calls observable ("return values,
@@ -1907,6 +2088,9 @@ int main(void)
     /* ---- the tag, per destination, and then not across a link ---- */
     test_account_tag_on_the_wire(sasl_good, acct_good);
     test_account_tag_does_not_cross_to_peers(sasl_good, acct_good);
+
+    /* ---- and the unsolicited ACCOUNT line ---- */
+    test_account_notify(sasl_good, acct_good);
 
     /* ---- the regression cases ---- */
     test_no_registry(sasl_only, "a credential store and no registry");

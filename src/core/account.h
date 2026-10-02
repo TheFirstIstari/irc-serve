@@ -190,4 +190,49 @@ size_t account_tag_block(const char *name, char *out, size_t cap);
  * on a rare value is the failure this whole tree keeps refusing. */
 #define ACCOUNT_TAG_MAX (sizeof(ACCOUNT_TAG_KEY) + 1u + (ACCOUNT_MAX_NAME * 2u) + 1u)
 
+/* Tell `c` which account it is associated with, in the `account-notify` wire form:
+ *
+ *   :nick!user@host ACCOUNT <account> PASS
+ *   :nick!user@host ACCOUNT *
+ *
+ * `*` is what a user with NO account association gets, which is why this function
+ * is meaningful on a node with no registry at all -- and that is also why
+ * `account-notify` is available unconditionally while `account-tag` is not.
+ *
+ * ONE EMITTER AND NO ARGS, because there is nothing to vary: the subject is the
+ * connection, and account_logged_in() is the only question. A caller that has a
+ * different association to report is describing something this node does not have.
+ *
+ * ---------------------------------------------------------------------------
+ * WHERE THE NOTIFICATION GOES, AND THE LIMIT THAT IS LOAD-BEARING HERE
+ * ---------------------------------------------------------------------------
+ * The specification says the message goes to "clients on common channels with
+ * them, INCLUDING THEMSELVES". **On this node the second half is the only half
+ * there is, and that is a consequence of the account lifecycle rather than a
+ * choice.** The association is established by `account_set()`, which SASL runs
+ * BEFORE registration -- so at the moment it becomes true the connection has no
+ * nickname, no hostmask worth publishing and no channel. By the time a client has
+ * channels, the association has been fixed for its whole life and there is no
+ * later transition to report. A subscriber-style fan-out would therefore have
+ * exactly one member to address and no reachable path to a second.
+ *
+ * THE COST, stated rather than left for a reader to discover: two users in a
+ * channel do NOT learn each other's account association from this line. They learn
+ * it from `extended-join` (Phase 10.3) or from `330 RPL_WHOISACCOUNT`, and a
+ * client whose channel-mates logged in before it joined learns neither without
+ * asking. Adding a services layer with a real logout is what makes the
+ * channel-scoped half reachable, and it is what would make
+ * `ACCOUNT <account> FAIL` an emission rather than an unimplemented form; see
+ * design 2.5.6.
+ *
+ * NEVER WRITES TO A PEER, for the same reason `+account` does not cross a link:
+ * account.c's notify is reached from the client-facing paths only, and
+ * emit_to_client() refuses a CONN_SERVER destination anyway.
+ *
+ * IT PRINTS NOTHING ABOUT A NAME IT DOES NOT HAVE, which is the P10.1 discipline
+ * carried over: the `[observable]` line says `state=EMPTY` rather than
+ * `account=` with nothing after it, so the byte check that keeps an empty account
+ * from being an account named "" has nothing to trip over. */
+void account_notify_current(server_t *s, conn_t *c);
+
 #endif /* IRC_CORE_ACCOUNT_H */
