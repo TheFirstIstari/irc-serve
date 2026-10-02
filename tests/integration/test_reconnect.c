@@ -707,7 +707,19 @@ static void case_a_dropped_client_gets_its_channels_back(void)
                      "mismatch below would run against an empty table and pass "
                      "whether or not the ident were compared: %s",
                      n.out);
-        register_client(&wrong_ident, n.port, NICK_KEY, IDENT_WRONG, "reg-wrong");
+        /* The applied-count as it stands BEFORE this client exists. The claim
+         * below is that registering the wrong-ident client leaves it unchanged,
+         * so it is read on both sides of that registration rather than pinned to
+         * an absolute number: earlier beats in this test have already moved it to
+         * 2, and a hardcoded 1 would be an assertion about the test's own history
+         * rather than about the key comparison. */
+        uint64_t applied_before = 0u;
+
+
+            TF_CHECK_MSG(nf_find_u64(&n, "resume_applied=", &applied_before) == 0,
+                         "could not read resume_applied before the wrong-ident "
+                         "client: %s", n.out);
+            register_client(&wrong_ident, n.port, NICK_KEY, IDENT_WRONG, "reg-wrong");
         mark = tc_received(&wrong_ident);
         (void)snprintf(line, sizeof line, "NAMES " CHAN_OP);
         TF_CHECK_MSG(tc_send(&wrong_ident, line) == 0, "the NAMES send failed");
@@ -738,6 +750,29 @@ static void case_a_dropped_client_gets_its_channels_back(void)
          * and the one a name-only resolver would get wrong: a node that matched
          * on the nick alone would have told the CLIENT it was resumed, and this
          * is the line the client would have acted on. */
+        /* The negative assertion is scoped to the LOG AS IT STANDS NOW, and the
+         * boundary that makes it meaningful is the PONG above: that round trip is
+         * proof the node finished registering this client, so a resume line for it
+         * would already have been written. Asserting absence over a 400 ms window
+         * instead cannot tell "correctly refused" from "not written yet" -- and
+         * that is not theoretical: this is the assertion the sanitizer job failed,
+         * where the reconnect landed after the deadline, so the deadline expired
+         * with the line already there for the OTHER key.
+         *
+         * There is deliberately no resume_rejected counter for this path: a client
+         * that matches no window is not a failed resume and is told nothing (the
+         * NOTICE check below is the same property from the client's side), so a
+         * counter for it would report a rejection the node does not consider one.
+         * The boundary plus the monotonic resume_applied=1 is the honest form. */
+        TF_CHECK_MSG(strstr(n.out, "session_resume: nick=" NICK_KEY " ident=" IDENT_WRONG) ==
+                         NULL,
+                     "a window was applied to a client whose IDENT differs from "
+                     "the one the window recorded: %s", n.out);
+        TF_CHECK_MSG(nf_expect_u64(&n, "resume_applied=", applied_before, T_IO_MS) == 0,
+                     "resume_applied moved from %llu after a client whose IDENT "
+                     "differs from the one the window recorded registered, so the key "
+                     "is not really the three fields core/resume.h claims: %s",
+                     (unsigned long long)applied_before, n.out);
         TF_CHECK_MSG(nf_expect(&n, "session_resume: nick=" NICK_KEY " ident=" IDENT_WRONG,
                                400) != 0,
                      "a window was applied to a client whose IDENT differs from the "
