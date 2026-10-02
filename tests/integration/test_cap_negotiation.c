@@ -222,6 +222,14 @@ static void test_negotiation(void)
                 TF_CHECK_MSG(strstr(line, "account-tag") == NULL,
                              "CAP LS advertises account-tag on a node with no "
                              "account registry, which can never write the tag");
+                /* ...and `extended-join` IS advertised here even though this node
+                 * has no account system, because its answer is a `*` account field
+                 * rather than a name: `JOIN #chan * :Real Name` is complete and
+                 * true. Two account capabilities, two answers to the same shape of
+                 * question, and cap.h is where the difference is argued. */
+                TF_CHECK_MSG(strstr(line, "extended-join") != NULL,
+                             "CAP LS does not advertise extended-join, which this "
+                             "node implements on every node");
                 /* NOT ADVERTISED, and each of these is a capability a client
                  * would act on: cap-notify expects unsolicited CAP NEW lines,
                  * away-notify expects an AWAY you did not ask for,

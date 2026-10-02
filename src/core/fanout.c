@@ -778,6 +778,25 @@ static const char *fanout_tag_block(const conn_t *dst,
     return (out[0] != '\0') ? out : NULL;
 }
 
+/* WHICH OF TWO PARAMETER LISTS DOES THIS DESTINATION GET?
+ *
+ * One function, called from the member walk and from the single-user row, because
+ * the two arms of the switch are two destinations in all but name and a capability
+ * question answered twice is a capability question that can be answered two ways.
+ *
+ * A NULL or empty `extended` means there is only one shape, which is every
+ * emission in this file except the extended JOIN. */
+static void fanout_form_for(const conn_t *dst, const fanout_form_t *extended,
+                            const char *const **params, int *nparams)
+{
+    if (extended == NULL || extended->params == NULL ||
+        cap_extended_join_enabled(dst) == 0) {
+        return;
+    }
+    *params = extended->params;
+    *nparams = extended->nparams;
+}
+
 /* Write one line to every local member of `t->chan`, minus `exclude`.
  *
  * The same chan_member_live() rule every other member walk applies, for the
@@ -790,8 +809,14 @@ static int write_to_members(server_t *s, const fanout_target_t *t,
                             const char *prefix, const char *verb,
                             const char *const *params, int nparams,
                             conn_t *exclude, const irc_serve_tags_t *ident,
-                            const char *account)
+                            const char *account, const fanout_form_t *extended)
 {
+    /* THE SHAPE IS DECIDED PER MEMBER AND EVERYTHING ELSE IS NOT, which is the
+     * whole of what `extended` adds to this function. The parameter list, the
+     * verb, the prefix, the 2.4 stamp and the account name are one emission's
+     * facts and are the same for every member; only the recipient's negotiation
+     * decides which of two lists of parameters it will be handed. */
+
     /* The target is `t->name` -- 2.2's CANONICAL form -- and not whatever the
      * caller typed, PREPENDED to the caller's own parameters. That is why the
      * caller's list is the parameters AFTER the target: it is the same
@@ -826,13 +851,11 @@ static int write_to_members(server_t *s, const fanout_target_t *t,
     if (t->chan == NULL || nparams < 0 || nparams >= IRC_MAX_PARAMS) {
         return 0;
     }
-    all[0] = t->name;
-    for (int i = 0; i < nparams; i++) {
-        all[i + 1] = params[i];
-    }
     for (size_t i = 0; i < t->chan->nmembers; i++) {
         conn_t *m = t->chan->members[i].c;
         char tags[FANOUT_TAG_BLOCK_MAX + 1u];
+        const char *const *use = params;
+        int nuse = nparams;
 
         if (!chan_member_live(&t->chan->members[i])) {
             continue;
@@ -853,7 +876,33 @@ static int write_to_members(server_t *s, const fanout_target_t *t,
          * function: it is the SAME resolved name for every destination here and
          * for the forward below. What varies per member is whether it is rendered
          * at all. */
-        (void)send_line_tagged(s, m, prefix, verb, all, nparams + 1,
+        /* THE SHAPE, RESOLVED. fanout_form_for() is the ONE place that asks a
+         * destination which of two parameter lists it gets, and it is a function
+         * rather than an inline test so that the user row below cannot answer the
+         * question differently from this one. */
+        fanout_form_for(m, extended, &use, &nuse);
+        /* AND THE EXTENDED LIST IS ARITY-CHECKED PER MEMBER, because the guard
+         * above ran on the PLAIN one and an extended list can be longer. Unreachable
+         * today -- the only extended caller adds two parameters to a verb that had
+         * none -- and reported rather than assumed, for the reason write_to_members()
+         * reports its other refusals: a caller that outgrew the array is a bug and
+         * this node does not silently drop a member's copy of a line to hide one. */
+        if (nuse >= IRC_MAX_PARAMS) {
+            printf("[observable] fanout_unhandled_form: verb=%s target=%s "
+                   "nparams=%d\n", verb, t->name, nuse);
+            continue;
+        }
+        /* AND `all` IS BUILT PER MEMBER, INSIDE the walk, which it did not have to
+         * be before this pass. It is the target plus whichever of the two shapes
+         * this member gets, so hoisting it would have baked in whichever shape the
+         * function was called with and quietly given every member the same one --
+         * which is the bug fanout_form_for()'s comment says this shape decision
+         * exists to prevent, reached by the other road. */
+        all[0] = t->name;
+        for (int k = 0; k < nuse; k++) {
+            all[k + 1] = use[k];
+        }
+        (void)send_line_tagged(s, m, prefix, verb, all, nuse + 1,
                                fanout_tag_block(m, ident, account, tags,
                                                 sizeof tags));
         n++;
@@ -865,6 +914,20 @@ int fanout_deliver_local(server_t *s, const fanout_target_t *t, const char *pref
                          const char *verb, const char *const *params, int nparams,
                          conn_t *exclude)
 {
+    const fanout_form_t plain = { params, nparams };
+
+    /* ONE SHAPE, expressed as the two-shape call, for the reason fanout_deliver()
+     * gives. */
+    return fanout_deliver_local_forms(s, t, prefix, verb, &plain, NULL, exclude);
+}
+
+int fanout_deliver_local_forms(server_t *s, const fanout_target_t *t,
+                              const char *prefix, const char *verb,
+                              const fanout_form_t *plain,
+                              const fanout_form_t *extended, conn_t *exclude)
+{
+    const char *const *params = (plain != NULL) ? plain->params : NULL;
+    int nparams = (plain != NULL) ? plain->nparams : 0;
     irc_serve_tags_t ident;
     int relayed = 0;
     const char *account;
@@ -922,7 +985,7 @@ int fanout_deliver_local(server_t *s, const fanout_target_t *t, const char *pref
          * kind of channel it resolved would be asking a question with no answer
          * that changes anything. */
         return write_to_members(s, t, prefix, verb, params, nparams, exclude, &ident,
-                                account);
+                                account, extended);
 
     case FANOUT_REMOTE_USER:
     case FANOUT_NONE:
@@ -940,6 +1003,23 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
                    const char *verb, const char *const *params, int nparams,
                    conn_t *exclude, const irc_serve_tags_t *carry)
 {
+    const fanout_form_t plain = { params, nparams };
+
+    /* THE WHOLE OF THIS FUNCTION IS ONE LINE, and it is here so that the single
+     * shape case is expressed in terms of the two-shape one rather than the other
+     * way round: a NULL `extended` IS "one shape for everybody", and a caller that
+     * reached fanout_deliver() gets exactly the behaviour it had before the
+     * extension existed. */
+    return fanout_deliver_forms(s, t, prefix, verb, &plain, NULL, exclude, carry);
+}
+
+int fanout_deliver_forms(server_t *s, const fanout_target_t *t, const char *prefix,
+                         const char *verb, const fanout_form_t *plain,
+                         const fanout_form_t *extended, conn_t *exclude,
+                         const irc_serve_tags_t *carry)
+{
+    const char *const *params;
+    int nparams;
     const char *account;
     /* Switched on an int, not on the enum, and that is deliberate rather than
      * lazy.
@@ -972,8 +1052,12 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
     irc_serve_tags_t ident;
     int relayed;
 
-    if (s == NULL || t == NULL || verb == NULL || (params == NULL && nparams != 0) ||
-        nparams < 0) {
+    if (s == NULL || t == NULL || verb == NULL || plain == NULL) {
+        return 0;
+    }
+    params = plain->params;
+    nparams = plain->nparams;
+    if ((params == NULL && nparams != 0) || nparams < 0) {
         return 0;
     }
     kind = (int)t->kind;
@@ -997,6 +1081,20 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
          * See the comment there for why the claim and the code used to disagree
          * without anything noticing. */
         if (t->user == NULL || nparams >= IRC_MAX_PARAMS) {
+            return 0;
+        }
+        /* THE SHAPE IS RESOLVED BEFORE `all` IS BUILT, and for the same reason it
+         * is resolved per member in write_to_members(): this row is a destination
+         * like any other, and a capability question answered in one arm of this
+         * switch and not the other is a JOIN that changes shape depending on
+         * whether the caller resolved a channel or a nickname. No current caller
+         * passes `extended` for a user target -- a JOIN never has one -- and
+         * resolving it here anyway costs one AND rather than leaving the question
+         * open for the next caller. The arity check is repeated afterwards because
+         * the extended list can be longer than the plain one and `all` is one slot
+         * longer than the cap. */
+        fanout_form_for(t->user, extended, &params, &nparams);
+        if (nparams >= IRC_MAX_PARAMS) {
             return 0;
         }
         all[0] = t->name;
@@ -1028,9 +1126,16 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
 
     case FANOUT_LOCAL_CHANNEL: {
         int n = write_to_members(s, t, prefix, verb, params, nparams, exclude,
-                                 &ident, account);
+                                 &ident, account, extended);
 
         /* 3.1's two owned rows, AND THEY NOW SHARE ONE FORWARD ARM.
+         *
+         * AND THE FORWARD GETS `params`, NEVER `extended`. That is not an
+         * oversight and it is the whole of fanout.h's argument for this entry
+         * point: the peer-facing shape of a JOIN is 4.3's SJOIN, built by
+         * federation/verbs.c from the channel's membership, and it is one frozen
+         * shape for every peer. Which of a node's CLIENTS negotiated
+         * `extended-join` must not change what that node says to a peer.
          *
          * The local write is the only thing the verb class changes here, and the
          * forward is unconditional for both. The forward half is
@@ -1095,7 +1200,7 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
          * that do. */
         {
             int n = write_to_members(s, t, prefix, verb, params, nparams, exclude,
-                                     &ident, account);
+                                     &ident, account, extended);
 
             (void)fanout_forward_channel(s, t->chan, t->vclass, verb, prefix, params,
                                          nparams, &ident, relayed);

@@ -164,7 +164,15 @@ const char *account_name(const conn_t *c);
  * which is a corruption primitive handed to any client that can authenticate. */
 size_t account_tag_block(const char *name, char *out, size_t cap);
 
-/* The tag's key, as one constant, for the same reason message.h exports the
+/* `account_name_wire_safe()` IS DECLARED IN account_store.h, which is where the
+ * name's key space lives -- this module enforces it rather than defining it, for
+ * the reason the predicate's own comment gives: a registry must not be able to
+ * hold a name the node could never publish, so the rule belongs where the names
+ * are validated and account.h only has to be able to ask. The predicate is
+ * re-exported here by the include above, so a consumer of the IDENTITY can read it
+ * without knowing which store the name came from.
+ *
+ *//* The tag's key, as one constant, for the same reason message.h exports the
  * msgid one: fanout.c assembles a block holding both and a key spelled two ways
  * is a key that can drift. */
 #define ACCOUNT_TAG_KEY "account"

@@ -34,7 +34,8 @@ enum {
     CAPBIT_MESSAGE_IDS = 1u << 2,
     CAPBIT_SASL = 1u << 3,
     CAPBIT_ACCOUNT_TAG = 1u << 4,
-    CAPBIT_ACCOUNT_NOTIFY = 1u << 5
+    CAPBIT_ACCOUNT_NOTIFY = 1u << 5,
+    CAPBIT_EXTENDED_JOIN = 1u << 6
 };
 
 /* THE BIT ORDER IS FIXED AND THE TABLE BELOW IS THE CLAIM.
@@ -62,7 +63,8 @@ static const cap_def_t k_caps[] = {
     { CAP_MESSAGE_IDS, CAPBIT_MESSAGE_IDS },
     { CAP_SASL, CAPBIT_SASL },
     { CAP_ACCOUNT_TAG, CAPBIT_ACCOUNT_TAG },
-    { CAP_ACCOUNT_NOTIFY, CAPBIT_ACCOUNT_NOTIFY }
+    { CAP_ACCOUNT_NOTIFY, CAPBIT_ACCOUNT_NOTIFY },
+    { CAP_EXTENDED_JOIN, CAPBIT_EXTENDED_JOIN }
 };
 
 static const size_t k_ncaps = sizeof k_caps / sizeof k_caps[0];
@@ -273,6 +275,19 @@ int cap_account_tag_enabled(const conn_t *c)
 int cap_account_notify_enabled(const conn_t *c)
 {
     return cap_enabled(c, CAP_ACCOUNT_NOTIFY);
+}
+
+/* extended-join: ONE GATE AND NO AVAILABILITY CHECK, and the absence is the point.
+ *
+ * The line this capability turns on is a JOIN this node emits EITHER WAY, and the
+ * `*` account form is a complete answer on a node with no registry -- so there is
+ * no configuration in which this node cannot honour the capability. A store check
+ * here would mean a node with accounts silently sends a plainer JOIN to every
+ * client, which is a capability advertised and then declined rather than one
+ * advertised and honoured. */
+int cap_extended_join_enabled(const conn_t *c)
+{
+    return cap_enabled(c, CAP_EXTENDED_JOIN);
 }
 
 /* --------------------------------------------------------------------------

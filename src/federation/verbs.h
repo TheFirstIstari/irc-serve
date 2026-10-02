@@ -241,8 +241,8 @@ int fed_queue_line(server_t *s, conn_t *peer, const irc_serve_tags_t *tags,
  *   SNOTICE   <target> <text>
  *             `:alice!u@example S@1 SNOTICE #T :hello there`
  *
- *   SJOIN     <channel> <member> <flags>
- *             `:alice!u@example S@1 SJOIN #T alice +o`
+ *   SJOIN     <channel> <member> <flags> <account>
+ *             `:alice!u@example S@1 SJOIN #T alice +o *`
  *             The flags are the member's prefix flags as a `+` run, and the
  *             EMPTY CASE IS THE LITERAL `-`. That is not a mode convention: an
  *             empty middle parameter is not representable on this wire at all
@@ -252,6 +252,13 @@ int fed_queue_line(server_t *s, conn_t *peer, const irc_serve_tags_t *tags,
  *             parameter SJOIN and the flags would be read as absent on one node
  *             and as an empty token on another. `-` is one byte, never needs a
  *             colon, and is a legal channel-mode letter's negative form.
+ *
+ *             <account> is Phase 10.3's, and it is `4.3's SJOIN <account>` exactly
+ *             as `SBURSTM` carries it: the account name, or `*` for "not logged in
+ *             to an account". `*` rather than an empty token for the same reason as
+ *             `-`, and it is translated to "" on receipt so that the roster holds an
+ *             ABSENCE rather than an account named "*". It is derived from the
+ *             MEMBERSHIP, exactly as the flags are -- see fed_member_account().
  *
  *   SPART     <member> <channel> [<reason>]
  *             `:alice!u@example S@1 SPART alice #T :bye`
@@ -350,7 +357,13 @@ int fed_send_sverb(server_t *s, conn_t *peer, const irc_serve_tags_t *tags,
 /* How many parameters the S-verb for `client_verb` carries at most. The frozen
  * shapes above are what this is the length of, and it exists so that a caller
  * sizing an array has one number to ask for rather than a copy of the table. */
-#define FED_SVERB_MAX_PARAMS 4
+/* RAISED FROM 4 TO 5 IN PHASE 10.3, and the bound is the SJOIN's four parameters
+ * plus nothing else -- so the largest shape the S-verb family has is now FIVE, not
+ * four, and a caller that sized an array by the old number would have been one slot
+ * short for exactly one verb. Derived from the shapes above rather than picked:
+ * SJOIN is <channel> <member> <flags> <account>, SMODES is <server> <chan> <modes>
+ * [<arg>], and SKICK is <member> <chan> <target> [:reason]. */
+#define FED_SVERB_MAX_PARAMS 5
 
 /* ---------------------------------------------------------------------------
  * WHY THE SCRATCH BUFFER IS THE CALLER'S
@@ -373,6 +386,10 @@ int fed_send_sverb(server_t *s, conn_t *peer, const irc_serve_tags_t *tags,
 typedef struct {
     char nick[IRC_MAX_NICK + 1]; /* the member, split from the source prefix */
     char flags[4];               /* the SJOIN flag token: "+o", "+ov" or "-"   */
+    /* 4.3's SJOIN <account>, added in Phase 10.3: the account name, or the `*`
+     * that means "not logged in to an account". See fed_member_account() for why
+     * it is read out of the MEMBERSHIP rather than out of a nick record. */
+    char account[CONN_MAX_ACCOUNT + 2];
 } fed_sverb_scratch_t;
 
 /* Build the S-verb's parameter list for `client_verb` from a CLIENT emission.

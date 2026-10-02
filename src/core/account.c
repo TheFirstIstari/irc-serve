@@ -40,6 +40,22 @@ int account_set(server_t *s, conn_t *c, const char *name, const char *password)
          * only writer. */
         return -1;
     }
+    /* AND IT MUST BE WRITABLE AS A PARAMETER. This check is the reason
+     * account_name_wire_safe() exists, and it is HERE rather than only at a
+     * renderer because this is the ONE writer of the field: a connection can only
+     * be logged in once, so an account established here can be handed to 330, to a
+     * JOIN echo and to two S-verbs, and a renderer that refused one of them would
+     * be refusing a line rather than a name. See account.h for why the tag and the
+     * parameter have different rules.
+     *
+     * THE COST, stated: an operator cannot create an account whose name holds a
+     * space, so `account_store_add()` refuses one too and the file loader fails
+     * the record rather than storing a name this node could not publish. That is a
+     * restriction, and the alternative is an account that exists and is
+     * unreportable. */
+    if (account_name_wire_safe(name) == 0) {
+        return -1;
+    }
     nlen = strlen(name);
     if (nlen > sizeof c->account - 1u) {
         /* REFUSED, not truncated. An account is a name other people are shown

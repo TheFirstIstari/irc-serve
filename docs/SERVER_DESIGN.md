@@ -672,6 +672,75 @@ the welcome burst, and a question a client put on the wire is answered whatever 
 negotiated. A node that knows the answer and will not give it because of a
 negotiation bit is being unhelpful on purpose.
 
+#### 2.5.7 `extended-join`: THE CHANNEL ROSTER, WITH ACCOUNTS, IN ONE LINE
+
+**Added in Phase 10.3.** This is the capability that makes the account axis useful
+*inside a channel* rather than only per message, and it is the one that answers
+"who is in here" without a `NAMES` flood:
+
+```
+:nick!user@host JOIN #channel <account> :<realname>
+:nick!user@host JOIN #channel * :<realname>
+```
+
+**IT IS AVAILABLE ON A NODE WITH NO ACCOUNT SYSTEM, AND THAT IS THE THIRD
+DIFFERENT ANSWER THREE ACCOUNT CAPABILITIES GIVE.** §2.5.3 withholds
+`account-tag` because a tag that says nothing asserts anonymity; §2.5.6 advertises
+`account-notify` unconditionally because `ACCOUNT *` is a true answer; and this
+one is advertised unconditionally because **`*` is a complete answer** to "did this
+user log in to an account before channel ingress". A node with no registry has not
+got one to log in to. `cap.h` carries all three arguments together, and the reason
+they differ is that **one of the three capabilities carries a NAME and the other
+two carry a FACT**.
+
+**THE SHAPE IS PER DESTINATION, AND IT IS A DIFFERENT THING FROM A TAG.** Two
+members of one channel can disagree about `extended-join`, and the two forms are
+not two decorations of one line: a client that did not ask and received the extra
+parameters would read the account name as a topic and the realname as a reason, and
+it would do that silently. So `fanout_deliver_forms()` exists: `plain` is what
+everybody gets, `extended` is what a recipient that negotiated gets, and the
+**forward always uses `plain`** — the peer-facing shape is 4.3's SJOIN, which is
+built from the channel's own membership, and which of this node's *clients*
+negotiated a capability must not change what this node says to a *peer*.
+
+**THE ACCOUNT IS `<account>` OR `*` AND NEVER AN EMPTY PARAMETER**, and the rule is
+`account_logged_in()` rather than `c->account[0]`. That is §2.1.1's invariant one
+layer down: an empty account field would be a parameter a client reads as an empty
+one, and 3.2 cannot represent an empty middle parameter at all — so the node would
+be asserting a thing its own grammar has no way to say. `*` is one byte, never
+needs a colon, and is the protocol's own token for the absence.
+
+**AN ACCOUNT NAME MUST NOW BE WRITABLE AS A PARAMETER, AND THAT IS A RULE.**
+`account_name_wire_safe()` (in `account_store.h`, where the name's key space
+already lives) refuses a name holding SP, HTAB, CR, LF, any other control byte, or
+a leading `:`. **The tag and the parameter have different rules** — a message tag
+*escapes* `;`, `:`, `\`, SP, CR and LF, so a name holding them is fine in
+`account-tag` — and the parameter list is the binding one because a parameter can
+escape nothing at all. This was already true of `330 RPL_WHOISACCOUNT`, which has
+carried the account as a middle parameter since Phase 10.1; Phase 10.3 gave the
+name three more parameter positions to be wrong in, which is what made it visible.
+**The cost is stated: an operator cannot create an account whose name holds a
+space, and a registry record holding one is REFUSED rather than loaded with a name
+this node could not publish to anybody.** A restriction, enforced at the one writer
+of the field rather than discovered at a renderer.
+
+**WHAT IT FEDERATES, AND WHAT IT STILL DOES NOT.** `SJOIN` is now
+`<channel> <member> <flags> <account>` — four parameters, the fourth derived from
+the MEMBERSHIP exactly as the flags are — and `SBURSTM` carries the same fifth
+field so a resync does not lose what the live path writes (§4.3.1 argues why it is
+on the member record and not on `SBURSTN`). `chan_remote_t` grows an `account`, and
+`chan_remote_add()` takes one.
+
+**What is still absent, and it is a bigger gap than the capability's absence:**
+**this node emits no local client line for an INBOUND `SJOIN`.** 4.3's SJOIN carries
+only a server prefix, so `verbs.c` cannot render `:bob!user@host JOIN #T alice *`
+from a prefix that says `irc.b`, and a JOIN with a server prefix is a line no client
+understands. A local member therefore learns about a remote member through the
+roster (`353`) and not through an extended JOIN — which is the pre-existing gap
+`verbs.c` names, and it means the account a peer reported is stored and not yet
+shown. Closing it needs a hostmask for a remote member, which is `chan_remote_t`'s
+`host` field and a decision this phase does not make.
+
 ---
 
 ## 3. Message path
@@ -985,6 +1054,11 @@ src/federation/link.c  peer sockets, handshake FSM driving, keepalive
 `STOPIC` `SNAMES` `SSMODE` `SKICK` `SQUIT` `SHASH` `SBURST` `SNICK` `ADVERTISE`
 `SHUTDOWN`
 
+`SJOIN` is `<channel> <member> <flags> <account>`: the account field is Phase
+10.3's and is `*` for a member who is not logged in to an account, derived from
+the membership exactly as the flags are. It is also `SBURSTM`'s fifth parameter,
+for the reason §4.3.1 records.
+
 These are the internal verbs behind the client commands. Designing them as
 *distinct verbs* rather than reusing `JOIN`/`PRIVMSG` is what keeps the wire
 protocol unambiguous and lets a node distinguish "a user joined" from "a
@@ -1030,7 +1104,7 @@ list. Five verbs:
 :<origin> SBURST  <epoch> <nnicks>
 :<origin> SBURSTN <nick> <user> <host> <modes> <signon> :<away>
 :<origin> SBURSTC <chan> <origin> <topic_who> <topic_when> <modes> :<topic>
-:<origin> SBURSTM <chan> <server> <nick> <flags>
+:<origin> SBURSTM <chan> <server> <nick> <flags> <account>
 :<origin> SBURSTE <epoch> <nnicks> <nchans> <nmembers>
 ```
 
@@ -1043,6 +1117,22 @@ differs from the link's is a restart, and the link adopts it, because §2.4's de
 key pairs the epoch with the id and a mismatched pair aliases. An empty middle
 parameter is the literal `-` (empty middle tokens are unrepresentable — see 3.2);
 `<flags>` is `-`, `o`, `v` or `ov`, **not** the SJOIN token's `+ov`.
+
+**`<account>` was added to `SBURSTM` in Phase 10.3, and it is on THIS RECORD RATHER
+THAN ON `SBURSTN` ON PURPOSE.** An account is naturally a user property and
+`SBURSTN` is the user record, so the first instinct is the other one. It is here
+because **the thing a receiver can render to a client is the roster entry**: a
+remote member has no `conn_t`, so a fact delivered on `SBURSTN` would have to be
+re-joined onto the roster at install time, while a live `SJOIN` — the other way a
+member ever arrives — would have to put the same field somewhere else. Two records
+holding one fact is how a format comes to disagree with itself, and that is the
+very failure the `<server>` paragraph below is about. So `SBURSTM` carries exactly
+what `SJOIN` carries, in the same position, and both land in
+`chan_remote_t::account`: **agreement by construction rather than a join at install
+time.** The cost: **+64 bytes** on the worst-case `SBURSTM` line (510 rather than
+446), `CONN_MAX_ACCOUNT + 1` on every shadow member during a transaction and on
+every remote roster entry — 32 KiB more of shadow on the 500-member channel the
+budget prices — and nothing else.
 
 **`<server>` was added to `SBURSTM` before a second implementation existed, and it
 is the reason the frozen format is worth freezing.** The prefix answers *whose
@@ -1085,8 +1175,8 @@ carry is counted and a dropped one makes the terminator disagree.
 
 **The budget is volume, not line length.** The worst case is 753 bytes for
 `SBURSTC` and 787 for `SBURSTN` against an `IRC_MAX_LINE` of 8192 — 9%, so a
-per-line check would be a formality (`SBURSTM`, at 446 after the `<server>`
-field, is 5.4% and is not what the budget turns on). The real constraint is that
+per-line check would be a formality (`SBURSTM`, at 510 after the `<server>` and
+`<account>` fields, is 6.2% and is not what the budget turns on). The real constraint is that
 3.4 **drops** a saturated peer link rather than buffering it, and a burst is
 O(nicks + members), so a large node's burst can be megabytes and queueing it all
 would starve every live message behind it. A burst is therefore assembled into a
@@ -1732,8 +1822,15 @@ negotiation, with the capability available unconditionally because "you have no
 account" is an answer this node can give truthfully. The retired nickname-change
 meaning of the word is documented and refused on arity, and `NICK` is unaffected.
 
-**The remaining order, unchanged by 10.1:** 10.3 `extended-join`, `away-notify`,
-`chghost`; then the nine with no dependencies —
+**Phase 10.3 — `extended-join` (issue #117). COMPLETE.** §2.5.7: the JOIN echo
+carrying the account and the realname, per destination, with `*` for a member who
+is not logged in to an account — and the capability advertised even with no
+registry, because `*` is a complete answer there. `SJOIN` and `SBURSTM` carry the
+account (§4.3.1), and `account_name_wire_safe()` makes an account name
+representable as an IRC parameter, which `330` already needed.
+
+**The remaining order:** `away-notify`, `chghost`; then the nine with no
+dependencies —
 `extended-isupport`, `userhost-in-names`, `setname`, `echo-message`,
 **standard-replies** (which §2.5.2 is waiting on), `labeled-response` +
 `client-batch`, `invite-notify`, `read-marker`. `client-tags`/`channel-context`,
@@ -1863,6 +1960,15 @@ Federated:
       is per node and per operator and a peer cannot check the claim. The same
       subsection states that limit as a cost rather than leaving it to be
       discovered.
+- [x] *Phase 10.3:* **`extended-join` carries the account into the channel, per
+      destination.** `:nick!user@host JOIN #chan <account> :<realname>` to a client
+      that negotiated it, `:nick!user@host JOIN #chan * :<realname>` for a member
+      who is not logged in, and RFC 2812 3.3.1's bare JOIN to everybody else — the
+      last two of those three being observable **for the same JOIN and the same
+      sender**, which is what makes it a per-destination decision rather than a
+      per-verb one. `*` is never an empty parameter, and §2.5.7 says what is still
+      missing: this node emits no extended JOIN for a member it learned from a
+      peer, because 4.3's SJOIN carries no hostmask to render one from.
 - [x] *Phase 10.2b:* **`account-notify` answers, and only to a client that asked.**
       A client that negotiated it is told `ACCOUNT <account> PASS` or `ACCOUNT *`
       at the end of its own registration burst; a client that negotiated nothing is

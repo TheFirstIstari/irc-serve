@@ -131,6 +131,45 @@
                                     * WIDER field could not be filled by anything
                                     * this node accepts. See conn_t's block in
                                     * core/connection.h for the rest. */
+
+
+/* ---------------------------------------------------------------------------
+ * WHAT MAKES AN ACCOUNT NAME VALID, which is more than "not empty"
+ * ---------------------------------------------------------------------------
+ * `account_name_wire_safe()` is the whole of it, and it is here rather than in
+ * core/account.c because the KEY SPACE is this module's business: a name this
+ * predicate refuses is a name no connection can ever be logged in as, whatever the
+ * connection layer does with the string it is handed.
+
+ * `*` is ACCEPTED, and that is the exception the whole rule is built around: `*`
+ * is how both `extended-join` and `account-notify` spell "this user has no account",
+ * so a registry must be able to hold the one name the protocol reserves for the
+ * absence of one.
+
+ * THE RULE IS RENDERABILITY AND NOT A CHARSET. There is deliberately no list of
+ * "characters an account name may contain", because the list this node would need
+ * is the union of what every renderer downstream can represent, and that union is
+ * not one list:
+
+ *   - a MESSAGE TAG escapes ';', ':', '\\', SP, CR and LF, so a name holding them
+ *     is representable in `account-tag` -- which is why the tag renderer escapes
+ *     rather than refusing.
+ *   - a MESSAGE PARAMETER can escape NOTHING. 3.2 refuses SP, HTAB, CR and LF in
+ *     any parameter, and refuses a value that needs the ':' marker anywhere but the
+ *     final position. So a name holding one of those cannot be written into a JOIN
+ *     echo, into an SJOIN, or into 330 RPL_WHOISACCOUNT at all.
+ *
+ * The second list is the binding one, and it is why this was not added until
+ * Phase 10.3 even though it was already true: 330 has carried the account as a
+ * MIDDLE parameter since Phase 10.1, so the exposure was there first and this
+ * phase simply gave the name three more parameter positions to be wrong in.
+ *
+ * THE COST, stated rather than implied: an operator cannot create an account whose
+ * name holds a space, and a registry file holding one is REFUSED record by record
+ * rather than loaded with a name this node cannot show anybody. That is a
+ * restriction, and the alternative is an account that exists and is unreportable.
+ */
+int account_name_wire_safe(const char *name);
 #define ACCOUNT_MAX_PASSWORD  128   /* SASL_MAX_PASSWORD, deliberately the same
                                     * bound and for the same reason: this is the
                                     * account's own secret, the two stores are

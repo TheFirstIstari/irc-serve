@@ -888,7 +888,7 @@ int main(void)
     (void)snprintf(want, sizeof want,
                    "@irc-serve-origin=" NODE_NAME ";irc-serve-epoch=%llu"
                    ";irc-serve-id=500;irc-serve-hops=0 :" STATE_PREFIX
-                   " SJOIN " CHAN " joiner -\r\n",
+                   " SJOIN " CHAN " joiner - *\r\n",
                    (unsigned long long)s.epoch);
     TF_CHECK_MSG(drive_until(&s, &peer, want, T_IO_MS) == 0,
                  "an originating forward did not arrive stamped with this node's "

@@ -123,6 +123,7 @@
 #define CAP_SASL "sasl"
 #define CAP_ACCOUNT_TAG "account-tag"
 #define CAP_ACCOUNT_NOTIFY "account-notify"
+#define CAP_EXTENDED_JOIN "extended-join"
 
 /* 410 ERR_INVALIDCAPSUBCOMMAND. Not in design 4.4's numeric list, which is a gap
  * in the list rather than in the protocol, for the same reason 301, 303, 417,
@@ -256,6 +257,29 @@ int cap_account_tag_enabled(const conn_t *c);
  * honest about it, and withholding the name there would be a node that keeps a
  * fact from a client it does have. */
 int cap_account_notify_enabled(const conn_t *c);
+
+/* extended-join: whether this node extends the JOIN it echoes to this client with
+ * the joining user's account and realname.
+ *
+ *   :nick!user@host JOIN #chan <account> :<realname>
+ *   :nick!user@host JOIN #chan * :<realname>
+ *
+ * IT IS AVAILABLE ON A NODE WITH NO ACCOUNT SYSTEM, and that is deliberate rather
+ * than an oversight. The specification's `*` form says "this user has not logged
+ * in to an account prior to channel ingress", and a node with no registry has not
+ * got one to log in to -- so `*` is not an absence of information here, it is the
+ * information. Withholding the capability there would be refusing to tell a client
+ * something true, and a client that wanted the channel roster with accounts has no
+ * other way to ask for them. This is the opposite decision to `account-tag`'s, and
+ * cap.h's paragraph above is the one to read for why two account capabilities
+ * answer `cap_available()` differently.
+ *
+ * THE CHOICE IS PER DESTINATION, like every other capability in this file, and the
+ * two JOIN forms are not interchangeable: a client that did not negotiate this one
+ * receives `:nick!user@host JOIN #chan` and must not receive the two extra
+ * parameters, which it would read as a topic and a reason. fanout.c decides which
+ * shape a given destination gets; core/chan_verbs.c builds both. */
+int cap_extended_join_enabled(const conn_t *c);
 
 /* Handle one `CAP` line. Returns 1 if it was handled, 0 if it was not a CAP at
  * all (which cannot happen: the caller has already dispatched on the verb). */
