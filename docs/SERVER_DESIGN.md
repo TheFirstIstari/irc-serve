@@ -1339,6 +1339,118 @@ different name on a false premise, and the real cause is never surfaced.
 `005` with `PREFIX=(ov)@+`, `CHANTYPES=#&`, `NETWORK=` is effectively
 mandatory — many clients misbehave without it.
 
+#### 4.4.1 The full `005`, and the rule it is built on
+
+Phase 10.4 replaced the five-token list with eleven. The rule is one sentence:
+**a token is advertised only where a bound or a feature behind it can be named.**
+
+`005` is a list of *claims*. A client sizes a buffer from `CHANNELLEN`, decides
+whether one message may name six targets from `MAXTARGETS`, wraps a name at
+`NAMELEN`. So a token that is wrong is not a cosmetic defect — it is a client
+acting on a lie — and the two failure directions have different fixes: a **missing**
+token is a client that carries on, while a **wrong** one is a client that switches
+a feature on and then behaves as though the node agreed. That is the same rule
+`cap.h` holds `CAP LS` to, applied to the other list every client reads.
+
+| Token | Value | Derived from / honoured by |
+|---|---|---|
+| `NETWORK` | `irc-serve` | `NODE_NETWORK`, commands.c. A deployment property, not a node property |
+| `CHANTYPES` | `#&` | `CHAN_TYPES` in `channel.h`, and the two bytes `chan_name_valid()` accepts (`CHAN_TYPE1`, `CHAN_TYPE2`). One declaration, one validator |
+| `PREFIX` | `(ov)@+` | 4.4. The two prefix modes `channel.h` defines (`CHAN_MEMBER_OP`, `CHAN_MEMBER_VOICE`) and `names_signs()` draws. **Not** derived from constants — see the finding below |
+| `CASEMAPPING` | `ascii` | `message.c`'s `up()` and `fanout.c`'s `ascii_lower()` are ASCII-only. True, and the rfc1459 alternative is priced below |
+| `AWAYLEN` | `255` | `CONN_MAX_AWAY`; an over-long AWAY is **refused** with `417`, not truncated |
+| `CHANNELLEN` | `63` | `CHAN_MAX_NAME`; `chan_name_valid()` refuses anything longer |
+| `LINELEN` | `8192` | `IRC_MAX_LINE`; `conn_fill()`'s read cap and `message_parse_n()`'s on-wire cap |
+| `MAXTARGETS` | `1` | `MSG_MAX_TARGETS` in `msg_verbs.h`, which is the arity check `send_message()` applies — RFC 2812 3.3.1 gives PRIVMSG exactly one `<msgtarget>` and no message verb here parses a list |
+| `NAMELEN` | `255` | `CONN_MAX_REALNAME`; the value bound of `conn_t::realname`. **Mandatory** for a node advertising IRCv3's `setname`, so it is stated whether or not that command is present |
+| `NICKLEN` | `63` | `IRC_MAX_NICK`; `valid_nick()` refuses anything longer |
+| `TOPICLEN` | `255` | `CHAN_MAX_TOPIC`; an over-long TOPIC is **refused** with `417` |
+
+Every `*LEN` is rendered by `commands.c`'s `IRC_STR()` from the constant that
+*enforces* the limit, so raising a bound in another file moves the token with it.
+The test asserts the **literals** (`TOPICLEN=255`), not the constants, which is
+the whole of the teeth: a test built from `CHAN_MAX_TOPIC` would follow it and
+never notice that `005` was not updated. `tests/integration/test_registration.c`
+holds the whole `005` byte-for-byte, each token individually, and the list of
+tokens that must be **absent**.
+
+**`IRC_STR()` cannot stringify an expression.** `#x` stringifies an argument's
+token sequence rather than evaluating it, so a `sizeof(...)`-derived constant in
+that position renders as the literal text `sizeof(((conn_t *)0)->realname) - 1u`.
+That contains spaces, a middle parameter containing a space is `unrepresentable`,
+and the consequence is that the *entire* `005` is refused and every connecting
+client gets no ISUPPORT at all. `CONN_MAX_REALNAME` is therefore a written `255`
+— the same reason `CONN_MAX_AWAY` is — and the derivation that *can* be
+stringified runs one level up, in `k_005[]`.
+
+#### 4.4.2 The tokens deliberately NOT advertised, and two findings
+
+An absent token and a forgotten one look identical on the wire, so each absence is
+named at `k_005[]` with its reason. In summary:
+
+- **`BOT=B`** — 004 advertises `i` for users and `b,k,l,imnpst` for channels and
+  this node evaluates neither set. No BOT mode, no services, nothing that reads it.
+- **`EXTBAN=`** — `+b` stores a mask verbatim and `chan_has_ban()` tests it by
+  string equality (§2.2). There is no ban-**expression** parser, so there is no
+  `~&account:name` and no `EXTBAN` value. This is the same missing evaluator that
+  blocks `account-extban` (SPEC_TRACKING §10.2) — one gap, named twice.
+- **`SAFELIST`** — no safelist. `+S` is not a mode §4.4 advertises and `chan_t` has
+  no safe-mask store.
+- **`MONITOR`, `WATCH`, `WATCHNICK`** — no such verbs, so no watch list and no
+  ceiling on one.
+- **`MSGREFTYPES=`** — no message reference is recognised. `PRIVMSG @#chan :hi`
+  reaches `fanout_resolve()` with `@#chan` as the whole target, which is not a
+  valid channel name, so it is `403` rather than a reference to a history window.
+- **`ACCEPT`** — no `EXCEP`/`INVEX`, no accept-list store, no evaluation of either.
+- **`silence`** — no `SILENCE` verb and no silence store. This one is a fact rather
+  than a gap: a silence list is an operator list and this node has no operator
+  model at all (`CHOPER` answers `464` for every request).
+- **`draft/CHATHISTORY`** — no history. `resume.c`'s restore hands a client back the
+  channels it was in at disconnect, which is a *session* and not a history: it
+  keeps nothing that was not said while the client was connected, so it cannot
+  answer "what was said in `#t` last week". Advertising it would put a client into
+  a state it cannot leave.
+- **`MODES`** — this token is a *count* of mode changes permitted in one `MODE`
+  command, not a mode string (§4.4's `004` carries those). Nothing here caps one.
+
+**Two findings, reported rather than answered.**
+
+1. **`KICKLEN` is omitted because no bound exists.** `handle_kick()` takes
+   `<reason>` verbatim with no length test, so no number in this tree describes the
+   largest reason the node accepts. Writing `255` because `CHAN_MAX_TOPIC` and
+   `CONN_MAX_AWAY` happen to be 255 would advertise a limit nothing enforces. The
+   consequence is worse than an absent token and is worth naming: an over-long KICK
+   reason reaches `fanout_deliver()` and then `message_format()`, which **refuses
+   it as `unrepresentable`** — a refusal on `n_reply_refused`, the counter
+   `reply.c` holds at zero because a non-zero value of it is a bug report. So the
+   missing bound is a reachable way to make a client command trip that counter.
+   Fixing it means adding a KICK reason bound and a `417`, which is a change to
+   `handle_kick()` and outside Phase 10.4.
+2. **`USERLEN` is omitted although a bound exists**, because that bound is not
+   *enforced*: `USER`'s ident is truncated into `conn_t::user` rather than
+   refused, so `USERLEN=` would promise a limit the node does not apply to the one
+   parameter it is about. `NAMELEN` is advertised for the opposite reason — that
+   bound *is* what can be stored, and `SETNAME` refuses beyond it.
+
+**`PREFIX=(ov)@+` is the one advertised token that is still written out.** The
+mode letters (`o`, `v`) and the sigils (`@`, `+`) are literals inside
+`names_signs()` and inside the mode parser, and no constant names them. Deriving
+the token would mean making the mode letters constants and threading them through
+the mode evaluator — a change to what a mode *is* in this tree, made for the sake
+of one string. It is named here as a finding rather than done quietly.
+
+**What `CASEMAPPING=rfc1459` would cost**, since the honest answer is only useful
+if the alternative is on the record: `[]\~` and `{}\|^` become fold-equivalent,
+which makes it *unsafe* to use any of those bytes in a nickname, a channel name or
+a hostmask component — `#a[b` and `#a{b` become one channel. Every comparison that
+folds then has to fold the same way or two of them disagree:
+`server_nick_lookup()`, `chan_same_name()`, `fanout.c`'s `ascii_lower()`,
+`channel.c`'s `up_ascii()`, and the WHO mask matcher. That is five call sites
+plus the *set of bytes the validators must now refuse*, and the validators are the
+expensive half — `valid_nick()` and `chan_name_valid()` would both grow a
+deny-list. It is a change to what a nickname may be, which is not something a
+`005` token decides.
+
 ---
 
 ## 5. Fix the weak and fake parts
@@ -1876,6 +1988,16 @@ Single node:
       while advertising `(ov)@+` would be telling a client a status it does not
       hold. `tests/integration/test_multi_prefix.c` asserts the drawn token and
       `005` in the same case.
+      **Phase 10.4 widened the same obligation from three tokens to eleven**, and
+      the rule is §4.4.1: a token is advertised only where the bound or feature
+      behind it can be named, every `*LEN` is rendered from the constant that
+      *enforces* it, and the tokens this node cannot honour are absent with a
+      reason. `test_registration.c` now holds the whole `005` byte-for-byte against
+      **literals** — not against the constants, which would follow them and never
+      notice that `005` was left behind — plus each token individually and the
+      list of tokens that must be absent. `KICKLEN` is absent because no bound
+      exists; §4.4.2 names the cost of that gap, which is a reachable
+      `n_reply_refused`.
 
 Federated:
 - [ ] Two-node fixture: cross-server join visibility, cross-server `PRIVMSG`
@@ -2061,3 +2183,5 @@ Quality:
 | **Stamping `+account` on a relayed message** (Phase 10.2) | a client is shown an account name no registry it can consult holds, and cannot check it — the tag is exactly the assertion a client trusts | **The relay arm resolves nothing** (`fanout_emitter_account()` branches on `relayed`), because an account registry is per node and per operator. The cost is named at §2.5.3: per-message identity stops at the authenticating node. |
 | **Account identity treated as authority** (Phase 10.1) | a future phase reads `logged_in` as a privilege and every access-control rule silently inherits it | `logged_in` is documented at the struct and at the module as a NAME plus a VERIFICATION and grants nothing (§2.1.1), and the "what none of them grant" block in `connection.h` says so where a future editor will read it |
 | **The account store drifting from the credential store** (Phase 10.1) | a client authenticates and is not identified, or is identified for a name the operator removed | Both must agree or authentication stops (§2.5.1), the refusal is counted on `n_account_refused` and named on the node's own output, and `test_account.c` runs the not-identified path against a node whose two files **disagree** — byte-identical to a node with no registry at all |
+| **An `005` token this node does not honour** (Phase 10.4) | a client sizes a buffer from a bound nothing enforces, or switches on a feature this node has not implemented, and then behaves as though the server agreed — which is worse than the token's absence, because absence is a client that carries on | **Every token is derived from the constant that enforces it, and every absence is named with its reason (§4.4.2).** `k_005[]` renders each `*LEN` through `IRC_STR()` from the bound itself rather than writing it out, and `test_registration.c` asserts the whole `005` against **literals**, so raising a bound in another file fails the test unless `005` moved with it. The absences with a live feature behind them — `BOT`, `EXTBAN`, `SAFELIST`, `MONITOR`, `MSGREFTYPES`, `ACCEPT`, `silence`, `draft/CHATHISTORY` — are asserted **absent** on the wire, so adding one without implementing it fails a test |
+| **`KICKLEN` has no bound to advertise** (Phase 10.4) | an over-long KICK reason is not refused with a numeric; it reaches `message_format()`, which refuses it as `unrepresentable` — a non-zero `n_reply_refused`, the counter `reply.c` holds at zero because a non-zero value of it is a bug report | **Reported, not fixed, and the reason is scope.** The fix is a reason bound plus a `417` in `handle_kick()`, which is a change to a command this pass did not touch. §4.4.2 states it; the honest mitigation today is that the node logs `reply_refused ... reason=unrepresentable` naming the command, so the condition is visible rather than silent |

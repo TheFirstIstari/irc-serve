@@ -829,7 +829,49 @@ beyond the ones §4.4 advertises).
 | The one wire surface: `330 RPL_WHOISACCOUNT` | `src/core/msg_verbs.c` | `test_account.c`, from the client **and from a second client** |
 | The teardown arm | `server_shutdown()`, `[observable] account_store_close: store=OPEN|NONE` | asserted on both states; the `free` itself asserted by source inspection (`tf_calls`), because a line with no free behind it satisfies the line |
 
-### 10.4 The honest limits of this phase
+### 10.5 The four non-account specifications of issue #117
+
+Issue #117 groups eight specifications, and §10.2's seven are the account family.
+These four are **independent of the account subsystem** — none of them reads
+`conn_t::account`, and none was blocked by Phase 10.1 — so they were implemented
+as their own passes rather than as a consequence of anything above. Each is
+recorded here with what it cost, and the table is the measurement rather than the
+design (design §4.4.1 carries the reasoning for the first).
+
+| Spec | Status | What it cost, and what is named as missing |
+|---|---|---|
+| `extended-ispupport` | **IMPLEMENTED (Phase 10.4).** The `005` went from five hand-written tokens to eleven, every `*LEN` rendered from the constant that **enforces** it, and eight tokens that would have been claims about unimplemented features deliberately left out. | **Two findings, both reported rather than answered.** `KICKLEN` is absent because `handle_kick()` takes `<reason>` verbatim with no length test — so no number in the tree describes the largest reason accepted, and an over-long one reaches `message_format()` and trips `n_reply_refused`, the counter `reply.c` holds at zero. `USERLEN` is absent even though `CONN_USER_MAX` exists, because `USER`'s ident is *truncated* rather than refused, so the token would promise a limit the node does not apply. `PREFIX=(ov)@+` remains a written-out token: no constant names the mode letters, and making one would mean changing the mode evaluator. The cost of the work itself is one new constant (`MSG_MAX_TARGETS`), two sigil macros, and a test that now holds the whole `005` against **literals** rather than the constants. |
+| `userhost-in-names` | **IMPLEMENTED (Phase 10.5).** `353` renders `nick!user@host` per destination, on the recipient's own negotiation, for local *and* remote members. | **The privacy decision, stated plainly: this discloses every member's ident and observed host to every other member of the channel.** It is why the capability is opt-in and why the roster shape is decided per destination. The cost is `chan_remote_t::user` — the ident was on the wire in `SBURSTN` and in the burst shadow all along and was being **discarded**, so a federated roster could not have rendered a hostmask without it; +64 bytes per remote-member element, 4 KiB per channel's addressed array. See design §4.4.3. |
+| `setname` | **IMPLEMENTED in part (Phase 10.6).** The command, the capability, `NAMELEN`, and the confirmation to the originating client. | **The common-channel fan-out is NOT implemented, and that is the specification's MUST.** `core/fanout.c`'s per-destination decision is a choice between two wire **shapes** (the `fanout_form_t` the extended JOIN introduced); "send this member nothing" is a **third** outcome, and expressing it means a contract change to the routing module — which is the reason the alternative, a second member walk inside a handler, is worse. Named rather than faked. The refusals are also not `FAIL SETNAME INVALID_REALNAME` as the spec asks, because `standard-replies` is a separate pass and inventing a `FAIL` numeric was out of bounds; the node answers `417`, which is the numeric this tree already uses for an over-long parameter. |
+| `echo-message` | **IMPLEMENTED (Phase 10.7).** A sender who negotiated it gets its own `NOTICE` back, with its own hostmask as the source. | **Almost nothing, and the reason is the interesting part: `PRIVMSG` was already echoed.** This node delivers a channel `PRIVMSG` to every local member *including* the sender, so the copy `echo-message` requires already exists on the wire — the spec's example is byte-identical to what the normal path produces. The only gap was `NOTICE`, which RFC 1459 2.4.2 says is never returned to its sender. So the implementation is **one argument**: `exclude` stays `c` unless the sender negotiated the capability. There is no second emission, and that is the whole defence against the double-delivery bug the capability invites. `batch` echoes are out of scope, as is the acknowledgement for a `nick@server` target (no local destination exists to send one to). |
+
+### 10.6 What the four cost, with evidence
+
+| Claim | Where | Evidence |
+|---|---|---|
+| Every advertised `005` value is derived from the constant that enforces it | `commands.c` `k_005[]`, rendered by `IRC_STR()` | `test_registration.c`: the whole `005` byte-for-byte against **literals**, each token individually, and the twelve names that must be absent. A literal is the point — a test built from `CHAN_MAX_TOPIC` would follow the constant and never notice `005` was left behind |
+| `CHANTYPES=#&` and the validator cannot disagree | `channel.h`'s `CHAN_TYPES` / `CHAN_TYPE1` / `CHAN_TYPE2`, used by `chan_name_valid()` | `test_registration.c` asserts `CHANTYPES=#&`; `test_channels.c` and `test_dup_nick.c` already refuse a name the advertised token would not admit |
+| `NAMELEN` is the realname bound, not a figure of speech | `CONN_MAX_REALNAME` in `connection.h`; `conn_realname_check()` | `test_setname.c`: 255 accepted, 256 refused with `417` and the field **unchanged** |
+| A `353` roster's shape differs per destination for the same sender | `chan_verbs.c`'s `send_names_list()` / `names_emit()` | `test_userhost_in_names.c`: one channel, one member, three connections — negotiated, not negotiated, and a second negotiated one — with the long form required on two and the bare nick required on one |
+| The federation roster can render a hostmask at all | `chan_remote_t::user`, fed from `SBURSTN` | `test_fed_roster.c` — the ident was previously discarded by `burst.c`'s shadow→roster join and is now stored, which is the only reason a remote entry is not stuck at `nick` |
+| A sender who negotiated `echo-message` gets exactly **one** copy | `msg_verbs.c`'s `send_message()`, the `exclude` argument | `test_echo_message.c`: `PRIVMSG` to a channel counts 1 for a negotiating sender, 0 for a non-negotiating one; `NOTICE` counts 1 and 0 the same way |
+| The echoed copy is not *also* delivered by the normal path | there is one delivery call; `echo-message` chooses `exclude`, it does not add a second | the same test, with the double-delivery fault injected and watched to fail |
+
+### 10.7 The honest limits of these four
+
+- **`setname` does not fan out to common channels.** Named above, with the reason.
+  A client in a shared channel is not told the realname changed; the originating
+  client is.
+- **`echo-message` is not implemented for a `nick@server` target.** 3.1's last row
+  is forward-only, so there is no local destination to acknowledge to. The
+  acknowledgement would have to be a local-only emission invented here.
+- **`userhost-in-names` does not change `352` or `311`.** Those numerics already
+  carry `<user>` and `<host>` in the RFC's shape, so they were never the gap; the
+  gap was `353` alone.
+- **`extended-ispupport` did not close the `KICKLEN` gap**, and did not try to.
+  §10.5 names what a fix would cost.
+
+### 10.8 The honest limits of the account phase
 
 - **The identity is visible on ordinary traffic for LOCAL senders only.**
   `account-tag` (Phase 10.2a) stamps it on every line an identified client emits

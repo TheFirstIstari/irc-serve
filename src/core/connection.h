@@ -158,6 +158,48 @@ struct chan; /* opaque until Phase 4 (2.2) */
 #define CONN_USER_MAX (sizeof(((conn_t *)0)->user) - 1u)
 #define CONN_HOST_MAX (sizeof(((conn_t *)0)->host) - 1u)
 
+/* conn_t::realname, the GECOS field USER's fourth parameter carries and the one
+ * IRCv3's `setname` changes in place.
+ *
+ * WHY IT IS 255 AND NOT A `sizeof()` EXPRESSION, which the two constants above
+ * both are. Three things already agree on 255 for "a sentence a user typed":
+ *
+ *   1. the field is char[256], so the value bound is one less than the field --
+ *      the same relationship IRC_MAX_NICK has to conn_t::nick.
+ *   2. realname is 005's NAMELEN, which IRCv3's `setname` specification makes
+ *      MANDATORY for a node advertising that capability, so the number has to
+ *      exist whether or not the command does.
+ *   3. it equals CHAN_MAX_TOPIC and CONN_MAX_AWAY, the other two client-supplied
+ *      free-text fields this node stores. One bound for "a sentence a user
+ *      typed", not three that differ for no stated reason.
+ *
+ * AND THE REAL REASON, WHICH IS A COMPILER FACT: 005 renders this number with
+ * commands.c's IRC_STR(), and `#x` stringifies an argument's TOKEN SEQUENCE
+ * rather than evaluating it. A `sizeof(((conn_t *)0)->realname) - 1u` in this
+ * position renders the 43-character string
+ *
+ *     sizeof(((conn_t *)0)->realname) - 1u
+ *
+ * as the token's value, which contains spaces -- and a middle parameter holding
+ * a space is `unrepresentable`, so the whole 005 is REFUSED and every client
+ * connecting to the node gets no ISUPPORT at all. This is the same bound
+ * CONN_MAX_AWAY already carries as a literal for a related reason, and it is
+ * why the token is derived from a NUMBER here and the number is written down
+ * here: the derivation that can be stringified runs one level up, in k_005[].
+ *
+ * Raising conn_t::realname therefore means changing this AND the NAMELEN token,
+ * and tests/integration/test_registration.c asserts NAMELEN=255 as a literal
+ * precisely so that a change to the field without a change to 005 fails a test.
+ *
+ * IT IS A CAP NOT A TRUNCATION POINT, and that is the part with teeth. USER's
+ * realname is truncated into this field rather than refused, because a client
+ * that has sent NICK and USER is otherwise left half-registered with no way to
+ * recover (see handle_user()); SETNAME, which arrives on an already-registered
+ * connection, REFUSES rather than truncates, for the reason 3.2 states -- a
+ * truncated realname is one the user did not write, and it is reported to every
+ * member of every channel they are on as though it were theirs. */
+#define CONN_MAX_REALNAME 255
+
 /* conn_t::account -- the second axis of scoped identity (2.1), added in Phase
  * 10.1.
  *

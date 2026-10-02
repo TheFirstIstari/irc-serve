@@ -89,19 +89,143 @@ int commands_registered(const conn_t *c)
 #define NODE_CHAN_MODES "b,k,l,imnpst"
 
 /* NICKLEN is derived from IRC_MAX_NICK rather than typed out, so raising the
- * struct width cannot leave 005 advertising a length the node then refuses. */
+ * struct width cannot leave 005 advertising a length the node then refuses. The
+ * same argument is the reason EVERY `*LEN` token below is written this way, and
+ * the reason the derivation is visible at all: an ISUPPORT length a client uses
+ * to size its own buffers is a promise, and a promise that is a typed-out number
+ * stops being true the moment somebody raises a bound in another file. */
 #define IRC_STR_(x) #x
 #define IRC_STR(x) IRC_STR_(x)
 
+/* ---------------------------------------------------------------------------
+ * 005 IS A LIST OF CLAIMS THIS NODE HONOURS, AND BOTH HALVES MATTER
+ * ---------------------------------------------------------------------------
+ * An ISUPPORT token is read by a client as a FACT about this server: it sizes a
+ * buffer from CHANNELLEN, it decides whether a message may name six targets from
+ * MAXTARGETS, it wraps a name at NAMELEN. So the list has two obligations and
+ * they are opposites:
+ *
+ *   DERIVED, where a bound exists. Every `*LEN` and the one arity number below
+ *   come from the constant that ENFORCES the thing, never from a literal. The
+ *   test is not "the number looks right" but "is there a check in this tree that
+ *   would refuse more than this", and a token whose answer is no is omitted --
+ *   see KICKLEN below, which is the worked example of a bound that does not exist
+ *   and therefore a token that is not advertised.
+ *
+ *   HONOURED, where a feature exists. A token a client acts on and this node does
+ *   not implement is worse than the token's absence: absence is a client that
+ *   carries on, presence is a client that switches the feature on and then
+ *   behaves as though the server agreed. That is the same rule cap.h holds CAP LS
+ *   to, applied to the other list every client reads.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT IS DELIBERATELY NOT HERE, AND WHY -- the absences are the interesting half
+ * ---------------------------------------------------------------------------
+ * Each of these is a token a client may look for, and each is absent because
+ * there is nothing behind it on this node. They are named here rather than left
+ * for a reader to assume, because an absent token and a forgotten one look
+ * identical on the wire.
+ *
+ *   BOT=B          004 advertises `i` for users and `b,k,l,imnpst` for channels,
+ *                  and this node evaluates NEITHER set (commands.c's own note).
+ *                  There is no BOT mode, no services, and nothing that would ever
+ *                  read `BOT`. 4.3's SERVICES/bot verbs are not in 4.1 or 4.2.
+ *
+ *   EXTBAN=        `+b` stores a ban mask verbatim and chan_has_ban() tests it by
+ *                  string equality (2.2). There is no ban EXPRESSION parser, so
+ *                  there is no `~&account:name` to advertise and no `EXTBAN`
+ *                  value to write. This is the same missing evaluator that
+ *                  blocks IRCv3's `account-extban` (SPEC_TRACKING 10.2) -- one
+ *                  gap, named twice.
+ *
+ *   SAFELIST       there is no safelist: `+S` is not a mode 004 advertises, and
+ *                  chan_t has no safe-mask store. 2.2's ban list is a ban list.
+ *
+ *   MONITOR        there is no MONITOR verb. `WATCH` and `WATCHNICK` with it:
+ *                  there is no WATCH verb either, so there is no watch list and
+ *                  no ceiling on one.
+ *
+ *   MSGREFTYPES=   no message reference is recognised. `PRIVMSG @#chan :hi`
+ *                  reaches fanout_resolve() with `@#chan` as the WHOLE target,
+ *                  which is not a valid channel name, so it is 403 rather than a
+ *                  reference to a history window. draft/message-reference is not
+ *                  implemented, and this token's whole content is the list of
+ *                  reference types.
+ *
+ *   ACCEPT         no EXCEP or INVEX mode, no accept-list storage, and no
+ *                  evaluation of either. 2.2's model is one mask array for bans.
+ *
+ *   silence        there is no SILENCE verb and no silence store. Its absence is
+ *                  a fact rather than a gap: this node has no operator concept
+ *                  at all (CHOPER answers 464 for every request), and a silence
+ *                  list is an operator list.
+ *
+ *   draft/CHATHISTORY
+ *                  no channel history. resume.c's restore hands a client back the
+ *                  channels it was in at disconnect, which is a SESSION and not a
+ *                  history: it does not answer "what was said in #t last week"
+ *                  because it does not keep anything that was not said while the
+ *                  client was connected. Advertising the capability would put a
+ *                  client into a state it cannot leave.
+ *
+ *   KICKLEN        NO BOUND EXISTS, and this is the honest reason rather than an
+ *                  omission of memory: handle_kick() takes <reason> verbatim with
+ *                  no length test, so nothing on this node can name the largest
+ *                  reason it accepts. Inventing 255 -- the number both neighbours
+ *                  happen to use -- would advertise a limit this node does not
+ *                  enforce, and the consequence is not cosmetic (see the note
+ *                  below and the finding reported for Phase 10.4).
+ *
+ *   MODES          this token is a COUNT of mode changes permitted in one MODE
+ *                  command, not a mode string (004 carries those). This node puts
+ *                  no count on a MODE command, so there is no count to write.
+ *
+ *   USERLEN        the bound that EXISTS (CONN_USER_MAX) is not ENFORCED: USER's
+ *                  ident is truncated into the field rather than refused, so
+ *                  advertising a length would promise a limit this node does not
+ *                  apply to the one parameter it is about. NAMELEN below is
+ *                  advertised for the opposite reason: that bound IS what can be
+ *                  stored, and SETNAME refuses beyond it.
+ *
+ * ---------------------------------------------------------------------------
+ * THE `CASEMAPPING=ascii` LIE THAT IS NOT A LIE, AND WHAT rfc1459 WOULD COST
+ * ---------------------------------------------------------------------------
+ * message.c's up() folds A-Z and nothing else, and fanout.c's ascii_lower() is
+ * the same six lines written twice for the reason its own comment gives. So this
+ * node does NOT treat `[]\~` as equivalent to `{}|^`, which is exactly what
+ * rfc1459 says it should, and advertising ascii is the truth rather than the
+ * shorter answer.
+ *
+ * WHAT CHANGING IT WOULD COST, since the honest answer is only useful if the
+ * alternative is on the record: `[]\~` and `{}\|^` become fold-equivalent, which
+ * means it becomes UNSAFE to use any of those bytes in a nickname, a channel name
+ * or a hostmask component -- a channel named `#a[b` and one named `#a{b` become
+ * one channel. Then every comparison that folds has to fold the same way or two
+ * of them disagree: server_nick_lookup(), chan_same_name(), fanout.c's
+ * ascii_lower(), channel.c's up_ascii(), and the WHO mask matcher. That is five
+ * call sites plus the SET of bytes the validators refuse, and the validators are
+ * the expensive half -- message.h's valid_nick() and chan_name_valid() would both
+ * have to grow a deny-list. It is a change to what a nickname MAY BE, which is
+ * why it is not something a 005 token decides. */
 static const char *const k_005[] = {
     "NETWORK=" NODE_NETWORK,
-    "CHANTYPES=#&",     /* 4.4: many real clients misbehave without it */
-    "PREFIX=(ov)@+",    /* 4.4: and without this one */
+    "CHANTYPES=" CHAN_TYPES, /* 4.4: many real clients misbehave without it */
+    "PREFIX=(ov)@+",         /* 4.4: and without this one */
     /* True, and not a detail: message.c's up() is ASCII-only, so this node does
      * NOT treat []\~ and {}|^ as equivalent. Advertising rfc1459 here would be
      * a lie a client could act on. */
     "CASEMAPPING=ascii",
-    "NICKLEN=" IRC_STR(IRC_MAX_NICK)
+    /* ------------------------------------------------------------------------
+     * THE DERIVED LENGTHS. Each one is a bound this node REFUSES to exceed, not
+     * a figure of speech: raise the constant and this token moves with it.
+     * ---------------------------------------------------------------------- */
+    "AWAYLEN=" IRC_STR(CONN_MAX_AWAY),         /* 417, msg_verbs.c */
+    "CHANNELLEN=" IRC_STR(CHAN_MAX_NAME),      /* chan_name_valid() */
+    "LINELEN=" IRC_STR(IRC_MAX_LINE),          /* conn_fill() + message_parse_n() */
+    "MAXTARGETS=1",                            /* MSG_MAX_TARGETS, msg_verbs.h */
+    "NAMELEN=" IRC_STR(CONN_MAX_REALNAME),     /* conn_t::realname; SETNAME 417s */
+    "NICKLEN=" IRC_STR(IRC_MAX_NICK),
+    "TOPICLEN=" IRC_STR(CHAN_MAX_TOPIC)         /* 417, chan_verbs.c */
 };
 
 /* The MOTD body, sent as one 372 per line. It describes what the node IS

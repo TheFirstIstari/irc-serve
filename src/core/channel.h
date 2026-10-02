@@ -147,6 +147,22 @@
  * which is the same relationship IRC_MAX_NICK has to conn_t::nick in 2.1. */
 #define CHAN_MAX_NAME 63
 
+/* CHANTYPES, AND THE TWO SIGILS THE VALIDATOR ACCEPTS, AS ONE DECLARATION.
+ *
+ * 005's CHANTYPES token and chan_name_valid()'s first test are the same fact --
+ * "a channel name begins with one of these two bytes" -- and until Phase 10.4
+ * they were two written-out spellings of it. That is the shape of drift: raise a
+ * sigil in the validator and 005 goes on advertising the old set, so every client
+ * reads a name this node will refuse.
+ *
+ * The validator tests CHAN_TYPE1/CHAN_TYPE2 by name rather than indexing
+ * CHAN_TYPES, so a C string constant is never used as a byte value and the
+ * dependency runs the way it reads: the two sigils are declared, and the token
+ * is built from them. */
+#define CHAN_TYPE1 '#'
+#define CHAN_TYPE2 '&'
+#define CHAN_TYPES  "#&"
+
 /* 2.2: topic[256], topic_who[64]. */
 #define CHAN_MAX_TOPIC    255
 #define CHAN_MAX_TOPIC_WHO 63

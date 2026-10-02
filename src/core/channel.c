@@ -93,11 +93,14 @@ int chan_name_valid(const char *name)
     }
     n = strlen(name);
     /* CHANTYPES=#&, so a channel name begins with one of the two sigils. A bare
-     * sigil is not a name: there is nothing after it to distinguish. */
+     * sigil is not a name: there is nothing after it to distinguish. The two
+     * bytes are CHAN_TYPE1 and CHAN_TYPE2 rather than literals, because 005
+     * advertises CHAN_TYPES and a third spelling of the same pair is how the
+     * advertised token and the validator come to disagree. */
     if (n < 2u || n > (size_t)CHAN_MAX_NAME) {
         return 0;
     }
-    if (name[0] != '#' && name[0] != '&') {
+    if (name[0] != CHAN_TYPE1 && name[0] != CHAN_TYPE2) {
         return 0;
     }
     for (size_t i = 0; i < n; i++) {
