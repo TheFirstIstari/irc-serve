@@ -19,6 +19,7 @@ add_library(irc_core STATIC
   core/channel.c
   core/poll_loop.c
   core/reply.c
+  core/resume.c
   core/fanout.c
   core/commands.c
   # Phase 8: the IRCv3 capability negotiation. It is a module of its own rather
@@ -49,6 +50,17 @@ add_library(irc_core STATIC
   # transaction the size of a channel list, which is the reason it is a file and
   # not a function in the module that decides which sockets are up.
   federation/burst.c
+  # Phase 9's remote-nick registry: 2.1's "which server holds the user called
+  # X", which is what makes 3.1's `nick@server` row resolvable rather than merely
+  # routable, and the rename-the-loser decision that goes with it. It is listed
+  # LAST because it is the only module here that depends on TWO others -- it
+  # includes federation/link.h for the liveness constant its TTL is derived from,
+  # and core/channel.h for valid_nick() and the remote-host width, which is a
+  # wider dependency surface than anything else under federation/ has. The table
+  # itself is a vector on server_t rather than a module global, so it has a home
+  # the shutdown can reach -- the difference between it and the burst shadow,
+  # which is a file-scope static and needs fed_burst_close() to be released.
+  federation/nickreg.c
 )
 
 target_link_libraries(irc_core PRIVATE pthread)

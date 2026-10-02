@@ -10,6 +10,12 @@
 #include "federation/burst.h"
 #include "federation/dedup.h"
 #include "federation/link.h"
+/* Phase 9: 2.1's remote-nick registry. SNICK rekeys it, which is what makes a
+ * rename network-visible -- see fed_in_snick() for the three places it has to
+ * land and why all three are needed. */
+#include <stdlib.h>
+
+#include "federation/nickreg.h"
 
 /* The map, once, in the order 4.3 lists the client verbs rather than in the
  * order of the S-verbs, so that a reader comparing this against the design does
@@ -29,7 +35,21 @@ static const struct {
     { "TOPIC",   "STOPIC"   },
     /* SMODES, not 4.3's SSMODE and not the obvious SMODE. See verbs.h. */
     { "MODE",    "SMODES"   },
-    { "KICK",    "SKICK"    }
+    { "KICK",    "SKICK"    },
+    /* SNICK, which 4.3's list does not name and Phase 9 adds. 2.1's
+     * rename-the-loser policy cannot be network-visible without it: a rename this
+     * node performs on its own client is invisible to every peer, and a peer that
+     * does not learn it keeps resolving the old name to this server. The two
+     * problems are the same problem -- 2.1 says the loser must be told "on the
+     * wire, not silently renamed locally" -- and the wire is what SNICK is.
+     *
+     * IT IS A SIXTEENTH VERB AND NOT A CHANGE TO AN EXISTING ONE, which is the
+     * compatibility argument: 4.3.1's frozen format is the BURST family, and a
+     * rename is not a burst record, so nothing about SBURST is touched. A peer
+     * that predates this counts it in n_fed_unknown_verb and applies no rename --
+     * which is a stale nickname rather than a corrupted roster, and is the
+     * failure this one-liner is worth. */
+    { "NICK",    "SNICK"    }
 };
 
 const char *fed_sverb_for(const char *client_verb)
@@ -676,6 +696,24 @@ static void fed_in_sjoin(server_t *s, server_link_t *link, chan_t *ch,
                ch->name, (nparams > 1) ? params[1] : "?", link->name);
         return;
     }
+    /* 2.1's REGISTRY, on the LIVE path and not only on the burst path, and the
+     * reason is that a burst is per link ESTABLISHMENT: a member who joined this
+     * node's mesh ten minutes after the last one would be unknown to a registry
+     * fed only by SBURST, and 2.1's scoped `nick@server` would 401 a user who is
+     * right there. SJOIN is the only verb that reports a user joining, so it is
+     * the only place a live registry entry can come from. The holder is the LINK
+     * for the same reason the roster's is -- 4.3's SJOIN carries no server field
+     * -- and the two disagree only for a relaying peer's own best guess, which
+     * the next burst corrects. */
+    fed_nickreg_learn_member(s, params[1], link->name, link->name, server_now_ms());
+    /* 2.1's POLICY, ON THE LEARNING SIDE, and the reason it is a second call site
+     * rather than a detail of the learn above: a user can register `zed` on a node
+     * whose registry is empty and only later learn that a peer holds it, and a
+     * node that checked only at claim time would leave that user holding the name
+     * for ever. The far side of the same pair runs the same function against the
+     * same two names, so between the two of them exactly one renames -- which is
+     * the convergence fed_nickreg_local_loses() exists to make possible. */
+    (void)fed_nickreg_resolve_local(s, params[1], server_now_ms());
     fed_touch_server(ch, link->name, 1);
     printf("[observable] fed_sjoin: channel=%s member=%s server=%s flags=%u "
            "local=%zu remote=%zu origin=%s owned=%d\n",
@@ -683,6 +721,640 @@ static void fed_in_sjoin(server_t *s, server_link_t *link, chan_t *ch,
            ch->origin, chan_origin_is_self(s, ch));
     (void)fanout_forward_channel_sverb(s, ch, FANOUT_STATE_CHANGE, "SJOIN", prefix,
                                        params, nparams, tags);
+}
+
+/* SNICK: <old nick> <new nick>.
+ *
+ * IT NAMES NO CHANNEL, which is why it is NOT IN INBOUND: every row of that
+ * table is dispatched with its channel read from a fixed parameter position, and
+ * a two-parameter verb whose second parameter is a nickname has no position that
+ * is a channel. See the dispatch in fed_handle_message() for how SQUIT solves the
+ * same problem, and for why SNICK is asked in the same place rather than given a
+ * position that lies.
+ *
+ * THE EFFECT IS IN THREE PLACES, and all three are needed or a rename is only
+ * half-applied:
+ *   - 2.1's registry: the entry that answered `<old>`@<this peer> must answer
+ *     `<new>` instead, or every subsequent `old@peer` on this node still routes
+ *     here and every `new@peer` is a 401.
+ *   - the CHANNEL ROSTERS: the member is keyed (server, nick), so a rekeyed
+ *     member whose roster row still says the old name is a member the roster
+ *     cannot render and SPART cannot later remove.
+ *   - the LOCAL CLIENTS: an SJOIN/SPART fanout is what teaches a client's view
+ *     of the roster, and a rename that skips it leaves a client showing a name
+ *     the server no longer holds.
+ *
+ * AND IT IS NOT A STATE-DESTROYING VERB, which is the reason it is not routed
+ * through the same refusal chain a SQUIT is: nothing here ends, and a peer that
+ * sends it for a name this node never held is a peer with a stale view rather
+ * than one trying to remove a channel's member. It is still a 401-free silent
+ * accept, because "I do not have that nick" is not an error worth breaking a
+ * link over -- the next SBURST is the authority, and this node will correct
+ * itself then.
+ */
+static void fed_in_snick(server_t *s, server_link_t *link, const char *prefix,
+                         const irc_serve_tags_t *tags, const char *const *params,
+                         int nparams)
+{
+    int renamed = 0;
+
+    if (nparams != 2) {
+        return;
+    }
+    /* THE PREFIX IS IGNORED, and that is load-bearing rather than lazy. SNICK is
+     * forwarded to every established peer EXCEPT the one it came from, so on a
+     * three-node mesh a rename the middle node performed is seen by the third
+     * node as a rename the MIDDLE node performed. Attributing it to the prefix
+     * instead would move the member to a different server's roster, which is the
+     * misattribution 4.3.1 added `<server>` to SBURSTM to prevent. The member's
+     * server is the LINK, because a rename does not move anybody between servers
+     * -- it changes what this one calls them. */
+    (void)prefix;
+
+    fed_nickreg_rename(s, link->name, params[0], params[1], server_now_ms());
+    printf("[observable] fed_nickreg_rename: server=%s from=%s to=%s\n", link->name,
+           params[0], params[1]);
+
+    /* THE ROSTERS, one channel at a time. There is no index from nickname to
+     * channel, and there must not be: a member's name is not a global key, so a
+     * node-wide map would be a second registry whose only use is this walk and
+     * whose staleness would then be a second thing to reconcile. The walk is
+     * O(channels) and this node has a bounded number of them. */
+    for (size_t ci = 0, nch = server_chan_count(s); ci < nch; ci++) {
+        chan_t *ch = server_chan_at(s, ci);
+
+        if (ch == NULL || ch->nremotes == 0) {
+            continue;
+        }
+        if (chan_remote_rename(ch, link->name, params[0], params[1]) == 1) {
+            renamed++;
+            fed_touch_server(ch, link->name, 0);
+            /* THE CHANNEL'S OWN CLIENTS, and the prefix is the LINK because the
+             * line as it arrives names the link; fanout_forward_channel_sverb()
+             * renders the prefix itself and this is the shape every other
+             * state-change verb uses. A member's rename inside a channel is
+             * something a client watching the channel must be told, and the
+             * fanout is the only path to a client that exists. */
+            (void)fanout_forward_channel_sverb(s, ch, FANOUT_STATE_CHANGE, "SNICK",
+                                               link->name, params, nparams, tags);
+        }
+    }
+    if (renamed == 0) {
+        /* NO ROSTER HELD IT, which is the ordinary case for a user who is
+         * connected but not in any channel this node knows about -- the common
+         * case on a relay. The registry is still updated above, and a rename
+         * that reaches nobody is not a failure: there was nothing to tell. */
+        printf("[observable] fed_snick: server=%s from=%s to=%s rosters=0\n",
+               link->name, params[0], params[1]);
+    } else {
+        printf("[observable] fed_snick: server=%s from=%s to=%s rosters=%d\n",
+               link->name, params[0], params[1], renamed);
+    }
+}
+
+/* Does this node ALREADY hold a link to the server called `name`? The
+ * collision check needs exactly this question and nothing more, so it walks the
+ * link vector here rather than going through a lookup nobody else wants: a
+ * by-name accessor on server_t::links would be a general-purpose API whose only
+ * caller is one collision check, and the lesson 2.1 teaches about the nickname
+ * registry is that a second place to ask "do we already know this name" is a
+ * second place for the answer to be wrong.
+ *
+ * CONFIGURED OR ESTABLISHED, BOTH, and the reason is what a collision IS: a link
+ * this node has been told about and a link this node has finished handshaking
+ * with are both a claim on the name, and a name is unique per MESH (2.3) rather
+ * than per socket. So the check is against the link vector and not against the
+ * FSM state, and a peer that advertises a name this node is still dialling is
+ * reported as a collision -- which is exactly when an operator wants to hear
+ * about it, because that is the moment the refusal is coming. */
+static int advert_name_is_held(const server_t *s, const char *name)
+{
+    if (s == NULL || name == NULL) {
+        return 0;
+    }
+    for (size_t i = 0; i < server_link_count(s); i++) {
+        if (chan_same_name(server_link_at(s, i)->name, name)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * What a peer ADVERTISES about itself, and the store it lands in
+ * ---------------------------------------------------------------------------
+ *
+ * ONE ENTRY PER ADVERTISING PEER, refreshed in place, bounded by
+ * IRC_FED_MAX_ADVERTISED. The bound is the number of peers a node can be
+ * configured with (IRC_FED_MAX_PEERS), which is what makes it the RIGHT bound
+ * rather than an arbitrary one: this node cannot be advertised to by more servers
+ * than it has links, so the table cannot grow past its own peer set and an
+ * advertisement from a stranger has nowhere to go. The store is allocated at its
+ * FULL bound on first use rather than grown, for the reason every other flat
+ * table in this node is (see fed_nickreg.c), and freed by fed_advert_close().
+ *
+ * EVERY FIELD IS COPIED THROUGH A BOUNDED COPY, and the host is a name and not an
+ * address struct, which is deliberate: the wire carries a hostname and a port
+ * because that is what an operator can configure and what a human can read in a
+ * log. Storing an address here would be storing something the dial path could
+ * be tempted by, and the whole argument in server.h is that the temptation
+ * should not exist. */
+struct fed_advert {
+    char     peer[IRC_MAX_SERVER_NAME + 1];  /* the LINK this came over */
+    char     name[IRC_MAX_SERVER_NAME + 1];  /* the name it advertises */
+    char     host[CONN_HOST_MAX + 1];        /* the dial hint it advertises */
+    unsigned port;
+    unsigned load_pct;
+    uint64_t seen_ms;
+};
+
+static struct fed_advert *advert_table(server_t *s)
+{
+    if (s->advs == NULL) {
+        s->advs = (struct fed_advert *)calloc(IRC_FED_MAX_ADVERTISED,
+                                              sizeof *s->advs);
+        if (s->advs == NULL) {
+            /* A node that cannot record cannot report, and saying so is better
+             * than a store that silently did not record: an operator looking at
+             * `advert_known=0` on a mesh that is advertising would otherwise have
+             * no way to tell a quiet node from a broken one. */
+            printf("[observable] fed_advert_alloc_failed\n");
+            return NULL;
+        }
+    }
+    return s->advs;
+}
+
+/* A bounded copy that reports whether it fitted, for the reason resume.c's is the
+ * same: a name or a host stored truncated is a name or a host that matches
+ * nothing, and a store full of near-misses is worse than an empty one because it
+ * looks populated. */
+static int advert_copy(char *dst, size_t cap, const char *src)
+{
+    size_t n;
+
+    if (dst == NULL || cap == 0u) {
+        return 0;
+    }
+    if (src == NULL) {
+        dst[0] = '\0';
+        return 1;
+    }
+    n = strlen(src);
+    if (n >= cap) {
+        dst[0] = '\0';
+        return 0;
+    }
+    memcpy(dst, src, n + 1u);
+    return 1;
+}
+
+/* The advertised fields of one peer, FOR A LOG OR A COUNTER. This is the whole
+ * read surface of the store, and its return type is the enforcement of the SSRF
+ * property as much as the comment is: it hands out two bounded strings and two
+ * numbers, and there is no function in this file that returns a sockaddr, a
+ * server_link_t or anything the dial path could be built from. */
+const char *fed_advertised(const server_t *s, const char *peer, char *name,
+                           size_t name_cap, char *host, size_t host_cap,
+                           unsigned *port_out, unsigned *load_out);
+
+/* ADVERTISE <load%> [<name> <host> <port>].
+ *
+ * A PAYLOAD, AND NOT A BARE LIVENESS PING, and the reason is that a bare one
+ * would be a second liveness signal that can disagree with the first.
+ * federation/link.c's T4 already decides a link is dead from the link's own
+ * silence, and it is the only thing that should: it is on a timer, it has a
+ * threshold, and its counter is one an operator watches. A peer that sent a bare
+ * ADVERTISE as a heartbeat would be asserting liveness on a schedule neither
+ * side agreed, and a node receiving one would have to decide whether to believe
+ * it -- and the answer would be "no, because T4 exists", which makes the verb
+ * pointless.
+ *
+ * SO ADVERTISE IS FOR PROPAGATION OF STATE THE LINK DOES NOT OTHERWISE CARRY,
+ * and the state a single node has is how loaded it is. The load percentage is
+ * therefore REQUIRED rather than optional: an ADVERTISE with no payload would be
+ * a heartbeat, and this is not a heartbeat. It is also the only number this node
+ * puts on the wire about itself, and it comes from fed_set_load() -- an operator's
+ * value, not a measurement, because this node has no load metric and a fabricated
+ * 0% would be a number it does not believe.
+ *
+ * THE SECOND HALF IS THE DIAL HINT, and it is OPTIONAL because a peer may not
+ * want to publish where it is. It is recorded, reported and NEVER DIalled, and
+ * server.h says at length why that is a security property and what a future
+ * reader would have to write down before changing it. The one thing this node
+ * DOES do with it is the collision check below, which is a use that cannot
+ * connect to anything.
+ *
+ * VALIDATION, and each refusal is a distinct one because they have distinct
+ * fixes: the load must parse as a number in 0..100; a hint is either absent or
+ * exactly three parameters; the name must satisfy 2.4's server-name grammar (the
+ * same rule fed_on_federate() applies, so an advertisement cannot claim a name
+ * this node would refuse to link to); the host must be non-empty and printable
+ * (a hostname, not a URL, not a sockaddr -- 3.4 resolves names to addresses ONCE
+ * at startup and never inside the event loop, and this store is not a resolver);
+ * and the port must be 1..65535. A refused ADVERTISE does NOT tear the link down:
+ * a peer running a build with a different shape for this verb is a version fact,
+ * and the same reasoning fed_in_smodes() applies when a line it cannot use
+ * arrives. */
+static void fed_in_advertise(server_t *s, server_link_t *link, const char *prefix,
+                              const irc_serve_tags_t *tags,
+                              const char *const *params, int nparams)
+{
+    struct fed_advert *table;
+    struct fed_advert *slot = NULL;
+    char loadbuf[16];
+    unsigned long load = 0u;
+    int hinted = 0;
+
+    (void)prefix;
+    (void)tags;
+
+    /* ARITY: one parameter, or four. Not two and not three, because a partial
+     * hint is not a hint -- a name with no address, or an address with no port,
+     * is a fragment that would have to be interpreted, and this node's rule is
+     * that it does not interpret fragments of a wire format it invented. */
+    if (nparams != 1 && nparams != 4) {
+        s->n_fed_advertise_bad++;
+        printf("[observable] fed_advertise_refused: peer=%s reason=ARITY "
+               "nparams=%d\n",
+               link->name, nparams);
+        return;
+    }
+    if (strlen(params[0]) >= sizeof loadbuf) {
+        s->n_fed_advertise_bad++;
+        printf("[observable] fed_advertise_refused: peer=%s reason=LOAD_LONG\n",
+               link->name);
+        return;
+    }
+    (void)advert_copy(loadbuf, sizeof loadbuf, params[0]);
+    /* A STRICT PARSE, and the reason is the same one 4.3's terminator counts
+     * have: a field that "looks like" a number and is not would be stored as
+     * whatever the parser salvaged, and a load of 50 from "50abc" is a number
+     * this node reported that the peer never sent. */
+    for (const char *c = loadbuf; *c != '\0'; c++) {
+        if (*c < '0' || *c > '9') {
+            s->n_fed_advertise_bad++;
+            printf("[observable] fed_advertise_refused: peer=%s reason=LOAD_NOT_NUML "
+                   "value=%s\n",
+                   link->name, loadbuf);
+            return;
+        }
+        load = (load * 10u) + (unsigned long)(*c - '0');
+        if (load > 100u) {
+            s->n_fed_advertise_bad++;
+            printf("[observable] fed_advertise_refused: peer=%s reason=LOAD_RANGE "
+                   "value=%s\n",
+                   link->name, loadbuf);
+            return;
+        }
+    }
+    if (loadbuf[0] == '\0') {
+        s->n_fed_advertise_bad++;
+        printf("[observable] fed_advertise_refused: peer=%s reason=LOAD_EMPTY\n",
+               link->name);
+        return;
+    }
+    if (nparams == 4) {
+        unsigned long port = 0u;
+        int digits = 0;
+
+        hinted = 1;
+        if (!irc_serve_server_name_valid(params[1])) {
+            s->n_fed_advertise_bad++;
+            printf("[observable] fed_advertise_refused: peer=%s reason=NAME_INVALID "
+                   "name=%s\n",
+                   link->name, params[1]);
+            return;
+        }
+        if (params[2][0] == '\0' || strlen(params[2]) >= CONN_HOST_MAX + 1u) {
+            s->n_fed_advertise_bad++;
+            printf("[observable] fed_advertise_refused: peer=%s reason=HOST_INVALID\n",
+                   link->name);
+            return;
+        }
+        for (const char *c = params[2]; *c != '\0'; c++) {
+            if (*c <= 0x20 || (unsigned char)*c >= 0x7fu) {
+                /* PRINTABLE AND NOT A SEPARATOR, and the reason is that this
+                 * field is a HOSTNAME in a log: a value containing a space, a
+                 * colon or a control byte would render a line a reader
+                 * misparses, and 3.2's rule about parameters that cannot be
+                 * represented is the same rule about text that cannot be read
+                 * safely. It is NOT a hostname syntax check: 3.4 resolves names
+                 * once at startup, and this store never resolves anything. */
+                s->n_fed_advertise_bad++;
+                printf("[observable] fed_advertise_refused: peer=%s "
+                       "reason=HOST_UNPRINTABLE\n",
+                       link->name);
+                return;
+            }
+        }
+        for (const char *c = params[3]; *c != '\0'; c++) {
+            if (*c < '0' || *c > '9') {
+                s->n_fed_advertise_bad++;
+                printf("[observable] fed_advertise_refused: peer=%s reason=PORT_NOT_NUML "
+                       "value=%s\n",
+                       link->name, params[3]);
+                return;
+            }
+            port = (port * 10u) + (unsigned long)(*c - '0');
+            digits++;
+        }
+        if (digits == 0 || port == 0u || port > 65535u) {
+            s->n_fed_advertise_bad++;
+            printf("[observable] fed_advertise_refused: peer=%s reason=PORT_RANGE "
+                   "value=%s\n",
+                   link->name, params[3]);
+            return;
+        }
+    }
+    table = advert_table(s);
+    if (table == NULL) {
+        return;
+    }
+    /* REFRESH IN PLACE, keyed on the LINK and not on the advertised name, and the
+     * reason is that the link is the only thing this node can vouch for. A store
+     * keyed on the advertised name would let a peer overwrite another peer's
+     * entry, and the two are exactly the entries an operator would be comparing.
+     * A peer that advertises a DIFFERENT name than its link is not an error --
+     * a relay is a legitimate thing to be -- so the record is allowed to disagree
+     * with its own key and the line below says so. */
+    for (size_t i = 0; i < s->nadv; i++) {
+        if (chan_same_name(table[i].peer, link->name)) {
+            slot = &table[i];
+            break;
+        }
+    }
+    if (slot == NULL) {
+        if (s->nadv >= IRC_FED_MAX_ADVERTISED) {
+            /* Unreachable given the bound is IRC_FED_MAX_PEERS and the link came
+             * from one of this node's peers, and it is handled rather than
+             * asserted because a table that dropped an advertisement because it
+             * was full would be a store that reports a smaller mesh than it has. */
+            s->n_fed_advertise_bad++;
+            printf("[observable] fed_advertise_refused: peer=%s reason=STORE_FULL "
+                   "bound=%zu\n",
+                   link->name, IRC_FED_MAX_ADVERTISED);
+            return;
+        }
+        slot = &table[s->nadv];
+        memset(slot, 0, sizeof *slot);
+        s->nadv++;
+    } else {
+        memset(slot, 0, sizeof *slot);
+    }
+    (void)advert_copy(slot->peer, sizeof slot->peer, link->name);
+    (void)advert_copy(slot->name, sizeof slot->name, hinted ? params[1] : "");
+    (void)advert_copy(slot->host, sizeof slot->host, hinted ? params[2] : "");
+    if (hinted != 0) {
+        unsigned long port = 0u;
+
+        for (const char *c = params[3]; *c != '\0'; c++) {
+            port = (port * 10u) + (unsigned long)(*c - '0');
+        }
+        slot->port = (unsigned)port;
+    }
+    slot->load_pct = (unsigned)load;
+    slot->seen_ms = server_now_ms();
+    s->n_fed_advertise++;
+    /* AND THE ROUTING COPY, which is the propagation half's whole payload. This is
+     * the second writer of server_link_t::load_seen and the only one -- server.h
+     * says why the figure is held in two places (the store is observational, the
+     * field is what T8's policy reads), and it is written HERE rather than in the
+     * tick so that the store and the field cannot disagree: they are two halves of
+     * one statement sequence.
+     *
+     * THE EDGE LATCH IS CLEARED HERE AND ONLY HERE, when the figure arrives BELOW
+     * the threshold, so a peer that sheds, recovers and sheds again is reported
+     * twice. It is deliberately NOT cleared when the figure merely refreshes at the
+     * same level: that is what makes the tick report a crossing rather than a
+     * state, and without it a busy peer would print one line per POLL_TICK_MS for
+     * the life of the link. The threshold of 0 means "no opinion" and the
+     * comparison below it is false for every figure, so an unset shed_pct neither
+     * reports nor latches -- a node with no threshold is not a node silently
+     * suppressing reports it would otherwise make. */
+    if (s->shed_pct == 0u || (unsigned)load < s->shed_pct) {
+        link->shed_reported = 0;
+    }
+    link->load_seen = (unsigned)load;
+    link->load_seen_ok = 1;
+
+    /* THE COLLISION CHECK, and it is one of the three things this store is allowed
+     * to be used for (server.h lists them). 2.3 makes two nodes with one name
+     * "catastrophic and undetectable later", and the handshake refuses the second
+     * -- so an advertisement is the CHEAPEST place to notice, because the node
+     * that advertises a name this node already holds is a node about to be
+     * refused, and an operator who learns that from this counter learns it before
+     * the refusal rather than after.
+     *
+     * IT COMPARES BOTH WAYS AND DOES NOT CALL IT A COLLISION WHEN THE NAME IS
+     * THIS NODE'S OWN, because that is not a collision -- it is a peer telling
+     * this node its own name, which is what a peer does. It is reported anyway,
+     * on its own line, because a peer whose link name and advertised name differ
+     * is a relay and an operator may want to know. */
+    if (hinted != 0) {
+        if (chan_same_name(slot->name, s->name)) {
+            printf("[observable] fed_advertise: peer=%s name=%s host=%s port=%u "
+                   "load=%u%% detail=SELF_NAME\n",
+                   link->name, slot->name, slot->host, slot->port, slot->load_pct);
+        } else if (advert_name_is_held(s, slot->name)) {
+            s->n_fed_advertise_collision++;
+            printf("[observable] fed_advertise_collision: peer=%s advertised=%s "
+                   "held_by=this_node\n",
+                   link->name, slot->name);
+        } else {
+            printf("[observable] fed_advertise: peer=%s name=%s host=%s port=%u "
+                   "load=%u%% dialed=NO\n",
+                   link->name, slot->name, slot->host, slot->port, slot->load_pct);
+        }
+    } else {
+        printf("[observable] fed_advertise: peer=%s load=%u%% dialed=NO\n",
+               link->name, slot->load_pct);
+    }
+}
+
+const char *fed_advertised(const server_t *s, const char *peer, char *name,
+                           size_t name_cap, char *host, size_t host_cap,
+                           unsigned *port_out, unsigned *load_out)
+{
+    size_t i;
+
+    if (name != NULL && name_cap > 0u) {
+        name[0] = '\0';
+    }
+    if (host != NULL && host_cap > 0u) {
+        host[0] = '\0';
+    }
+    if (port_out != NULL) {
+        *port_out = 0u;
+    }
+    if (load_out != NULL) {
+        *load_out = 0u;
+    }
+    if (s == NULL || s->advs == NULL || peer == NULL) {
+        return NULL;
+    }
+    for (i = 0; i < s->nadv; i++) {
+        if (!chan_same_name(s->advs[i].peer, peer)) {
+            continue;
+        }
+        if (name != NULL) {
+            (void)advert_copy(name, name_cap, s->advs[i].name);
+        }
+        if (host != NULL) {
+            (void)advert_copy(host, host_cap, s->advs[i].host);
+        }
+        if (port_out != NULL) {
+            *port_out = s->advs[i].port;
+        }
+        if (load_out != NULL) {
+            *load_out = s->advs[i].load_pct;
+        }
+        return s->advs[i].name;
+    }
+    return NULL;
+}
+
+size_t fed_advertised_count(const server_t *s)
+{
+    return (s != NULL) ? s->nadv : 0u;
+}
+
+void fed_advert_close(server_t *s)
+{
+    if (s == NULL) {
+        return;
+    }
+    /* THE ARM, printing whether the table was OPEN for the reason
+     * server_shutdown() makes about the burst shadow: LeakSanitizer does not run
+     * on Darwin, so the only local evidence that a store was released is a line a
+     * test can assert on, and the Linux CI job reads the same line beside its own
+     * LSan run. */
+    printf("[observable] fed_advert_close: table=%s known=%zu\n",
+           (s->advs != NULL) ? "OPEN" : "NONE", s->nadv);
+    free(s->advs);
+    s->advs = NULL;
+    s->nadv = 0u;
+}
+
+/* SHUTDOWN [:reason].
+ *
+ * "I am leaving DELIBERATELY", and the whole of the handler is about what that
+ * sentence is NOT allowed to mean. The three things it must not do:
+ *
+ *   1. IT MUST NOT ARM THE RETRY POLICY. A peer that went away is a peer whose
+ *      socket closed, and item 1's T4 turns that into a backoff and a budget and
+ *      a redial. A node that shut down on purpose is not going to answer those
+ *      dials, and the policy would spend a budget of three attempts and a
+ *      two-minute ceiling discovering that -- and, worse, would leave a link that
+ *      looks retryable in a dump, so an operator reading it would be looking for a
+ *      flaky peer where there is a departed one. So fed_mark_clean_leave() is
+ *      called FIRST and the T7 dial arm refuses a link with it set. The
+ *      distinction is in a FIELD rather than in a new handshake state, because
+ *      the handshake FSM is 2.1's frozen four states and adding a fifth to it
+ *      would be a change to a spec this phase does not own.
+ *
+ *   2. IT MUST NOT LEAVE THE MESH HOLDING STATE FOR A SERVER THAT IS GONE. The
+ *      same purge a SQUIT performs, keyed on this peer, and for the same reason:
+ *      4.3's roster for a server that is not coming back is state an operator
+ *      cannot explain. The purge is per-ORIGIN (chan_remote_purge is keyed on the
+ *      reporting origin), so nothing another origin contributed is touched.
+ *
+ *   3. IT MUST NOT BE SILENT, AND IT MUST NOT BE A CLIENT EVENT. There is no
+ *      client NOTICE here, and the reason is that no client's session is affected
+ *      by which server left: the affected party is the MESH. A NOTICE would have
+ *      to name a server the client cannot reach, cannot ask about, and has no way
+ *      to do anything with -- it is noise aimed at the wrong audience. What the
+ *      surviving node does instead is three things an operator can act on: it
+ *      prints the line with the peer and the reason, it tells its OTHER peers
+ *      (below), and it leaves the dump saying why the link is not being dialled.
+ *
+ * AND IT IS TOLD ONWARD, which is the half that makes it a mesh feature rather
+ * than a local one. The forwarding is a `SQUIT <peer>` -- not a `SHUTDOWN`, and
+ * the difference is the point: SQUIT is the verb the receiving side already knows
+ * how to act on, it is the one 4.3's list has, and a third node that has never
+ * heard of SHUTDOWN still purges correctly. A peer that predates this build counts
+ * an unknown verb and applies nothing, which is a stale roster -- the same
+ * degradation the SNICK argument makes, and the reason the forwarding reuses a
+ * verb that already exists rather than introducing a second departure signal. */
+static void fed_in_shutdown(server_t *s, server_link_t *link, const char *prefix,
+                            const irc_serve_tags_t *tags, const char *const *params,
+                            int nparams)
+{
+    const char *reason = "-";
+    size_t purged = 0u;
+    size_t chans = 0u;
+    size_t i;
+    int relayed = 0;
+
+    (void)prefix;
+    (void)tags;
+
+    if (nparams != 0 && nparams != 1) {
+        s->n_fed_shutdown_refused++;
+        printf("[observable] fed_shutdown_refused: peer=%s reason=ARITY nparams=%d\n",
+               link->name, nparams);
+        return;
+    }
+    if (nparams == 1) {
+        reason = params[0];
+    }
+
+    /* 1. FIRST, BEFORE ANY OBSERVABLE, so a reader of the log sees the decision
+     * before the consequences of it. The ordering also means that a purge which
+     * somehow re-entered the tick could not find a dialable link. */
+    (void)fed_mark_clean_leave(s, link, 1);
+
+    /* 2. THE PURGE, AND IT IS PER-ORIGIN AND IT IS THE SQUIT BODY'S. The walk
+     * shape is fed_in_squit()'s exactly, including the "do not advance past a
+     * disposed channel" rule, and reusing the shape rather than the function is
+     * deliberate: the two departures purge the same things for the same reason,
+     * and the one difference between them -- the retry policy, above -- is
+     * decided before this runs. */
+    for (i = 0; i < server_chan_count(s);) {
+        chan_t *ch = server_chan_at(s, i);
+        int disposed;
+
+        if (ch == NULL) {
+            i++;
+            continue;
+        }
+        purged += chan_remote_purge(ch, link->name);
+        if (chan_server_remove(ch, link->name) > 0) {
+            chans++;
+        }
+        fed_nickreg_purge_server(s, link->name);
+        disposed = chan_dispose_if_empty(s, ch);
+        if (disposed == 0) {
+            i++;
+        }
+    }
+
+    /* 3. TELL THE OTHERS, and the excluded link is this one because its socket is
+     * about to close. Everything else ESTABLISHED gets a SQUIT for the departing
+     * server, stamped once for the whole fan-out so 2.4's per-node dedup drops
+     * the second copy on a node reachable by two of this node's peers -- the same
+     * one-id argument fed_send_squit() makes for the identical fan-out. */
+    relayed = fed_send_squit_named(s, link->name, link);
+    s->n_fed_shutdown++;
+    if (relayed > 0) {
+        s->n_fed_shutdown_relayed++;
+    }
+    printf("[observable] fed_shutdown: peer=%s reason=%s chans=%zu purged=%zu "
+           "relayed=%d clean_leave=1 retried=0\n",
+           link->name, reason, chans, purged, relayed);
+    /* AND THE LINK ITSELF IS CLOSED, because a peer that said it is leaving and
+     * then kept the socket open would be a peer whose word and whose behaviour
+     * disagree, and this node has no way to make the word true. Marking the
+     * connection CLOSING (rather than closing the descriptor) is the 3.4
+     * invariant: the reaper is the only place an fd is closed, and the reaper
+     * runs at the end of this iteration. */
+    {
+        conn_t *c = server_link_conn(s, link);
+
+        if (c != NULL) {
+            conn_mark_closing(c);
+        }
+    }
 }
 
 /* SPART: <member> <channel> [<reason>]. */
@@ -903,6 +1575,15 @@ static void fed_in_squit(server_t *s, server_link_t *link,
             continue;
         }
         purged += chan_remote_purge(ch, gone);
+        /* 2.1's REGISTRY PURGE, and it is here for the reason the roster purge is
+         * here and not in chan_remote_purge(): a SQUIT is positive evidence that
+         * every user of that server is gone, and a registry entry left behind
+         * would be one more claim about a server that announced its own
+         * departure. It is a separate call rather than a side effect of the
+         * roster purge because the two tables are keyed by different things --
+         * (server, nick) versus (nick, server) -- and only the caller knows
+         * which one a given line is about. */
+        fed_nickreg_purge_server(s, gone);
         if (chan_server_remove(ch, gone) > 0) {
             chans++;
         }
@@ -949,6 +1630,32 @@ static void fed_in_squit(server_t *s, server_link_t *link,
         }
         (void)fanout_forward_sverb(s, lk->name, "SQUIT", NULL, params, nparams, tags);
     }
+}
+
+/* fed_forward_all() -- verbs.h states why this exists and what the two shapes of
+ * 4.3's verb set are. The body is SQUIT's broadcast loop with SQUIT's two
+ * exclusions left at ITS call site, which is what keeps the general function free
+ * of a verb it has no business naming. */
+int fed_forward_all(server_t *s, const char *sverb, const char *prefix,
+                    const char *const *params, int nparams)
+{
+    int carried = 0;
+
+    for (size_t k = 0; k < server_link_count(s); k++) {
+        server_link_t *lk = server_link_at(s, k);
+
+        if (lk == NULL || lk->state != (int)ESTABLISHED) {
+            continue;
+        }
+        /* == 0 IS SUCCESS, which is the shape fanout_forward_sverb() returns and
+         * the shape every call site in this file tests. Inverting it here would
+         * make the count mean the opposite of the one a reader expects. */
+        if (fanout_forward_sverb(s, lk->name, sverb, prefix, params, nparams, NULL) ==
+            0) {
+            carried++;
+        }
+    }
+    return carried;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1352,6 +2059,50 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
             sp[i] = m->params[i];
         }
         fed_in_squit(s, link, &tags, sp, m->nparams);
+        return;
+    }
+
+    /* SNICK, in SQUIT's place in the chain, for SQUIT's reason: it names no
+     * channel, so INBOUND's position-indexed read cannot reach it. It is asked
+     * AFTER the SQUIT arm and BEFORE the table, so a SQUIT's own-origin
+     * refusal and the burst family's ownership checks are all unaffected -- a
+     * rename arriving on a link this node does not hold a member for is
+     * unremarkable, and the two verbs must not be able to shadow each other. */
+    if (strcmp(m->command, "SNICK") == 0) {
+        for (int i = 0; i < m->nparams && i < IRC_MAX_PARAMS; i++) {
+            sp[i] = m->params[i];
+        }
+        fed_in_snick(s, link, m->prefix, &tags, sp, m->nparams);
+        return;
+    }
+
+    /* ADVERTISE AND SHUTDOWN, asked HERE for SQUIT's reason: neither names a
+     * channel, so INBOUND's position-indexed read cannot reach either, and a row
+     * for them would have to lie about what it reads. They are asked AFTER the
+     * SNICK arm and BEFORE the table, so the whole of the guard chain above has
+     * already run for them: G1 has refused a line from a link that is not
+     * ESTABLISHED, G4 has resolved the 2.4 identity, G5 has checked the hop
+     * ceiling, G6 has refused a line this node originated, and G7 has recorded the
+     * key so a peer cannot retry the same line under a new id.
+     *
+     * IT MATTERS FOR ADVERTISE SPECIFICALLY, and that is why these two are here
+     * rather than handled before the chain: an ADVERTISE carries a dial hint, and
+     * a dial hint is the one thing on this node's wire that must never reach the
+     * dial path. Handling it before the chain would mean accepting a hint from
+     * anything that opened a TCP connection, which is a stranger, and the secret
+     * in FEDERATE is the only thing that makes a peer a peer. */
+    if (strcmp(m->command, "ADVERTISE") == 0) {
+        for (int i = 0; i < m->nparams && i < IRC_MAX_PARAMS; i++) {
+            sp[i] = m->params[i];
+        }
+        fed_in_advertise(s, link, m->prefix, &tags, sp, m->nparams);
+        return;
+    }
+    if (strcmp(m->command, "SHUTDOWN") == 0) {
+        for (int i = 0; i < m->nparams && i < IRC_MAX_PARAMS; i++) {
+            sp[i] = m->params[i];
+        }
+        fed_in_shutdown(s, link, m->prefix, &tags, sp, m->nparams);
         return;
     }
 

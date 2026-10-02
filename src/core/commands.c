@@ -13,7 +13,9 @@
 #include "core/channel.h"
 #include "core/fanout.h"
 #include "core/msg_verbs.h"
+#include "core/resume.h"
 #include "core/reply.h"
+#include "federation/nickreg.h"
 #include "federation/verbs.h"
 #include "sasl_framework.h"
 
@@ -245,6 +247,27 @@ void commands_state_update(server_t *s, conn_t *c)
     c->state = state;
     if (state == CONN_REG_READY) {
         send_welcome(s, c);
+        /* THE SESSION WINDOW IS APPLIED HERE AND NOWHERE ELSE, and the position
+         * is the whole of what makes it possible: this is the one place a
+         * connection has all three of nick, ident and host -- the window's key
+         * -- AND is about to be addressed as a client, which is what a re-join
+         * needs because 3.1's table is keyed on the connection's class. Applying
+         * it at NICK time would compare an EMPTY ident against every window and
+         * match none; applying it at USER time would be a second place that
+         * promotes a connection to ready.
+         *
+         * IT IS AFTER THE WELCOME BURST, and that is a client-visible ordering
+         * choice rather than an accident: 001-005 and the MOTD are the server
+         * introducing itself, and a client that has not been told what it
+         * connected to should not be told what it is already a member of. Every
+         * real client parses 376 as "the server has finished talking", and the
+         * JOINs and rosters that follow read as the session coming back rather
+         * than as part of the handshake.
+         *
+         * IT IS A NO-OP FOR EVERY CONNECTION THAT DID NOT COME BACK FROM A DROP,
+         * which is every connection on a node whose clients never drop, and it
+         * costs one pointer comparison when there is no table. */
+        (void)resume_apply(s, c, server_now_ms());
     }
 }
 
@@ -379,27 +402,60 @@ static void handle_nick(server_t *s, conn_t *c, const message_t *m)
         return;
     }
 
-    /* The new name is ours, so the old one can go. Released only AFTER the new
-     * claim succeeded: releasing first would leave a window in which the name
-     * is unowned and a second client could take it.
+    /* 2.1's RENAME-THE-LOSER, and the whole policy is
+     * fed_nickreg_resolve_local() rather than anything here. That is the point of
+     * it being a function: a rule written at the claim site and a rule written at
+     * the report site would be TWO rules, and a rename needs FIVE effects -- the
+     * decision, a new name, the local registry, the client and its channels, and
+     * the mesh -- of which a call site implementing four would produce a mesh
+     * that LOOKS renamed and is not.
      *
-     * The order is also what makes the enumeration survive a rename. A claim
-     * adds an entry for a connection not already in the vector, and a release
-     * removes one only from a connection left holding no name at all -- so at
-     * this instant the table maps `want` to this conn, the release of `previous`
-     * finds it still holding `want`, and the connection stays exactly where it
-     * was in WHO's walk. Claim-then-release is not an accident of the order
-     * these two lines happen to be in; it is the order the two operations are
-     * defined to require. */
-    if (c->nick[0] != '\0') {
+     * IT IS CALLED HERE AND ALSO AFTER A REMOTE CLAIM IS LEARNED (on an SJOIN and
+     * on a burst), because a user can register a name on a node whose registry is
+     * empty and have the competing claim arrive afterwards. Checking only at claim
+     * time would leave that user holding a name for ever, which is the
+     * "user-visible and undefined" state 2.1 names. The other half of the
+     * convergence argument is that the OTHER node runs this same function against
+     * the same two names and renames its own user if it is the loser there -- so
+     * nothing has to tell a node to rename anybody.
+     *
+     * NOTHING BELOW THIS CALL TOUCHES THE NAME, because the function owns all of
+     * it -- including the case where it declines to act, which is most calls. */
+    /* A CLIENT-INITIATED CHANGE, for a connection that already held a name, and
+     * this is the block the rename-the-loser policy does NOT replace: a user
+     * choosing a new name is a different event from a user being told their name
+     * is taken, and the two observables are kept apart so a reader of a log can
+     * tell them. The release happens BEFORE the claim, which is the opposite
+     * order from fed_nickreg_resolve_local()'s and for the same reason stated
+     * there -- except that here the name being released is THIS connection's own
+     * and is being given up deliberately, so there is no third user who could
+     * take it in the window.
+     *
+     * IT IS REPORTED AND NOT FANNED OUT, which is a real limit rather than an
+     * oversight and is unchanged by anything above: a client-issued rename is
+     * visible to the client and to this node's registry, and NOT to the other
+     * members of its channels nor to the mesh. §7/Phase 4 has never claimed
+     * otherwise, and making it true is a separate piece of work from 2.1's
+     * duplicate policy -- which is a statement about DUPLICATES and does not
+     * need a general rename broadcast to be correct. */
+    if (have_nick(c)) {
         char previous[sizeof c->nick];
 
         memcpy(previous, c->nick, sizeof previous);
         server_nick_release(s, previous);
-        printf("[observable] nick_change: fd=%d from=%s to=%s\n", c->fd,
-               previous, want);
+        printf("[observable] nick_change: fd=%d from=%s to=%s\n", c->fd, previous,
+               want);
     }
+    /* c->nick IS SET BEFORE THE POLICY RUNS and not after, and the order is
+     * load-bearing in both directions. Before: fed_nickreg_resolve_local() finds
+     * the local holder with server_nick_lookup() and then writes c->nick itself,
+     * so a connection still carrying an empty nick would be renamed to nothing and
+     * a connection carrying its PREVIOUS nick would be renamed from the wrong
+     * name. After: the rename the policy performs would be undone by the memcpy,
+     * leaving the registry claiming `fresh` and the connection answering to
+     * `want` -- the divergence 2.1's policy exists to end. */
     memcpy(c->nick, want, strlen(want) + 1u);
+    (void)fed_nickreg_resolve_local(s, want, server_now_ms());
     update_state(s, c);
 }
 

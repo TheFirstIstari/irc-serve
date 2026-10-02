@@ -219,6 +219,26 @@ allowlist that only fails on a *new* skip is a permanent permission: a test
 implemented in 2026 and left on the list goes on authorising a skip for ever and
 the count stops meaning anything.
 
+### The list is EMPTY, and the file is not deleted
+
+Phase 9 closed the last five, so `tests/known_skips.txt` has no lines in it — comments
+only — and the gate is now simply **"no test may skip"**, which is the phrase §6.4
+always said the goal was.
+
+Two consequences worth knowing before you touch either:
+
+- **The first row is now total.** With no permitted lines, *every* test that skips
+  lands in it. The other three rows have nothing to check and pass vacuously — which
+  is said plainly here so nobody reads a green gate as a four-way check still running.
+- **Do not delete the file.** `check-skips.sh` fails on a **MISSING** list by design:
+  a test that skipped with no list would otherwise be permitted by the accident of the
+  file's own absence. An empty file is the finished state; an absent one is a broken
+  gate, and the two look identical from a passing run.
+
+Adding a line back needs no change to the script. A developer who genuinely cannot
+implement something writes the line and the skip is red until they do — which is still
+the whole point of the file.
+
 It runs in `ci_test` (the required merge gate), in `local-ci.sh`, and in
 `make test`. CTest's own exit code cannot express "a test skipped" — it excludes
 skips from the pass rate and from the status — which is why the gate is a
@@ -237,8 +257,15 @@ out would be to delete the tests — the exact failure the gate prevents — or 
 build two phases inside one.
 
 Seven skips were permitted when this gate landed, and the list was the account of
-all seven. **Five are permitted now**: Phase 8 closed `CapNegotiation` and
-`MultiPrefix`, and the remaining five are §7/Phase 9's.
+all seven. Phase 8 closed `CapNegotiation` and `MultiPrefix`. **Phase 9 closed the
+remaining five** — `SyncState`, `FailoverReconnect`, `Reconnect`, `PeerDiscovery` and
+`AutoScale` — and each moved to `tests/integration/` with its **CTest name unchanged**,
+which is why the gate has nothing left to check.
+
+A moved test keeps its name for a mechanical reason: the ratchet names tests by that
+name, so renaming a test to suit a build system is how a line goes stale without
+anybody noticing. `tests/CMakeLists.txt`'s `irc_ctest_name()` shim is where the name
+survives a move.
 
 ### Adding a skip
 
@@ -258,3 +285,10 @@ test's CMakeLists, and **delete the line from `tests/known_skips.txt` in the sam
 change**. Leaving the line is a CI failure by design. `test_topic_persist` is the
 worked example: it skipped from Phase 1, Phase 7 implemented topic persistence
 across a reconnect, and the line is gone.
+
+**If the test moves directories, keep the CTest name.** `AutoScale` is the worked
+example: the implementation needed real sockets between real processes, which a target
+in `tests/loadbal/` cannot do (it links `irc_core` and nothing else), so the file moved
+to `tests/integration/` and the *target* was renamed while `irc_ctest_name()` kept the
+CTest name. Renaming both is how a name on the list goes stale, and `check-skips.sh`'s
+third row is what catches it.

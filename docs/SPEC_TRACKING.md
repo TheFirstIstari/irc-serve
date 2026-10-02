@@ -375,13 +375,24 @@ neither Phase 4 nor Phase 9.
 
 | CTest name | File | Feature it is waiting on | Lands in | Issue |
 |---|---|---|---|---|
-| `MultiPrefix` | `tests/protocol/test_multi_prefix.c` | IRCv3 `multi-prefix` capability (multi-`prefix` in `353`) | Phase 8 | #82 |
-| `SyncState` | `tests/federation/test_sync_state.c` | the §4.3 resync **driven by a reconnect** — backoff, retry budget | Phase 9 | #83 |
-| `FailoverReconnect` | `tests/federation/test_failover_reconnect.c` | Peer failover / reconnect | Phase 9 | #83 |
-| `CapNegotiation` | `tests/compliance/test_cap_negotiation.c` | IRCv3 CAP negotiation (`LS`/`REQ`/`ACK`/`NAK`) | Phase 8 | #82 |
-| `PeerDiscovery` | `tests/loadbal/test_peer_discovery.c` | Load-balancer peer discovery (advertise / graceful leave) | Phase 9 | #83 |
-| `Reconnect` | `tests/loadbal/test_reconnect.c` | Client reconnect preserving session state | Phase 9 | #83 |
-| `AutoScale` | `tests/loadbal/test_autoscale.c` | Auto-scaling (spawn / shutdown / propagation) | Phase 9 | #83 |
+| _(none)_ | — | **the skip list is EMPTY** | — | — |
+
+**As of Phase 9 (issue #83) there are no skipped tests.** All five Phase 9 skips
+were retired by implementing the feature, and each skip line was deleted from
+`tests/known_skips.txt` in the same commit — `SyncState` and `FailoverReconnect`
+by the link policy (backoff, retry budget, heartbeat-driven redial, resync on
+link-up); `Reconnect` by the bounded session window; `PeerDiscovery` by
+`ADVERTISE`/`SHUTDOWN`; `AutoScale` by propagation and graceful leave, scoped to
+what a node can honestly do. `MultiPrefix` and `CapNegotiation` landed in Phase 8.
+
+Two honest notes about the gate now that the list is empty. `check-skips.sh` fails
+in **both** directions — a skip the list does not permit, and a list line naming no
+skip — and with no lines the first arm is total while the other three pass
+*vacuously*. That is not the same four-way check it was, and it should be read as
+such rather than as a stronger gate. And a green suite is now **necessary, not
+sufficient**: with nothing skipped there is no list saying which behaviour is
+still unimplemented, so this document and `docs/SERVER_DESIGN.md` §8 are the only
+places left that can record it, and they have to be read.
 
 **This table and `tests/known_skips.txt` must agree, and CI checks that they
 do.** The list is the single authoritative copy — one line per skip, naming the
@@ -565,7 +576,7 @@ Source: `gh issue list --milestone "Federated IRC Server v1.0" --state all`
 | 6 | #80 | Phase 6: Federation link - peer sockets, SBURST resync, loop prevention | OPEN | Not started. Dial FSM and handshake FSM exist and are tested; nothing calls `server_dial`, no peer link, no `SBURST`, no dedup, no relay. |
 | 7 | #81 | Phase 7: Remaining command surface and empty skip gate | OPEN | Not started. `KNOWN_SKIPS` does not exist. |
 | 8 | #82 | Phase 8: IRCv3 - real tag escaping, CAP negotiation, SASL PLAIN | OPEN | Not started. Turns `CapNegotiation` green and replaces `ircv3_tags.c` and `sasl_framework.c`. |
-| 9 | #83 | Phase 9: Federation hardening, peer discovery, auto-scaling | OPEN | Not started. Turns `SyncState`, `FailoverReconnect`, `PeerDiscovery`, `Reconnect`, `AutoScale` green. |
+| 9 | #83 | Phase 9: Federation hardening, peer discovery, auto-scaling | DONE | Turns `SyncState`, `FailoverReconnect`, `PeerDiscovery`, `Reconnect`, `AutoScale` green. All five retired; `tests/known_skips.txt` is EMPTY and the gate is "no test may skip". Auto-scale is scoped to propagation + graceful leave, NOT node lifecycle (§2.3). |
 
 Phases 1 and 2 are done and committed. **Phase 3 is not done in any sense a
 reader can rely on** — the work exists and passes, but it lives in uncommitted

@@ -22,7 +22,21 @@
  * here rather than left to federation/dedup.c. core/fanout.c and
  * core/commands.c already include federation/ headers for the same class of
  * reason, so this is a direction this tree already has. */
+#include "core/resume.h"
 #include "federation/burst.h"
+/* Phase 9's ADVERTISE / SHUTDOWN half, for the ONE thing server_shutdown() does
+ * that is not a free: the goodbye at the top of the teardown. Same direction of
+ * include as burst.h above and for the same class of reason -- a federation module's
+ * entry point, called from the one function that ends every allocation on this
+ * struct. It used to be reached only through federation/nickreg.h, which includes
+ * this header, and that was an accident of include order rather than a decision:
+ * a file calling fed_send_shutdown() should say so itself. */
+#include "federation/link.h"
+/* Phase 9's remote-nick registry. Included here rather than declared extern
+ * because it is a teardown arm on a table this struct holds, exactly as
+ * federation/burst.h is: the layout belongs to the module that owns it and the
+ * pointer belongs to the node. */
+#include "federation/nickreg.h"
 #include "sasl_framework.h"
 
 /* ---------------------------------------------------------------------------
@@ -623,6 +637,19 @@ void server_shutdown(server_t *s)
     if (s == NULL) {
         return;
     }
+    /* THE GOODBYE, AND IT IS FIRST because everything below closes the sockets it
+     * would have to travel on. See server.h's server_shutdown() block for the whole
+     * argument: without this arm a planned restart is a crash on every peer, and
+     * the node that would have told them otherwise is the one that went away. It is
+     * safe on the half-built server_t the four startup-failure paths hand it, which
+     * is stated in the header because those paths are the reason it cannot sit
+     * behind a "did we federate" guard.
+     *
+     * `NULL` rather than a reason string, and fed_send_shutdown() takes the reason
+     * and does not send it: 4.3's verb list has no SHUTDOWN, so a field a second
+     * implementation would have to guess at is a compatibility break bought for
+     * nothing, and the receiver's log already names who left. */
+    (void)fed_send_shutdown(s, NULL);
     for (i = 0; i < SERVER_FD_TABLE; i++) {
         if (s->by_fd != NULL && s->by_fd[i] != NULL) {
             server_close_conn(s, (int)i);
@@ -693,6 +720,21 @@ void server_shutdown(server_t *s)
      * ASSERTED here too: a test can prove the arm ran without a leak checker,
      * and Linux CI can read the same line next to its LSan run. */
     fed_burst_close(s);
+    /* The client session window, the third optional store this function ends,
+     * and the second one it has to CALL rather than free. Same reasoning as the
+     * burst shadow above: the records are core/resume.c's, the pointer is here,
+     * and a teardown that could not see this allocation would not be a teardown
+     * of everything on this struct. It is SAFE at this point in the walk,
+     * because a window holds no conn_t*, no chan_t* and no server_link_t* -- it
+     * holds three strings and a bounded array of channel NAMES, and every
+     * connection and channel the walk above released has already been copied
+     * out as text.
+     *
+     * The arm PRINTS whether the table was OPEN, for the reason the shadow's
+     * does: LeakSanitizer does not run on Darwin, so a missing free here is
+     * invisible locally and the only local evidence is a line a test can assert
+     * on. Linux CI reads the same line next to its own LSan run. */
+    resume_close(s);
     /* Phase 7's topic cache: a plain free of a plain vector, which is the
      * simplest arm on this function and the newest. It sits HERE rather than at
      * the end because the ordering that matters on this struct is "the peer links
@@ -719,6 +761,27 @@ void server_shutdown(server_t *s)
      * pointer into it. */
     sasl_store_free(s->sasl_store);
     s->sasl_store = NULL;
+    /* Phase 9's remote-nick registry: 2.1's "which server holds the user called
+     * X", the table that makes 3.1's last row resolvable. A CALL rather than a
+     * free for the same reason as the two arms above -- the layout and the
+     * least-recently-used ordering are federation/nickreg.c's, and the owner also
+     * reports whether the table held anything.
+     *
+     * IT IS SAFE HERE AND AT ANY POINT in the walk above: an entry holds three
+     * copied strings and two integers and no conn_t*, no chan_t* and no
+     * server_link_t*, so nothing it can be holding has been freed yet. And it is
+     * safe on a node that never called fed_open(), which is every test that links
+     * this library without the federation fixture -- the table is a field on
+     * server_t, so it is already NULL. */
+    fed_nickreg_close(s);
+    /* The advertise table is the same shape of obligation as the nick registry
+     * above and for the same reason: server_t::advs is a lazily calloc()ed table
+     * with no conn_t* in it, so it survives every per-connection teardown and only
+     * server_shutdown() can reach it. Leaving it unfreed is a real LSan failure on
+     * the Linux CI job -- and one no macOS run can see, which is why this arm
+     * exists rather than being left to the next reader. Safe on a node that never
+     * advertised: the field is NULL until the first calloc. */
+    fed_advert_close(s);
     strtab_free(s->nicks);
     s->nicks = NULL;
     strtab_free(s->chans);
@@ -822,6 +885,35 @@ void server_tick(server_t *s, uint64_t now_ms)
         return;
     }
     s->n_ticks++;
+    /* THE SESSION WINDOW'S SWEEP IS HERE AND NOT IN on_tick, and the reason is
+     * ownership: the window is a CORE structure and this is the core tick, while
+     * on_tick belongs to whichever module the embedding application installed
+     * (federation's fed_tick in this build). A core store swept from a
+     * federation callback would never expire on a node that federates with
+     * nobody -- which is exactly the quiet node whose windows are all stale.
+     *
+     * IT IS THROTTLED HERE AND NOT IN resume_sweep(), so the walk happens about
+     * once per window/16 rather than on every 50 ms tick: expiry is O(windows)
+     * and nothing about it needs millisecond resolution. The same split
+     * fed_dedup_sweep()'s throttle makes, and for the same reason -- the TIME
+     * half of "is a sweep due" belongs to the store's owner, and the OCCUPANCY
+     * half to the tick. */
+    if (s->resume_windows != NULL) {
+        /* The divisor is CLAMPED AT 1 and the guard is the same `now >=` test
+         * the sweep itself uses: a window shorter than the divisor has to be
+         * swept every tick, and a stamp in the future (which a clock that went
+         * backwards would produce) must not be read as "due long ago". */
+        uint64_t due = resume_window_ms() / RESUME_TICK_DIVISOR;
+
+        if (due == 0u) {
+            due = 1u;
+        }
+        if (s->resume_swept_ms == 0u || now_ms < s->resume_swept_ms ||
+            (now_ms - s->resume_swept_ms) >= due) {
+            (void)resume_sweep(s, now_ms);
+            s->resume_swept_ms = now_ms;
+        }
+    }
     if (s->on_tick != NULL) {
         s->on_tick(s, now_ms);
     }
@@ -943,6 +1035,20 @@ void server_close_conn(server_t *s, int fd)
     if (c == NULL) {
         return; /* unregistered: a second close is a no-op, not a double close */
     }
+
+    /* THE SESSION WINDOW IS RECORDED HERE AND NOT BELOW, and the position is
+     * the whole of what makes it work: chan_conn_gone() -- the very next call --
+     * walks c->chans, parts the client out of every channel and disposes of any
+     * that have run out of reasons to exist. A window noted after it would
+     * record an empty channel list and restore nothing, SILENTLY, and a silent
+     * no-op is the failure mode core/resume.h is arranged to avoid.
+     *
+     * IT IS BEFORE THE NICK IS RETIRED too, for the same reason and not by
+     * accident: core/resume.c distinguishes a lost session from an explicit
+     * QUIT by asking whether this connection still holds its nickname, and the
+     * QUIT handler has already unclaimed it by the time a QUIT reaches here.
+     * See resume_note() for why a QUIT is not a resumable session. */
+    resume_note(s, c, server_now_ms());
 
     /* Take the connection out of its channels BEFORE it is detached, and
      * before conn_free() releases the array.

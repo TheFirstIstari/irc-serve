@@ -10,6 +10,10 @@
 #include "core/channel.h"
 #include "core/connection.h"
 #include "federation/link.h"
+/* Phase 9: the COMMIT installs this transaction's nick records into 2.1's
+ * remote-nick registry, which is what the four fields Phase 6 kept on the wire
+ * and discarded were for. See the comment at apply_end()'s registry loop. */
+#include "federation/nickreg.h"
 #include "federation/verbs.h"
 
 /* ---------------------------------------------------------------------------
@@ -63,7 +67,24 @@ int fed_burst_verb(const char *verb)
  * against, and a counter does not need the records themselves to do that. */
 typedef struct {
     char nick[IRC_MAX_NICK + 1];
+    /* The four fields Phase 6 kept on the wire and DISCARDED, kept now because
+     * 2.1's remote-nick registry arrived and they are what it stores. `user` and
+     * `host` are what a rendered hostmask is made of; `signon` is 317's
+     * <signon time> for a user this node has no conn_t for; `away` is 301's text.
+     *
+     * `away` is stored and NOT YET RENDERED, and the cost of that decision is
+     * stated where it is made: it is 256 bytes on every shadow entry, so a
+     * thousand-nick burst's shadow grows by 256 KiB to carry a field nothing reads
+     * yet. It is kept because 4.3.1's argument for having it on the wire at all
+     * was that a format which omitted it would have to be EXTENDED the moment the
+     * registry arrived -- and the registry has now arrived, so a receiver that
+     * threw it away would be the one that needed a format change. The renderer
+     * that would use it is future work and the comment at fed_nickreg_render()
+     * says so where a reader would otherwise assume the field is dead. */
+    char user[64];
     char host[CHAN_MAX_REMOTE_HOST + 1];
+    uint64_t signon;
+    char away[CONN_MAX_AWAY + 1];
 } burst_nick_t;
 
 /* One member line. The flags word is the wire's: '-', "o", "v" or "ov". It is
@@ -963,14 +984,33 @@ static int apply_nick(server_t *s, server_link_t *link, const message_t *m)
         g_shadow.nnick_cap = want;
     }
     slot = &g_shadow.nicks[g_shadow.nnicks];
+    memset(slot, 0, sizeof *slot);
     (void)burst_copy(slot->nick, sizeof slot->nick, m->params[0]);
     /* A host longer than conn_t::host is TRUNCATED rather than refused, and that
      * is the one place in this file where a value is cut. The alternative -- a
      * refusal -- would abandon the whole transaction over a field the receiver
      * has one slot for, and the slot is the width this node would render the
      * hostmask at anyway. What is stored is what this node could have shown a
-     * client, which is the honest bound on a cache. */
+     * client, which is the honest bound on a cache.
+     *
+     * THE OTHER THREE FIELDS ARE COPIED NOW rather than discarded, which is the
+     * deferral this struct's comment above described being paid: `user` and
+     * `signon` are what fed_nickreg_learn() stores, and 4.3.1's argument for
+     * their being on the wire at all was that a receiver which threw them away
+     * would need the format EXTENDED the moment a registry wanted them. The
+     * memory is charged at the top of this struct and the shadow is already
+     * bounded by IRC_BURST_MAX_BYTES, so the cost is inside a budget that
+     * exists. */
+    (void)snprintf(slot->user, sizeof slot->user, "%s", m->params[1]);
     (void)snprintf(slot->host, sizeof slot->host, "%s", m->params[2]);
+    (void)snprintf(slot->away, sizeof slot->away, "%s", m->params[5]);
+    /* signon was already parsed and validated above -- the terminator's counts are
+     * about records this node ACCEPTED, so a record whose numeric field is not a
+     * number would make that a count of lines rather than of records -- so the
+     * value is in hand and this is a copy rather than a second parse. A second
+     * parse of the same field would be a second opinion about it, and this file
+     * is explicit that the parse belongs with the shape check. */
+    slot->signon = signon;
     g_shadow.nnicks++;
     return 0;
 }
@@ -1273,6 +1313,14 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
     size_t installed = 0u;
     size_t purged = 0u;
     size_t dropped = 0u;
+    /* WHEN THE TRANSACTION WAS COMMITTED, and it is read HERE rather than inside
+     * the registry call because 4.3.1's rule is that a burst's effect is dated by
+     * the moment it was COMMITTED and not by any stamp a record carried. A record
+     * that arrived ten minutes ago and a transaction that committed a moment ago
+     * are the same age to the receiver, and dating the registry entries by their
+     * arrival would make one long burst look like a set of fresh reports and
+     * defeat the TTL's job of measuring how long this node has believed them. */
+    const uint64_t applied_ms = server_now_ms();
 
     if (g_shadow.open == 0) {
         /* A COMMIT with nothing open. Counted, not applied: a terminator on its
@@ -1350,6 +1398,42 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
         link->epoch = epoch;
     }
 
+    /* --- the nick records, into 2.1's registry ---------------------------- */
+    /* 2.1's "which server holds the user called X", and it is HERE rather than at
+     * the record because of 4.3.1's replace-never-merge: a resync is a
+     * statement about an origin, and a registry entry written per record would
+     * accumulate the nicks of every PREVIOUS resync from the same origin with no
+     * way to tell them from this one's. The purge below is therefore a purge of
+     * the ORIGIN's entries as well as of its roster entries, and the two are the
+     * same operation on different tables.
+     *
+     * THE SERVER IS THE BURST ORIGIN for every nick record, and that is right
+     * rather than a shortcut: 4.3's SBURSTN is about the ORIGIN's own users
+     * (its prefix names the origin, and the sender's enumeration is
+     * server_nick_at() over its own connections), so the holder of a nick record
+     * IS the origin. The member lines below are the ones that can name a third
+     * server, which is why fed_nickreg_learn_member() exists separately and why
+     * it can correct a record this pass already wrote. */
+    fed_nickreg_purge_server(s, origin);
+    for (size_t i = 0; i < g_shadow.nnicks; i++) {
+        const burst_nick_t *n = &g_shadow.nicks[i];
+
+        if (n->nick[0] == '\0') {
+            continue;
+        }
+        fed_nickreg_learn(s, n->nick, origin, n->user, n->host, n->signon,
+                          applied_ms);
+        /* 2.1's POLICY, PER RECORD, and the reason this loop is the third call
+         * site of fed_nickreg_resolve_local(): a burst is how a node learns what
+         * a peer holds, and a user who registered a name this node had never
+         * heard of is a duplicate that only this loop can discover. The resolve
+         * is inside the loop rather than after it because a rename changes the
+         * node's LOCAL registry, and doing them all at the end would let a nick
+         * be claimed by a rename and then re-learned from a record the burst had
+         * already passed. */
+        (void)fed_nickreg_resolve_local(s, n->nick, applied_ms);
+    }
+
     /* --- the install, channel by channel --------------------------------- */
     for (size_t i = 0; i < g_shadow.nchan_used; i++) {
         const burst_chan_t *sc = &g_shadow.chans[i];
@@ -1401,6 +1485,16 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
                 dropped++;
                 continue;
             }
+            /* THE MEMBER'S HOLDER, into 2.1's registry. This is the one place a
+             * nick can be attributed to a server that is NOT the burst origin --
+             * 4.3.1's SBURSTM <server> field exists for exactly that -- and it is
+             * the correction to the entry apply_nick's loop wrote above, which
+             * attributed every nick record to the origin because that is what a
+             * nick record is about. A member living on a third node is reachable
+             * through THAT node, and a registry that answered `bob@<origin>` for
+             * it would forward the message to a server that does not hold bob. */
+            fed_nickreg_learn_member(s, sc->members[k].nick, origin,
+                                     sc->members[k].server, applied_ms);
             host = shadow_host(sc->members[k].nick);
             if (host != NULL) {
                 (void)chan_remote_set_host(ch, origin, sc->members[k].nick, host);
