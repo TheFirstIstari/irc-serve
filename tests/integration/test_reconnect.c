@@ -575,6 +575,21 @@ static void case_a_dropped_client_gets_its_channels_back(void)
                      "it held no operator status at all. A restore able to add a "
                      "prefix it was not given is a privilege bug: %.*s", (int)rlen,
                      (roster != NULL) ? roster : "");
+        /* The watcher is closed here, and it WAS NOT before this line. LeakSanitizer
+         * on the Linux CI job reported 8192 bytes in 2 allocations from
+         * register_client() at line 221, which is this beat's watcher, and only on
+         * Linux: LSan does not exist on Darwin, so no local run of any kind could
+         * have shown it. Every other client in this test is closed -- `again`,
+         * `second`, `holder`, `challenger`, `late`, `first` -- and the watcher was
+         * opened at the top of the beat, used across two separate NAMES round
+         * trips, and then simply abandoned when the beat ended.
+         *
+         * It is worth noting what did NOT catch this and could not have: 65/65
+         * green, 0 AddressSanitizer errors, 0 warnings on three compilers, a clean
+         * ratchet and teeth that all reproduced. A leak is invisible to every gate
+         * this repository has except the one that runs on a different operating
+         * system, which is the argument for keeping that job. */
+        tc_close(&watcher);
     }
 
     /* CLAIM 3, THE WINDOW IS ONE-SHOT -- AS A COUNT, and the count is the right
