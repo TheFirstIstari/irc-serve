@@ -67,6 +67,17 @@
  * capability would become a privilege, and it should be added when there is a
  * privilege to grant.
  *
+ * PHASE 10.1 ADDS ONE AND IT GRANTS NOTHING EITHER, which is worth saying in
+ * this same block because the paragraph above reads like a permanent position.
+ * `account`/`logged_in` are a NAME and a VERIFICATION, not a privilege: being
+ * logged in to an account on this node authorises nothing here, no operator
+ * flag, no channel privilege, no mode, no exemption. What it will eventually buy
+ * is VISIBILITY -- `account-tag` stamping it on lines so other users can see who
+ * is who -- and that is a different thing from authority, which is why the field
+ * could be added without anyone having to decide what a logged-in client may do.
+ * If a later phase wants `logged_in` to mean a privilege, that is the change
+ * that needs a threat model, and it does not belong in a field.
+ *
  * ---------------------------------------------------------------------------
  * THE WRITE QUEUE
  * ---------------------------------------------------------------------------
@@ -146,6 +157,53 @@ struct chan; /* opaque until Phase 4 (2.2) */
  * describe_peer() and this is that width. */
 #define CONN_USER_MAX (sizeof(((conn_t *)0)->user) - 1u)
 #define CONN_HOST_MAX (sizeof(((conn_t *)0)->host) - 1u)
+
+/* conn_t::account -- the second axis of scoped identity (2.1), added in Phase
+ * 10.1.
+ *
+ * ---------------------------------------------------------------------------
+ * TWO AXES, AND WHY 2.1's SCOPED NICK ALONE IS NOT AN IDENTITY
+ * ---------------------------------------------------------------------------
+ * 2.1 makes identity `nick@server`: two clients on two nodes may both be `bob`,
+ * they are distinct, and no policy or lock is needed to say so. That is a
+ * correct answer to "how does this node address a user" and it is NOT an answer
+ * to "who is this person" -- `bob@irc.a` and `bob@irc.b` are two registry keys,
+ * and both are true, and neither of them survives the person reconnecting.
+ *
+ * An ACCOUNT is the other axis: a name that outlives the socket and is the same
+ * on every node that knows about it. It is the difference between an address and
+ * an identity, and 2.1's rename-the-loser policy is exactly what the account
+ * axis makes survivable -- a user who loses a duplicate nick is still the same
+ * account afterwards.
+ *
+ * ---------------------------------------------------------------------------
+ * THE BOUND, DERIVED RATHER THAN PICKED
+ * ---------------------------------------------------------------------------
+ * The field is 64 wide, so CONN_MAX_ACCOUNT is 63, and 63 is ACCOUNT_MAX_NAME in
+ * account_store.h. The derivation runs one way only: an account on a connection
+ * is written by exactly one function (account_set(), in core/account.h), whose
+ * only source of a name is the authcid of a completed SASL exchange, and
+ * SASL_MAX_AUTHCID is 63 because conn_t::nick's bound minus one is. So 63 is the
+ * LONGEST VALUE THAT CAN REACH THIS FIELD AT ALL. A wider field would be bytes
+ * nothing could ever fill and a narrower one would refuse a client that
+ * successfully authenticated -- which would be worse than the truncation the
+ * design refuses everywhere else, because it would tell somebody their account
+ * does not exist.
+ *
+ * ---------------------------------------------------------------------------
+ * `logged_in` IS NOT DERIVABLE FROM THE NAME AND IS NOT REDUNDANT WITH IT
+ * ---------------------------------------------------------------------------
+ * Empty means "not logged in", exactly as `nick[0]` means "no nickname chosen
+ * yet" and `away[0]` means "not away" -- the idiom this struct already uses so
+ * that a field and a fact about it cannot drift apart. `logged_in` is
+ * nevertheless a separate field, and the reason is which question each answers:
+ * the NAME is a claim the connection makes about itself, and the FLAG is a
+ * verification this node performed. core/account.h's account_logged_in() is the
+ * conjunction of the two, which is what makes "an empty account" and "a real
+ * account named the empty string" not merely equal but UNREPRESENTABLE: there is
+ * no sequence of bytes that leaves this struct meaning "logged in as nothing".
+ */
+#define CONN_MAX_ACCOUNT 63
 
 /* conn_t::away, the AWAY message. Empty means "not away", the same idiom
  * nick[0]/user[0] already use for "this fact is not established yet", so no
@@ -232,6 +290,15 @@ typedef struct conn {
     unsigned    caps;              /* negotiated capabilities; core/cap.h bits */
     int         cap_negotiating;   /* CAP LS/REQ in flight; CAP END clears it */
     int         sasl;              /* sasl_state_t; FAILED is terminal */
+    /* Phase 10.1: the account identity, which is what `c->sasl` was missing.
+     * An ADDITION and not a rearrangement, like the three fields above, and for
+     * the same reason: it is a fact another module has to ask about and one
+     * place has to own. `logged_in` is written only by account_set() in
+     * core/account.c and cleared only by account_clear(); a caller reads
+     * account_logged_in()/account_name() rather than these fields, so that the
+     * two can never be read apart. See the CONN_MAX_ACCOUNT block above. */
+    char        account[CONN_MAX_ACCOUNT + 1];
+    int         logged_in;
     struct chan **chans;           /* channels joined; Phase 4 */
     size_t      nchans;
     size_t      cap;

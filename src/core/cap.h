@@ -61,6 +61,42 @@
  * there is no `cap-notify` (this node never sends an unsolicited CAP NEW), no
  * `away-notify`, `chghost`, `account-notify` or `echo-message` (it sends none of
  * those), and no `server-time` or `userhost-in-names` (it stamps neither).
+ *
+ * ---------------------------------------------------------------------------
+ * `account-tag` IS NOT IN THE TABLE, AND PHASE 10.1 ADDED THE SUBSYSTEM IT
+ * NEEDS WITHOUT ADDING THE NAME. Read this before adding it.
+ * ---------------------------------------------------------------------------
+ * Phase 10.1 built the account identity: a `conn_t` now carries an account name
+ * and a `logged_in` flag, set from the SASL `authcid` when -- and only when --
+ * both an operator's credential store and their account registry verify the
+ * credential. That is what seven blocked IRCv3 specs were waiting for. It is not
+ * `account-tag`, and the capability is deliberately absent from k_caps[].
+ *
+ * THE REASON IS THE SPEC'S OWN SENTENCE, quoted because paraphrasing it loses
+ * the part that matters: the `account-tag` specification says the server adds the
+ * tag, that the tag MUST be added to all commands sent by a user, and that
+ * **"If the user is not identified to any services account, the tag MUST NOT be
+ * sent."**
+ *
+ * That last clause is the whole argument. The tag's ABSENCE is an assertion -- a
+ * client reads "no `account` tag" as "this user is anonymous" -- so advertising
+ * the capability and then never emitting the tag does not merely fail to help: it
+ * tells every client that every logged-in user on this node is anonymous. This
+ * node HAS logins now, so that is not a harmless gap; it is a node whose account
+ * subsystem's entire observable purpose is inverted by the advertisement. The
+ * same rule cap.c was written for -- a listed capability is a client switching
+ * the feature on and then behaving as though this node honoured it -- applies
+ * here with the sign flipped: a missing one is a client that carries on, a listed
+ * one is a client that draws the wrong conclusion from every line.
+ *
+ * WHEN IT GOES IN: with the emission, and both halves of it at once -- the tag on
+ * every command a client sends, and the availability check that goes in beside
+ * sasl_possible() above, because a node with no registry must withhold the name
+ * for exactly the reason sasl is withheld. Adding the name to this table in a
+ * phase that does not emit the tag is the exact defect the table's header warns
+ * about, and a store check would not save it: that check asks whether there is
+ * anything to SAY, and with no emission there is nothing to say however many
+ * accounts exist.
  */
 #ifndef IRC_CORE_CAP_H
 #define IRC_CORE_CAP_H

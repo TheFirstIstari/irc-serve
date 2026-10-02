@@ -21,6 +21,7 @@
  * AND NOW THE OPTIONS, WHICH MUST NOT BREAK THAT
  * ---------------------------------------------------------------------------
  *   --name NAME            --secret S            --peer NAME,HOST,PORT
+ *   --sasl-store PATH      --account-store PATH
  *
  * `irc-serve 6667` behaves EXACTLY as it did before this phase: same default
  * name, same default port, same default (empty) secret, same stdout. The bare
@@ -100,6 +101,10 @@
  * learned anything. */
 #include "core/resume.h"
 #include "federation/nickreg.h"
+/* Phase 10.1: the credential store and the ACCOUNT REGISTRY, loaded once each,
+ * before the loop, in the same place and for the same reason (3.4 forbids a
+ * blocking call inside it). Two files, two questions -- see account_store.h. */
+#include "account_store.h"
 #include "sasl_framework.h"
 
 /* The node's own name, when --name is not given. It must satisfy the 2.4 tag
@@ -197,7 +202,8 @@ static int install_handler(int sig, void (*handler)(int))
 static void usage(FILE *out, const char *argv0)
 {
     fprintf(out, "usage: %s [port] [--name NAME] [--secret S]\n", argv0);
-    fprintf(out, "            [--sasl-store PATH] [--peer NAME,HOST,PORT]...\n");
+    fprintf(out, "            [--sasl-store PATH] [--account-store PATH]\n");
+    fprintf(out, "            [--peer NAME,HOST,PORT]...\n");
     fprintf(out, "\n");
     fprintf(out, "  port   TCP port to listen on, 0-%d; 0 asks the kernel for\n"
                  "         an ephemeral port and reports which one it chose\n",
@@ -223,6 +229,23 @@ static void usage(FILE *out, const char *argv0)
                  "         as --name; HOST and PORT are resolved to an address\n"
                  "         ONCE, at startup, and never inside the event loop.\n",
             NODE_MAX_PEERS);
+    fprintf(out, "\n");
+    fprintf(out, "  --sasl-store PATH\n"
+                 "         the credential store SASL PLAIN verifies against,\n"
+                 "         one `authcid<TAB>password` record per line. A file\n"
+                 "         that is unreadable, world-readable, malformed or\n"
+                 "         empty is REFUSED and this node advertises no sasl\n"
+                 "         capability. Default: none.\n");
+    fprintf(out, "\n");
+    fprintf(out, "  --account-store PATH\n"
+                 "         the ACCOUNT REGISTRY: `name<TAB>password<TAB>created`\n"
+                 "         per line, which says which account names EXIST. It is\n"
+                 "         a SEPARATE file from --sasl-store on purpose: the first\n"
+                 "         says who may authenticate, the second says who\n"
+                 "         exists. A client is identified to an account only when\n"
+                 "         BOTH files agree on its name and password, so a node\n"
+                 "         with neither keeps exactly the behaviour it has today.\n"
+                 "         Same secret-file rules, same refusals.\n");
     fprintf(out, "\n");
     fprintf(out, "  --help  print this text and exit\n");
     fprintf(out, "\n");
@@ -276,6 +299,14 @@ typedef struct {
      * different from a node that was never handed one, and the two print
      * different startup lines and advertise different capabilities. */
     const char *sasl_store;
+    /* Phase 10.1's ACCOUNT REGISTRY, or NULL, and the NULL default means the same
+     * thing here that it means for the credential store above -- with one
+     * difference worth stating: a node with no credential store authenticates
+     * NOBODY, while a node with no account registry authenticates everybody and
+     * identifies nobody. The second is the additive change; the first is Phase
+     * 8's and it is why `--sasl-store` and `--account-store` are separate
+     * options rather than one flag with two meanings. */
+    const char *account_store;
     int         port;
     int         have_port;
     node_peer_t peers[NODE_MAX_PEERS];
@@ -374,7 +405,8 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
             return 1;
         }
         if (strcmp(arg, "--name") == 0 || strcmp(arg, "--secret") == 0 ||
-            strcmp(arg, "--peer") == 0 || strcmp(arg, "--sasl-store") == 0) {
+            strcmp(arg, "--peer") == 0 || strcmp(arg, "--sasl-store") == 0 ||
+            strcmp(arg, "--account-store") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "irc-serve: %s needs a value\n", arg);
                 return -1;
@@ -399,6 +431,8 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
             o->secret = value;
         } else if (strcmp(arg, "--sasl-store") == 0) {
             o->sasl_store = value;
+        } else if (strcmp(arg, "--account-store") == 0) {
+            o->account_store = value;
         } else {
             if (o->npeers >= NODE_MAX_PEERS) {
                 fprintf(stderr, "irc-serve: at most %d --peer options\n",
@@ -564,6 +598,37 @@ int main(int argc, char **argv)
         }
     }
 
+    /* ------------------------------------------------------------------------
+     * THE ACCOUNT REGISTRY, loaded here for the same two reasons the credential
+     * store above is: 3.4 forbids a blocking call inside the event loop, and a
+     * node's configuration is read once, before the loop is armed.
+     *
+     * IT IS A SEPARATE FILE AND IT IS LOADED SEPARATELY, deliberately. The two
+     * files answer different questions -- "may this client authenticate" and
+     * "does this account exist" -- and a node started with neither, or with
+     * either, has to be a state this binary can be in. Loading one file and
+     * splitting it on a per-record flag would make the meaning of the FILE a
+     * property of a byte inside a line, and a credential file whose rows mean
+     * different things is a file whose blast radius is one bad edit wide.
+     *
+     * A REGISTRY THAT FAILED TO LOAD IS NOT A STARTUP FAILURE, for the same
+     * reason the credential store's is not: the node comes up, says so on stderr
+     * and in the startup line, and identifies nobody. Crucially this is NOT the
+     * same as refusing the client -- a client that authenticates against
+     * --sasl-store is still authenticated, and is simply not identified to an
+     * account, which is the state it is already in when it declines to
+     * authenticate at all. That equivalence is what makes the account subsystem
+     * ADDITIVE: nothing a deployment did before this option changes.
+     */
+    if (opts.account_store != NULL) {
+        srv.account_store = account_store_load(opts.account_store);
+        if (srv.account_store == NULL) {
+            fprintf(stderr, "irc-serve: --account-store %s was refused; this node "
+                            "will identify no client to an account\n",
+                    opts.account_store);
+        }
+    }
+
     /* Resolve and configure the peers, still before the loop. */
     for (i = 0; i < opts.npeers; i++) {
         if (resolve_peer(&srv, &opts.peers[i]) != 0) {
@@ -594,11 +659,12 @@ int main(int argc, char **argv)
      * reader comparing two nodes' startup output can tell which one offers
      * authentication without opening either one's credential file. */
     printf("[observable] server initialized: name=%s epoch=%llu peers=%d "
-           "secret=%s sasl=%s\n",
+           "secret=%s sasl=%s accounts=%s\n",
            opts.name, (unsigned long long)srv.epoch,
            (int)server_link_count(&srv),
            (opts.secret[0] == '\0') ? "none" : "set",
-           sasl_store_count(srv.sasl_store) > 0u ? "loaded" : "none");
+           sasl_store_count(srv.sasl_store) > 0u ? "loaded" : "none",
+           account_store_count(srv.account_store) > 0u ? "loaded" : "none");
 
     /* Readiness: emitted after the listener is up and immediately before the
      * loop is armed, so anything waiting on this line is talking to a serving

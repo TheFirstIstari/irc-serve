@@ -10,6 +10,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "core/account.h"
 #include "core/cap.h"
 #include "core/channel.h"
 #include "core/fanout.h"
@@ -444,10 +445,58 @@ void handle_whois(server_t *s, conn_t *c, const message_t *m)
     (void)reply(s, c, "317", (const char *const[]){ who->nick, idle, signon }, 3,
                 "seconds idle");
 
+    /* ------------------------------------------------------------------------
+     * 330 RPL_WHOISACCOUNT, and it is the ONE wire surface the account subsystem
+     * has in Phase 10.1. Read this before concluding that is the wrong scope.
+     *
+     * A FIFTH HOLE IN 4.4's LIST, in exactly the way 301, 303, 417 and 302 are:
+     * RFC 1459 3.3.4 defines 330 as the reply carrying "<nick> <account> :is
+     * logged in as", and this tree had nothing to put in <account> -- because it
+     * had no account. The list has a gap and the protocol does not.
+     *
+     * WHY IT IS IN THIS PHASE RATHER THAN P10.2. The forbidden list for 10.1 is
+     * `account-tag` EMISSION, `account-notify`, `extended-join`, `oper-tag`,
+     * `chghost`, `account-extban` and `away-notify` -- all of which push an
+     * identity onto a line UNSOLICITED, and all of which are what "account-tag"
+     * means. 330 is not that: it answers a question the client ASKED, on a
+     * connection that already registered, about a person it named. Nothing is
+     * stamped on anybody's traffic.
+     *
+     * AND WITHOUT IT THE PASS'S CENTRAL INVARIANT HAS NO WIRE PROOF AT ALL.
+     * The claim is that `account == ""` is indistinguishable from "this node has
+     * no account system", and the way to show that on the wire is that a client
+     * that is not logged in and a node that has no accounts produce BYTE-IDENTICAL
+     * WHOIS output. That is only checkable if a logged-in client produces
+     * something different, and 330 is that something. Leaving it out would mean
+     * the account name exists, is set from a verified credential, is free at
+     * teardown -- and is invisible to every client and every operator except as
+     * one log line, which is an identity only this node can see.
+     *
+     * SENT ONLY WHEN THERE IS AN ACCOUNT, and the absence is the RFC-conventional
+     * "not identified". That is NOT the same hazard as `account-tag`'s absent
+     * tag, which the specification makes meaningful: 330's absence means "no
+     * account", and on this node that is exactly and only true -- account_name()
+     * returns "" precisely when the predicate is false. The two were argued
+     * separately; see cap.h on why `account-tag` is withheld and this is not.
+     *
+     * THE COST, stated: one more line in a WHOIS for every identified user, so
+     * a client that parses WHOIS positionally must find 330 by number rather
+     * than by offset -- which is what the numerics are for. And it is the only
+     * place a person's account name is revealed to another user, so an operator
+     * who does not want that has no way to turn it off short of not loading a
+     * registry. That trade is worth one sentence here rather than being left to
+     * be discovered.
+     */
+    if (account_logged_in(who) != 0) {
+        (void)reply(s, c, "330", (const char *const[]){ who->nick, account_name(who) },
+                    2, "is logged in as");
+    }
+
     (void)reply(s, c, "318", (const char *const[]){ who->nick }, 1,
                 "End of /WHOIS list");
-    printf("[observable] whois: by=%s nick=%s host=%s away=%d\n", c->nick,
-           who->nick, who->host, (who->away[0] != '\0') ? 1 : 0);
+    printf("[observable] whois: by=%s nick=%s host=%s away=%d account=%d\n",
+           c->nick, who->nick, who->host, (who->away[0] != '\0') ? 1 : 0,
+           account_logged_in(who));
 }
 
 /* ---------------------------------------------------------------------------
