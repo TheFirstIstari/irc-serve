@@ -774,7 +774,7 @@ static void test_logged_in(const char *sasl, const char *registry)
     TF_CHECK_MSG(strstr(tc_buffer(&alice.c),
                         " CAP * LS :multi-prefix message-tags draft/message-ids "
                         "sasl account-tag account-notify "
-                        "extended-join\r\n") != NULL,
+                        "extended-join userhost-in-names\r\n") != NULL,
                  "the advertised list on a node with BOTH stores is not the seven "
                  "capabilities this node implements: %s", tc_buffer(&alice.c));
 
@@ -877,9 +877,9 @@ static void test_no_registry(const char *sasl, const char *label)
     TF_CHECK_MSG(strstr(tc_buffer(&alice.c),
                         " CAP " "alice" " LS :multi-prefix message-tags "
                         "draft/message-ids sasl account-notify "
-                        "extended-join\r\n") != NULL,
+                        "extended-join userhost-in-names\r\n") != NULL,
                  "%s: the advertised list on a node with a credential store and "
-                 "NO registry is not exactly the six capabilities it really "
+                 "NO registry is not exactly the seven capabilities it really "
                  "has; a client would read an account-tag here as an identity it "
                  "can never get", label);
     /* AND ONLY account-tag, which is why this cannot be a sweep for the substring
@@ -980,15 +980,15 @@ static void test_default_node(void)
     /* THE WHOLE LIST, spelled out. An equality rather than a set of "absent"
      * checks on purpose: adding a name to k_caps[] must break this line, which
      * is the property that makes the table a list of implementations rather than
-     * a list of intentions. A node with no stores offers exactly the three
+     * a list of intentions. A node with no stores offers exactly the capabilities
      * capabilities that need no configuration. */
     /* The copy stops AT the CRLF rather than including it -- `n` is measured to
      * the CR -- so the expected literal has no terminator either. */
     TF_CHECK_MSG(strcmp(caps, " CAP * LS :multi-prefix message-tags "
                               "draft/message-ids account-notify "
-                              "extended-join") == 0,
+                              "extended-join userhost-in-names") == 0,
                  "the advertised capability list on a node with no stores is "
-                 "\"%s\"; it must be exactly the five that need no "
+                 "\"%s\"; it must be exactly the ones that need no "
                  "configuration", caps);
     /* `account-notify` IS in that list and `account-tag` is NOT, and the
      * difference is the whole of the store check. `ACCOUNT *` is an answer a node

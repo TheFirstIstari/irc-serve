@@ -230,17 +230,37 @@ static void test_negotiation(void)
                 TF_CHECK_MSG(strstr(line, "extended-join") != NULL,
                              "CAP LS does not advertise extended-join, which this "
                              "node implements on every node");
+                /* ...and `userhost-in-names` IS here (Phase 10.5), which is a
+                 * DISCLOSURE capability rather than a rendering one: it puts every
+                 * member's ident and host in front of the client that asked. That
+                 * is exactly why the roster shape is decided per destination and
+                 * not per channel, and why this test's sibling
+                 * (test_userhost_in_names.c) is the one that checks the two
+                 * renderings rather than this file checking the advertisement. */
+                TF_CHECK_MSG(strstr(line, "userhost-in-names") != NULL,
+                             "CAP LS does not advertise userhost-in-names, which "
+                             "this node implements for every 353 it draws");
                 /* NOT ADVERTISED, and each of these is a capability a client
-                 * would act on: cap-notify expects unsolicited CAP NEW lines,
-                 * away-notify expects an AWAY you did not ask for,
-                 * echo-message expects your own PRIVMSG back. */
+                 * would act on: cap-notify expects unsolicited CAP NEW lines and
+                 * away-notify expects an AWAY you did not ask for.
+                 *
+                 * `echo-message` WAS on this list, under a comment reading "expects
+                 * your own PRIVMSG back" -- which is a DESCRIPTION of the feature
+                 * presented as a reason for withholding it, and it was the wrong
+                 * reason: this node has echoed a channel PRIVMSG to its sender since
+                 * Phase 5, because fanout writes to every local member. What the
+                 * capability adds is NOTICE, and it is not here because it is not
+                 * implemented yet. The assertion stays until it is; Phase 10.7 moves
+                 * the line to test_echo_message.c, which is where the behaviour can
+                 * actually be checked. */
                 TF_CHECK_MSG(strstr(line, "cap-notify") == NULL,
                              "CAP LS advertises cap-notify, which nothing here "
                              "sends CAP NEW for");
                 TF_CHECK_MSG(strstr(line, "away-notify") == NULL,
                              "CAP LS advertises away-notify");
                 TF_CHECK_MSG(strstr(line, "echo-message") == NULL,
-                             "CAP LS advertises echo-message");
+                             "CAP LS advertises echo-message, and this node sends "
+                             "no copy of a NOTICE back to its sender yet");
                 /* `account-notify` WAS here, and Phase 10.2b is why it is not any
                  * more. The node emitted no ACCOUNT line, and a listed capability
                  * is a client switching the feature on and then drawing the wrong

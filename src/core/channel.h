@@ -409,6 +409,29 @@ typedef struct chan_remote {
     /* The member's host, or "" when this node learned the member from a live
      * SJOIN rather than from a burst. See the note above. */
     char     host[CHAN_MAX_REMOTE_HOST + 1];
+    /* The member's IDENT, or "" when this node has not been told. Added in Phase
+     * 10.5, and it is a field whose data was ALREADY ON THE WIRE and being
+     * discarded: 4.3's SBURSTN carries `<user>`, `burst.c`'s shadow has stored it
+     * since Phase 6, and the join from the shadow to the roster copied only the
+     * host across. So nothing about this field required a wire format change --
+     * it required somebody to notice that half of a hostmask was being thrown
+     * away.
+     *
+     * IT IS HERE BECAUSE `userhost-in-names` NEEDS IT, and that is worth stating as
+     * a fact rather than as a justification: before Phase 10.5 no code path read a
+     * remote member's ident, so dropping it cost nothing observable. A 353 drawn in
+     * the extended form is `nick!user@host`, and a roster entry with an empty host
+     * already has a documented rendering rule (bare nick); an entry with a host and
+     * no ident has no such rule, and inventing `*` for the ident would put a byte
+     * on the wire that means nothing to a client parsing a hostmask.
+     *
+     * THE COST, since every added field has one: 64 bytes per element, and the
+     * array is CHAN_MAX_REMOTE_MEMOTEES -- CHAN_MAX_REMOTE_MEMBERS (64) elements,
+     * so 4 KiB per channel of ADDRESSED array of which only the used prefix is
+     * touched. The three properties that made the previous two additions safe all
+     * still hold and are the note above's: nothing serialises this struct, the
+     * array grows in whole elements, and everything addresses it by name. */
+    char     user[CONN_USER_MAX + 1];
     /* The account the member is logged in to, or "" when this node has not been
      * told. See the note below -- this field's placement is the argument. */
     char     account[CONN_MAX_ACCOUNT + 1];
@@ -742,6 +765,19 @@ size_t chan_remote_purge(chan_t *ch, const char *server);
  * prevent. */
 int chan_remote_set_host(chan_t *ch, const char *server, const char *nick,
                          const char *host);
+
+/* As chan_remote_set_host(), for the member's IDENT. Added with the field, in
+ * Phase 10.5, and for the same reason: the bounded copy belongs in the module that
+ * owns the struct, and the only caller is `federation/burst.c` translating a
+ * shadow record into a roster entry.
+ *
+ * THE REFUSAL IS THE SAME SHAPE AS THE HOST'S AND FOR THE SAME REASON -- an over
+ * long ident is REFUSED, not truncated, because a truncated ident renders a
+ * hostmask that is not the one the peer reported. The bound is CONN_USER_MAX, which
+ * is `conn_t::user` minus one, so the widest ident a peer can report is the widest
+ * this field can hold and neither side has to guess. */
+int chan_remote_set_user(chan_t *ch, const char *server, const char *nick,
+                         const char *user);
 
 /* Rekey the (server, old) member to (server, new). Returns 1 when a member was
  * renamed, 0 when there was none, -1 when `new` is not a legal nickname, is

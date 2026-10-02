@@ -330,10 +330,107 @@ static const char *names_signs(unsigned flags, int multiprefix, char *out,
     return out;
 }
 
+/* The ROSTER ENTRY for one member, drawn in the shape this DESTINATION asked
+ * for, into `out`. Returns `out`, or "" when nothing fits.
+ *
+ * ---------------------------------------------------------------------------
+ * THE PRIVACY DECISION IS IN THIS FUNCTION, NOT IN ITS CALLER
+ * ---------------------------------------------------------------------------
+ * IRCv3's `userhost-in-names` says a `353` may carry `nick!user@host` rather than
+ * a bare nickname. What that means is that **every member's ident and observed
+ * host address is disclosed to every other member of the channel**, to clients
+ * that member has never spoken to and to clients who joined after them. There is
+ * no per-member consent anywhere in it: one client asking puts the whole roster's
+ * hostmasks on the wire to that client.
+ *
+ * So the shape is decided per DESTINATION and nowhere else, and it is decided
+ * here rather than in `send_names_list()` so that the LOCAL roster and the REMOTE
+ * roster -- two separate arrays walked by two separate loops -- cannot answer the
+ * question differently. That was already the reason `multiprefix` is a parameter
+ * of `names_signs()`; the difference is the cost of getting it wrong. One sigil
+ * drawn in the wrong shape is cosmetic; one hostmask disclosed to a client that
+ * did not ask is not.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT HAPPENS WHEN THE NODE DOES NOT HAVE A HOSTMASK TO DRAW
+ * ---------------------------------------------------------------------------
+ * It draws the BARE NICK, which is the historical shape and which every client
+ * parses, and the asymmetry is genuine rather than an oversight:
+ *
+ *   - a LOCAL member always has both halves. `c->host` was filled by accept()
+ *     before the connection had a nickname, and `c->user` by USER.
+ *   - a REMOTE member has them only if 4.3's SBURSTN announced them. A live SJOIN
+ *     carries neither (4.3's SJOIN is `<server> <chan> <nick> <flags>`), so the
+ *     empty host is the NORMAL state for a member learned from one -- channel.h
+ *     says so at `chan_remote_t` and that note is still true.
+ *
+ * The alternative would be to put `*` in place of a missing half, and that is
+ * refused on purpose: `*` would be a byte on the wire that reads as part of a
+ * hostmask and means nothing. A client that negotiated this capability and still
+ * sees a bare nickname learns exactly the true thing -- that this node has not been
+ * told -- and RFC 2812 3.3.5 permits a `353` to hold bare nicknames, so the mixed
+ * roster is parseable rather than surprising.
+ *
+ * THE BUFFER IS PER MEMBER AND NOT HOISTED, for the reason `write_to_members()`
+ * gives for its tag buffer: this renders inside the loop because the decision is
+ * per destination, and a buffer shared across iterations is one whose contents
+ * change under a line already queued. CONN_HOSTMASK_MAX is written from the three
+ * struct widths rather than picked, so raising any of `nick`, `user` or `host`
+ * cannot leave this one byte short. */
+static const char *names_entry(const conn_t *dst, const char *nick,
+                               const char *ident, const char *host, char *out,
+                               size_t cap)
+{
+    const int long_form = cap_userhost_in_names_enabled(dst);
+
+    if (out == NULL || cap == 0u || nick == NULL) {
+        return "";
+    }
+    if (long_form == 0 || ident == NULL || ident[0] == '\0' ||
+        host == NULL || host[0] == '\0') {
+        if (strlen(nick) >= cap) {
+            return "";
+        }
+        memcpy(out, nick, strlen(nick) + 1u);
+        return out;
+    }
+    /* `nick!ident@host` is exactly conn_hostmask()'s own shape, so the local arm
+     * could have called it -- and it deliberately does not, because this function
+     * also renders REMOTE members, which have no conn_t and therefore no
+     * conn_hostmask(). One renderer for both lists is why a remote entry and a local
+     * one cannot come out in different shapes, which is the failure this whole
+     * capability would otherwise have. */
+    {
+        const int w = snprintf(out, cap, "%s!%s@%s", nick, ident, host);
+
+        /* snprintf returns what it WOULD have written, so the check is on the
+         * return and a truncation is the negative side of it: a half-written
+         * hostmask is worse than no hostmask, because a client parses what it is
+         * given. Returning "" makes the caller SKIP the member rather than draw it
+         * short, which would be a roster entry naming nobody. Unreachable with the
+         * current bounds -- a 353 line is CHAN_NAMES_LINE (400) and the widest
+         * entry is CONN_HOSTMASK_MAX (259) -- and stated rather than assumed
+         * because the roster is the one place a silent omission is invisible. */
+        if (w < 0 || (size_t)w >= cap) {
+            out[0] = '\0';
+            return "";
+        }
+    }
+    return out;
+}
+
 /* Emit `nick` into the 353 line under construction, flushing first if it will not
  * fit. Returns the new `used`. The flush is RFC 2819 3.3.5's "a 353 MAY be
  * split across lines" and 3.2's "never deliver a shortened value" together: a
  * half-written nickname is worse than one more line.
+ *
+ * `entry` is the ALREADY-RENDERED member name: the sigils are drawn by the
+ * caller's `names_signs()` because they are 005's PREFIX and `multi-prefix`'s, and
+ * the name itself is drawn by `names_entry()` because it is 353's shape and
+ * `userhost-in-names`'s. Two decisions about two different things, kept apart so
+ * that a caller cannot render a name and forget the gate -- which is the defect
+ * `userhost-in-names` invites, and the same one `extended-join` had to be careful
+ * about for the same reason.
  *
  * This is the ONE place a name is rendered into a 353, and it takes the two
  * lists as (nick, flags) rather than reading either of them itself. That is what
@@ -351,14 +448,31 @@ static const char *names_signs(unsigned flags, int multiprefix, char *out,
  * order it is handed them, so dropping the parameter changes nothing about where a
  * name lands -- only about how much is drawn in front of it. */
 static size_t names_emit(server_t *s, conn_t *dst, const char *const *mid,
-                         unsigned flags, const char *nick, char *line,
+                         unsigned flags, const char *entry, char *line,
                          size_t used, int *produced, int multiprefix)
 {
     char signs[4];
     size_t slen = strlen(names_signs(flags, multiprefix, signs, sizeof signs));
-    size_t nicklen = strlen(nick);
-    size_t need = slen + nicklen + 1u; /* +1 for the joining space */
+    size_t elen = strlen(entry);
+    size_t need = slen + elen + 1u; /* +1 for the joining space */
 
+    if (elen == 0u) {
+        /* A member this node cannot draw at all. `names_entry()` returns "" only
+         * when the entry would not fit its buffer, which the current bounds make
+         * unreachable -- a 353 line is CHAN_NAMES_LINE (400) and the widest entry
+         * is CONN_HOSTMASK_MAX (259) -- and it is handled rather than assumed,
+         * because the alternative is a silent omission from a names list, and a
+         * names list is exactly where a silent omission is invisible.
+         *
+         * IT IS REPORTED RATHER THAN DRAWN SHORT. Falling back to the bare nick
+         * here would be a second opinion about the shape, taken in a function that
+         * does not have the capability gate, and it would produce a roster entry
+         * asserting that this node does not know a host it does. The refusal goes
+         * to the node's own output and the member is left out. */
+        printf("[observable] names_entry_refused: channel=%s\n",
+               (mid != NULL && mid[1] != NULL) ? mid[1] : "?");
+        return used;
+    }
     if (used != 0 && used + need > (size_t)CHAN_NAMES_LINE) {
         (void)reply(s, dst, "353", mid, 2, "%s", line);
         *produced = 1;
@@ -373,8 +487,8 @@ static size_t names_emit(server_t *s, conn_t *dst, const char *const *mid,
      * about. */
     memcpy(line + used, signs, slen);
     used += slen;
-    memcpy(line + used, nick, nicklen);
-    used += nicklen;
+    memcpy(line + used, entry, elen);
+    used += elen;
     line[used] = '\0';
     return used;
 }
@@ -412,6 +526,11 @@ static void send_names_list(server_t *s, conn_t *dst, const chan_t *ch)
 
         for (size_t i = 0; i < ch->nmembers; i++) {
             const struct member *m = &ch->members[i];
+            /* PER MEMBER, and the buffer is per member rather than hoisted for the
+             * reason `write_to_members()` gives for its tag buffer: the shape is
+             * decided per destination inside the walk, and a buffer shared across
+             * iterations is one whose contents change under a line already queued. */
+            char entry[CONN_HOSTMASK_MAX];
 
             if (m->c == NULL || m->c->nick[0] == '\0') {
                 continue;
@@ -419,17 +538,29 @@ static void send_names_list(server_t *s, conn_t *dst, const chan_t *ch)
             if (names_group(m) != group) {
                 continue;
             }
-            used = names_emit(s, dst, mid, m->flags, m->c->nick, line, used,
-                              &produced, multiprefix);
+            used = names_emit(s, dst, mid, m->flags,
+                              names_entry(dst, m->c->nick, m->c->user, m->c->host,
+                                          entry, sizeof entry),
+                              line, used, &produced, multiprefix);
         }
         for (size_t i = 0; i < ch->nremotes; i++) {
             const chan_remote_t *r = &ch->remotes[i];
+            /* AND THE SAME RENDERER FOR A REMOTE MEMBER, which is the whole reason
+             * `names_entry()` takes (nick, ident, host) rather than a conn_t: a
+             * remote member has no conn_t, so a renderer that read one could not
+             * have drawn it at all and the roster would carry two shapes by
+             * construction. The empty ident and empty host are the documented normal
+             * state for a member learned from a live SJOIN, and they render as the
+             * bare nick rather than as a half-built hostmask. */
+            char entry[CONN_HOSTMASK_MAX];
 
             if (r->nick[0] == '\0' || names_group_flags(r->flags) != group) {
                 continue;
             }
-            used = names_emit(s, dst, mid, r->flags, r->nick, line, used,
-                              &produced, multiprefix);
+            used = names_emit(s, dst, mid, r->flags,
+                              names_entry(dst, r->nick, r->user, r->host, entry,
+                                          sizeof entry),
+                              line, used, &produced, multiprefix);
         }
         if (used != 0) {
             (void)reply(s, dst, "353", mid, 2, "%s", line);

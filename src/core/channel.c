@@ -715,6 +715,31 @@ int chan_remote_set_host(chan_t *ch, const char *server, const char *nick,
     return copy_bounded(seen->host, sizeof seen->host, host) ? 0 : -1;
 }
 
+/* The ident setter, and the same three refusals in the same order as
+ * chan_remote_set_host()'s: bad argument, no such entry, or a value that does not
+ * fit. The comment on the declaration has the argument for why the copy is
+ * REFUSED rather than truncated; repeating it here would be worse than saying
+ * nothing, so this points there. */
+int chan_remote_set_user(chan_t *ch, const char *server, const char *nick,
+                         const char *user)
+{
+    chan_remote_t *seen;
+
+    if (ch == NULL || server == NULL || nick == NULL || user == NULL) {
+        return -1;
+    }
+    /* An EMPTY ident is a real answer, not a bad argument, and it is what a live
+     * SJOIN leaves behind -- 4.3's SJOIN carries no ident at all, so this is the
+     * NORMAL state for a member learned from one rather than from a burst. That is
+     * the same asymmetry `host` has and for the same reason, and the renderer has
+     * to handle it rather than printing a half-built hostmask. */
+    seen = chan_remote_find(ch, server, nick);
+    if (seen == NULL) {
+        return -1;
+    }
+    return copy_bounded(seen->user, sizeof seen->user, user) ? 0 : -1;
+}
+
 int chan_remote_remove(chan_t *ch, const char *server, const char *nick)
 {
     if (ch == NULL || server == NULL || nick == NULL) {

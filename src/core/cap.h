@@ -58,9 +58,16 @@
  *
  * The consistency that DOES have to hold is between `CAP LS` and the code: every
  * name in cap_available() must be a name something here implements. That is why
- * there is no `cap-notify` (this node never sends an unsolicited CAP NEW), no
- * `away-notify`, `chghost` or `echo-message` (it sends none of those), and no
- * `server-time` or `userhost-in-names` (it stamps neither).
+ * there is no `cap-notify` (this node never sends an unsolicited CAP NEW) and no
+ * `away-notify` or `chghost` (it sends neither).
+ *
+ * **Phase 10.5 retired one name from that sentence.** It used to read "and no
+ * `server-time` or `userhost-in-names` (it stamps neither)" — true when written,
+ * and no longer true of `userhost-in-names`, which is in the table above and
+ * implemented behind it. `server-time` is still absent, because this node stamps
+ * no time tag on anything. The line is corrected rather than deleted because an
+ * out-of-date "and no X" in a header is the exact shape of the incoherence this
+ * file exists to prevent, and the build cannot see it.
  *
  * ---------------------------------------------------------------------------
  * `account-tag` IS IN THE TABLE, AND BOTH HALVES OF IT LANDED TOGETHER
@@ -124,6 +131,7 @@
 #define CAP_ACCOUNT_TAG "account-tag"
 #define CAP_ACCOUNT_NOTIFY "account-notify"
 #define CAP_EXTENDED_JOIN "extended-join"
+#define CAP_USERHOST_IN_NAMES "userhost-in-names"
 
 /* 410 ERR_INVALIDCAPSUBCOMMAND. Not in design 4.4's numeric list, which is a gap
  * in the list rather than in the protocol, for the same reason 301, 303, 417,
@@ -280,6 +288,38 @@ int cap_account_notify_enabled(const conn_t *c);
  * parameters, which it would read as a topic and a reason. fanout.c decides which
  * shape a given destination gets; core/chan_verbs.c builds both. */
 int cap_extended_join_enabled(const conn_t *c);
+
+/* userhost-in-names: whether this node draws a `353` member as
+ * `nick!user@host` for THIS client rather than as a bare nickname.
+ *
+ * ---------------------------------------------------------------------------
+ * THIS ONE IS A PRIVACY CAPABILITY AND THE DOCUMENTATION IS THE POINT
+ * ---------------------------------------------------------------------------
+ * A `353` normally discloses a nickname and nothing else. With this one, it
+ * discloses **every member's ident and observed host address to every other
+ * member of the channel** -- including to clients the member has never spoken to,
+ * and including to clients that joined after them. Nothing about it is scoped:
+ * one client asking puts the whole roster's hostmasks on the wire to that client,
+ * and there is no per-member consent.
+ *
+ * So it is opt-in in the strongest sense available: per DESTINATION, decided in
+ * `chan_verbs.c`'s `send_names_list()` for the connection being answered, and two
+ * clients on one channel may see two different roster SHAPES for the same member.
+ * That is the same per-destination shape `multi-prefix` and `extended-join` use,
+ * and for this one the reason is stronger than consistency: a node that decided
+ * once per channel would disclose hostmasks to every member whether they asked or
+ * not, which is a disclosure the member never agreed to.
+ *
+ * AVAILABLE ON EVERY NODE, unconditionally, because the question is whether the
+ * data EXISTS and not whether some registry is loaded: `c->user` and `c->host` are
+ * filled at accept() and by USER on every connection, and a remote member's pair
+ * is carried by 4.3's SBURSTN. There is no configuration under which this node has
+ * a `353` roster and no host in it, so there is no reason to withhold the name.
+ *
+ * WHAT IT DOES NOT CHANGE: `352` RPL_WHOREPLY and `311` RPL_WHOISREPLY already
+ * carry `<user>` and `<host>` as their own RFC fields, so they were never the gap.
+ * The gap was `353` alone, and that is the whole scope. */
+int cap_userhost_in_names_enabled(const conn_t *c);
 
 /* Handle one `CAP` line. Returns 1 if it was handled, 0 if it was not a CAP at
  * all (which cannot happen: the caller has already dispatched on the verb). */
