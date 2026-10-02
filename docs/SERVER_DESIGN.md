@@ -620,13 +620,33 @@ src/federation/link.c  peer sockets, handshake FSM driving, keepalive
 ### 4.3 Server-to-server (internal, not client-facing)
 
 `FEDERATE` (link handshake — existing FSM) `SJOIN` `SPART` `SPRIVMSG` `SNOTICE`
-`STOPIC` `SNAMES` `SSMODE` `SKICK` `SQUIT` `SHASH` `SBURST`
+`STOPIC` `SNAMES` `SSMODE` `SKICK` `SQUIT` `SHASH` `SBURST` `SNICK` `ADVERTISE`
+`SHUTDOWN`
 
 These are the internal verbs behind the client commands. Designing them as
 *distinct verbs* rather than reusing `JOIN`/`PRIVMSG` is what keeps the wire
 protocol unambiguous and lets a node distinguish "a user joined" from "a
 server tells me a user joined" — which is what makes loop prevention and
 ownership decidable.
+
+
+The last three are **Phase 9's**, and they are a different kind of verb from the
+ones above. `SNICK` renames a remote member across the mesh, and is the network-
+visible half of §2.1's rename-the-loser: a duplicate nick is resolved on the wire
+rather than silently in one node's memory. `ADVERTISE` publishes this node's
+operator-set load figure to each established peer, and `SHUTDOWN` announces a
+deliberate departure.
+
+Both of the latter two are **observational or terminal, never load-bearing for
+routing**. An advertised name or address is read by logs, by the stats line and by
+name-collision detection — **never by the dial path** — because a peer that could
+name a host this node would then connect to has turned a shared secret into an
+SSRF. That separation is structural rather than a matter of remembering: the
+advertised table is a distinct type with no path into `server_dial()`. And a
+`SHUTDOWN` is a **clean leave, not a failure** — it is the one teardown that must
+not arm §4.2's retry ladder, since retrying a peer that said goodbye is exactly
+what "graceful leave" exists to prevent. Presence detection remains T4's job;
+neither verb replaces it.
 
 **`SBURST` is the resync verb.** On **every** link establishment the initiator
 sends full state:
@@ -772,7 +792,7 @@ read that as the deferral it is. A channel's creation race is **not** re-keyed f
 a burst: 2.2's tie-break needs the (epoch, name) of the *first* creator and the
 wire carries one epoch. **Driving** the resync — link loss, reconnect, backoff — is
 Phase 9, which is why 8's "link loss and reconnect re-syncs channel state via
-`SBURST`" is still open: Phase 6 owns the verb and the format, not the policy.
+`SBURST`" is now CLOSED, and was closed by Phase 9 rather than by Phase 6: Phase 6 owned the verb and the format, and Phase 9 owned the policy — the backoff, the retry budget and the heartbeat-driven redial that decide WHEN a resync happens. §4.3.1's frozen burst format is unchanged by any of it.
 
 **A node's resync shadow is released at shutdown, and that arm is verified by
 LeakSanitizer on the Linux runner rather than on the developer machine.** The
@@ -1381,7 +1401,7 @@ Federated:
       `bob@a` and `bob@b` are distinct registry keys. (The old criterion,
       "nick collision between nodes resolves without a global lock", was
       vacuous — there is no collision for it to resolve.)
-- [ ] *Phase 9:* network-visible nick ambiguity resolved by rename-the-loser
+- [x] *Phase 9:* network-visible nick ambiguity resolved by rename-the-loser
       plus a nick-registry broadcast. Until then, duplicate cross-server nicks
       are user-visible and undefined
 - [ ] Origin is immutable and a dead origin is **failed closed**: local members
@@ -1394,10 +1414,10 @@ Federated:
       §2.4.
 
 Quality:
-- [ ] ASan/UBSan/LeakSanitizer clean
-- [ ] CI green on gcc and clang, Release and Debug
+- [~] **ASan/UBSan** clean at 65/65 with zero AddressSanitizer errors. **LeakSanitizer has not run** — it does not exist on Darwin, so this row closes when the Linux CI job reports, not before. Two arms were added specifically so it can (`fed_advert_close()` in `server_shutdown()`; `fed_burst_close()`/`resume_close()` beside it), because an unfreed table is a failure no macOS run can see.
+- [~] **CI green on gcc and clang, Release and Debug.** Locally: 0 warnings on gcc-16, 65/65 twice. Upstream Clang 23 is **not installed locally**, so the three-compiler claim is only as good as the Linux runner's report — this row closes on CI, not on this machine.
 - [ ] `SPEC_TRACKING.md` matches source, verified by reading it
-- [ ] No test asserts internal plumbing
+- [x] No test asserts internal plumbing
 
 ---
 
