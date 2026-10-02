@@ -45,12 +45,16 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
     int member;
     int delivered;
 
-    /* Arity. RFC 2812 3.3.1 gives PRIVMSG <msgtarget> <text> and 3.3.2 gives
+/* Arity. RFC 2812 3.3.1 gives PRIVMSG <msgtarget> <text> and 3.3.2 gives
      * NOTICE the same two. A third parameter is not text the client meant to
-     * send -- the grammar has already absorbed everything after a ':' -- so it
-     * is refused rather than guessed at, which is the same call Phase 3 made
-     * for "NICK a b". */
-    if (m->nparams != 2) {
+     * send -- the grammar has already absorbed everything after a ':' -- so it is
+     * refused rather than guessed at, which is the same call Phase 3 made for
+     * "NICK a b".
+     *
+     * `MSG_MAX_TARGETS + 1` rather than a written 2, because 005 advertises
+     * `MAXTARGETS=` from the same number (msg_verbs.h) and two spellings of it
+     * is one too many. */
+    if (m->nparams != MSG_MAX_TARGETS + 1) {
         (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
         return;
     }

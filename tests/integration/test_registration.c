@@ -169,13 +169,29 @@ int main(void)
 
     /* ---------------------------------------------------------------------
      * The tail of 003, 004, 005 and the whole MOTD -- exact bytes.
+     *
+     * THE 005 NUMBERS BELOW ARE WRITTEN OUT AND NOT TAKEN FROM THE CONSTANTS
+     * THEY DESCRIBE. That is the whole of the Phase 10.4 addition to this file
+     * and it is deliberate in the direction that looks wrong: k_005[] derives
+     * every one of them from the bound that ENFORCES it, so a value cannot drift
+     * from its constant at run time -- and that is precisely why this test must
+     * not derive from the constant too. A test built from IRC_MAX_TOPIC passes
+     * the moment somebody raises CHAN_MAX_TOPIC, and the question Phase 10.4 has
+     * to be able to answer is whether 005 was updated with it. Only a literal
+     * here can fail that, so `TOPICLEN=255` and friends are literals.
+     *
+     * It also means raising any bound in src/ now breaks THIS line, which is the
+     * intended cost: the person who raises CHAN_MAX_TOPIC has to look at 005 and
+     * decide whether the new number is what clients should be told.
      * --------------------------------------------------------------------- */
     n = snprintf(want, sizeof want,
                  " (UTC)\r\n"
                  ":%s 004 alice %s %s i b,k,l,imnpst "
                  ":are supported by this server\r\n"
                  ":%s 005 alice NETWORK=irc-serve CHANTYPES=#& PREFIX=(ov)@+ "
-                 "CASEMAPPING=ascii NICKLEN=%d :are supported by this server\r\n"
+                 "CASEMAPPING=ascii AWAYLEN=255 CHANNELLEN=63 LINELEN=8192 "
+                 "MAXTARGETS=1 NAMELEN=255 NICKLEN=63 TOPICLEN=255 "
+                 ":are supported by this server\r\n"
                  ":%s 372 alice :- irc-serve: a federation-native IRC node.\r\n"
                    ":%s 372 alice :- registration, channels, messaging and peer "
                    "federation are implemented.\r\n"
@@ -184,7 +200,7 @@ int main(void)
                  ":%s 375 alice :- Message of the day -\r\n"
                  ":%s 376 alice :End of /MOTD command.\r\n",
                  NODE_NAME, NODE_NAME, IRC_SERVE_VERSION,
-                 NODE_NAME, IRC_MAX_NICK,
+                 NODE_NAME,
                  NODE_NAME, NODE_NAME, NODE_NAME, NODE_NAME, NODE_NAME);
     TF_CHECK_MSG(n > 0 && (size_t)n < sizeof want, "expected string too large");
     TF_CHECK_MSG(tc_expect(&c, want, T_IO_MS) == 0,
@@ -200,6 +216,81 @@ int main(void)
                  "005 does not advertise CHANTYPES=#&");
     TF_CHECK_MSG(tc_expect(&c, " NETWORK=irc-serve ", T_IO_MS) == 0,
                  "005 does not advertise NETWORK=");
+
+    /* ---------------------------------------------------------------------
+     * EVERY DERIVED TOKEN, ONE BY ONE, so a drift names itself.
+     * ---------------------------------------------------------------------
+     * The byte-exact line above already fails on any change. These exist for the
+     * OTHER failure: a token that keeps its value while the constant it is
+     * derived from moves, which the byte-exact line catches too -- but it catches
+     * it by printing the whole burst, and a failure that says "TOPICLEN=255 is
+     * gone" is worth more than one that says "005 is not byte-exact". */
+    {
+        /* Each is <token>=<value>, spelled out with the leading and trailing SPACE
+         * that bounds a middle parameter. The spaces are not decoration: without
+         * them a test for "NAMELEN=" would be satisfied by a node advertising
+         * `NAMELEN_MAX=255`, and `LINELEN=` would be satisfied by a
+         * `CHANNELLEN=`-style neighbour that happens to share a prefix. A token
+         * in a 005 is a whole space-delimited word or it is not a token. */
+        static const char *const want_tokens[] = {
+            " AWAYLEN=255 ",
+            " CHANNELLEN=63 ",
+            " LINELEN=8192 ",
+            " MAXTARGETS=1 ",
+            " NAMELEN=255 ",
+            " NICKLEN=63 ",
+            " TOPICLEN=255 ",
+            " CASEMAPPING=ascii "
+        };
+
+        for (size_t i = 0; i < sizeof want_tokens / sizeof want_tokens[0]; i++) {
+            TF_CHECK_MSG(strstr(tc_buffer(&c), want_tokens[i]) != NULL,
+                         "005 does not carry \"%s\". Every one of these is derived "
+                         "in k_005[] from the constant that ENFORCES the limit, so "
+                         "a token that is missing here is either a number nobody "
+                         "wrote out or a number that drifted from its constant.",
+                         want_tokens[i]);
+        }
+    }
+
+    /* ---------------------------------------------------------------------
+     * AND NO OTHERS: the tokens this node does NOT advertise.
+     * ---------------------------------------------------------------------
+     * An ISUPPORT token is a promise, so the interesting half of "only what this
+     * node honours" is the set of absences, and a list that only grows is exactly
+     * how a node ends up claiming features it does not have. The reasons are at
+     * k_005[] in commands.c; what is asserted here is only that the names are not
+     * on the wire.
+     *
+     * KICKLEN IS IN THIS LIST AND NOT BY OMISSION, which is why it is worth a
+     * name of its own: handle_kick() takes <reason> verbatim with no length test,
+     * so no number in this tree describes the largest reason this node accepts.
+     * Advertising 255 because CHAN_MAX_TOPIC and CONN_MAX_AWAY happen to be 255
+     * would be a number about a limit nobody enforces.
+     *
+     * BOT / EXTBAN / SAFELIST / MONITOR / WATCHNICK are the features; ACCEPT and
+     * silence are the operator-model features, and this node has no operator
+     * model at all (CHOPER answers 464 for everything). MSGREFTYPES needs a
+     * message-reference parser, draft/CHATHISTORY needs a history store, MODES
+     * needs a cap on one MODE command, and USERLEN is the one omission that has
+     * a bound behind it and still cannot be advertised: USER's ident is
+     * truncated rather than refused, so the number would promise a limit this
+     * node does not apply. */
+    {
+        static const char *const absent[] = {
+            " BOT=", " EXTBAN=", " SAFELIST", " MONITOR", " WATCHNICK",
+            " MSGREFTYPES=", " ACCEPT", " silence", " CHATHISTORY", " KICKLEN=",
+            " MODES=", " USERLEN="
+        };
+
+        for (size_t i = 0; i < sizeof absent / sizeof absent[0]; i++) {
+            TF_CHECK_MSG(strstr(tc_buffer(&c), absent[i]) == NULL,
+                         "005 advertises \"%s\" and this node implements nothing "
+                         "behind it. An advertised token a client acts on is worse "
+                         "than an absent one, because absence is a client that "
+                         "carries on.", absent[i]);
+        }
+    }
 
     /* Exactly one welcome burst. A second 001 for one registration would mean
      * the state machine re-fired, and a client that treats 001 as "I am
