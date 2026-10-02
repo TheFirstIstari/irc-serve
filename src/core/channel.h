@@ -348,6 +348,39 @@ struct chan_ban {
  * tree may report it as one. Anything that renders a remote member has to handle
  * the empty case rather than printing a half-built hostmask.
  */
+/* THE `account` FIELD, ADDED IN PHASE 10.3, AND WHY IT IS ON THE MEMBERSHIP
+ * RECORD RATHER THAN ON THE USER RECORD
+ *
+ * 4.3 has a per-USER record (`SBURSTN`, carrying nick/user/host/modes/signon/away)
+ * and a per-MEMBERSHIP one (`SBURSTM`, carrying chan/server/nick/flags). An
+ * account is naturally the former -- it belongs to a person, not to one of their
+ * memberships -- and this field is on the latter anyway, for a reason that is
+ * about where the receiver has to PUT it rather than about what it means:
+ *
+ *   the thing this node can render to a client is the ROSTER ENTRY, because a
+ *   remote member has no conn_t and 353 and any future extended JOIN read from
+ *   chan_remote_t. A fact delivered on `SBURSTN` would have to be re-joined onto
+ *   the roster by a lookup at install time, and a live `SJOIN` -- the other way a
+ *   member arrives -- would have to put the SAME field in a DIFFERENT place. Two
+ *   records holding one fact is how a wire format comes to disagree with itself,
+ *   and 4.3.1's `<server>` paragraph is the argument against exactly that.
+ *
+ * So the account rides the record the roster is BUILT FROM, which means the two
+ * ways a member arrives -- a live SJOIN and a resync -- carry it in the same
+ * parameter of the same verb family and land it in the same field. Agreement by
+ * construction rather than by a join at install time.
+ *
+ * THE COST: 64 bytes on every remote roster entry, and CONN_MAX_ACCOUNT + 1 on
+ * every shadow member during a burst. It is the same trade 4.3.1 already records
+ * for `<server>` and `host`, and it is stated rather than implied.
+ *
+ * AN EMPTY ACCOUNT IS NORMAL, exactly as an empty `host` and an empty
+ * `member_server` are: it means "this node has not been told", which is the state
+ * of an entry learned from a peer that does not implement 4.3 as extended. `*` is
+ * NOT stored -- it is translated to "" on receipt, because `*` is a rendering of
+ * the absence and storing the absence as a name is how an account named "*" would
+ * become representable. Nothing in this tree may render an empty account; it
+ * renders `*`. */
 typedef struct chan_remote {
     char     nick[IRC_MAX_NICK + 1];
     /* The ATTRIBUTION KEY: the peer whose report put this entry here. See the
@@ -360,6 +393,9 @@ typedef struct chan_remote {
     /* The member's host, or "" when this node learned the member from a live
      * SJOIN rather than from a burst. See the note above. */
     char     host[CHAN_MAX_REMOTE_HOST + 1];
+    /* The account the member is logged in to, or "" when this node has not been
+     * told. See the note below -- this field's placement is the argument. */
+    char     account[CONN_MAX_ACCOUNT + 1];
     unsigned flags; /* CHAN_MEMBER_OP / CHAN_MEMBER_VOICE, as for a local one */
 } chan_remote_t;
 
@@ -653,7 +689,7 @@ int chan_server_has(const chan_t *ch, const char *name);
  * because an entry's holder is a fact a later record can correct and a stale
  * one is an entry nobody can act on. */
 int chan_remote_add(chan_t *ch, const char *server, const char *member_server,
-                    const char *nick, unsigned flags);
+                    const char *nick, const char *account, unsigned flags);
 
 /* Drop the (server, nick) member. Returns 1 when one was removed, 0 when there
  * was none. Does NOT touch servers[] -- the caller decrements that, because the

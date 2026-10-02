@@ -493,9 +493,14 @@ static const struct {
 } VERBS[] = {
     { "PRIVMSG", "SPRIVMSG", CHAN " :" TEXT,            TEXT, NULL, 1 },
     { "NOTICE",  "SNOTICE",  CHAN " :" TEXT,            TEXT, NULL, 1 },
-    /* The member is the nick of the source prefix, and the flag token is `-`
-     * because this fixture has no channel and therefore no flags to report. */
-    { "JOIN",    "SJOIN",    CHAN " " CLIENT_NICK " -", NULL, NULL, 0 },
+    /* The member is the nick of the source prefix, the flag token is `-` because
+     * this fixture has no channel and therefore no flags to report, and the fourth
+     * parameter is the ACCOUNT -- which Phase 10.3 added to 4.3's SJOIN and which
+     * is `*` here because this fixture's client never authenticated. `*` is the
+     * protocol's spelling of "not logged in to an account", and putting it in the
+     * expected wire line rather than leaving the row three-wide is what makes the
+     * format change visible in this test instead of only in the acceptance. */
+    { "JOIN",    "SJOIN",    CHAN " " CLIENT_NICK " - *", NULL, NULL, 0 },
     { "PART",    "SPART",    CLIENT_NICK " " CHAN " :" TEXT, TEXT, NULL, 1 },
     { "TOPIC",   "STOPIC",   CLIENT_NICK " " CHAN " :" TEXT, TEXT, NULL, 1 },
     /* SMODES' subject is the SERVER that evaluated the change, per 2.2, and it
@@ -763,7 +768,7 @@ int main(void)
         (void)snprintf(hostmask, sizeof hostmask, "%s!%s@%s", CLIENT_NICK,
                        CLIENT_NICK, CLIENT_HOST);
         want_line(want, sizeof want, hostmask, epoch, 48u, 0u, "SJOIN",
-                  CHAN " " CLIENT_NICK " +o");
+                  CHAN " " CLIENT_NICK " +o *");
     }
     TF_CHECK_MSG(drive_until(&s, &cli, &peer, &peer, want, T_IO_MS) == 0,
                  "a JOIN did not reach the owning server, so 3.1's state-change "

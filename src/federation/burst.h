@@ -28,8 +28,40 @@
  *   :<origin> SBURST  <epoch> <nnicks>
  *   :<origin> SBURSTN <nick> <user> <host> <modes> <signon> :<away>
  *   :<origin> SBURSTC <chan> <origin> <topic_who> <topic_when> <modes> :<topic>
- *   :<origin> SBURSTM <chan> <server> <nick> <flags>
+ *   :<origin> SBURSTM <chan> <server> <nick> <flags> <account>
  *   :<origin> SBURSTE <epoch> <nnicks> <nchans> <nmembers>
+ *
+ * `SBURSTM`'s `<account>` is Phase 10.3's, and it is the SAME fourth field
+ * 4.3's SJOIN carries as its fourth -- `<account>` is `<account>` or `*`. The next
+ * paragraph is why it is on this record and not on `SBURSTN`.
+ *
+ * ---------------------------------------------------------------------------
+ * THE ACCOUNT IS ON SBURSTM, NOT ON SBURSTN, AND THE ARGUMENT IS ABOUT WHERE A
+ * RECEIVER CAN PUT IT
+ * ---------------------------------------------------------------------------
+ * An account is naturally a property of a USER, and `SBURSTN` is the user record,
+ * so the first instinct is to put it there. It is on `SBURSTM` instead, for one
+ * reason: **the thing this node can render to a client is the roster entry**, and
+ * a remote member has no `conn_t`. A fact delivered on `SBURSTN` would have to be
+ * re-joined onto the roster at install time, while a live `SJOIN` -- the other way
+ * a member ever arrives -- would have to put the SAME field in a DIFFERENT place.
+ * Two records holding one fact is how a wire format comes to disagree with itself,
+ * and the `<server>` paragraph below is the existing argument against exactly
+ * that.
+ *
+ * So `SBURSTM` carries what `SJOIN` carries, in the same position, and both land
+ * in `chan_remote_t::account`. A resync therefore restores the field the live path
+ * would have written, which is agreement by construction rather than a join at
+ * install time -- and a format whose resync silently drops a field the live path
+ * sets is precisely the defect this file's `<server>` work exists to prevent.
+ *
+ * WHAT IT COSTS, stated rather than implied: +64 bytes on the worst-case `SBURSTM`
+ * line (510 rather than 446 -- the arithmetic is below), `CONN_MAX_ACCOUNT + 1` on
+ * every `burst_member_t` during a transaction, and the same on every
+ * `chan_remote_t`. A resync of 500 members therefore holds 32 KiB more of shadow
+ * than before. It is the same trade `<server>` already records, and 4.3 says a
+ * field added after two implementations run is a compatibility break rather than a
+ * change.
  *
  * Every line carries 2.4's internal tag block, like every other relayed line,
  * and hops is 0 on all of them: a burst originates at the node that sends it.
@@ -178,8 +210,14 @@
  *   64 (user, conn_t::user) + 128 (host, conn_t::host) + 2 (the modes token) +
  *   21 (signon) + 256 (away) = 787. SBURSTM is 179 + 65 + 8 + 64 (<chan>,
  *   CHAN_MAX_NAME) + 64 (<server>, IRC_MAX_SERVER_NAME) + 64 (nick) + 2 (the
- *   flags token) = 446, which is 5.4% of the cap and is NOT what the budget
- *   turns on. SBURST and SBURSTE carry only numerics and are under 320.
+ *   flags token) + 64 (<account>, CONN_MAX_ACCOUNT) = 510, which is 6.2% of the
+ *   cap and is NOT what the budget turns on. SBURST and SBURSTE carry only
+ *   numerics and are under 320.
+ *
+ *   THE BUDGET TURNS ON THE TOTAL, AND +64 ON A MEMBER LINE IS 64 ON EVERY MEMBER
+ *   of every channel in the burst. On the 500-member channel the header prices,
+ *   that is 32 KiB more of transaction -- which is 2% of the 128 KiB staging
+ *   bound, so it does not change what fits, only what it costs to fit it.
  *
  * 753 and 787 against 8192 is 9.2% and 9.6% of the cap, so LINE LENGTH IS NOT
  * THE BURST'S CONSTRAINT and a per-line check would be a formality. THE REAL

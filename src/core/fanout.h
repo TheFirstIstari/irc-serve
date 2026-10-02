@@ -291,6 +291,56 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
                    const char *verb, const char *const *params, int nparams,
                    conn_t *exclude, const irc_serve_tags_t *carry);
 
+/* ONE WIRE SHAPE: a parameter list and its length. A struct rather than two more
+ * arguments because the thing it carries IS a list, and a shape with a length is
+ * the shape every parameter in this file already has. */
+typedef struct {
+    const char *const *params;
+    int         nparams;
+} fanout_form_t;
+
+/* As fanout_deliver(), for an emission whose PARAMETERS -- not merely its tags --
+ * differ per destination. `plain` is the shape everybody gets; `extended` is the
+ * shape a destination that negotiated `extended-join` gets instead. A NULL
+ * `extended` means one shape for all, and is exactly fanout_deliver().
+ *
+ * WHY IT IS A SEPARATE ENTRY POINT AND NOT A FLAG. `extended-join` changes the
+ * JOIN from `:nick!user@host JOIN #chan` to `:nick!user@host JOIN #chan <account>
+ * :<realname>`, and those are two different messages rather than two decorations
+ * of one. Every tag in this file is a per-destination decision because a tag is
+ * not part of what the line MEANS; a parameter is. A client that did not ask for
+ * the extension and received the two extra ones would read the account name as a
+ * topic and the realname as a reason, and it would do that silently.
+ *
+ * WHAT THE FORWARD DOES WITH IT, because this is where the two shapes have to be
+ * reconciled: **the forward always uses `plain`.** The peer-facing form of a JOIN
+ * is 4.3's SJOIN, and its shape is decided by federation/verbs.c's
+ * fed_sverb_params() from the channel's own membership -- which is where the
+ * account and the flags both come from. Handing `extended` to the forward would
+ * give a peer two different JOIN shapes depending on which of its clients had
+ * negotiated a capability, which is precisely the divergence 4.3's single frozen
+ * shape exists to prevent.
+ *
+ * The identity is minted once for both shapes, exactly as it is for the tags, so
+ * a client that receives the plain form and a peer that receives the SJOIN are
+ * looking at one emission. */
+int fanout_deliver_forms(server_t *s, const fanout_target_t *t, const char *prefix,
+                         const char *verb, const fanout_form_t *plain,
+                         const fanout_form_t *extended, conn_t *exclude,
+                         const irc_serve_tags_t *carry);
+
+/* As fanout_deliver_local(), for an emission whose parameters differ per
+ * destination, and with the SAME reason for existing: the extended JOIN is a
+ * local emission with no forward leg, and a future caller that resolved a channel
+ * and wanted the extension would otherwise have to reimplement the member walk.
+ *
+ * `carry` is still not a parameter, for fanout_deliver_local()'s reason: a
+ * local-only emission originates here. */
+int fanout_deliver_local_forms(server_t *s, const fanout_target_t *t,
+                              const char *prefix, const char *verb,
+                              const fanout_form_t *plain,
+                              const fanout_form_t *extended, conn_t *exclude);
+
 
 /* ---------------------------------------------------------------------------
  * The forward leg

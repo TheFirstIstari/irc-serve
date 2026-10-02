@@ -43,6 +43,7 @@
 
 #include "core/cap.h"
 #include "core/channel.h"
+#include "core/account.h"
 #include "core/fanout.h"
 #include "core/reply.h"
 
@@ -554,9 +555,10 @@ static void send_creation_time(server_t *s, conn_t *dst, const chan_t *ch)
  * forwarding IS the action. A caller that treated FORWARD as "do nothing" would
  * answer every client on a non-owned channel with success and change nothing
  * anywhere. */
-static void deliver_state_change(server_t *s, conn_t *c, chan_t *ch,
-                                 const char *verb, const char *prefix,
-                                 const char *const *params, int nparams)
+static void deliver_state_change_forms(server_t *s, conn_t *c, chan_t *ch,
+                                      const char *verb, const char *prefix,
+                                      const fanout_form_t *plain,
+                                      const fanout_form_t *extended)
 {
     fanout_target_t t;
 
@@ -571,7 +573,19 @@ static void deliver_state_change(server_t *s, conn_t *c, chan_t *ch,
      * command and this node is minting its 2.4 identity at the forward. The
      * relay path is federation/verbs.c, and it hands its own tags to
      * fanout_deliver() instead. */
-    (void)fanout_deliver(s, &t, prefix, verb, params, nparams, NULL, NULL);
+    (void)fanout_deliver_forms(s, &t, prefix, verb, plain, extended, NULL, NULL);
+}
+
+/* The one-shape form, and every state change except JOIN uses it: the extension
+ * is a JOIN extension, so there is exactly one caller of the two-shape entry point
+ * and this wrapper is what the other five get. */
+static void deliver_state_change(server_t *s, conn_t *c, chan_t *ch,
+                                 const char *verb, const char *prefix,
+                                 const char *const *params, int nparams)
+{
+    const fanout_form_t plain = { params, nparams };
+
+    deliver_state_change_forms(s, c, ch, verb, prefix, &plain, NULL);
 }
 
 /* ---------------------------------------------------------------------------
@@ -767,6 +781,37 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
 int chan_admit(server_t *s, conn_t *c, chan_t *ch, unsigned flags)
 {
     char prefix[CONN_HOSTMASK_MAX];
+    /* THE TWO JOIN SHAPES, BUILT ONCE PER ADMISSION.
+     *
+     * `plain` is RFC 2812 3.3.1's JOIN echo, with no parameters at all -- the
+     * channel name is the target, which fanout prepends. `extended` adds the two
+     * parameters `extended-join` defines:
+     *
+     *   :nick!user@host JOIN #chan <account> :<realname>
+     *   :nick!user@host JOIN #chan * :<realname>
+     *
+     * THE ACCOUNT IS `<account>` OR `*` AND NEVER EMPTY, and the rule is
+     * account_logged_in() rather than `c->account[0]`, because the `*` form is the
+     * specification's way of saying "this user has not logged in to an account
+     * prior to channel ingress" -- and on a node with NO REGISTRY nobody ever is,
+     * so `*` is not an absence of information here, it is the information. A node
+     * that emitted an empty account field would be sending a parameter that reads
+     * as an empty one, which is the exact confusion 2.1.1's invariant exists to
+     * prevent, moved from a struct field to the wire.
+     *
+     * THE REALNAME IS `c->realname` AND MAY BE EMPTY, which is legal: it is the
+     * trailing parameter, 3.2 colons it, and an empty one renders as a bare `:`
+     * -- the one representation of "no text here". USER fills the field at
+     * registration and a client that sent none has an empty realname, which is a
+     * fact about the client rather than a limit this node imposes.
+     *
+     * BOTH LIVES ARE IN THIS FRAME, which is the same reason the hostmask is: the
+     * emission happens inside fanout, so the values have to outlive the call that
+     * builds them. */
+    const char *extended_params[2];
+    char acct_token[CONN_MAX_ACCOUNT + 2];
+    fanout_form_t plain;
+    fanout_form_t extended;
 
     if (s == NULL || c == NULL || ch == NULL) {
         return -1;
@@ -787,7 +832,19 @@ int chan_admit(server_t *s, conn_t *c, chan_t *ch, unsigned flags)
                     "Cannot join channel");
         return -1;
     }
-    deliver_state_change(s, c, ch, "JOIN", prefix, NULL, 0);
+    memcpy(acct_token, account_logged_in(c) != 0 ? c->account : "*",
+           strlen(account_logged_in(c) != 0 ? c->account : "*") + 1u);
+    /* NEITHER LIST CARRIES THE CHANNEL NAME, because fanout prepends the resolved
+     * target: 3.1's row is "write the target, then the caller's parameters", and
+     * putting the name in the caller's list as well would render it twice. That is
+     * why the plain list is EMPTY rather than holding one entry. */
+    extended_params[0] = acct_token;
+    extended_params[1] = c->realname;
+    plain.params = NULL;
+    plain.nparams = 0;
+    extended.params = extended_params;
+    extended.nparams = 2;
+    deliver_state_change_forms(s, c, ch, "JOIN", prefix, &plain, &extended);
 
     send_topic(s, c, ch);
     send_names_list(s, c, ch);

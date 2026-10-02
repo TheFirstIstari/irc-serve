@@ -773,8 +773,9 @@ static void test_logged_in(const char *sasl, const char *registry)
      * above is the one that is conditional. */
     TF_CHECK_MSG(strstr(tc_buffer(&alice.c),
                         " CAP * LS :multi-prefix message-tags draft/message-ids "
-                        "sasl account-tag account-notify\r\n") != NULL,
-                 "the advertised list on a node with BOTH stores is not the six "
+                        "sasl account-tag account-notify "
+                        "extended-join\r\n") != NULL,
+                 "the advertised list on a node with BOTH stores is not the seven "
                  "capabilities this node implements: %s", tc_buffer(&alice.c));
 
     /* ---- the credential, and the identity it establishes ---- */
@@ -875,9 +876,10 @@ static void test_no_registry(const char *sasl, const char *label)
     TF_CHECK_MSG(tc_expect(&alice.c, ls, T_IO_MS) == 0, "%s: no CAP LS", label);
     TF_CHECK_MSG(strstr(tc_buffer(&alice.c),
                         " CAP " "alice" " LS :multi-prefix message-tags "
-                        "draft/message-ids sasl account-notify\r\n") != NULL,
+                        "draft/message-ids sasl account-notify "
+                        "extended-join\r\n") != NULL,
                  "%s: the advertised list on a node with a credential store and "
-                 "NO registry is not exactly the five capabilities it really "
+                 "NO registry is not exactly the six capabilities it really "
                  "has; a client would read an account-tag here as an identity it "
                  "can never get", label);
     /* AND ONLY account-tag, which is why this cannot be a sweep for the substring
@@ -983,9 +985,10 @@ static void test_default_node(void)
     /* The copy stops AT the CRLF rather than including it -- `n` is measured to
      * the CR -- so the expected literal has no terminator either. */
     TF_CHECK_MSG(strcmp(caps, " CAP * LS :multi-prefix message-tags "
-                              "draft/message-ids account-notify") == 0,
+                              "draft/message-ids account-notify "
+                              "extended-join") == 0,
                  "the advertised capability list on a node with no stores is "
-                 "\"%s\"; it must be exactly the four that need no "
+                 "\"%s\"; it must be exactly the five that need no "
                  "configuration", caps);
     /* `account-notify` IS in that list and `account-tag` is NOT, and the
      * difference is the whole of the store check. `ACCOUNT *` is an answer a node
@@ -1832,6 +1835,148 @@ static void test_account_notify(const char *sasl, const char *registry)
 }
 
 /* ==========================================================================
+ * CASE 10: `extended-join`
+ * ==========================================================================
+ * The JOIN echo carries the account and the realname, and the account field is
+ * `<account>` or `*` -- which is the whole of what has to be true, so the
+ * assertions are on whole lines and on the `*` case as much as on the name.
+ *
+ *   bob     NOT logged in, negotiated extended-join
+ *   carol   logged in, negotiated NOTHING
+ *   alice   logged in, negotiated extended-join -- JOINS LAST
+ *
+ * ORDER IS THE POINT. A JOIN echo goes to the channel's EXISTING members, so alice
+ * has to arrive after the other two or there is nobody to observe her JOIN -- and
+ * one emission observed by a recipient who asked and by one who did not is the only
+ * way to show the choice is per destination rather than per verb. The JOIN is sent
+ * on the SENDER's connection and the sender's PONG closes the barrier, for the
+ * reason speak_and_close() gives.
+ */
+#define CHAN_XJOIN "#XJOIN"
+
+static void test_extended_join(const char *sasl, const char *registry)
+{
+    nf_node_t node;
+    client_t alice;
+    client_t bob;
+    client_t carol;
+    char want[256];
+    char line[128];
+    size_t ab;
+    size_t ae;
+    size_t bb;
+    size_t be;
+    size_t cb;
+    size_t ce;
+
+    spawn_node(&node, sasl, registry, "the extended JOIN echo");
+    TF_CHECK_MSG(nf_expect(&node, "accounts=loaded", T_READY_MS) == 0,
+                 "the registry did not load, so nothing below is about an account");
+
+    client_open_logged_in(&bob, &node, "bob", "CAP REQ :extended-join", NULL, NULL,
+                          "bob");
+    /* carol is logged in TOO and negotiated nothing, so her JOIN echo says nothing
+     * about accounts -- which is the point of the third row of this table: the
+     * difference between her line and bob's is the capability, not whether there is
+     * an account. */
+    client_open_logged_in(&carol, &node, "carol", NULL, "alice", "correct horse",
+                          "carol");
+    client_open_logged_in(&alice, &node, "alice", "CAP REQ :extended-join", "alice",
+                          "correct horse", "alice");
+    TF_CHECK_MSG(nf_expect(&node, "account=alice verified=1", T_IO_MS) == 0,
+                 "alice did not establish an account, so the name below would be "
+                 "about nothing");
+
+    /* ==================== carol IS THERE FIRST ==================== */
+    /* A JOIN echo goes to the channel's EXISTING members, so somebody has to be in
+     * the channel before there is anybody to observe the next JOIN. carol goes in
+     * first precisely so that bob's and alice's joins are both observable, and her
+     * own echo is unobserved -- which is fine, because what this case is about is
+     * what an EXISTING member is shown. */
+    (void)snprintf(line, sizeof line, "JOIN " CHAN_XJOIN);
+    TF_CHECK_MSG(tc_send(&carol.c, line) == 0, "carol's JOIN could not be sent");
+    (void)drain(&carol);
+
+    /* ==================== bob JOINS, and has NO ACCOUNT ==================== */
+    bb = drain(&bob);
+    cb = drain(&carol);
+    (void)snprintf(line, sizeof line, "JOIN " CHAN_XJOIN);
+    TF_CHECK_MSG(tc_send(&bob.c, line) == 0, "bob's JOIN could not be sent");
+    be = drain(&bob); /* the barrier: bob sent it */
+    ce = drain(&carol);
+
+    /* `*` AND NOT AN EMPTY FIELD. This is the specification's whole claim about the
+     * anonymous case, and 2.1.1's invariant one layer down: a value a client reads
+     * as "this user has no account" must be the protocol's own token for it and not
+     * an empty parameter -- which 3.2 cannot even represent. */
+    (void)snprintf(want, sizeof want,
+                   ":bob!bob@127.0.0.1 JOIN " CHAN_XJOIN " * :Real bob\r\n");
+    expect_in_window(&bob, bb, be, "the extended JOIN for a member with NO account",
+                     want);
+
+    /* AND CAROL GETS RFC 2812 3.3.1's JOIN AND NOTHING ELSE. The whole line is
+     * asserted rather than a prefix of it, because the failure this guards against
+     * is a client reading the account name as a topic and the realname as a
+     * reason -- and a prefix assertion would pass on the very line that does it. */
+    (void)snprintf(want, sizeof want, ":bob!bob@127.0.0.1 JOIN " CHAN_XJOIN "\r\n");
+    expect_in_window(&carol, cb, ce,
+                     "the PLAIN JOIN for a member that negotiated nothing", want);
+    expect_absent_in_window(&carol, cb, ce,
+                            "an extended JOIN for a member that negotiated nothing",
+                            "Real bob");
+
+    /* ---- AND NO `account` MESSAGE TAG LEAKS INTO THE JOIN, WHICH IS A DIFFERENT
+     * FEATURE ON A DIFFERENT CAPABILITY ---- */
+    expect_absent_in_window(&bob, bb, be,
+                            "an account message tag on the extended JOIN, which is "
+                            "`account-tag`'s job and needs its own negotiation",
+                            "@account=");
+
+    /* ==================== alice JOINS, WITH AN ACCOUNT ==================== */
+    ab = drain(&alice);
+    bb = drain(&bob);
+    cb = drain(&carol);
+    (void)snprintf(line, sizeof line, "JOIN " CHAN_XJOIN);
+    TF_CHECK_MSG(tc_send(&alice.c, line) == 0, "alice's JOIN could not be sent");
+    ae = drain(&alice); /* the barrier: alice sent it */
+    be = drain(&bob);
+    ce = drain(&carol);
+
+    /* THE ACCOUNT AND THE REALNAME, AS A WHOLE LINE. RFC 1459 2.3.1's realname is
+     * what USER sent, and client_register() sends `:Real alice`, so the trailing
+     * parameter is exactly that. */
+    (void)snprintf(want, sizeof want,
+                   ":alice!alice@127.0.0.1 JOIN " CHAN_XJOIN " alice :Real "
+                   "alice\r\n");
+    expect_in_window(&alice, ab, ae, "the extended JOIN the joiner sees", want);
+    /* ...and bob, who asked, sees the same extended form: ONE emission, and both
+     * recipients are handed the shape they asked for rather than the shape the
+     * first member happened to negotiate. */
+    expect_in_window(&bob, bb, be, "the extended JOIN for the member that asked",
+                     want);
+
+    /* AND CAROL STILL GETS THE PLAIN ONE, for the same alice. This is the contrast
+     * the case exists for: the same sender, the same account, two recipients, two
+     * shapes -- so neither line can be explained by anything about the JOIN. */
+    (void)snprintf(want, sizeof want, ":alice!alice@127.0.0.1 JOIN " CHAN_XJOIN "\r\n");
+    expect_in_window(&carol, cb, ce,
+                     "the PLAIN JOIN for a member that did not negotiate "
+                     "extended-join", want);
+    expect_absent_in_window(&carol, cb, ce,
+                            "an extended JOIN for a member that did not negotiate "
+                            "it", "Real alice");
+    expect_absent_in_window(&carol, cb, ce,
+                            "the ACCOUNT of the joiner, to a member that did not "
+                            "negotiate extended-join", "XJOIN alice");
+
+    TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not stop cleanly");
+    nf_free(&node);
+    tc_close(&alice.c);
+    tc_close(&bob.c);
+    tc_close(&carol.c);
+}
+
+/* ==========================================================================
  * THE REFUSAL RULES OF account_set(), IN PROCESS, ON RETURN VALUES
  * ==========================================================================
  * These are the assertions CONTRIBUTING.md calls observable ("return values,
@@ -1959,6 +2104,52 @@ static void expect_account_set_refuses(void)
     }
     TF_CHECK_MSG(account_logged_in(c) == 0,
                  "a node with no registry left a connection logged in");
+
+    /* ---- AND A NAME THAT IS NOT WRITABLE AS A PARAMETER ----
+     *
+     * The rule is account_name_wire_safe()'s, and Phase 10.3 made it
+     * LOAD-BEARING: an account name is a MIDDLE parameter of 330
+     * RPL_WHOISACCOUNT, of the extended JOIN echo and of two S-verbs, and a message
+     * PARAMETER can escape nothing -- 3.2 refuses SP outright. A name holding a
+     * space would be a `330` with four parameters where the specification says
+     * three, and a JOIN echo a client reads as carrying a topic.
+     *
+     * It is asserted on RETURN VALUES and on the store's key space, and no wire
+     * sequence reaches either: a registry holding such a name is refused at load,
+     * so a client could never authenticate as one, so there is nothing for the wire
+     * to carry. That is the same argument the in-process section makes about the
+     * empty name, and for the same reason -- no command sequence produces these
+     * states. */
+    TF_CHECK_MSG(account_set(&s, c, "two words", "correct horse") == -1,
+                 "account_set() accepted an account name holding a SPACE; it has "
+                 "to be refused, because an account name is an IRC middle "
+                 "parameter and 3.2 cannot escape a space in one");
+    TF_CHECK_MSG(account_set(&s, c, "alice bob", "correct horse") == -1,
+                 "account_set() accepted an account name holding a space in the "
+                 "middle");
+    TF_CHECK_MSG(account_set(&s, c, "alice\tctl", "correct horse") == -1,
+                 "account_set() accepted an account name holding a TAB");
+    TF_CHECK_MSG(account_set(&s, c, ":alice", "correct horse") == -1,
+                 "account_set() accepted an account name with a LEADING COLON, "
+                 "which is 3.2's parameter marker and cannot be told from one");
+    TF_CHECK_MSG(account_set(&s, c, "*", "correct horse") == -1,
+                 "account_set() accepted the protocol's \"no account\" token as "
+                 "an account name; 2.1.1's invariant is about not being able to "
+                 "represent one, and `*` is the name that would break it");
+    TF_CHECK_MSG(account_logged_in(c) == 0,
+                 "a refused account name left the connection logged in");
+    /* ...and `*` IS ACCEPTED BY THE PREDICATE, because it is what a client reads
+     * as "no account" and the RENDERERS must be able to say it. */
+    TF_CHECK_MSG(account_name_wire_safe("*") == 1,
+                 "account_name_wire_safe() refuses `*`, which is the protocol's own "
+                 "token for the absence of an account; every renderer here depends "
+                 "on being able to write it");
+    /* ...and the store's KEY SPACE refuses it too, which is the whole of why a
+     * registry cannot contain a name this node could not publish. */
+    TF_CHECK_MSG(account_store_add(reg, "two words", "correct horse", 0) == -1,
+                 "account_store_add() accepted an account name holding a space; a "
+                 "registry must not be able to hold a name this node cannot show a "
+                 "user");
 
     /* AND THE GOOD CASE, because a function that refuses everything passes every
      * refusal above. */
@@ -2091,6 +2282,9 @@ int main(void)
 
     /* ---- and the unsolicited ACCOUNT line ---- */
     test_account_notify(sasl_good, acct_good);
+
+    /* ---- and the JOIN that carries the account ---- */
+    test_extended_join(sasl_good, acct_good);
 
     /* ---- the regression cases ---- */
     test_no_registry(sasl_only, "a credential store and no registry");

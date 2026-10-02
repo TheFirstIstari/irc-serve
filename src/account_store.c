@@ -10,6 +10,7 @@
  */
 #include "account_store.h"
 
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -125,6 +126,34 @@ size_t account_store_count(const account_store_t *store)
     return (store != NULL) ? store->n : 0u;
 }
 
+int account_name_wire_safe(const char *name)
+{
+    size_t i;
+
+    if (name == NULL || name[0] == '\0') {
+        return 0;
+    }
+    if (name[0] == ':') {
+        /* A LEADING colon is the marker 3.2 writes itself; a value that starts
+         * with one cannot be told apart from a marker by a parser, and
+         * message_format() refuses such a value in every position but the last.
+         * The `*` case is the exception and is the reason it is not simply "a
+         * colon is bad". */
+        return (name[1] == '\0') ? 1 : 0;
+    }
+    for (i = 0; name[i] != '\0'; i++) {
+        const unsigned char ch = (unsigned char)name[i];
+
+        if (ch <= 0x20u || ch == 0x7fu) {
+            /* SP, HTAB, CR, LF, every other control byte, and DEL. 3.2 refuses all
+             * of them in a parameter, and a parameter is where three of the four
+             * places this name appears have to put it. */
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int account_store_add(account_store_t *store, const char *name,
                       const char *password, long created)
 {
@@ -143,8 +172,20 @@ int account_store_add(account_store_t *store, const char *name,
     /* A TAB cannot appear in either field: the first is the separator and the
      * second is what would follow it. A SPACE in the PASSWORD is allowed and is
      * the reason the separator is a TAB rather than a split on whitespace --
-     * sasl_store_add() makes the same call for the same reason. */
-    if (strchr(name, '\t') != NULL || strchr(password, '\t') != NULL) {
+     * sasl_store_add() makes the same call for the same reason.
+     *
+     * AND THE NAME MUST BE PUBLISHABLE, which is the one asymmetry between the two
+     * fields and it is Phase 10.3 that made it visible. A password never leaves
+     * this process; an account name is a middle parameter of 330 RPL_WHOISACCOUNT,
+     * of the JOIN echo and of two S-verbs, and 3.2 can escape nothing in a
+     * parameter. account_name_wire_safe() is the rule and account.h is where it is
+     * argued; enforcing it HERE rather than only at the renderer is what makes a
+     * registry unable to contain a name this node could never show a user.
+     *
+     * `*` is accepted, because it is what the protocol reserves for "no account"
+     * and refusing it here would make a registry unable to hold the one name the
+     * wire uses for the absence. */
+    if (strchr(password, '\t') != NULL || account_name_wire_safe(name) == 0) {
         return -1;
     }
     for (size_t i = 0; i < store->n; i++) {

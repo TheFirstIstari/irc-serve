@@ -20,6 +20,7 @@
 /* Phase 9: the session window, asked by chan_dispose_if_empty() whether a
  * channel is still HELD by a client that is coming back to it. See the guard there
  * for why the hold is short: 2.2's disposal rule is delayed, not exempted. */
+#include "account_store.h"
 #include "core/resume.h"
 #include "core/reply.h"
 
@@ -533,11 +534,30 @@ chan_remote_t *chan_remote_find(const chan_t *ch, const char *server,
 }
 
 int chan_remote_add(chan_t *ch, const char *server, const char *member_server,
-                    const char *nick, unsigned flags)
+                    const char *nick, const char *account, unsigned flags)
 {
     chan_remote_t *seen;
 
     if (ch == NULL || server == NULL || nick == NULL) {
+        return -1;
+    }
+    /* THE ACCOUNT IS VALIDATED WHEN IT IS GIVEN AND TREATED AS ABSENT WHEN IT IS
+     * NOT, on exactly the terms channel.h gives for `member_server`: "" and NULL
+     * both mean "this node has not been told", which is the ordinary state of an
+     * entry learned from a peer that does not carry the field. An account that
+     * cannot be rendered as a PARAMETER is refused rather than stored, because a
+     * roster entry carrying a string this node could not put on the wire is a
+     * member it could not describe to a client -- and because the alternative is a
+     * value that arrives intact and then cannot be emitted.
+     *
+     * `*` IS THE PROTOCOL'S SPELLING OF THE ABSENCE and is translated to "" here,
+     * so that the roster holds "no account" rather than an account named "*". And
+     * an EMPTY account is the not-told state and is not checked at all -- which is
+     * why the guard tests for empty BEFORE it tests for safety rather than letting
+     * account_name_wire_safe() refuse it. It did refuse it, and the symptom was a
+     * resync that dropped every member it had been told nothing about. */
+    if (account != NULL && account[0] != '\0' && account[0] != '*' &&
+        account_name_wire_safe(account) == 0) {
         return -1;
     }
     /* Validated HERE, and not left to the caller, because the caller is a peer
@@ -585,6 +605,16 @@ int chan_remote_add(chan_t *ch, const char *server, const char *member_server,
             (void)copy_bounded(seen->member_server, sizeof seen->member_server,
                                member_server);
         }
+        /* THE ACCOUNT IS OVERWRITTEN ON A REPEAT WHEN IT IS GIVEN, and NOT
+         * CLEARED when it is not, which is `member_server`'s rule rather than
+         * `host`'s. A peer's re-assertion is allowed to correct a stale account --
+         * a user who changed accounts is now a fact this node should hold -- while
+         * a peer that says nothing must not clear what a burst established, since a
+         * cleared account is a member this node can no longer describe. */
+        if (account != NULL && account[0] != '\0') {
+            (void)copy_bounded(seen->account, sizeof seen->account,
+                               (account[0] == '*') ? "" : account);
+        }
         return 0;
     }
     if (ch->nremotes == ch->rcap) {
@@ -619,6 +649,15 @@ int chan_remote_add(chan_t *ch, const char *server, const char *member_server,
      * different field. */
     ch->remotes[ch->nremotes].host[0] = '\0';
     ch->remotes[ch->nremotes].member_server[0] = '\0';
+    /* ...and `account` the same way, for the same reason, because it grew in
+     * Phase 10.3 and a recycled element inheriting the previous member's account
+     * would be that same impersonation with a third field. */
+    ch->remotes[ch->nremotes].account[0] = '\0';
+    if (account != NULL && account[0] != '\0') {
+        (void)copy_bounded(ch->remotes[ch->nremotes].account,
+                           sizeof ch->remotes[0].account,
+                           (account[0] == '*') ? "" : account);
+    }
     if (member_server != NULL) {
         (void)copy_bounded(ch->remotes[ch->nremotes].member_server,
                            sizeof ch->remotes[0].member_server, member_server);
