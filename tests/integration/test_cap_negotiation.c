@@ -249,18 +249,19 @@ static void test_negotiation(void)
                  * presented as a reason for withholding it, and it was the wrong
                  * reason: this node has echoed a channel PRIVMSG to its sender since
                  * Phase 5, because fanout writes to every local member. What the
-                 * capability adds is NOTICE, and it is not here because it is not
-                 * implemented yet. The assertion stays until it is; Phase 10.7 moves
-                 * the line to test_echo_message.c, which is where the behaviour can
-                 * actually be checked. */
+                 * capability adds is NOTICE, which is what Phase 10.7 implemented --
+                 * so the line has moved from "must be absent" to "must be present",
+                 * and the behaviour it names is asserted in test_echo_message.c,
+                 * which is where a count can be taken rather than a substring. */
                 TF_CHECK_MSG(strstr(line, "cap-notify") == NULL,
                              "CAP LS advertises cap-notify, which nothing here "
                              "sends CAP NEW for");
                 TF_CHECK_MSG(strstr(line, "away-notify") == NULL,
                              "CAP LS advertises away-notify");
-                TF_CHECK_MSG(strstr(line, "echo-message") == NULL,
-                             "CAP LS advertises echo-message, and this node sends "
-                             "no copy of a NOTICE back to its sender yet");
+                TF_CHECK_MSG(strstr(line, "echo-message") != NULL,
+                             "CAP LS does not advertise echo-message, which this node "
+                             "implements -- a sender that negotiated it gets its own "
+                             "NOTICE back");
                 /* `account-notify` WAS here, and Phase 10.2b is why it is not any
                  * more. The node emitted no ACCOUNT line, and a listed capability
                  * is a client switching the feature on and then drawing the wrong

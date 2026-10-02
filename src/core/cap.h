@@ -64,7 +64,8 @@
  * **Phase 10.5 and 10.6 retired two names from that sentence.** It used to read
  * "and no `server-time` or `userhost-in-names` (it stamps neither)" — true when
  * written, and no longer true of `userhost-in-names` (Phase 10.5) or `setname`
- * (Phase 10.6), both of which are in the table above and implemented behind it.
+ * (Phase 10.6), and `echo-message` (Phase 10.7), all of which are in the
+ * table above and implemented behind it.
  * `server-time` is still absent, because this node stamps no time tag on anything.
  * The line is corrected rather than deleted because an out-of-date "and no X" in a
  * header is the exact shape of the incoherence this file exists to prevent, and the
@@ -134,6 +135,7 @@
 #define CAP_EXTENDED_JOIN "extended-join"
 #define CAP_USERHOST_IN_NAMES "userhost-in-names"
 #define CAP_SETNAME "setname"
+#define CAP_ECHO_MESSAGE "echo-message"
 
 /* 410 ERR_INVALIDCAPSUBCOMMAND. Not in design 4.4's numeric list, which is a gap
  * in the list rather than in the protocol, for the same reason 301, 303, 417,
@@ -346,6 +348,48 @@ int cap_userhost_in_names_enabled(const conn_t *c);
  * client that asked cannot discover another member's realname change by watching
  * them, and this capability cannot become a disclosure channel by accident. */
 int cap_setname_enabled(const conn_t *c);
+
+/* echo-message: whether this node sends THIS client a copy of the `PRIVMSG` or
+ * `NOTICE` it sent.
+ *
+ * ---------------------------------------------------------------------------
+ * THE COPY IS NOT A SECOND DELIVERY, and that is the whole of the obligation
+ * ---------------------------------------------------------------------------
+ * A node that implements this naively sends the message once through the normal
+ * path and then sends a SECOND copy to the sender, because the sender is not
+ * obviously already in the audience. Every message a client that negotiated this
+ * sends arrives twice, and a client that renders both shows the user their own
+ * message twice -- which is the exact bug the capability is supposed to fix,
+ * arrived at from the other direction.
+ *
+ * SO IT IS NOT A SEPARATE EMISSION. `msg_verbs.c`'s `send_message()` makes this
+ * capability decide ONE thing: whether the sender stays in the audience of the one
+ * delivery that is happening anyway. The specification's own example
+ *
+ *     --> PRIVMSG Attila :hi
+ *     :example!ex@example.com PRIVMSG Attila :hi
+ *
+ * is byte-identical to what this node's normal path has produced for a channel
+ * `PRIVMSG` since Phase 5, because `fanout.c` writes to every local member
+ * INCLUDING the author -- which is why `exclude` is NULL for `PRIVMSG` and has
+ * been since before this capability existed.
+ *
+ * The only verb whose RFC rule REMOVES the sender from the audience is `NOTICE`
+ * (RFC 1459 2.4.2: "The NOTICE message is sent to a user or channel, whether or
+ * not the sender is on the channel", and a NOTICE is never returned to the client
+ * that sent it). So `echo-message` changes exactly one thing on this node: a sender
+ * who negotiated it gets its own `NOTICE` back, with its own hostmask as the
+ * source prefix.
+ *
+ * THE COST, and it is worth naming because it looks like nothing: nothing. There is
+ * no second code path, no second stamp, no second message identity -- `fanout.c`
+ * mints the emission's 2.4 identity once, above its switch, and the sender's copy
+ * carries the SAME `msgid` as everyone else's, which is what the specification means
+ * by "the final version of the message".
+ *
+ * ONE GATE AND NO AVAILABILITY CHECK: unlike `account-tag` there is nothing here
+ * that depends on an operator file. */
+int cap_echo_message_enabled(const conn_t *c);
 
 /* Handle one `CAP` line. Returns 1 if it was handled, 0 if it was not a CAP at
  * all (which cannot happen: the caller has already dispatched on the verb). */

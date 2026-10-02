@@ -1048,6 +1048,43 @@ src/federation/link.c  peer sockets, handshake FSM driving, keepalive
 `WHO` `WHOIS` `ISON` `LIST` `AWAY` `INVITE` `MOTD` `LUSERS` `ADMIN` `INFO`
 `USERHOST` `KNOCK` `CHOPER`
 
+#### 4.2.2 `echo-message` (Phase 10.7, IRCv3)
+
+`echo-message` says a server MUST send `PRIVMSG` and `NOTICE` back to the client that
+sent them. On this node **that copy already existed for `PRIVMSG` before the
+capability did**: `fanout.c`'s `write_to_members()` writes to every live local member
+**including the author**, and the specification's own example
+
+```
+--> PRIVMSG Attila :hi
+:example!ex@example.com PRIVMSG Attila :hi
+```
+
+is byte-identical to what that path has produced since Phase 5. `exclude` has been
+`NULL` for `PRIVMSG` for exactly that reason.
+
+**So the implementation is one argument, and the bug it invites is a second
+delivery.** A node that "implements" this by sending the message normally and then
+acknowledging it delivers every message twice to every client that negotiated the
+capability — the exact defect the capability exists to remove, reached from the
+other side. The two copies differ only in their prefix, so a substring assertion
+passes; `tests/integration/test_echo_message.c` therefore **counts** copies over a
+marked region of the wire, and one of its faults adds exactly that second emission
+and is watched failing with `2 != 1`.
+
+What the capability actually changes is the one verb whose RFC rule removes the
+sender from the audience: **RFC 1459 2.4.2's `NOTICE`**, which is never returned to
+the client that sent it. For a sender that negotiated `echo-message` it is put back;
+for one that did not, nothing changes. There is **no second emission, no second
+stamp, and no second message identity** — `fanout.c` mints the emission's 2.4
+identity once, above its switch, so the sender's copy carries the same `msgid` as
+every other recipient, which is what "the final version of the message" means.
+
+**Not covered, and named:** `TAGMSG` echoes, `batch` echoes, and a `nick@server`
+target. The last is a routing fact rather than an omission — §3.1's last row is
+forward-only, so the target has no local destination and there is nobody on this
+node to acknowledge to.
+
 #### 4.2.1 `SETNAME` (Phase 10.6, IRCv3)
 
 `SETNAME :<realname>` changes `conn_t::realname` on a live connection. It is not in
@@ -2310,4 +2347,5 @@ Quality:
 | **`userhost-in-names` disclosing hostmasks to the wrong client** (Phase 10.5) | every member's ident and host reach every other member of the channel, including clients that member has never spoken to — and there is no per-member consent anywhere in the capability | **The roster shape is decided per DESTINATION**, in `chan_verbs.c`'s `names_entry()`, for the connection being answered — so a client is shown the long form only if it negotiated it (§4.4.3). A node deciding once per channel would disclose to the whole channel on one client's request. A member the node cannot render a hostmask for gets the **bare nick**, not a `*` placeholder: inventing a half would put a byte on the wire that reads as part of a hostmask and means nothing |
 | **A realname stored without validation** (Phase 10.6) | an unbounded or under-validated realname is a memory-safety bug and a **log-injection vector** — the field reaches this node's own `printf("%s")` with no escaping, so `0x07` rings a recipient's bell and ESC `[` is a CSI sequence a terminal executes | **One predicate, two writers.** `conn_realname_check()` is called by *both* `handle_user()` and `handle_setname()`, so "SETNAME is not a looser path than registration" is a property of the code rather than a claim about it. It refuses over-long values and every C0 control and DEL; `message_parse_n()` refuses CR/LF/NUL ahead of it, and the test covers the rest. `SETNAME` refuses; `USER` empties rather than refusing, because refusing `USER` would strand a half-registered client — §4.2.1 argues it and the empty result is a legal state |
 | **`SETNAME` silently ignoring a client that did not negotiate** (Phase 10.6) | read as "the command does not exist" by a client that tried it anyway, which `setname` explicitly permits | **It is the specification's instruction**, and it is implemented rather than worked around: no reply, no change. A `FAIL SETNAME CANNOT_CHANGE_REALNAME` needs `standard-replies`, which this node does not have, and inventing a `FAIL` would put a command word on the wire no client here has been told to expect. The test asserts **exhaustively** — the drain `PONG` must be the only line in the window — because a list of absent numerics is not a test of silence (a `482` fault passed the first version of it) |
+| **A message delivered twice to a client that negotiated `echo-message`** (Phase 10.7) | every message the user sends appears twice, from two different-looking prefixes — the defect the capability exists to remove, arrived at from the other side | **There is no second emission.** The capability decides one thing: whether the sender stays in the audience of the delivery that is happening anyway (`msg_verbs.c`'s `exclude`). The sender of a channel `PRIVMSG` was *already* in the audience, so the copy is that one; only `NOTICE`, which RFC 1459 2.4.2 removes, is affected. `test_echo_message.c` **counts** copies rather than searching for them — the two copies are identical apart from the prefix, so a substring assertion passes — and one of its faults adds exactly the extra emission |
 | **`KICKLEN` has no bound to advertise** (Phase 10.4) | an over-long KICK reason is not refused with a numeric; it reaches `message_format()`, which refuses it as `unrepresentable` — a non-zero `n_reply_refused`, the counter `reply.c` holds at zero because a non-zero value of it is a bug report | **Reported, not fixed, and the reason is scope.** The fix is a reason bound plus a `417` in `handle_kick()`, which is a change to a command this pass did not touch. §4.4.2 states it; the honest mitigation today is that the node logs `reply_refused ... reason=unrepresentable` naming the command, so the condition is visible rather than silent |

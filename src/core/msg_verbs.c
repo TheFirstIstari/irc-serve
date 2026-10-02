@@ -44,6 +44,7 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
     int is_channel;
     int member;
     int delivered;
+    conn_t *exclude;
 
 /* Arity. RFC 2812 3.3.1 gives PRIVMSG <msgtarget> <text> and 3.3.2 gives
      * NOTICE the same two. A third parameter is not text the client meant to
@@ -117,6 +118,13 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
         const char *textp[1];
 
         textp[0] = text;
+        /* NO echo-message GATE HERE, and the omission is deliberate rather than a
+         * gap: 3.1's last row is "forward to that server", so the target has no
+         * local destination at all and there is nobody on this node to send an
+         * acknowledgement to. A negotiating client whose PRIVMSG went to
+         * `bob@irc.b` gets no copy back, and the honest reason is that the
+         * acknowledgement would have to be a local-only emission invented here for a
+         * user who is not here. SPEC_TRACKING 10.7 records it. */
         fanout_deliver(s, &t, prefix, verb, textp, 1, NULL, NULL);
         return;
     }
@@ -198,20 +206,63 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
      * after the target in both verbs (RFC 2812 3.3.1: <msgtarget> <text>) and
      * the arity check at the top of this function has already refused anything
      * else, so the array cannot overflow. */
+    /* ------------------------------------------------------------------------
+     * `exclude`, AND IT IS DECIDED HERE AND NOWHERE ELSE
+     * ------------------------------------------------------------------------
+     * `exclude` is the sender for a verb whose RFC rule says it must not see its
+     * own message, and NULL when it must. RFC 2812 3.3.2 defines NOTICE that way
+     * and nothing else does, so before IRCv3's `echo-message` the whole expression
+     * was `(is_notice != 0) ? c : NULL`.
+     *
+     * WHAT `echo-message` CHANGES, AND WHY IT IS NOT A SECOND DELIVERY. The
+     * specification says a server MUST send PRIVMSG and NOTICE back to the client
+     * that sent them, and its own example --
+     *
+     *     --> PRIVMSG Attila :hi
+     *     :example!ex@example.com PRIVMSG Attila :hi
+     *
+     * -- is BYTE-IDENTICAL to what this node's normal path has produced for a
+     * channel PRIVMSG since Phase 5, because `fanout.c`'s write_to_members() writes
+     * to every live local member INCLUDING the author, and `exclude` has been NULL
+     * for PRIVMSG for exactly that reason. The copy the specification asks for is
+     * already on the wire. What is NOT already on the wire is a sender's own NOTICE,
+     * which 2.4.2 takes away and which `echo-message` -- for a client that negotiated
+     * it -- puts back.
+     *
+     * SO THE IMPLEMENTATION IS THIS ONE ARGUMENT. There is no second call to
+     * fanout_deliver(), no second emission, and therefore no way for one message to
+     * arrive twice: a node that "implemented" this by sending an acknowledgement
+     * after the normal delivery would deliver EVERY message from every negotiating
+     * client twice, which is the bug the capability exists to remove reached from the
+     * other side. One delivery, one 2.4 stamp minted above fanout's switch, one
+     * `msgid` shared by the sender and every other recipient.
+     *
+     * IT IS PER DESTINATION IN THE SENSE THAT MATTERS, which is that the decision
+     * is about THIS connection's own capability rather than about the target or
+     * about the node. Two members of one channel, one with the capability and one
+     * without, get different audiences out of the same emission -- which is why the
+     * `echo=` field on the observable line below reports the decision that was
+     * actually taken rather than re-deriving it from the verb.
+     *
+     * `nick@server` IS NOT COVERED, and that is a named limit rather than an
+     * oversight: 3.1's last row is forward-only, so the target has no local
+     * destination and there is nobody here to send an acknowledgement to. Building
+     * one would be inventing a local emission for a target that does not exist on
+     * this node. The branch above returns before this one, and it is commented. */
+    exclude = ((is_notice != 0) && (cap_echo_message_enabled(c) == 0)) ? c : NULL;
     {
         const char *sp[1];
 
         sp[0] = m->params[1];
         /* `carry` is NULL: a client sent this line, so this node is ORIGINATING
          * it and fanout_forward_sverb() mints the 2.4 identity at the forward. */
-        delivered = fanout_deliver(s, &t, prefix, verb, sp, 1,
-                                   (is_notice != 0) ? c : NULL, NULL);
+        delivered = fanout_deliver(s, &t, prefix, verb, sp, 1, exclude, NULL);
     }
     printf("[observable] msg: verb=%s from=%s target=%s kind=%d members=%zu "
            "delivered=%d echo=%s member=%d\n",
            verb, c->nick, t.name, (int)t.kind,
            (t.chan != NULL) ? t.chan->nmembers : 0u, delivered,
-           (is_notice != 0) ? "no" : "yes", member);
+           (exclude != NULL) ? "no" : "yes", member);
 }
 
 void handle_privmsg(server_t *s, conn_t *c, const message_t *m)
