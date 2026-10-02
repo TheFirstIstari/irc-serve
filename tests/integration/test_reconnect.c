@@ -727,6 +727,22 @@ static void case_a_dropped_client_gets_its_channels_back(void)
         TF_CHECK_MSG(tc_send(&wrong_ident, line) == 0, "the PING send failed");
         TF_CHECK_MSG(tc_expect(&wrong_ident, "wrong-names", T_IO_MS) == 0,
                      "the client never got its PONG: %s", tc_buffer(&wrong_ident));
+          /* And WAIT FOR THE 353 EXPLICITLY, rather than reading the buffer and
+           * hoping. The PONG above proves the node answered a command, which is
+           * not the same as proving it had already answered NAMES: those are
+           * separate writes, and on a loaded machine the 353 can still be in
+           * flight when the PONG lands. This check used to pass only because a
+           * LATER assertion in the same beat -- the racy 400 ms nf_expect() -- sat
+           * far enough down the function to pump the node's output for 400 ms
+           * first, and the roster read whatever that pump happened to collect.
+           * Remove the racy assertion and the roster check starts reading a buffer
+           * the node has not finished writing, which is the same class of bug this
+           * beat was fixed for: an assertion whose outcome depends on timing that
+           * belongs to a different assertion. */
+          TF_CHECK_MSG(tc_expect(&wrong_ident, " 353 ", T_IO_MS) == 0,
+                       "the client never received a 353, so the roster claim below "
+                       "reads a buffer that does not contain it: %s",
+                       tc_buffer(&wrong_ident));
         {
             size_t rlen = 0u;
             const char *roster =
@@ -763,7 +779,15 @@ static void case_a_dropped_client_gets_its_channels_back(void)
          * that matches no window is not a failed resume and is told nothing (the
          * NOTICE check below is the same property from the client's side), so a
          * counter for it would report a rejection the node does not consider one.
-         * The boundary plus the monotonic resume_applied=1 is the honest form. */
+         * The boundary plus the two counters is the honest form.
+         *
+         * The 400 ms nf_expect() that stood here before is GONE, and it was the
+         * whole cause of the sanitizer job's failure: it asked "is this line
+         * absent right now", which is a question about the scheduler as much as
+         * about the key comparison. It survived the previous commit -- I added
+         * the two sound checks ABOVE it and left it in place -- so the job kept
+         * failing on the racy assertion while correct ones sat immediately above
+         * it saying the same thing. */
         TF_CHECK_MSG(strstr(n.out, "session_resume: nick=" NICK_KEY " ident=" IDENT_WRONG) ==
                          NULL,
                      "a window was applied to a client whose IDENT differs from "
@@ -773,12 +797,6 @@ static void case_a_dropped_client_gets_its_channels_back(void)
                      "differs from the one the window recorded registered, so the key "
                      "is not really the three fields core/resume.h claims: %s",
                      (unsigned long long)applied_before, n.out);
-        TF_CHECK_MSG(nf_expect(&n, "session_resume: nick=" NICK_KEY " ident=" IDENT_WRONG,
-                               400) != 0,
-                     "a window was applied to a client whose IDENT differs from the "
-                     "one the window recorded, so the key is not really the three "
-                     "fields core/resume.h claims: %s",
-                     n.out);
         /* AND A PLAIN FRESH CLIENT IS NOT TOLD ANYTHING, which is the other side
          * of the same coin and is the property that keeps the feature invisible to
          * clients that do not use it: there is no window, so there is no failed
