@@ -119,7 +119,22 @@
 #include "harness/node_fixture.h"
 #include "harness/test_util.h"
 
-#define T_IO_MS 15000
+/* The per-wait budget for the four-node mesh test.
+ *
+ * RAISED from 15000 to 30000, and the reason is measurement rather than hope.
+ * Locally this test completes in ~3.0s under both Release and ASan -- about 5x
+ * headroom against 15000 -- and it passed 12/12 in Release and 3/3 in ASan at
+ * that budget. On GitHub's two-core macOS runner it has twice consumed the entire
+ * 15000ms with `dial_connected=0`, which is a STARVED test rather than a slow
+ * one: four nodes, nine spawned processes and a full mesh build contending for
+ * two cores against a sibling job at -j 2. 30000 does not make the test slower in
+ * the normal case, because it is a deadline and the test returns when the line
+ * arrives -- it only changes what happens when the runner is contended.
+ *
+ * It does not make the test CHEAPER to fail: a real hang still costs 30s. That is
+ * the trade, and the alternative was a red required check that says nothing about
+ * the product. */
+#define T_IO_MS 30000
 
 #define SECRET "irc-serve-federation-secret-a"
 #define NAME_A "irc.a"
