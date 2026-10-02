@@ -200,6 +200,35 @@ struct chan; /* opaque until Phase 4 (2.2) */
  * member of every channel they are on as though it were theirs. */
 #define CONN_MAX_REALNAME 255
 
+/* The verdict on a candidate realname. Only CONN_REALNAME_OK may be stored, and
+ * each other value names WHICH refusal it was rather than only that there was one:
+ * the two have different reasons on the wire (one is a limit, the other is a
+ * character that must never be logged) and a caller that cannot tell them apart
+ * reports a vague message and learns nothing.
+ *
+ * The function is here, in connection.h, rather than in a command handler, because
+ * `conn_t::realname` is a CONNECTION field with two writers -- `USER` and IRCv3's
+ * `SETNAME` -- and the whole point of one predicate is that neither writer can
+ * drift from the other. See conn_realname_check(). */
+typedef enum {
+    CONN_REALNAME_OK = 0,
+    CONN_REALNAME_TOO_LONG = 1,
+    CONN_REALNAME_BAD_BYTE = 2
+} conn_realname_verdict_t;
+
+/* May `name` be stored in `conn_t::realname`? CONN_REALNAME_OK for yes.
+ *
+ * An EMPTY (or NULL) name is admissible: an empty realname is a legal state this
+ * node already renders, and a client clearing its own realname has to be able to
+ * say so. The two refusals are CONN_REALNAME_TOO_LONG (longer than
+ * CONN_MAX_REALNAME, which 005 advertises as NAMELEN) and CONN_REALNAME_BAD_BYTE
+ * (a C0 control or DEL -- the log-injection set; CR, LF and NUL cannot arrive
+ * because the parser refuses them first, but the rest can).
+ *
+ * Never truncates and never rewrites. The argument for both refusals is at the
+ * definition. */
+conn_realname_verdict_t conn_realname_check(const char *name);
+
 /* conn_t::account -- the second axis of scoped identity (2.1), added in Phase
  * 10.1.
  *

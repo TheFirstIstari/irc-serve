@@ -147,6 +147,13 @@ irc_add_integration_test(test_multi_prefix test_multi_prefix.c)
 # easy to skim past.
 irc_add_integration_test(test_userhost_in_names test_userhost_in_names.c)
 
+# setname (Phase 10.6), its own file for one reason: almost everything the
+# specification says about it is a REFUSAL -- before registration, without the
+# capability, over-long, hostile -- and a file whose cases are mostly "nothing
+# arrived, and the field did not change" reads very differently beside one whose
+# cases are all "this line is on the wire".
+irc_add_integration_test(test_setname test_setname.c)
+
 # 2.1 / 5: valid_nick() enforced at runtime. Phase 1 shipped the predicate with
 # no caller in src/, so this is the test that makes it load-bearing. Asserts the
 # RESPONSE, never that the function was called.

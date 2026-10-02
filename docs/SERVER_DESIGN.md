@@ -1048,6 +1048,72 @@ src/federation/link.c  peer sockets, handshake FSM driving, keepalive
 `WHO` `WHOIS` `ISON` `LIST` `AWAY` `INVITE` `MOTD` `LUSERS` `ADMIN` `INFO`
 `USERHOST` `KNOCK` `CHOPER`
 
+#### 4.2.1 `SETNAME` (Phase 10.6, IRCv3)
+
+`SETNAME :<realname>` changes `conn_t::realname` on a live connection. It is not in
+§4.1's MUST list or §4.2's SHOULD list because it is an **extension**, and adding it
+to either would put a document in a chain this project has been careful not to
+extend. Three gates, in order, and the order is the argument:
+
+1. **Registered.** `451` otherwise, and it is `pre_reg = 0` in the dispatch table so
+   the gate is the table's rule rather than a check in the handler. It has to be a
+   gate: a pre-registration connection has an *empty* realname, so without one a
+   `SETNAME` would "succeed" at setting state that does not exist yet.
+2. **The capability.** Refused **silently** — no reply, no change — which is the
+   specification's own instruction and the opposite of what every other capability
+   here does. A `FAIL SETNAME CANNOT_CHANGE_REALNAME` is what the specification asks
+   for and **`standard-replies` is a separate phase this node does not have**;
+   inventing a `FAIL` to stand in for it would put a command word on the wire that no
+   client on this node has been told to expect. Silence is a shape every client
+   already handles, and it is observable: nothing arrives, and nothing changes.
+3. **Validation**, through `conn_realname_check()` — the **same predicate
+   `handle_user()` runs**, which is what makes this not a looser path than
+   registration. A refusal is `417` and the previous realname is left exactly as it
+   was. It is **not truncated**: 3.2's rule, and the reason is that this value is
+   then shown to every member of every channel the user is on.
+
+**The predicate, and why there is one.** `conn_t::realname` has two writers and three
+readers (the extended-`JOIN` echo, `352`'s `<realname>`, and 4.3's `SBURSTN`). One
+function, called by both writers, is what makes "same validation" a property of the
+code rather than a claim about it. It refuses two things:
+
+- **over-long** — longer than `CONN_MAX_REALNAME`, which §4.4.1's `NAMELEN` advertises.
+  A truncated realname is one the user did not write, reported to third parties as
+  though it were theirs.
+- **a C0 control or DEL** — the log-injection set. `message_parse_n()` already
+  refuses CR, LF and NUL, but the rest get through, and a realname reaches this
+  node's own `printf("%s")` with no escaping. `0x07` rings the recipient's bell; ESC
+  followed by `[` is a CSI sequence any terminal executes, which is a channel member
+  rewriting an operator's screen. The test is `ch <= 0x1f || ch == 0x7f`, the same
+  rule `chan_name_valid()` already applies to a channel name. **TAB is inside that
+  range and is therefore refused too** — a TAB in a GECOS field is a rendering
+  accident rather than a name, and no current client sends one. That is the cost and
+  it is named rather than assumed.
+
+**Why `USER` behaves differently on length, on purpose.** `USER` *truncates* an
+over-long realname and *empties* a control-bearing one, where `SETNAME` refuses both.
+The asymmetry is about when the command arrives: `SETNAME` lands on a live
+connection where refusing costs nothing, while refusing `USER` would leave the client
+half-registered with no recovery but a reconnect — for a value no current client
+sends. Registration therefore completes with an empty realname, which is already a
+legal state here (`extended-join` renders it as a bare `:`), and the refusal is
+reported on the node's own output rather than being invisible.
+
+**What is NOT implemented, and it is the specification's MUST.** On success this node
+sends the server-to-client form
+
+```
+:nick!user@host SETNAME :<new realname>
+```
+
+to the **originating client**. It does **not** send it to the clients in common
+channels. `core/fanout.c`'s per-destination decision is a choice between two wire
+**shapes** — the `fanout_form_t` the extended `JOIN` introduced — and "send this
+member **nothing**" is a *third* outcome that the form cannot express. Adding it is
+a contract change to the routing module; the alternative, a second member walk
+inside a handler, is exactly the duplication `fanout.c` exists to prevent. So the
+limitation is named rather than faked (SPEC_TRACKING §10.5).
+
 ### 4.3 Server-to-server (internal, not client-facing)
 
 `FEDERATE` (link handshake — existing FSM) `SJOIN` `SPART` `SPRIVMSG` `SNOTICE`
@@ -2242,4 +2308,6 @@ Quality:
 | **The account store drifting from the credential store** (Phase 10.1) | a client authenticates and is not identified, or is identified for a name the operator removed | Both must agree or authentication stops (§2.5.1), the refusal is counted on `n_account_refused` and named on the node's own output, and `test_account.c` runs the not-identified path against a node whose two files **disagree** — byte-identical to a node with no registry at all |
 | **An `005` token this node does not honour** (Phase 10.4) | a client sizes a buffer from a bound nothing enforces, or switches on a feature this node has not implemented, and then behaves as though the server agreed — which is worse than the token's absence, because absence is a client that carries on | **Every token is derived from the constant that enforces it, and every absence is named with its reason (§4.4.2).** `k_005[]` renders each `*LEN` through `IRC_STR()` from the bound itself rather than writing it out, and `test_registration.c` asserts the whole `005` against **literals**, so raising a bound in another file fails the test unless `005` moved with it. The absences with a live feature behind them — `BOT`, `EXTBAN`, `SAFELIST`, `MONITOR`, `MSGREFTYPES`, `ACCEPT`, `silence`, `draft/CHATHISTORY` — are asserted **absent** on the wire, so adding one without implementing it fails a test |
 | **`userhost-in-names` disclosing hostmasks to the wrong client** (Phase 10.5) | every member's ident and host reach every other member of the channel, including clients that member has never spoken to — and there is no per-member consent anywhere in the capability | **The roster shape is decided per DESTINATION**, in `chan_verbs.c`'s `names_entry()`, for the connection being answered — so a client is shown the long form only if it negotiated it (§4.4.3). A node deciding once per channel would disclose to the whole channel on one client's request. A member the node cannot render a hostmask for gets the **bare nick**, not a `*` placeholder: inventing a half would put a byte on the wire that reads as part of a hostmask and means nothing |
+| **A realname stored without validation** (Phase 10.6) | an unbounded or under-validated realname is a memory-safety bug and a **log-injection vector** — the field reaches this node's own `printf("%s")` with no escaping, so `0x07` rings a recipient's bell and ESC `[` is a CSI sequence a terminal executes | **One predicate, two writers.** `conn_realname_check()` is called by *both* `handle_user()` and `handle_setname()`, so "SETNAME is not a looser path than registration" is a property of the code rather than a claim about it. It refuses over-long values and every C0 control and DEL; `message_parse_n()` refuses CR/LF/NUL ahead of it, and the test covers the rest. `SETNAME` refuses; `USER` empties rather than refusing, because refusing `USER` would strand a half-registered client — §4.2.1 argues it and the empty result is a legal state |
+| **`SETNAME` silently ignoring a client that did not negotiate** (Phase 10.6) | read as "the command does not exist" by a client that tried it anyway, which `setname` explicitly permits | **It is the specification's instruction**, and it is implemented rather than worked around: no reply, no change. A `FAIL SETNAME CANNOT_CHANGE_REALNAME` needs `standard-replies`, which this node does not have, and inventing a `FAIL` would put a command word on the wire no client here has been told to expect. The test asserts **exhaustively** — the drain `PONG` must be the only line in the window — because a list of absent numerics is not a test of silence (a `482` fault passed the first version of it) |
 | **`KICKLEN` has no bound to advertise** (Phase 10.4) | an over-long KICK reason is not refused with a numeric; it reaches `message_format()`, which refuses it as `unrepresentable` — a non-zero `n_reply_refused`, the counter `reply.c` holds at zero because a non-zero value of it is a bug report | **Reported, not fixed, and the reason is scope.** The fix is a reason bound plus a `417` in `handle_kick()`, which is a change to a command this pass did not touch. §4.4.2 states it; the honest mitigation today is that the node logs `reply_refused ... reason=unrepresentable` naming the command, so the condition is visible rather than silent |

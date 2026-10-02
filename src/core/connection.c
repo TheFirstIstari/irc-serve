@@ -266,3 +266,65 @@ size_t conn_hostmask(const conn_t *c, char *out, size_t cap)
     }
     return (size_t)n;
 }
+
+/* ---------------------------------------------------------------------------
+ * THE REALNAME VALIDATOR, and why it is ONE function for two callers
+ * ---------------------------------------------------------------------------
+ * `conn_t::realname` is written from two places and read from three: `USER`'s
+ * fourth parameter (handle_user()), IRCv3's `SETNAME` (handle_setname()), and
+ * rendered by `extended-join`'s trailing parameter, by `352`'s <realname> and by
+ * 4.3's SBURSTN. A field with two writers and three readers needs the writers to
+ * agree, and the alternative -- each caller deciding for itself -- is a second
+ * opinion about what may be stored, which is how the two come to disagree.
+ *
+ * SO: ONE predicate, called by both. That is what makes "SETNAME is not a looser
+ * path than USER" a property of the code rather than a claim about it -- a
+ * reviewer can read one function and know both writers ran it.
+ *
+ * ---------------------------------------------------------------------------
+ * THE TWO REFUSALS, AND WHY EACH EXISTS
+ * ---------------------------------------------------------------------------
+ *   TOO_LONG     3.2's "never deliver a silently shortened parameter". A truncated
+ *                realname is one the user did not write, and this node then shows it
+ *                to every member of every channel that person is on. 005 advertises
+ *                the bound as NAMELEN (Phase 10.4), so it is also the number a client
+ *                sizes its own buffer from; a server that stores a fifth of it is the
+ *                server that broke the promise.
+ *
+ *   BAD_BYTE     A realname reaches the node's own LOG, and it is the one
+ *                client-supplied free-text field with no escaping between the socket
+ *                and a printf("%s"). message_parse_n() refuses CR, LF and NUL
+ *                already, so the three that matter most cannot arrive; what CAN
+ *                arrive is every other C0 control and DEL. 0x07 rings the recipient's
+ *                terminal bell, and ESC followed by `[` is a CSI sequence any
+ *                terminal will execute -- which is a realname that rewrites the
+ *                operator's screen, from a channel member, into a log that other
+ *                tooling also reads.
+ *
+ *                The test is `ch <= 0x1f || ch == 0x7f`, and it is the SAME rule
+ *                `chan_name_valid()` already applies to a channel name (channel.c),
+ *                for the same reason. TAB is inside that range and is therefore
+ *                refused too; a realname is a GECOS field and a TAB in one is a
+ *                rendering accident rather than a name, and no current client sends
+ *                one. That is the cost, and it is named rather than assumed.
+ *
+ * NULL IS OK: an empty realname is a legal state (chan_verbs.c's extended-join
+ * comment says so, and renders it as a bare `:`), and a client that clears its own
+ * realname must be able to say so. */
+conn_realname_verdict_t conn_realname_check(const char *name)
+{
+    if (name == NULL) {
+        return CONN_REALNAME_OK;
+    }
+    if (strlen(name) > (size_t)CONN_MAX_REALNAME) {
+        return CONN_REALNAME_TOO_LONG;
+    }
+    for (size_t i = 0; name[i] != '\0'; i++) {
+        const unsigned char ch = (unsigned char)name[i];
+
+        if (ch <= 0x1fu || ch == 0x7fu) {
+            return CONN_REALNAME_BAD_BYTE;
+        }
+    }
+    return CONN_REALNAME_OK;
+}

@@ -36,7 +36,8 @@ enum {
     CAPBIT_ACCOUNT_TAG = 1u << 4,
     CAPBIT_ACCOUNT_NOTIFY = 1u << 5,
     CAPBIT_EXTENDED_JOIN = 1u << 6,
-    CAPBIT_USERHOST_IN_NAMES = 1u << 7
+    CAPBIT_USERHOST_IN_NAMES = 1u << 7,
+    CAPBIT_SETNAME = 1u << 8
 };
 
 /* THE BIT ORDER IS FIXED AND THE TABLE BELOW IS THE CLAIM.
@@ -66,7 +67,8 @@ static const cap_def_t k_caps[] = {
     { CAP_ACCOUNT_TAG, CAPBIT_ACCOUNT_TAG },
     { CAP_ACCOUNT_NOTIFY, CAPBIT_ACCOUNT_NOTIFY },
     { CAP_EXTENDED_JOIN, CAPBIT_EXTENDED_JOIN },
-    { CAP_USERHOST_IN_NAMES, CAPBIT_USERHOST_IN_NAMES }
+    { CAP_USERHOST_IN_NAMES, CAPBIT_USERHOST_IN_NAMES },
+    { CAP_SETNAME, CAPBIT_SETNAME }
 };
 
 static const size_t k_ncaps = sizeof k_caps / sizeof k_caps[0];
@@ -308,6 +310,18 @@ int cap_extended_join_enabled(const conn_t *c)
 int cap_userhost_in_names_enabled(const conn_t *c)
 {
     return cap_enabled(c, CAP_USERHOST_IN_NAMES);
+}
+
+/* setname: ONE GATE, and the asymmetry that the NAME is advertised while this
+ * gates is the specification's rather than this file's -- the command has to work
+ * whether or not the client negotiated it, and a non-negotiating client's SETNAME
+ * is handled SILENTLY. So the name is in `k_caps[]` (the verb exists) and this
+ * decides whether this connection's SETNAME changes anything or produces no line at
+ * all. See cap.h for why a silent refusal is the specified behaviour rather than a
+ * gap in this implementation. */
+int cap_setname_enabled(const conn_t *c)
+{
+    return cap_enabled(c, CAP_SETNAME);
 }
 
 /* --------------------------------------------------------------------------

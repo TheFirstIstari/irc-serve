@@ -634,13 +634,55 @@ static void handle_user(server_t *s, conn_t *c, const message_t *m)
 {
     int trunc_user = 0;
     int trunc_real = 0;
+    conn_realname_verdict_t v;
 
     if (m->nparams < 4) {
         (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
         return;
     }
     copy_field(c->user, sizeof c->user, m->params[0], &trunc_user);
-    copy_field(c->realname, sizeof c->realname, m->params[3], &trunc_real);
+    /* THE REALNAME IS CHECKED BY THE SAME PREDICATE `SETNAME` USES, and it is
+     * checked BEFORE the field is written rather than after, so a refused value is
+     * never briefly stored. conn_realname_check()'s argument is at its definition;
+     * what is decided here is what happens when it says no, and the decision is not
+     * "truncate".
+     *
+     * A realname carrying a C0 control is LEFT EMPTY rather than refused, and the
+     * asymmetry with SETNAME is deliberate rather than an inconsistency:
+     *
+     *   - SETNAME arrives on an already-REGISTERED connection, where refusing leaves
+     *     the connection usable and the previous value in place -- 417 and nothing
+     *     changes.
+     *   - USER arrives BEFORE registration completes. Refusing it would leave the
+     *     client half-registered with no way to recover except reconnecting, for a
+     *     value no current client sends (a realname containing ESC or BEL is a
+     *     rendering accident, and CR/LF/NUL cannot reach here at all because the
+     *     parser refuses them first). So the registration is allowed to complete
+     *     with an EMPTY realname, which is already a legal state in this node --
+     *     `extended-join` renders it as a bare `:`, and the comment there says a
+     *     client that sent none has an empty realname "which is a fact about the
+     *     client rather than a limit this node imposes".
+     *
+     * IT IS REPORTED, because the failure is otherwise invisible: the only
+     * observable difference between "the client sent nothing" and "the client sent
+     * something this node threw away" would be a realname that is missing from
+     * every later roster, which is exactly the kind of discrepancy 3.4's observable
+     * output exists to make findable.
+     *
+     * LENGTH IS STILL TRUNCATED HERE and refused by SETNAME, and that difference is
+     * the same argument from the other side: 3.2's rule against a silently shortened
+     * parameter is about a value the node then REPORTS as the user's, and at
+     * registration the alternative is a stranded connection. copy_field() says so
+     * at its own definition and the truncation is announced rather than silent. */
+    v = conn_realname_check(m->params[3]);
+    if (v == CONN_REALNAME_BAD_BYTE) {
+        printf("[observable] realname_refused: fd=%d nick=%s verb=USER "
+               "reason=BAD_BYTE len=%zu\n",
+               c->fd, c->nick, strlen(m->params[3]));
+        c->realname[0] = '\0';
+    } else {
+        copy_field(c->realname, sizeof c->realname, m->params[3], &trunc_real);
+    }
     printf("[observable] user: fd=%d user=%s realname_trunc=%d "
            "asserted_host=%s host=%s host_source=observed\n",
            c->fd, c->user, trunc_real, m->params[2], c->host);
@@ -648,6 +690,121 @@ static void handle_user(server_t *s, conn_t *c, const message_t *m)
         printf("[observable] field_truncated: fd=%d field=user\n", c->fd);
     }
     update_state(s, c);
+}
+
+/* ---------------------------------------------------------------------------
+ * SETNAME -- IRCv3's `setname`, and the three gates in front of it
+ * ---------------------------------------------------------------------------
+ * `SETNAME :<realname>` changes `conn_t::realname` on a live connection. Three
+ * gates, in this order, and the order is the argument:
+ *
+ *   1. REGISTERED. 451 if not. Not `pre_reg` in k_commands[], so this is answered
+ *      by the dispatch table's own rule rather than here -- and it has to be a gate
+ *      rather than an accident of the field being empty, because a pre-registration
+ *      connection HAS an empty realname and would otherwise "succeed" at setting it
+ *      to something, which is a command acting on state that does not exist yet.
+ *
+ *   2. THE CAPABILITY. Refused SILENTLY, with no reply and no change.
+ *
+ *      This is the specification's own instruction and it is the opposite of what
+ *      every other capability in cap.h does, so it is worth being explicit: `setname`
+ *      says a server MUST support the command even while the capability is not
+ *      negotiated, and that a SETNAME from a client which did not negotiate it
+ *      SHOULD be handled silently. "Silently" IS the refusal -- nothing arrives and
+ *      nothing changes -- and it is observable, because a protocol test can assert
+ *      that nothing arrived.
+ *
+ *      A NUMERIC HERE WOULD BE WRONG, not merely different. The specification asks
+ *      for `FAIL SETNAME CANNOT_CHANGE_REALNAME`, and `standard-replies` is a
+ *      separate phase this node does not have; inventing a `FAIL` to stand in for
+ *      it would put a command word on the wire that no client on this node has ever
+ *      been told to expect. Silence is a shape every client already handles.
+ *
+ *   3. VALIDATION, through conn_realname_check() -- the SAME predicate handle_user()
+ *      runs, which is what makes this not a looser path than registration. A
+ *      refusal is 417 and the previous realname is left exactly as it was. It is
+ *      NOT truncated: 3.2's rule, and the reason is that this value is then shown
+ *      to every member of every channel the user is on as though it were theirs.
+ *
+ * THE CONFIRMATION. On success this node sends the server-to-client form back to
+ * the originating client:
+ *
+ *     :nick!user@host SETNAME :<new realname>
+ *
+ * which is the specification's MUST for "to all clients in common channels, as well
+ * as to the client from which it originated" -- PARTIALLY. The originating client
+ * gets it; **the common-channel fan-out does not happen**, and that is a named
+ * limit rather than an oversight. `core/fanout.c`'s per-destination decision is a
+ * choice between two wire SHAPES (the `fanout_form_t` the extended JOIN
+ * introduced), and "send this member NOTHING" is a THIRD outcome that the form
+ * cannot express; adding it is a contract change to the routing module, and the
+ * alternative -- a second member walk inside a handler -- is the exact duplication
+ * fanout.c exists to prevent. So the originating client is told, and a member of a
+ * shared channel is not. SPEC_TRACKING 10.5 records it.
+ *
+ * THE PREFIX IS THE ACTING CLIENT'S OWN HOSTMASK, which is the specification's
+ * server-to-client shape and is also what makes the line trustworthy: it names who
+ * changed, and `conn_hostmask()` renders it from the fields §2.1 owns (including the
+ * OBSERVED host, which USER does not touch). */
+static void handle_setname(server_t *s, conn_t *c, const message_t *m)
+{
+    conn_realname_verdict_t v;
+    char prefix[CONN_HOSTMASK_MAX];
+    const char *params[1];
+
+    /* Arity before anything else, and the gate order above says why: a malformed
+     * command from a client that cannot use it is answered 461 rather than
+     * silently, because 461 is the shape the specification's own "handle silently"
+     * does NOT apply to -- silence is for a well-formed SETNAME, not for a missing
+     * parameter. */
+    if (m->nparams != 1) {
+        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        printf("[observable] setname_refused: fd=%d nick=%s reason=ARITY nparams=%d\n",
+               c->fd, c->nick, m->nparams);
+        return;
+    }
+    if (cap_setname_enabled(c) == 0) {
+        /* THE SILENT REFUSAL. No reply, no change, and the only trace is this line,
+         * which is the same observable output every other refusal in this file uses.
+         * It is deliberately NOT a 417 and NOT a 482: a client that did not ask for
+         * `setname` has not done anything wrong, and the specification asks for
+         * silence rather than for an error a client cannot act on. */
+        printf("[observable] setname_ignored: fd=%d nick=%s "
+               "reason=NOT_NEGOTIATED len=%zu\n",
+               c->fd, c->nick, strlen(m->params[0]));
+        return;
+    }
+    v = conn_realname_check(m->params[0]);
+    if (v != CONN_REALNAME_OK) {
+        (void)reply(s, c, "417", NULL, 0, "Realname is not acceptable");
+        printf("[observable] setname_refused: fd=%d nick=%s reason=%s len=%zu "
+               "max=%d\n",
+               c->fd, c->nick,
+               (v == CONN_REALNAME_TOO_LONG) ? "TOO_LONG" : "BAD_BYTE",
+               strlen(m->params[0]), CONN_MAX_REALNAME);
+        return;
+    }
+    /* NOT copy_field(), and the difference is the point of gate 3. copy_field()
+     * truncates; this must not, because the stored value is one this node will
+     * report to third parties. The length has just been checked against
+     * CONN_MAX_REALNAME, which is sizeof(conn_t::realname) - 1, so this copy
+     * cannot truncate -- and it is written out rather than delegated so that a
+     * future change to the bound cannot silently reintroduce the truncation
+     * through the helper. */
+    memcpy(c->realname, m->params[0], strlen(m->params[0]) + 1u);
+    if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
+        /* The value is already stored at this point, because the check happened
+         * first and the store is unconditional once it passed. A connection whose
+         * hostmask will not render is a bug report rather than a refusal, and the
+         * honest outcome is that the change happened and could not be confirmed. */
+        printf("[observable] setname_unconfirmed: fd=%d nick=%s reason=UNRENDERABLE\n",
+               c->fd, c->nick);
+        return;
+    }
+    params[0] = c->realname;
+    (void)send_line(s, c, prefix, "SETNAME", params, 1);
+    printf("[observable] setname: fd=%d nick=%s len=%zu\n", c->fd, c->nick,
+           strlen(c->realname));
 }
 
 /* PING. Legal before registration, like every liveness probe: a client that
@@ -1581,6 +1738,14 @@ static const command_t k_commands[] = {
      * the whole of what a refusal is, and 421 cannot express it. */
     { "REGISTER",   handle_register,   0 },
     { "UNREGISTER", handle_unregister, 0 },
+    /* 7/Phase 10.6: IRCv3's `setname`. NOT `pre_reg`, which is gate 1 of the three
+     * in handle_setname() -- an unregistered connection has an EMPTY realname, so
+     * without the gate a SETNAME would "succeed" at setting state that does not
+     * exist yet. The verb is IN the table even though the capability gates what it
+     * does, because the specification requires the command to be supported whether
+     * or not the client negotiated it: a client that sent SETNAME and got 421 would
+     * read "this server has never heard of it". */
+    { "SETNAME",    handle_setname,    0 },
     /* 7/Phase 10.2b: the account-notify query. NOT `pre_reg`, because the answer
      * carries this connection's hostmask and a pre-registration connection has no
      * nickname to put in it -- an unregistered client sending ACCOUNT gets 451,
