@@ -775,7 +775,7 @@ static void test_logged_in(const char *sasl, const char *registry)
                         " CAP * LS :multi-prefix message-tags draft/message-ids "
                         "sasl account-tag account-notify "
                         "extended-join userhost-in-names setname echo-message "
-                        "standard-replies away-notify batch labeled-response\r\n") != NULL,
+                        "standard-replies away-notify batch labeled-response invite-notify\r\n") != NULL,
                  "the advertised list on a node with BOTH stores is not the whole set "
                  "of capabilities this node implements: %s", tc_buffer(&alice.c));
 
@@ -879,7 +879,7 @@ static void test_no_registry(const char *sasl, const char *label)
                         " CAP " "alice" " LS :multi-prefix message-tags "
                         "draft/message-ids sasl account-notify "
                         "extended-join userhost-in-names setname echo-message "
-                        "standard-replies away-notify batch labeled-response\r\n") != NULL,
+                        "standard-replies away-notify batch labeled-response invite-notify\r\n") != NULL,
                  "%s: the advertised list on a node with a credential store and "
                  "NO registry is not exactly the whole set it really "
                  "has; a client would read an account-tag here as an identity it "
@@ -990,7 +990,7 @@ static void test_default_node(void)
                               "draft/message-ids account-notify "
                               "extended-join userhost-in-names setname "
                               "echo-message standard-replies "
-                              "away-notify batch labeled-response") == 0,
+                              "away-notify batch labeled-response invite-notify") == 0,
                  "the advertised capability list on a node with no stores is "
                  "\"%s\"; it must be exactly the ones that need no "
                  "configuration", caps);

@@ -163,6 +163,7 @@
 #define CAP_AWAY_NOTIFY "away-notify"
 #define CAP_BATCH "batch"
 #define CAP_LABELED_RESPONSE "labeled-response"
+#define CAP_INVITE_NOTIFY "invite-notify"
 
 /* 410 ERR_INVALIDCAPSUBCOMMAND. Not in design 4.4's numeric list, which is a gap
  * in the list rather than in the protocol, for the same reason 301, 303, 417,
@@ -546,6 +547,42 @@ int cap_gate_setname(const conn_t *dst, void *ctx);
  * separate capability this node advertises unconditionally, and the only thing
  * conditional here is whether the CLIENT negotiated this one. */
 int cap_labeled_response_enabled(const conn_t *c);
+
+/* invite-notify: whether this node tells THIS client, unprompted, that somebody was
+ * invited to a channel they are on.
+ *
+ * THE AUDIENCE IS THE CHANNEL AND NOT THE INVITEE, and that is worth stating because
+ * the specification is easy to misread as being about the invitee. It says: "allows a
+ * client to specify that it would like to be notified when users are invited to
+ * channels", and the format is `:<inviter> INVITE <target> <channel>` -- the SOURCE is
+ * the inviter and the message is about a third party (the target) doing something to a
+ * channel the recipient is on. RFC 2812 3.3.6's own rule is that "Other channel members
+ * SHOULD NOT be notified"; this capability is the opt-in that permits it. Nothing here
+ * concerns the invitee's connections, and the set of a user's OTHER connections is a
+ * bouncer-shaped question this node does not have: exactly one connection may hold a
+ * nickname, because the nick registry refuses a second with `433`.
+ *
+ * IT IS ASKED ABOUT THE DESTINATION, like every notification on this node, and for the
+ * same reason: an unsolicited line is an assertion about a USER, so what reaches a
+ * connection is a fact about that connection. The specification also says "The server is
+ * not required to send the INVITE message ... to all clients supporting this capability
+ * on a channel" and names a narrower audience as a permitted choice; this node's choice
+ * is the one the capability names -- every member of the channel that negotiated it.
+ *
+ * NO AVAILABILITY CHECK, and there is nothing to check: the invitation is an event this
+ * node produces whenever a channel operator issues an `INVITE`, and a node that
+ * advertised the name and then sent nothing would be a client waiting for a message that
+ * never comes.
+ */
+int cap_invite_notify_enabled(const conn_t *c);
+
+/* The same predicate in `fanout.h`'s `fanout_gate_fn` shape, for the same reason
+ * `cap_gate_away_notify()` and `cap_gate_setname()` exist: the adaptation between this
+ * file's one-argument predicates and the gate's two-argument signature lives in ONE place
+ * so that "every capability predicate here is one-argument, and the gate that adapts
+ * them is this" stays a single readable claim. */
+int cap_gate_invite_notify(const conn_t *dst, void *ctx);
+
 
 
 

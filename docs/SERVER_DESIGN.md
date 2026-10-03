@@ -1893,6 +1893,72 @@ the splitting of one command into several — the framing this depends on **is**
 `TAGMSG` labelled echo; and the `bouncer` routing considerations, which are non-normative
 and are about a bouncer this node is not.
 
+#### 4.4.9 `invite-notify`, and the audience the brief got wrong
+
+Phase 10.14 implements IRCv3's `invite-notify`. **The pass plan described it as "INVITE
+reaching a client's other connections", and that is a bouncer-shaped reading of a
+specification that says something else** — so the correction is part of the deliverable
+rather than a footnote.
+
+**THE AUDIENCE IS THE CHANNEL.** The specification: the capability "allows a client to
+specify that it would like to be notified when users are invited to channels", and the
+message is
+
+```
+:<inviter> INVITE <target> <channel>
+```
+
+— the **source** is the inviter, the **target** is a third party, and the recipient has to
+be *on the channel*. RFC 2812 3.3.6's own rule is "Other channel members SHOULD NOT be
+notified", and this capability is precisely the opt-in that lets a client say it wants
+them. Nothing in it concerns the invitee's connections.
+
+**THE OTHER-CONNECTIONS READING IS VACUOUS ON THIS NODE, AND THAT IS A FACT ABOUT THE
+NODE, NOT ABOUT THE SPECIFICATION.** Exactly one connection may hold a nickname — the nick
+registry refuses a second with `433` — so the set of a user's other connections is empty by
+construction and the reading would be satisfied without a line of code. `cap.h` says so at
+the predicate and `test_invite_notify.c` asserts the `433`, so a future phase adding
+multi-connection support would trip a test rather than silently make a second reading
+meaningful.
+
+**THE GATE IS THE RECIPIENT'S**, for the same reason every notification on this node is
+gated on the destination: an unsolicited line is an assertion about a third party, and the
+specification's whole purpose is to be the opt-in that permits it. The specification also
+says "The server is not required to send the INVITE message … to all clients supporting
+this capability on a channel", so a narrower audience is permitted — this node's choice is
+the one the capability names.
+
+**THE INVITER IS EXCLUDED AND IT IS `exclude`, NOT THE GATE.** The inviter negotiated the
+capability, so the gate would have let it through; the `341 RPL_INVITING` above **is** the
+inviter's answer, and the specification's own phrase is "when *another* client does an
+/INVITE". One line per event, to the audience it is for.
+
+**IT GOES THROUGH `fanout_deliver_union_local_gated()` WITH A ONE-ELEMENT LIST, and the
+reason is the parameter ORDER.** 3.1's row prepends the resolved target, so a
+channel-addressed emission renders `:inv!u@h INVITE #chan <target>` — and this
+specification's grammar is the other way round. The first version did exactly that, and the
+line on the wire was `:in_op!in_op@… INVITE #I in_g #I`. The union entry point's contract is
+about the **audience** — "the local members of these channels, each written once, with no
+target prepended" — and a one-element list of one channel is exactly the members of that
+channel, with the de-duplication inside the walk a no-op.
+
+**That makes three notification shapes on this node and they differ, which is the finding:**
+
+| specification | line | entry point | why |
+|---|---|---|---|
+| `away-notify` | `:nick!u@h AWAY #chan :message` | `fanout_deliver_local_gated()`, per channel | target-first **by coincidence** — the grammar happens to match 3.1's row |
+| `invite-notify` | `:inv!u@h INVITE <target> #chan` | `fanout_deliver_union_local_gated()`, one channel | grammar is the **opposite** of 3.1's row |
+| `setname` | `:nick!u@h SETNAME :<realname>` | `fanout_deliver_union_local_gated()`, `c->chans` | grammar names **no** channel at all |
+
+`away-notify` is not the general case and the other two are not exceptions to it: in two
+cases out of three the emission's grammar and the routing table's row disagree about where
+the channel goes.
+
+**NOT FORWARDED**, for `notify_away()`'s reason — an originating emission, and the local-only
+path has no forward arm. And here the cost is *louder* than away-notify's: 4.3's frozen
+verb table has **no S-verb for an invitation at all**, so there is nothing to add even in
+principle without a wire-format change (§6 forbids inventing one).
+
 #### 4.4.6 `462 ERR_ALREADYREGISTRED`, and the second `USER`
 
 Phase 10.10 closes the defect §9's risk row recorded: `handle_user()` wrote
