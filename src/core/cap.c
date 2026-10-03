@@ -40,7 +40,8 @@ enum {
     CAPBIT_SETNAME = 1u << 8,
     CAPBIT_ECHO_MESSAGE = 1u << 9,
     CAPBIT_STANDARD_REPLIES = 1u << 10,
-    CAPBIT_AWAY_NOTIFY = 1u << 11
+    CAPBIT_AWAY_NOTIFY = 1u << 11,
+    CAPBIT_BATCH = 1u << 12
 };
 
 /* THE BIT ORDER IS FIXED AND THE TABLE BELOW IS THE CLAIM.
@@ -74,7 +75,8 @@ static const cap_def_t k_caps[] = {
     { CAP_SETNAME, CAPBIT_SETNAME },
     { CAP_ECHO_MESSAGE, CAPBIT_ECHO_MESSAGE },
     { CAP_STANDARD_REPLIES, CAPBIT_STANDARD_REPLIES },
-    { CAP_AWAY_NOTIFY, CAPBIT_AWAY_NOTIFY }
+    { CAP_AWAY_NOTIFY, CAPBIT_AWAY_NOTIFY },
+    { CAP_BATCH, CAPBIT_BATCH }
 };
 
 static const size_t k_ncaps = sizeof k_caps / sizeof k_caps[0];

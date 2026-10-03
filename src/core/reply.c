@@ -23,6 +23,20 @@
 
 #include "core/message.h"
 #include "core/cap.h"
+#include "core/batch.h"
+#include "core/fanout.h"
+
+/* THE MERGED BUFFER'S ARITHMETIC, in three named pieces so that raising any bound
+ * moves it rather than silently overflowing:
+ *
+ *   BATCH_TAG_MAX         one `batch=<ref>` pair INCLUDING its NUL -- the key, the
+ *                         '=', and the widest reference CONN_MAX_BATCH_REF admits
+ *   1u                    the ';' that joins it to whatever the caller already had
+ *   FANOUT_TAG_BLOCK_MAX  that whatever: the `msgid`/`account` block fanout.c renders
+ *
+ * The whole of this is one line, and it is here rather than beside the buffer because
+ * the first version of this file sized the CALLER's `bref` at CONN_MAX_BATCH_REF + 1
+ * and dropped the tag at the boundary -- see BATCH_TAG_MAX's own comment. */
 
 /* ---------------------------------------------------------------------------
  * Refusals
@@ -89,8 +103,71 @@ static int emit_built_ex(server_t *s, conn_t *c, const char *code,
      * message_format() reserves one byte for a NUL, so the render buffer needs
      * two more than that to hold a maximal line plus its CRLF. */
     char line[IRC_MAX_LINE + 2];
+    /* The batch tag is PREPENDED to whatever tag block the caller already had, so
+     * the merged form has to be a buffer rather than an in-place edit: a `msgid` and
+     * an `account` block are rendered by fanout.c into a per-destination buffer that
+     * is about to be freed, and "insert 71 bytes at the front of that" is not
+     * something this function may do to a pointer it does not own.
+     *
+     * SIZED FROM THE TWO THINGS IT CAN HOLD. BATCH_TAG_KEY_MAX is
+     * "batch=" (6) plus CONN_MAX_BATCH_REF; BATCH_TAG_SEP is the ';' that joins two
+     * pairs; and the caller's own block is bounded by FANOUT_TAG_BLOCK_MAX, which is
+     * the buffer fanout.c sizes. If a future caller of send_line_tagged() had a
+     * larger block, this buffer would be the thing that has to move with it -- which
+     * is why the size is written as an arithmetic expression over named pieces
+     * rather than as a literal that looks generous. */
+    char merged[FANOUT_TAG_BLOCK_MAX + BATCH_TAG_MAX + 1u];
     size_t len;
 
+    /* ------------------------------------------------------------------------
+     * `batch=<ref>` -- THE ONE PLACE A CLIENT-VISIBLE TAG IS ADDED
+     * ------------------------------------------------------------------------
+     * IT IS HERE AND NOT IN EACH EMITTER, and the reason is the one reply.c was
+     * written for: this is the ONE place an outbound message to a client is built and
+     * queued, so a `batch=` tag applied here is applied to a numeric, to a `353`, to a
+     * `SETNAME` confirmation and to a `msgid`-stamped fan-out line alike. Applied at
+     * the emitters, it would be applied to whichever emitters somebody remembered and
+     * silently absent from the rest — and a client that opened a batch and then had
+     * the numerics escape it would see a batch with holes in it.
+     *
+     * IT IS PREPENDED, so the order in the block is `batch` then whatever came next.
+     * Tag order is not semantically meaningful in IRCv3 and nothing parses it, so
+     * this is a readability choice: `batch=` first is the tag a reader is looking for.
+     */
+    if (c != NULL && c->kind != CONN_SERVER) {
+        char bref[BATCH_TAG_MAX];
+
+        if (batch_line_tag(c, bref, sizeof bref) == 1) {
+            /* NO "batch=" PREFIX HERE. `batch_line_tag()` writes the WHOLE pair --
+             * key, '=', value -- because batch.h says so and because a caller that
+             * had to know the key name would be a second place to get it wrong. The
+             * buffer's arithmetic is still in terms of the key, which is why
+             * BATCH_TAG_KEY_MAX is a piece of that expression. */
+            int n = snprintf(merged, sizeof merged, "%s", bref);
+
+            if (n > 0 && (size_t)n < sizeof merged) {
+                if (tags != NULL && tags[0] != '\0') {
+                    int k = snprintf(merged + n, sizeof merged - (size_t)n, ";%s",
+                                     tags);
+
+                    if (k > 0 && (size_t)(n + k) < sizeof merged) {
+                        tags = merged;
+                    }
+                    /* ELSE the merged block does not fit and `tags` is LEFT ALONE,
+                     * which drops the `batch=` tag rather than the line. That is the
+                     * deliberate choice, and it is the one reply.c's own header
+                     * already makes about an oversized tag: the alternative is a
+                     * refusal counted on n_reply_refused, the counter this project
+                     * holds at zero because a non-zero value of it is a bug report.
+                     * The buffer cannot in fact overflow -- see the arithmetic on its
+                     * declaration -- so this arm is unreachable today and is written
+                     * to be safe rather than to be believed. */
+                } else {
+                    tags = merged;
+                }
+            }
+        }
+    }
     if (message_build(&m, tags, (prefix != NULL) ? prefix : s->name, code,
                       params, nparams) != 0) {
         return refuse(s, c, code, "unbuildable");

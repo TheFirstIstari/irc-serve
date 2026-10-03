@@ -3,6 +3,7 @@
  * both a client line and a peer line arrive at.
  */
 #include "core/commands.h"
+#include "core/batch.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -1989,6 +1990,13 @@ static const command_t k_commands[] = {
      * or not the client negotiated it: a client that sent SETNAME and got 421 would
      * read "this server has never heard of it". */
     { "SETNAME",    handle_setname,    0 },
+    /* 7/Phase 10.12: IRCv3 `batch`. `pre_reg`, and that is a decision worth the
+     * comment: a client that batches its OWN registration lines is legal -- the
+     * reference tags are a property of any command -- and holding the gate closed
+     * until `001` would mean the `001`-`005` burst escaped the batch a client had
+     * legitimately opened around it. The batch state is per connection and lives in
+     * conn_t, so nothing here can reach another client's. */
+    { "BATCH",      handle_batch,      1 },
     /* 7/Phase 10.2b: the account-notify query. NOT `pre_reg`, because the answer
      * carries this connection's hostmask and a pre-registration connection has no
      * nickname to put in it -- an unregistered client sending ACCOUNT gets 451,
@@ -2089,5 +2097,24 @@ void commands_dispatch(server_t *s, conn_t *c, const message_t *m)
         return;
     }
 
+    /* THE `batch` HOOK, AND WHY IT BRACKETS THE HANDLER RATHER THAN PRECEDING IT.
+     *
+     * `batch_begin_command()` is what turns an inbound line's `@`/`+` reference tags
+     * into two things this dispatch then makes true: a `batch=` tag on the response
+     * (a one-shot, consumed by the reply path) and a SUPPRESSION that lasts exactly as
+     * long as the command. Both have to be set BEFORE `cmd->fn` runs -- a handler's
+     * first byte of output is already too late for the first, and the second would be
+     * cleared by `batch_end_command()` before it was ever set.
+     *
+     * AND `batch_end_command()` IS NOT OPTIONAL ON ANY PATH, which is why it is after
+     * the call rather than inside an error branch: a suppressed flag that survived a
+     * command would swallow the NEXT command's replies too, and the symptom would be
+     * a client that goes silent for no reason it can see. There is exactly one exit
+     * from `cmd->fn()` that is not a `return`, because every handler returns.
+     *
+     * IT IS HERE AND NOT IN reply.c, because reply.c cannot know when a command
+     * starts: it only sees outbound lines, and "which of them is the FIRST line of
+     * this command's response" is not a property of any one of them. */
+    batch_begin_command(c, m);
     cmd->fn(s, c, m);
 }

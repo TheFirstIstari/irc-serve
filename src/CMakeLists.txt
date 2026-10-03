@@ -41,6 +41,13 @@ add_library(irc_core STATIC
   core/cap.c
   core/chan_verbs.c
   core/msg_verbs.c
+  # Phase 10.12: IRCv3 `batch`, the client-facing half -- the BATCH verb and the
+  # `@`/`+` reference tags. It is a module of its own for the reason cap.c is: the
+  # per-connection batch state is read in THREE places that must agree
+  # (commands.c's dispatch, reply.c's single queueing site, and the verb table),
+  # and a decision any two of them have to reach into separately is a decision they
+  # will eventually disagree about.
+  core/batch.c
   # Phase 6. federation/ is a DIRECTORY of its own rather than more core/*.c,
   # because the split that matters in this phase is not "core versus
   # federation" but "encode versus decode": verbs.c is the outbound half of

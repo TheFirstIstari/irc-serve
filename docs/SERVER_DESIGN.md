@@ -1745,6 +1745,90 @@ a symptom.
 
 #### 4.4.5 `userhost-in-names`, and the disclosure it makes
 
+#### 4.4.7 `batch`, and the reference tag the parser cannot preserve
+
+Phase 10.12 implements IRCv3's `batch` framing in **both** directions and the
+`client-batch` extension's client-to-server half. Four decisions, and two of them are
+findings rather than choices.
+
+**THE ORDER WAS CHOSEN AGAINST THE PASS PLAN, and the specification is why.**
+`labeled-response`'s own dependency line reads "This specification depends on the `batch`
+capability which MUST be negotiated to use labeled responses", and its multi-line rule
+reads "If a response consists of more than one message, a batch MUST be used to group
+them into a single logical response." So `batch` landed **first**: shipping
+`labeled-response` first would have shipped the single-line case and left the case the
+specification's own example is — a four-line `WHOIS` — as a named gap in a specification
+whose central requirement is grouping.
+
+**ONE OPEN BATCH PER CONNECTION, refused rather than re-opened.** A second `BATCH +`
+while one is open is `462` and **the open batch is left alone**. The alternative —
+closing it — is not a transaction this node performs: the client's own reference
+accounting is what would break, and silently closing a batch it believes is open makes
+every subsequent line's `batch=` tag wrong in a way the client cannot detect. The same
+argument is why `BATCH -ref` with a **mismatched** reference is refused and leaves the
+batch open, and why the match is `strcmp()` and not `strcasecmp()`: the specification
+says a reference tag "MUST be case-sensitive".
+
+**`INVALID_REFTAG` IS `client-batch`'s OWN `FAIL` CODE, and it is per destination.**
+`client-batch` says servers "MUST use `FAIL` messages from the standard replies
+framework", and defines `INVALID_REFTAG <reference-tag>`. `reply_refused()` is what makes
+that per destination: a client that negotiated `standard-replies` reads
+`FAIL BATCH INVALID_REFTAG` and one that did not reads the byte-identical legacy `417`.
+The refusals `client-batch` does **not** define — a second open batch, a mismatched
+close, a `BATCH` inside a batch — use a borrowed `462` with the reason in the text, and
+the cost of borrowing is named at `handle_batch()`: RFC 2812 has no numeric for "you
+already have one of those", and the alternatives are silence for a refused command or a
+new numeric, both of which §4.4 and §6 forbid.
+
+**`UNKNOWN_TYPE` IS NOT SENT, and `TIMEOUT` HAS NO PRODUCER.** `client-batch` says it
+"does not introduce any client-to-server batch type, but is designed as a framework for
+other specifications", and its `UNKNOWN_TYPE` remedy is that "all past and future
+messages in this batch will be ignored". **This node's framing is type-agnostic** — a
+batch here means "tag the lines this connection sends", true whatever the type is called
+— so there is no type it handles differently and **nothing to ignore**. The cost is named:
+a client opening a `draft/multiline` batch is accepted and its lines arrive as ordinary
+commands with no concatenation and no `max-bytes`/`max-lines` accounting, and is not told.
+For `draft/multiline` specifically the observable result is the same either way. `TIMEOUT`
+defines a code and **no duration**, and a batch's age is per-connection state this node
+does not track; it joins `WARN` and `NOTE` as a code with no producer (§4.4.3).
+
+**THE `batch=` TAG IS APPLIED IN ONE PLACE, AND IT IS `reply.c`.** This is the one
+enforcement point the whole reply path was built around, so a tag applied here reaches a
+numeric, a `353`, a `SETNAME` confirmation and a `msgid`-stamped fan-out line alike.
+Applied at the emitters it would reach whichever emitters somebody remembered. It is
+**prepended** to whatever tag block the caller already had, which is why
+`FANOUT_TAG_BLOCK_MAX` moved from `fanout.c` into `fanout.h`: a module that *writes* a
+client-visible tag and a module that *renders* one have to agree on how wide one is, and
+the only honest way to arrange that is one declaration both can see.
+
+**THE `@<ref>` DROP FORM IS NOT IMPLEMENTED, and this is the finding.** The retired
+`client-tags/reference-tags` specification defined `@<ref>` as "send the response
+nowhere" beside `+<ref>`. `@` is the tag-block **marker**, and `message_parse_n()`
+consumes exactly one of them. Both candidate spellings were run against this node's
+parser rather than reasoned about:
+
+| on the wire | what this node's parser does |
+|---|---|
+| `@ref WHOIS bob` | parses; `m->tags` is `ref` — a **valueless tag**, indistinguishable |
+| `@@ref WHOIS bob` | **`message_parse_n()` refuses the line outright** |
+| `@+ref WHOIS bob` | parses; `m->tags` is `+ref` — the sigil survives |
+
+There is no third spelling. The drop form has no encoding a conformant parser
+preserves, and making one would mean changing what the framing layer keeps — which §3.2
+owns and which every peer line depends on. So `+<ref>` is implemented, which is also the
+sigil the modern grammar keeps *inside* the key (`<key> ::= [ <client_prefix> ] ...`,
+`client_prefix ::= '+'`), and the drop form is recorded as not implemented rather than
+approximated. `conn_t` carries **no** field for it and says so.
+
+**TWO BOUNDS, AND THE FIRST VERSION OF THIS SHIPPED ONE OF THEM AS A BUG.**
+`CONN_MAX_BATCH_REF` (64) bounds how long a reference may **be**; `BATCH_TAG_MAX` bounds
+how many bytes a written `batch=<ref>` pair may occupy, including the key. The first
+`reply.c` sized its buffer at `CONN_MAX_BATCH_REF + 1`, a 64-byte reference produced a
+71-byte tag, `snprintf()` reported a truncation, `batch_line_tag()` returned 0, and the
+tag was **silently dropped for exactly the references at the boundary**. The test is
+64-accepted / 65-refused, and the 64 half is there because a bound tested only below its
+own edge passes.
+
 #### 4.4.6 `462 ERR_ALREADYREGISTRED`, and the second `USER`
 
 Phase 10.10 closes the defect §9's risk row recorded: `handle_user()` wrote

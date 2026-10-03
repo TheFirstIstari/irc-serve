@@ -402,21 +402,11 @@ int fanout_is_member(const fanout_target_t *t, const conn_t *c)
     return (t->chan != NULL && chan_find_member(t->chan, c) != NULL) ? 1 : 0;
 }
 
-/* The worst-case CLIENT-VISIBLE tag block for one destination, DERIVED from the
- * two tags this node can write and not picked:
- *
- *   IRC_MAX_MSGTAG   the `msgid` block, derived in message.h
- *        1           the ';' between two pairs
- * ACCOUNT_TAG_MAX   the `account` block, derived in account.h
- *        1           the NUL
- *
- * IT IS USED FOR TWO THINGS, and the second is why it is here rather than beside
- * its renderer: it sizes the per-destination buffer in write_to_members() and in
- * fanout_deliver()'s user row, AND it is the charge fanout_line_fits() adds to the
- * client-facing cap. A buffer sized by eye and a cap that forgot the tag are the
- * same defect in two places -- a line that cannot be rendered -- and the charge is
- * derived from this number so that raising a tag's bound moves both. */
-#define FANOUT_TAG_BLOCK_MAX (IRC_MAX_MSGTAG + 1u + ACCOUNT_TAG_MAX + 1u)
+/* The worst-case client-visible tag block is FANOUT_TAG_BLOCK_MAX, and it now lives
+ * in fanout.h rather than here: Phase 10.12's `batch=` tag is prepended to a block
+ * THIS file renders, by reply.c, so the two modules have to agree on how wide one is
+ * and the only way to arrange that is one declaration both can see. The derivation and
+ * the argument for deriving it are at the definition. */
 
 /* ---------------------------------------------------------------------------
  * 3.2's client-facing cap

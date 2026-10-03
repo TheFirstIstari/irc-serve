@@ -510,3 +510,10 @@ irc_add_integration_test(test_chghost test_chghost.c)
 # node that notified only on the way out leaves every member believing their
 # friend is still at lunch for ever.
 irc_add_integration_test(test_away_notify test_away_notify.c)
+
+# IRCv3 `batch`, the client-facing half (Phase 10.12). Its own file because the whole
+# capability's visible behaviour is a TAG on somebody else's line, so every assertion
+# in it is either a count of tagged lines or a count of their absence -- and a
+# substring search reports success for both. It is also the only place the `@`/`+`
+# reference tags are tested at all.
+irc_add_integration_test(test_batch test_batch.c)
