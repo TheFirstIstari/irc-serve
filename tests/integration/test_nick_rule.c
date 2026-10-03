@@ -153,10 +153,17 @@ int main(void)
      * 461: a nickname containing a space, which the wire expresses as two
      * parameters. See the header: the rule cannot be violated by a
      * well-formed line, and this is the answer a client gets for trying.
+     *
+     * The `NICK` between the target and the text is 5.2's `<command>` field and
+     * it is asserted, not decoration: RFC 2812 5.2 writes 461 as
+     * `<client> <command> :Not enough parameters`, and the node renders it from
+     * reply_refused()'s own `command` argument so every one of its 29 sites gets
+     * it. Dropping it would make this expectation pass again, which is why the
+     * literal below names the verb.
      * --------------------------------------------------------------------- */
     TF_CHECK_MSG(tc_send(&carol, "NICK a b") == 0, "tc_send(NICK a b) failed");
     expect_line(&carol, "NICK with two parameters",
-                ":irc.test 461 * :Not enough parameters\r\n");
+                ":irc.test 461 * NICK :Not enough parameters\r\n");
 
     /* ---------------------------------------------------------------------
      * None of the refusals may have wedged the state machine: a legal

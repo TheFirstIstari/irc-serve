@@ -293,19 +293,25 @@ int main(void)
      * 3. Arity, and a nickname that is not connected
      * ==================================================================== */
     /* Arity in both directions, and 461 rather than 462: 461 is what every other
-     * handler in this node answers for a wrong-arity line, and 4.4 lists it. */
+     * handler in this node answers for a wrong-arity line, and 4.4 lists it.
+     *
+     * `INVITE` before the text is 5.2's `<command>` field, which 461's RFC field
+     * list names and which reply_refused() renders from the command word the
+     * handler already holds. It is asserted because a client attributing the
+     * refusal to a verb needs it, and because a node that dropped it would pass
+     * a needle that stopped at `461 alice`. */
     from = mark(&alice);
     TF_CHECK_MSG(tc_send(&alice.c, "INVITE bob") == 0, "tc_send failed");
     end = mark(&alice);
     expect_in_window(&alice, from, end, "461 for one parameter",
-                     ":" BIN_NAME " 461 alice :Not enough parameters\r\n");
+                     ":" BIN_NAME " 461 alice INVITE :Not enough parameters\r\n");
 
     from = mark(&alice);
     TF_CHECK_MSG(tc_send(&alice.c, "INVITE bob " CHAN " extra") == 0,
                  "tc_send failed");
     end = mark(&alice);
     expect_in_window(&alice, from, end, "461 for three parameters",
-                     ":" BIN_NAME " 461 alice :Not enough parameters\r\n");
+                     ":" BIN_NAME " 461 alice INVITE :Not enough parameters\r\n");
 
     /* A nickname this node has never heard of is 401, and NO 341 follows. The
      * absence is the half with teeth: a node that answered every INVITE with a

@@ -486,13 +486,15 @@ int main(void)
                      BIN_NAME " cannot reach other.example\r\n");
     expect_absent_in_window(&alice, from, end, "the foreign-mask ADMIN", " 256 ");
     /* ADMIN takes at most one mask (RFC 2812 3.4.2), and 461 rather than 462 for
-     * the same reason every handler in the node uses 461. */
+     * the same reason every handler in the node uses 461. `ADMIN` before the
+     * text is 5.2's `<command>` field and is asserted, so this needle fails
+     * against a 461 that did not say which verb. */
     from = mark(&alice);
     TF_CHECK_MSG(tc_send(&alice.c, "ADMIN " BIN_NAME " extra") == 0,
                  "tc_send failed");
     end = mark(&alice);
     expect_in_window(&alice, from, end, "461 for two masks",
-                     ":" BIN_NAME " 461 alice :Not enough parameters\r\n");
+                     ":" BIN_NAME " 461 alice ADMIN :Not enough parameters\r\n");
 
     /* =======================================================================
      * 5. INFO: 371 lines terminated by 374, and 374 LAST

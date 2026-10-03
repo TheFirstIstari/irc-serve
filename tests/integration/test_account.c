@@ -1808,14 +1808,19 @@ static void test_account_notify(const char *sasl, const char *registry)
      * and nickname changes are `NICK`, so the two words never reached the same
      * switch. What is asserted here is that adding the row did not make the
      * retired shape mean something: it is refused on ARITY, and the nickname is
-     * still changeable afterwards. */
+     * still changeable afterwards.
+     *
+     * `ACCOUNT` between dave and the text is RFC 2812 5.2's `<command>` field,
+     * and it is asserted because this is the one place a 461 is expected for a
+     * verb that is not in the RFC at all: naming it is what tells a client the
+     * arity was wrong rather than that ACCOUNT was removed. */
     from = drain(&dave);
     (void)snprintf(line, sizeof line, "ACCOUNT hunter2");
     TF_CHECK_MSG(tc_send(&dave.c, line) == 0, "the retired ACCOUNT form could not "
                                               "be sent");
     end = drain(&dave);
     (void)snprintf(want, sizeof want,
-                   ":" BIN_NAME " 461 dave :Not enough parameters\r\n");
+                   ":" BIN_NAME " 461 dave ACCOUNT :Not enough parameters\r\n");
     expect_in_window(&dave, from, end,
                      "the refusal of the retired one-parameter ACCOUNT form",
                      want);
