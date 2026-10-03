@@ -287,6 +287,7 @@ int main(void)
     client_t alice, bob, gina, dave, erin;
     size_t from, end;
     char want[512];
+    char shape[96];
     char name[CHAN_NAME_MAX + 1];
     int i;
 
@@ -436,6 +437,35 @@ int main(void)
                  "lines, expected at least 2: the overflow was dropped rather than "
                  "chunked",
                  LONG_CHANS, count_in_window(&alice, from, end, ":" BIN_NAME " 319 "));
+    /* EVERY 319 LINE HAS THE SAME FIELD ORDER, and this is asserted as a COUNT
+     * rather than as a search because there are at least two lines here and the
+     * chunked case is the one that regresses.
+     *
+     * The first version of this file asserted the field order only on the
+     * single-line case in section 1, which left the chunk-flush path -- the second
+     * `reply()` inside send_whois_channels(), which is a separate call site with
+     * its own arguments -- completely uncovered. A fault that moved the nick from
+     * the middle parameters into the trailing text of THAT call passed every
+     * assertion in this file: the three-channel line still had the right order,
+     * and the chunked lines were only checked for "at least two 319s" and "every
+     * name appears somewhere". Both of those remain true of a wrong field order.
+     *
+     * So the needle is the RFC's shape -- ":<server> 319 <target> <nick> :" -- and
+     * it has to occur once per 319 line. With the nick in the trailing text the
+     * lines read ":<server> 319 <target> :<nick><run>" and the needle matches the
+     * FIRST line only, so the two counts differ. */
+    {
+        size_t lines;
+
+        lines = count_in_window(&alice, from, end, ":" BIN_NAME " 319 ");
+        (void)snprintf(shape, sizeof shape, ":%s 319 alice erin :", BIN_NAME);
+        TF_CHECK_MSG(count_in_window(&alice, from, end, shape) == lines,
+                     "%zu of %zu 319 lines have the RFC 2812 field order "
+                     "\":<server> 319 <target> <nick> :<run>\"; the rest have the "
+                     "nick somewhere else in the line",
+                     count_in_window(&alice, from, end, shape), lines);
+    }
+
     /* EVERY channel is named somewhere in the window, which is what makes the
      * count above mean "chunked" rather than "truncated". A dropped second line
      * satisfies the count check if it emitted two empty ones.
