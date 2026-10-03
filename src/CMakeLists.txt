@@ -13,6 +13,13 @@ add_library(irc_core STATIC
   ircv3_tags.c
   federation_handshake.c
   sasl_framework.c
+  # Phase 10.1: the ACCOUNT REGISTRY. It sits beside sasl_framework.c and NOT
+  # inside core/ for the same reason sasl_framework.c is at this level: it is a
+  # file-backed secret store whose layout and bounds belong to one module, and
+  # both that module and the credential store it is deliberately separate from
+  # are loaded from main() before the loop is armed. See account_store.h for the
+  # argument that they are two files rather than one.
+  account_store.c
   core/message.c
   core/connection.c
   core/server.c
@@ -22,6 +29,11 @@ add_library(irc_core STATIC
   core/resume.c
   core/fanout.c
   core/commands.c
+  # Phase 10.1: the account IDENTITY on a connection. It is a module of its own
+  # for the reason core/cap.c is -- the predicate every consumer asks must have
+  # one home, or two callers will each write `c->logged_in && c->account[0]` and
+  # the pair will be read apart somewhere.
+  core/account.c
   # Phase 8: the IRCv3 capability negotiation. It is a module of its own rather
   # than part of commands.c because the TABLE of what this node implements is
   # the part that has to be read in one place -- a capability advertised by a
@@ -29,6 +41,19 @@ add_library(irc_core STATIC
   core/cap.c
   core/chan_verbs.c
   core/msg_verbs.c
+  # Phase 10.12: IRCv3 `batch`, the client-facing half -- the BATCH verb and the
+  # `@`/`+` reference tags. It is a module of its own for the reason cap.c is: the
+  # per-connection batch state is read in THREE places that must agree
+  # (commands.c's dispatch, reply.c's single queueing site, and the verb table),
+  # and a decision any two of them have to reach into separately is a decision they
+  # will eventually disagree about.
+  core/batch.c
+  # Phase 10.13: IRCv3 `labeled-response`. It is a module of its own because the
+  # specification's requirement is not "echo the tag" but "the tag appears in EXACTLY ONE
+  # LOGICAL MESSAGE", and on this node a response is frequently several lines -- so the
+  # state has to answer "what tag does THIS line carry" from inside reply.c's one
+  # queueing site AND "what remains to be said" from inside commands.c's dispatch tail.
+  core/label.c
   # Phase 6. federation/ is a DIRECTORY of its own rather than more core/*.c,
   # because the split that matters in this phase is not "core versus
   # federation" but "encode versus decode": verbs.c is the outbound half of

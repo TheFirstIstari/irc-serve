@@ -3,11 +3,14 @@
  * both a client line and a peer line arrive at.
  */
 #include "core/commands.h"
+#include "core/batch.h"
+#include "core/label.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
 
+#include "core/account.h"
 #include "core/cap.h"
 #include "core/chan_verbs.h"
 #include "core/channel.h"
@@ -88,19 +91,152 @@ int commands_registered(const conn_t *c)
 #define NODE_CHAN_MODES "b,k,l,imnpst"
 
 /* NICKLEN is derived from IRC_MAX_NICK rather than typed out, so raising the
- * struct width cannot leave 005 advertising a length the node then refuses. */
+ * struct width cannot leave 005 advertising a length the node then refuses. The
+ * same argument is the reason EVERY `*LEN` token below is written this way, and
+ * the reason the derivation is visible at all: an ISUPPORT length a client uses
+ * to size its own buffers is a promise, and a promise that is a typed-out number
+ * stops being true the moment somebody raises a bound in another file. */
 #define IRC_STR_(x) #x
 #define IRC_STR(x) IRC_STR_(x)
 
+/* ---------------------------------------------------------------------------
+ * 005 IS A LIST OF CLAIMS THIS NODE HONOURS, AND BOTH HALVES MATTER
+ * ---------------------------------------------------------------------------
+ * An ISUPPORT token is read by a client as a FACT about this server: it sizes a
+ * buffer from CHANNELLEN, it decides whether a message may name six targets from
+ * MAXTARGETS, it wraps a name at NAMELEN. So the list has two obligations and
+ * they are opposites:
+ *
+ *   DERIVED, where a bound exists. Every `*LEN` and the one arity number below
+ *   come from the constant that ENFORCES the thing, never from a literal. The
+ *   test is not "the number looks right" but "is there a check in this tree that
+ *   would refuse more than this", and a token whose answer is no is omitted.
+ *   `KICKLEN` was the worked example of the second kind for two phases: Phase
+ *   10.4 found that `handle_kick()` took `<reason>` verbatim with no test, so no
+ *   number described the largest reason accepted AND an over-long one reached
+ *   `message_format()`, which refuses rather than reshapes -- a reachable
+ *   `n_reply_refused`, the counter `reply.c` holds at zero because a non-zero
+ *   value is a bug report. Phase 10.9 added `CHAN_MAX_KICK_REASON`, the 417 and
+ *   the token, so the worked example is now `USERLEN` below.
+ *
+ *   HONOURED, where a feature exists. A token a client acts on and this node does
+ *   not implement is worse than the token's absence: absence is a client that
+ *   carries on, presence is a client that switches the feature on and then
+ *   behaves as though the server agreed. That is the same rule cap.h holds CAP LS
+ *   to, applied to the other list every client reads.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT IS DELIBERATELY NOT HERE, AND WHY -- the absences are the interesting half
+ * ---------------------------------------------------------------------------
+ * Each of these is a token a client may look for, and each is absent because
+ * there is nothing behind it on this node. They are named here rather than left
+ * for a reader to assume, because an absent token and a forgotten one look
+ * identical on the wire.
+ *
+ *   BOT=B          004 advertises `i` for users and `b,k,l,imnpst` for channels,
+ *                  and this node evaluates NEITHER set (commands.c's own note).
+ *                  There is no BOT mode, no services, and nothing that would ever
+ *                  read `BOT`. 4.3's SERVICES/bot verbs are not in 4.1 or 4.2.
+ *
+ *   EXTBAN=        `+b` stores a ban mask verbatim and chan_has_ban() tests it by
+ *                  string equality (2.2). There is no ban EXPRESSION parser, so
+ *                  there is no `~&account:name` to advertise and no `EXTBAN`
+ *                  value to write. This is the same missing evaluator that
+ *                  blocks IRCv3's `account-extban` (SPEC_TRACKING 10.2) -- one
+ *                  gap, named twice.
+ *
+ *   SAFELIST       there is no safelist: `+S` is not a mode 004 advertises, and
+ *                  chan_t has no safe-mask store. 2.2's ban list is a ban list.
+ *
+ *   MONITOR        there is no MONITOR verb. `WATCH` and `WATCHNICK` with it:
+ *                  there is no WATCH verb either, so there is no watch list and
+ *                  no ceiling on one.
+ *
+ *   MSGREFTYPES=   no message reference is recognised. `PRIVMSG @#chan :hi`
+ *                  reaches fanout_resolve() with `@#chan` as the WHOLE target,
+ *                  which is not a valid channel name, so it is 403 rather than a
+ *                  reference to a history window. draft/message-reference is not
+ *                  implemented, and this token's whole content is the list of
+ *                  reference types.
+ *
+ *   ACCEPT         no EXCEP or INVEX mode, no accept-list storage, and no
+ *                  evaluation of either. 2.2's model is one mask array for bans.
+ *
+ *   silence        there is no SILENCE verb and no silence store. Its absence is
+ *                  a fact rather than a gap: this node has no operator concept
+ *                  at all (CHOPER answers 464 for every request), and a silence
+ *                  list is an operator list.
+ *
+ *   draft/CHATHISTORY
+ *                  no channel history. resume.c's restore hands a client back the
+ *                  channels it was in at disconnect, which is a SESSION and not a
+ *                  history: it does not answer "what was said in #t last week"
+ *                  because it does not keep anything that was not said while the
+ *                  client was connected. Advertising the capability would put a
+ *                  client into a state it cannot leave.
+ *
+ *   MODES          this token is a COUNT of mode changes permitted in one MODE
+ *                  command, not a mode string (004 carries those). This node puts
+ *                  no count on a MODE command, so there is no count to write.
+ *
+ *   USERLEN        the bound that EXISTS (CONN_USER_MAX) is not ENFORCED: USER's
+ *                  ident is truncated into the field rather than refused, so
+ *                  advertising a length would promise a limit this node does not
+ *                  apply to the one parameter it is about. NAMELEN below is
+ *                  advertised for the opposite reason: that bound IS what can be
+ *                  stored, and SETNAME refuses beyond it.
+ *
+ * ---------------------------------------------------------------------------
+ * THE `CASEMAPPING=ascii` LIE THAT IS NOT A LIE, AND WHAT rfc1459 WOULD COST
+ * ---------------------------------------------------------------------------
+ * message.c's up() folds A-Z and nothing else, and fanout.c's ascii_lower() is
+ * the same six lines written twice for the reason its own comment gives. So this
+ * node does NOT treat `[]\~` as equivalent to `{}|^`, which is exactly what
+ * rfc1459 says it should, and advertising ascii is the truth rather than the
+ * shorter answer.
+ *
+ * WHAT CHANGING IT WOULD COST, since the honest answer is only useful if the
+ * alternative is on the record: `[]\~` and `{}\|^` become fold-equivalent, which
+ * means it becomes UNSAFE to use any of those bytes in a nickname, a channel name
+ * or a hostmask component -- a channel named `#a[b` and one named `#a{b` become
+ * one channel. Then every comparison that folds has to fold the same way or two
+ * of them disagree: server_nick_lookup(), chan_same_name(), fanout.c's
+ * ascii_lower(), channel.c's up_ascii(), and the WHO mask matcher. That is five
+ * call sites plus the SET of bytes the validators refuse, and the validators are
+ * the expensive half -- message.h's valid_nick() and chan_name_valid() would both
+ * have to grow a deny-list. It is a change to what a nickname MAY BE, which is
+ * why it is not something a 005 token decides. */
 static const char *const k_005[] = {
     "NETWORK=" NODE_NETWORK,
-    "CHANTYPES=#&",     /* 4.4: many real clients misbehave without it */
-    "PREFIX=(ov)@+",    /* 4.4: and without this one */
+    "CHANTYPES=" CHAN_TYPES, /* 4.4: many real clients misbehave without it */
+    "PREFIX=(ov)@+",         /* 4.4: and without this one */
     /* True, and not a detail: message.c's up() is ASCII-only, so this node does
      * NOT treat []\~ and {}|^ as equivalent. Advertising rfc1459 here would be
      * a lie a client could act on. */
     "CASEMAPPING=ascii",
-    "NICKLEN=" IRC_STR(IRC_MAX_NICK)
+    /* ------------------------------------------------------------------------
+     * THE DERIVED LENGTHS. Each one is a bound this node REFUSES to exceed, not
+     * a figure of speech: raise the constant and this token moves with it.
+     * ---------------------------------------------------------------------- */
+    "AWAYLEN=" IRC_STR(CONN_MAX_AWAY),         /* 417, msg_verbs.c */
+    "CHANNELLEN=" IRC_STR(CHAN_MAX_NAME),      /* chan_name_valid() */
+    /* ADDED IN PHASE 10.9, AND IT IS THE CLOSE OF A FINDING RATHER THAN A NEW
+     * TOKEN. Phase 10.4 recorded that `handle_kick()` took `<reason>` verbatim with
+     * no length test, so (a) no number in the tree described the largest reason
+     * this node accepts and (b) an over-long one reached `message_format()`, which
+     * refuses rather than reshapes, tripping `n_reply_refused` -- the counter
+     * `reply.c` holds at zero because a non-zero value is a bug report. That is a
+     * reachable way to make a client command file a bug report.
+     *
+     * `CHAN_MAX_KICK_REASON` now enforces it and `handle_kick()` answers 417, so
+     * the bound below is a fact rather than a figure of speech: it is the same
+     * shape as TOPICLEN beside it, derived from the constant that refuses. */
+    "KICKLEN=" IRC_STR(CHAN_MAX_KICK_REASON),  /* 417, chan_verbs.c */
+    "LINELEN=" IRC_STR(IRC_MAX_LINE),          /* conn_fill() + message_parse_n() */
+    "MAXTARGETS=1",                            /* MSG_MAX_TARGETS, msg_verbs.h */
+    "NAMELEN=" IRC_STR(CONN_MAX_REALNAME),     /* conn_t::realname; SETNAME 417s */
+    "NICKLEN=" IRC_STR(IRC_MAX_NICK),
+    "TOPICLEN=" IRC_STR(CHAN_MAX_TOPIC)         /* 417, chan_verbs.c */
 };
 
 /* The MOTD body, sent as one 372 per line. It describes what the node IS
@@ -182,6 +318,23 @@ static void send_welcome(server_t *s, conn_t *c)
 
     printf("[observable] welcome: fd=%d nick=%s\n", c->fd, c->nick);
     send_motd(s, c);
+    /* AND THE account-notify LINE, AFTER 376 AND NOT BEFORE IT.
+     *
+     * This is the first moment on this node at which a client can be told which
+     * account it is associated with: SASL ran before registration, so before 001
+     * the connection had no hostmask to attribute the line to and no nickname to
+     * put in the prefix. It is after the MOTD rather than interleaved with the
+     * numerics because a client parses the registration burst as one thing and an
+     * extra verb in the middle of it is a line it does not expect yet.
+     *
+     * IT IS GATED ON THE CAPABILITY AND NOT ON WHETHER THERE IS AN ACCOUNT, which
+     * is the whole of what account-notify's unconditional availability means: a
+     * client that asked is told `ACCOUNT *` on a node with no registry, because
+     * "you are not associated with an account" is a true and useful answer rather
+     * than an absence. */
+    if (cap_account_notify_enabled(c) != 0) {
+        account_notify_current(s, c);
+    }
 }
 
 /* Recompute the state from the two facts, and emit the welcome burst on the
@@ -321,7 +474,8 @@ static void copy_field(char *dst, size_t cap, const char *src, int *trunc)
 static void handle_pass(server_t *s, conn_t *c, const message_t *m)
 {
     if (m->nparams < 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "PASS", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     s->n_pass_seen++;
@@ -366,9 +520,13 @@ static void handle_nick(server_t *s, conn_t *c, const message_t *m)
     if (m->nparams > 1) {
         /* Also how a nickname containing a space is refused: the wire cannot
          * express a space inside one parameter, so a client that sends
-         * "NICK a b" has sent two parameters, and this is the answer it gets. */
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
-        return;
+         * "NICK a b" has sent two parameters, and this is the answer it gets --
+         * which is a TOO MANY case that the legacy text calls "not enough". The
+         * text is left exactly as it is, because changing it would change the wire
+         * for every client that negotiated nothing; for one that negotiated
+         * `standard-replies` the code above says which of the two it was. */
+        (void)reply_refused(s, c, "NICK", "TOO_MANY_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");        return;
     }
     want = m->params[0];
     if (!valid_nick(want)) {
@@ -487,18 +645,156 @@ static void handle_nick(server_t *s, conn_t *c, const message_t *m)
  *
  * The assertion is not thrown away silently -- it goes to the observable
  * output, so a mismatch between what a client claims and where it connected from
- * is visible when diagnosing something -- but it is not identity. */
+ * is visible when diagnosing something -- but it is not identity.
+ *
+ * ---------------------------------------------------------------------------
+ * A SECOND `USER` IS REFUSED: 462, AND THE IDENT IS NOT WRITTEN
+ * ---------------------------------------------------------------------------
+ * `USER` is `pre_reg` in k_commands[] because CAP, SASL, NICK, USER, PING, PONG
+ * and QUIT are the seven verbs a client may send BEFORE it has registered. That
+ * is a statement about what may arrive FIRST, and it is not a statement about
+ * what may arrive again: the dispatch table's registration gate is
+ *
+ *     if (!commands_registered(c) && (cmd == NULL || cmd->pre_reg == 0))
+ *
+ * which a REGISTERED connection passes for every row including `pre_reg`, so
+ * this handler used to run for a second `USER` on a live connection and wrote
+ * `conn_t::user` unconditionally. A client could therefore move its own ident
+ * with no line to itself and no line to anybody sharing a channel.
+ *
+ * THE THREAT MODEL, and the part of it that is not the obvious one. Three
+ * candidate harms, and only two are real:
+ *
+ *   NOT IMIMPERSONATION, and the reason is worth stating because it is the
+ *   answer that makes "just refuse it" feel arbitrary otherwise. Nothing on
+ *   this node is GRANTED to an ident. No privilege, no account and no access
+ *   decision reads `c->user` alone -- `account-logged-in` and every operator
+ *   check are keyed on other things, and the ident is client-asserted and
+ *   UNVERIFIED at registration, so two users may already hold the same one and
+ *   a client could equally have REGISTERED with the ident it now moves to. There
+ *   is no identity here to impersonate.
+ *
+ *   YES, A CHANNEL BAN MASK. This is the part that makes the write a defect
+ *   rather than a shrug. `chan_banned()` is called on every JOIN and matches a
+ *   stored mask against the NICK, against the HOST, and against the COMPOSITE
+ *   `nick!user@host` -- and the suite exercises exactly that composite form
+ *   (`MODE #mo +b *!*@127.0.0.1`, refused with 474). A mask of the shape
+ *   `mallory!*@*` or `mallory!badident@*` can only match through the composite,
+ *   so on this node a client that changes its ident, PARTs and re-JOINs is
+ *   ADMITTED to a channel it is banned from. That is an access-control bypass
+ *   reachable from a single client command, and it is why the answer is not (b)
+ *   "accept but notify": a notification does not stop the rejoin.
+ *
+ *   YES, THE SILENCE ITSELF, to two audiences. Every roster this node draws --
+ *   311, 352, 353, the message prefix, 302 -- then reports an ident nobody was
+ *   told about, so a `userhost-in-names` client (Phase 10.5) is shown a hostmask
+ *   that changed without a word. And `resume.c` REQUIRES (nick, ident, host) to
+ *   all match to resume, so the write silently invalidates the client's own
+ *   session record. On a mesh the peer's roster keeps the old ident until the
+ *   next SBURST, because nothing tells it.
+ *
+ * WHY 462, AND IT IS NOT A CHOICE. RFC 2812 3.1.3 lists the numeric replies to
+ * `USER` as exactly two -- `ERR_NEEDMOREPARAMS` and `ERR_ALREADYREGISTRED` -- and
+ * the numeric's own entry in RFC 2812 9 names the case: "user details from second
+ * USER message". So a second `USER` is 462 because the RFC says so, not because
+ * 462 is the nearest available complaint. (Design 9's risk row previously recorded
+ * the opposite -- that refusing "is a behaviour change to an RFC 1459 MUST command
+ * with nothing in the RFC requiring it" -- and that was wrong: it had read RFC
+ * 1459, whose `USER` section says nothing about a second one, and not RFC 2812
+ * 3.1.3. The finding the row was built on is correct; the reason it did not act
+ * on it was not.)
+ *
+ * WHY 462 IS NOT MIGRATED, which looks inconsistent beside the four numerics
+ * 4.4.3 does migrate: those four answer MORE THAN ONE QUESTION on this node, so
+ * the number alone cannot say which refusal happened. `462` answers exactly one
+ * -- "you are already registered" -- so by the rule it stays legacy, and
+ * reply_refused()'s NULL code is what selects that branch. A client that
+ * negotiated `standard-replies` gets the 462; it is unambiguous.
+ *
+ * THE GATE IS `commands_registered()`, NOT "HAS SEEN A `USER` BEFORE", and the
+ * difference is the whole of the compatibility cost. A client that sends `USER`
+ * twice BEFORE completing registration still works, last-one-wins, because it is
+ * pre-registration in the sense every other gate in this file means. What is
+ * refused is the write to a connection that has already been told `001`, which
+ * is where the hole was.
+ *
+ * THE GATE IS BEFORE THE ARITY TEST, and this is the one place it differs from
+ * handle_setname()'s order, deliberately: the arity complaint is a fact about the
+ * MESSAGE and the registration state is a fact about the CONNECTION, and for a
+ * registered connection the message cannot be processed at all. Answering `461
+ * Not enough parameters` to a client that sent the very same four parameters a
+ * moment ago and was answered `001` would be a numeric describing a problem the
+ * client does not have.
+ *
+ * WHAT IT COSTS, honestly. A client that re-sends `USER` after registration gets
+ * one numeric it did not ask for and keeps its connection, its nickname, its
+ * channels and its realname -- the refusal does not close anything. The only
+ * thing taken away is the ability to move its own ident, which is the defect. The
+ * ident a client wants is the one it should have sent at registration, where it
+ * can still be refused (417/empty) rather than silently truncated. */
 static void handle_user(server_t *s, conn_t *c, const message_t *m)
 {
     int trunc_user = 0;
     int trunc_real = 0;
+    conn_realname_verdict_t v;
+
+    if (commands_registered(c)) {
+        (void)reply_refused(s, c, "USER", NULL, "462", NULL, 0,
+                            "Unauthorized command (already registered)");
+        printf("[observable] user_refused: fd=%d nick=%s reason=ALREADY_REGISTERED "
+               "nparams=%d\n",
+               c->fd, c->nick, m->nparams);
+        return;
+    }
 
     if (m->nparams < 4) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "USER", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     copy_field(c->user, sizeof c->user, m->params[0], &trunc_user);
-    copy_field(c->realname, sizeof c->realname, m->params[3], &trunc_real);
+    /* THE REALNAME IS CHECKED BY THE SAME PREDICATE `SETNAME` USES, and it is
+     * checked BEFORE the field is written rather than after, so a refused value is
+     * never briefly stored. conn_realname_check()'s argument is at its definition;
+     * what is decided here is what happens when it says no, and the decision is not
+     * "truncate".
+     *
+     * A realname carrying a C0 control is LEFT EMPTY rather than refused, and the
+     * asymmetry with SETNAME is deliberate rather than an inconsistency:
+     *
+     *   - SETNAME arrives on an already-REGISTERED connection, where refusing leaves
+     *     the connection usable and the previous value in place -- 417 and nothing
+     *     changes.
+     *   - USER arrives BEFORE registration completes. Refusing it would leave the
+     *     client half-registered with no way to recover except reconnecting, for a
+     *     value no current client sends (a realname containing ESC or BEL is a
+     *     rendering accident, and CR/LF/NUL cannot reach here at all because the
+     *     parser refuses them first). So the registration is allowed to complete
+     *     with an EMPTY realname, which is already a legal state in this node --
+     *     `extended-join` renders it as a bare `:`, and the comment there says a
+     *     client that sent none has an empty realname "which is a fact about the
+     *     client rather than a limit this node imposes".
+     *
+     * IT IS REPORTED, because the failure is otherwise invisible: the only
+     * observable difference between "the client sent nothing" and "the client sent
+     * something this node threw away" would be a realname that is missing from
+     * every later roster, which is exactly the kind of discrepancy 3.4's observable
+     * output exists to make findable.
+     *
+     * LENGTH IS STILL TRUNCATED HERE and refused by SETNAME, and that difference is
+     * the same argument from the other side: 3.2's rule against a silently shortened
+     * parameter is about a value the node then REPORTS as the user's, and at
+     * registration the alternative is a stranded connection. copy_field() says so
+     * at its own definition and the truncation is announced rather than silent. */
+    v = conn_realname_check(m->params[3]);
+    if (v == CONN_REALNAME_BAD_BYTE) {
+        printf("[observable] realname_refused: fd=%d nick=%s verb=USER "
+               "reason=BAD_BYTE len=%zu\n",
+               c->fd, c->nick, strlen(m->params[3]));
+        c->realname[0] = '\0';
+    } else {
+        copy_field(c->realname, sizeof c->realname, m->params[3], &trunc_real);
+    }
     printf("[observable] user: fd=%d user=%s realname_trunc=%d "
            "asserted_host=%s host=%s host_source=observed\n",
            c->fd, c->user, trunc_real, m->params[2], c->host);
@@ -506,6 +802,220 @@ static void handle_user(server_t *s, conn_t *c, const message_t *m)
         printf("[observable] field_truncated: fd=%d field=user\n", c->fd);
     }
     update_state(s, c);
+}
+
+/* ---------------------------------------------------------------------------
+ * SETNAME -- IRCv3's `setname`, and the three gates in front of it
+ * ---------------------------------------------------------------------------
+ * `SETNAME :<realname>` changes `conn_t::realname` on a live connection. Three
+ * gates, in this order, and the order is the argument:
+ *
+ *   1. REGISTERED. 451 if not. Not `pre_reg` in k_commands[], so this is answered
+ *      by the dispatch table's own rule rather than here -- and it has to be a gate
+ *      rather than an accident of the field being empty, because a pre-registration
+ *      connection HAS an empty realname and would otherwise "succeed" at setting it
+ *      to something, which is a command acting on state that does not exist yet.
+ *
+ *   2. THE CAPABILITY. Refused SILENTLY, with no reply and no change.
+ *
+ *      This is the specification's own instruction and it is the opposite of what
+ *      every other capability in cap.h does, so it is worth being explicit: `setname`
+ *      says a server MUST support the command even while the capability is not
+ *      negotiated, and that a SETNAME from a client which did not negotiate it
+ *      SHOULD be handled silently. "Silently" IS the refusal -- nothing arrives and
+ *      nothing changes -- and it is observable, because a protocol test can assert
+ *      that nothing arrived.
+ *
+ *      THE SILENCE IS NOT BECAUSE `standard-replies` WAS ABSENT. It used to be
+ *      justified that way and that justification was WRONG the moment the
+ *      capability landed in Phase 10.9: `FAIL SETNAME CANNOT_CHANGE_REALNAME` is
+ *      now expressible, and sending it would still be wrong, because the
+ *      specification asks for SILENCE here and a `FAIL` is a response. The reason
+ *      for silence is the specification's instruction and nothing else. (The other
+ *      half of that sentence is now handled: the refusal below for an
+ *      unacceptable VALUE is a `FAIL` for a client that negotiated
+ *      `standard-replies`, which is a different refusal from not being permitted to
+ *      try.)
+ *
+ *   3. VALIDATION, through conn_realname_check() -- the SAME predicate handle_user()
+ *      runs, which is what makes this not a looser path than registration. A
+ *      refusal is 417 and the previous realname is left exactly as it was. It is
+ *      NOT truncated: 3.2's rule, and the reason is that this value is then shown
+ *      to every member of every channel the user is on as though it were theirs.
+ *
+ *      417 IS STILL THE NUMERIC, and for a client that negotiated
+ *      `standard-replies` it is `FAIL SETNAME ERR_INPUTTOOLONG` or
+ *      `ERR_INVALID_PARAM` depending on which of the two refusals this was -- a
+ *      distinction the number never carried and the verdict `v` already knows.
+ *      reply.c's `reply_refused()` is what makes the swap per destination, so a
+ *      client that negotiated nothing still receives the 417 and the same text.
+ *
+ * THE CONFIRMATION. On success this node sends the server-to-client form back to
+ * the originating client:
+ *
+ *     :nick!user@host SETNAME :<new realname>
+ *
+ * which is the specification's MUST for "to all clients in common channels, as well
+ * as to the client from which it originated" -- PARTIALLY. The originating client
+ * gets it; **the common-channel fan-out does not happen**, and that is a named
+ * limit rather than an oversight. `core/fanout.c`'s per-destination decision is a
+ * choice between two wire SHAPES (the `fanout_form_t` the extended JOIN
+ * introduced), and "send this member NOTHING" is a THIRD outcome that the form
+ * cannot express; adding it is a contract change to the routing module, and the
+ * alternative -- a second member walk inside a handler -- is the exact duplication
+ * fanout.c exists to prevent. So the originating client is told, and a member of a
+ * shared channel is not. SPEC_TRACKING 10.5 records it.
+ *
+ * THE PREFIX IS THE ACTING CLIENT'S OWN HOSTMASK, which is the specification's
+ * server-to-client shape and is also what makes the line trustworthy: it names who
+ * changed, and `conn_hostmask()` renders it from the fields §2.1 owns (including the
+ * OBSERVED host, which USER does not touch). */
+
+/* THE COMMON-CHANNEL FAN-OUT, and the disclosure decision is the whole of it.
+ *
+ * The specification: "they MUST send the server-to-client version of the SETNAME
+ * message **to all clients in common channels**, as well as to the client from which
+ * it originated" and "The SETNAME message **MUST NOT** be sent to clients which do
+ * not have the `setname` capability negotiated."
+ *
+ * THE GATE IS THE RECIPIENT'S, which is the specification's condition read
+ * literally ("clients", plural) and the answer that agrees with `cap.h`'s existing
+ * rule for the CONFIRMATION above. Gating on the SENDER -- which is the other thing
+ * one could implement, and which is one line -- would let a client who negotiated
+ * `setname` put a member's realname on the wire to every other member of a shared
+ * channel by asking for a capability those members never requested, and would
+ * contradict the confirmation's own rule in the same handler. A realname is personal
+ * data; the per-destination answer is the only one that does not require trusting
+ * the person disclosing it to be careful about who finds out.
+ *
+ * THE ORIGIN IS EXCLUDED, and the reason is the ORDER rather than a rule about
+ * authors: the confirmation above has ALREADY delivered this line to the client that
+ * asked, and the specification counts that as the origin's half of the MUST. Leaving
+ * the origin in the audience would give it two byte-identical `SETNAME` lines for one
+ * command, which is the same double-delivery defect `echo-message` has a fault for.
+ * So `exclude` is `c`, exactly as msg_verbs.c's notify_away() excludes the away
+ * setter because 306/305 are that user's own answer.
+ *
+ * IT IS THE UNION, NOT ONE CALL PER CHANNEL, and the SHAPE is why:
+ * `:nick!user@host SETNAME :<realname>` has no channel parameter, so a per-channel
+ * emission would put a `#channel` where a client expects the realname, and would hand
+ * a member of three shared channels three copies of one fact. fanout.h's
+ * `fanout_deliver_union_local_gated()` is the one walk that gets both right, and its
+ * de-duplication is a search over the caller's own `conn_t::chans` rather than a
+ * cache -- which is why there is no bounded store here with a teardown arm to forget.
+ *
+ * NOT FORWARDED, for the same reason away-notify is not: this is an originating
+ * emission and the local-only entry points have no forward arm. Worth being honest
+ * about what that costs: 4.3's frozen `SBURSTN` carries no realname, so a mesh
+ * member's clients learn a peer's realname from its own roster -- `extended-join` --
+ * and never learn that it CHANGED, because there is no S-verb to carry the change and
+ * a wire format cannot be invented after Phase 6. Closing that needs a new 4.3 verb
+ * and a version bump, not a decision. */
+static void setname_notify_channels(server_t *s, conn_t *c)
+{
+    const char *params[1];
+    fanout_form_t plain;
+    char prefix[CONN_HOSTMASK_MAX];
+    int delivered;
+
+    /* NO CHANNELS MEANS NO AUDIENCE, and that is `c->nchans` rather than a check
+     * anywhere else: the audience is "users sharing a channel", so with no channels
+     * there is nobody to tell. The confirmation above has already reached the only
+     * client the specification requires an answer to. */
+    if (c->nchans == 0u) {
+        printf("[observable] setname_notify: nick=%s recipients=0 "
+               "reason=NO_SHARED_CHANNEL\n",
+               c->nick);
+        return;
+    }
+    if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
+        /* Unrenderable is a bug report rather than a refusal, and it cannot have
+         * happened: the caller rendered this same prefix a few lines ago and got here
+         * because it succeeded. Reported rather than assumed, because the alternative
+         * is a silent reason for a notification that never went out. */
+        printf("[observable] setname_notify: nick=%s reason=UNRENDERABLE\n", c->nick);
+        return;
+    }
+    params[0] = c->realname;
+    plain.params = params;
+    plain.nparams = 1;
+    delivered = fanout_deliver_union_local_gated(s, c->chans, c->nchans, prefix,
+                                                 "SETNAME", &plain, NULL,
+                                                 cap_gate_setname, NULL, c);
+    printf("[observable] setname_notify: nick=%s channels=%zu recipients=%d\n",
+           c->nick, c->nchans, delivered);
+}
+
+static void handle_setname(server_t *s, conn_t *c, const message_t *m)
+{
+    conn_realname_verdict_t v;
+    char prefix[CONN_HOSTMASK_MAX];
+    const char *params[1];
+
+    /* Arity before anything else, and the gate order above says why: a malformed
+     * command from a client that cannot use it is answered 461 rather than
+     * silently, because 461 is the shape the specification's own "handle silently"
+     * does NOT apply to -- silence is for a well-formed SETNAME, not for a missing
+     * parameter. */
+    if (m->nparams != 1) {
+        (void)reply_refused(s, c, "SETNAME", "INVALID_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
+        printf("[observable] setname_refused: fd=%d nick=%s reason=ARITY nparams=%d\n",
+               c->fd, c->nick, m->nparams);
+        return;
+    }
+    if (cap_setname_enabled(c) == 0) {
+        /* THE SILENT REFUSAL. No reply, no change, and the only trace is this line,
+         * which is the same observable output every other refusal in this file uses.
+         * It is deliberately NOT a 417 and NOT a 482: a client that did not ask for
+         * `setname` has not done anything wrong, and the specification asks for
+         * silence rather than for an error a client cannot act on. */
+        printf("[observable] setname_ignored: fd=%d nick=%s "
+               "reason=NOT_NEGOTIATED len=%zu\n",
+               c->fd, c->nick, strlen(m->params[0]));
+        return;
+    }
+    v = conn_realname_check(m->params[0]);
+    if (v != CONN_REALNAME_OK) {
+        /* THE DISTINCTION THE NUMBER NEVER CARRIED, and it is the clearest small
+         * argument for the migration: `v` already knows whether the realname was
+         * too long or held a byte this node will not store, and both were 417
+         * carrying the same text. For a client that negotiated `standard-replies`
+         * they are now two codes, and only the length one is the numeric's own
+         * complaint. */
+        (void)reply_refused(s, c, "SETNAME",
+                            (v == CONN_REALNAME_TOO_LONG) ? "ERR_INPUTTOOLONG"
+                            : "ERR_INVALID_PARAM",
+                            "417", NULL, 0, "Realname is not acceptable");
+        printf("[observable] setname_refused: fd=%d nick=%s reason=%s len=%zu "
+               "max=%d\n",
+               c->fd, c->nick,
+               (v == CONN_REALNAME_TOO_LONG) ? "TOO_LONG" : "BAD_BYTE",
+               strlen(m->params[0]), CONN_MAX_REALNAME);
+        return;
+    }
+    /* NOT copy_field(), and the difference is the point of gate 3. copy_field()
+     * truncates; this must not, because the stored value is one this node will
+     * report to third parties. The length has just been checked against
+     * CONN_MAX_REALNAME, which is sizeof(conn_t::realname) - 1, so this copy
+     * cannot truncate -- and it is written out rather than delegated so that a
+     * future change to the bound cannot silently reintroduce the truncation
+     * through the helper. */
+    memcpy(c->realname, m->params[0], strlen(m->params[0]) + 1u);
+    if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
+        /* The value is already stored at this point, because the check happened
+         * first and the store is unconditional once it passed. A connection whose
+         * hostmask will not render is a bug report rather than a refusal, and the
+         * honest outcome is that the change happened and could not be confirmed. */
+        printf("[observable] setname_unconfirmed: fd=%d nick=%s reason=UNRENDERABLE\n",
+               c->fd, c->nick);
+        return;
+    }
+    params[0] = c->realname;
+    (void)send_line(s, c, prefix, "SETNAME", params, 1);
+    setname_notify_channels(s, c);
+    printf("[observable] setname: fd=%d nick=%s len=%zu\n", c->fd, c->nick,
+           strlen(c->realname));
 }
 
 /* PING. Legal before registration, like every liveness probe: a client that
@@ -774,7 +1284,8 @@ static void handle_lusers(server_t *s, conn_t *c, const message_t *m)
 static void handle_admin(server_t *s, conn_t *c, const message_t *m)
 {
     if (m->nparams > 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "ADMIN", "TOO_MANY_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     if (m->nparams == 1 && server_mask_is_self(s, m->params[0]) == 0) {
@@ -903,7 +1414,8 @@ static void handle_choper(server_t *s, conn_t *c, const message_t *m)
     conn_t *who;
 
     if (m->nparams != 2) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "CHOPER", "INVALID_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     /* fanout_find_nick() rather than server_nick_lookup(): both are the same
@@ -925,10 +1437,15 @@ static void handle_choper(server_t *s, conn_t *c, const message_t *m)
         return;
     }
 
-    (void)reply(s, c, "464", NULL, 0,
-                "%s cannot become an operator: this server holds no operator "
-                "flags and no operator credentials",
-                who->nick);
+    /* 464, WHICH THE SAME NUMBER ALSO ANSWERS FOR A FAILED SASL EXCHANGE. For a
+     * client that negotiated `standard-replies` this is
+     * `FAIL CHOPER ERR_NOPRIVILEGES`, which says "you are not an operator" rather
+     * than leaving the client to work out that an operator request and a
+     * credential failure share a number. */
+    (void)reply_refused(s, c, "CHOPER", NULL, "464", NULL, 0,
+                        "%s cannot become an operator: this server holds no "
+                        "operator flags and no operator credentials",
+                        who->nick);
     printf("[observable] choper_refused: by=%s target=%s reason=NO_OPER_FLAGS "
            "oper=0 pass_seen=%llu\n",
            c->nick, who->nick, (unsigned long long)s->n_pass_seen);
@@ -941,6 +1458,178 @@ static void handle_choper(server_t *s, conn_t *c, const message_t *m)
 static void handle_cap_wrapper(server_t *s, conn_t *c, const message_t *m)
 {
     cap_handle(s, c, m);
+}
+
+/* ---------------------------------------------------------------------------
+ * REGISTER and UNREGISTER -- REFUSED, and this is the decision rather than the
+ * omission. Read the argument before changing the answer.
+ * ---------------------------------------------------------------------------
+ * The IRCv3 `account-registration` specification is in k_caps[]' absence and in
+ * both of these handlers. Four independent reasons, and each of them is
+ * sufficient on its own; they are given in the order they would stop a reviewer.
+ *
+ * 1. THE SPECIFICATION SAYS NOT TO. `account-registration` is a
+ *    work-in-progress document whose own header says implementations "MUST NOT
+ *    use the unprefixed account-registration capability name", SHOULD use
+ *    `draft/account-registration` instead, and that the specification "may change
+ *    at any time and we do not recommend implementing it in a production
+ *    environment". Shipping a stable command named `REGISTER` that a draft will
+ *    later redefine is how a server ends up un-upgradable without anyone noticing.
+ *
+ * 2. ITS WIRE FORM WAS NOT AVAILABLE WHEN THIS WAS WRITTEN, and half of that
+ *    reason has since expired. The draft answers with the standard replies
+ *    framework -- `FAIL ACCOUNT_REGISTER <reason>` -- and this node had no FAIL at
+ *    the time, so there was no numeric a real client parses as a registration
+ *    answer. Phase 10.9 landed `standard-replies`, so the form EXISTS now and the
+ *    refusal below renders as `FAIL REGISTER ERR_ACCOUNTREGISTRATIONDISABLED` for
+ *    a client that negotiated it.
+ *
+ *    WHAT THE ARRIVAL DID NOT CHANGE IS THE DECISION, and that is worth being
+ *    blunt about rather than leaving a reader to wonder whether reason 2 quietly
+ *    expired and took the refusal with it: **being able to say the right thing is
+ *    not a reason to say it.** Reasons 3 and 4 are the ones that hold, and neither
+ *    mentions the wire form. A node that could answer the command truthfully
+ *    should still refuse it, and the refusal is now the more precise of the two
+ *    renderings rather than a compromise.
+ *
+ * 3. OPEN REGISTRATION IS NOT A FEATURE HERE, IT IS A NAME-CLAIMING PRIMITIVE.
+ *    REGISTER takes a password and an optional email and, without a verification
+ *    mail and without a rate limit, the ONLY thing stopping an unauthenticated
+ *    client from taking any name is the speed of the connection. And taking a
+ *    name is not a nuisance here: once `account-tag` exists, an account name is
+ *    stamped on every message a client sends, and the entire value of the tag is
+ *    that it means "this is who this is". An open registry makes that value
+ *    worthless to every honest user while remaining perfectly usable as an
+ *    impersonation tool against them -- so the failure mode is not "the feature
+ *    is half-built", it is "the feature actively harms the people it was built
+ *    for". There is no rate limiter, no captcha and no mail path in this tree,
+ *    and the account store is READ-ONLY after startup: there is no write in this
+ *    tree that could record a registration even if one were allowed.
+ *
+ * 4. UNREGISTER IS WORSE THAN NOTHING, which is why it is refused too and not
+ *    implemented. The store is an operator's file, loaded once before the loop
+ *    (3.4 forbids a blocking write inside it), so an in-memory removal would
+ *    vanish on the next restart. A client told "your account has been deleted"
+ *    and then finding it intact after a restart has been told a falsehood by a
+ *    server that is supposed to be the authority on whether an account exists --
+ *    and account deletion is precisely the case where a user is relying on the
+ *    answer. Refusing is the only answer that is true at every moment.
+ *
+ * THE THREAT MODEL, stated once and plainly: on a node with this pair of
+ * commands refused, an attacker can still connect, register a nickname, send
+ * messages, and join channels -- everything this node has always allowed. What
+ * they CANNOT do is assert an account identity, because the only writer of
+ * conn_t::account is account_set() and it requires a credential the operator's
+ * credential store holds AND a registry entry the operator's registry holds.
+ * That is the whole of the model, and the cost of it is that accounts on this
+ * node are created by an operator editing a file. That cost is stated rather than
+ * hidden: it is real, it is the reason a deployment with open registration
+ * should not use this node, and it is cheaper than the alternative.
+ *
+ * ---------------------------------------------------------------------------
+ * 482, AND WHY IT IS WRONG
+ * ---------------------------------------------------------------------------
+ * 482 ERR_CHANOPRIVSNEEDED. Not in RFC 1459's sense -- it is not about a channel
+ * -- but its own RFC text is "Permission Denied- You're not an IRC operator",
+ * and that is the truest available answer: this node has NO operator concept at
+ * all, so a client that has not been made one is being told the truth. It is also
+ * the numeric CHOPER already answers with, for the same reason, and reusing it
+ * keeps "there is no operator here" to one numeric.
+ *
+ * The honest numeric is `FAIL ACCOUNT_REGISTRATION NOT_ENABLED`, and it does not
+ * exist until standard-replies does. That gap is recorded in the design rather
+ * than papered over, and it is the third of the four reasons above.
+ */
+static void account_refuse(server_t *s, conn_t *c, const char *verb,
+                           const char *text)
+{
+    /* 482, WHICH ON THIS NODE ALSO MEANS "NOT A CHANNEL OPERATOR" (KICK, MODE,
+     * INVITE) and "NOT AN IRC OPERATOR" (KNOCK). A REGISTER refused because the
+     * deployment has no open registration is a third fact wearing the same number,
+     * and `verb` is already the command word the `FAIL` needs -- which is why this
+     * site's code is an override rather than the table's. */
+    (void)reply_refused(s, c, verb, "ERR_ACCOUNTREGISTRATIONDISABLED", "482", NULL, 0,
+                        "%s", text);
+    printf("[observable] account_cmd_refused: fd=%d nick=%s verb=%s "
+           "reason=OPERATOR_SIDE_REGISTRY registry=%s\n",
+           c->fd, (c->nick[0] != '\0') ? c->nick : "*", verb,
+           (s->account_store != NULL) ? "loaded" : "none");
+}
+
+/* REGISTER <password> [email]. Refused unconditionally and without reading the
+ * arguments, and the arity is NOT checked first: a `REGISTER` with no password
+ * and a `REGISTER` with one both get the same answer, because answering one of
+ * them differently would be a way to probe which inputs the node recognises --
+ * which is the shape of every oracle this tree has refused to build. */
+static void handle_register(server_t *s, conn_t *c, const message_t *m)
+{
+    (void)m;
+    account_refuse(s, c, "REGISTER",
+                   "REGISTER is not available: this node's accounts are created "
+                   "by its operator in a registry file");
+}
+
+/* ---------------------------------------------------------------------------
+ * ACCOUNT -- the account-notify query, and the collision that had to be resolved
+ * deliberately rather than by accident
+ * ---------------------------------------------------------------------------
+ * `ACCOUNT` was, in the retired draft, the NICKNAME-CHANGE command: a client
+ * changed its nick and supplied a password in one command, and `ACCOUNT
+ * <password>` is the shape every server of that era accepted.
+ *
+ * **WHAT THIS NODE DISPATCHED BEFORE THIS PASS: NOTHING.** There was no
+ * `ACCOUNT` row in k_commands[] at all, so a client that sent it got 421 -- "I
+ * have never heard of this verb" -- and a nickname change was, and still is, `NICK
+ * <newnick>` and nothing else (handle_nick(), above). So there was no live
+ * nick-change verb to collide with, and adding this row cannot break a nick
+ * change: the two words have never reached the same switch.
+ *
+ * The IRCv3 position is that the nick-change MEANING is gone rather than merely
+ * unfashionable: an account association changed through the account service, not
+ * through the server, and a server that took a password on a nickname change was
+ * a server asking for a credential it had no way to verify. What survives is the
+ * name, reused by `account-notify` for a completely different fact.
+ *
+ * THE TWO SHAPES ARE ALSO DISJOINT, which is worth saying because it is the reason
+ * the collision costs nothing rather than merely nothing today:
+ *
+ *   the retired nick-change form  ACCOUNT <password>   ONE parameter
+ *   the query below               ACCOUNT              ZERO parameters
+ *
+ * So a client still speaking the retired dialect gets 461 for a verb with a
+ * parameter, not a nickname change. That is the right answer and it is also the
+ * reason a future phase that wanted a one-parameter ACCOUNT would have to decide
+ * to take it back rather than find it already spoken for.
+ *
+ * WHAT IS *NOT* HERE, and is the honest limit of this implementation:
+ * `ACCOUNT <account> FAIL`. There is no logout on this node -- SASL PLAIN has no
+ * logout and there is no account service to log out of, and account_clear() runs
+ * only from server_close_conn(), where the connection is already gone -- so there
+ * is no event the form describes. account.h says where an emitter would go if a
+ * phase adds one. */
+static void handle_account(server_t *s, conn_t *c, const message_t *m)
+{
+    if (m->nparams != 0) {
+        (void)reply_refused(s, c, "ACCOUNT", "INVALID_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
+        printf("[observable] account_cmd_refused: fd=%d nick=%s verb=ACCOUNT "
+               "reason=arity nparams=%d\n", c->fd, c->nick, m->nparams);
+        return;
+    }
+    /* ANSWERED REGARDLESS OF THE CAPABILITY, because the client ASKED. The
+     * capability governs the unsolicited line at the end of the welcome burst;
+     * refusing a question a client put on the wire would be a node that knows the
+     * answer and will not give it. */
+    account_notify_current(s, c);
+}
+
+/* UNREGISTER [password]. Refused unconditionally, for reason 4 above. */
+static void handle_unregister(server_t *s, conn_t *c, const message_t *m)
+{
+    (void)m;
+    account_refuse(s, c, "UNREGISTER",
+                   "UNREGISTER is not available: this node's accounts are created "
+                   "by its operator in a registry file");
 }
 
 /* ---------------------------------------------------------------------------
@@ -1113,9 +1802,15 @@ static void handle_authenticate(server_t *s, conn_t *c, const message_t *m)
          * with a byte comparison, so it is written as the RFC writes it. */
         params[0] = "*";
         (void)send_line(s, c, NULL, "AUTHENTICATE", params, 1);
-        (void)reply(s, c, "464", NULL, 0,
-                    "SASL PLAIN payload was not base64 or not three "
-                    "NUL-separated fields");
+        /* `INVALID_AUTHENTICATE` is the code the SASL specification defines for
+         * exactly this -- an AUTHENTICATE whose payload this node cannot read --
+         * and standard-replies says an existing code MUST be used where one is
+         * defined. The other two 464 sites are NOT this, which is why they carry
+         * different codes. */
+        (void)reply_refused(s, c, "AUTHENTICATE", "INVALID_AUTHENTICATE", "464",
+                            NULL, 0,
+                            "SASL PLAIN payload was not base64 or not three "
+                            "NUL-separated fields");
         conn_mark_closing(c);
         printf("[observable] sasl: fd=%d outcome=REJECTED reason=BAD_PAYLOAD\n",
                c->fd);
@@ -1137,23 +1832,65 @@ static void handle_authenticate(server_t *s, conn_t *c, const message_t *m)
          * whether to fix the store or to look for an attack, and the client
          * needs to know not to retry the same password. It never says anything
          * about the credential itself. */
-        (void)reply(s, c, "464", NULL, 0, "SASL authentication failed: %s",
-                    no_store ? "this node holds no client credential store"
-                             : "the credentials did not verify");
+        /* NOT `SAASL_FAIL`, which the registry defines as an account that is
+         * TEMPORARILY locked: neither of this node's two failures is that, and a
+         * client reading `SAASL_FAIL` would offer the user to wait and retry a
+         * password that will never verify. The registry has no code for "the
+         * credentials did not verify", so this one is `ERR_`-prefixed as ours. */
+        (void)reply_refused(s, c, "AUTHENTICATE", "ERR_AUTHENTICATIONFAILED", "464",
+                            NULL, 0, "SASL authentication failed: %s",
+                            no_store ? "this node holds no client credential store"
+                            : "the credentials did not verify");
         printf("[observable] sasl: fd=%d authcid=%s outcome=REJECTED reason=%s\n",
                c->fd, authcid, no_store ? "NO_STORE" : "BAD_CREDENTIAL");
         return;
     }
 
-    /* Verified. Nothing is GRANTED, because there is nothing here to grant -- see
-     * sasl_framework.h on what SASL authenticates against. What is recorded is
-     * the fact and the identity, so a later numeric could report it; the counter
-     * is the node's own claim and it is incremented here because this is the
-     * only place a credential is ever accepted. */
+    /* Verified. What is recorded is the fact and the identity, so a later numeric
+     * could report it; the counter is the node's own claim and it is incremented
+     * here because this is the only place a credential is ever accepted.
+     *
+     * AND THE ACCOUNT IS ESTABLISHED HERE, which is the whole of what Phase 10.1
+     * added to this function. Until now `c->sasl = SASL_COMPLETED` granted
+     * nothing and recorded an authcid nothing could read, which is why seven
+     * IRCv3 specs were blocked on an account concept that did not exist: SASL
+     * authenticates a CONNECTION and an account is what you are ACROSS
+     * connections.
+     *
+     * THE PASSWORD IS HANDED TO account_set() AND NOT STORED, and it is the same
+     * `passwd` local that sasl_plain_verify() just read. account_set() re-checks
+     * it against the OPERATOR'S ACCOUNT REGISTRY -- a different table from the
+     * credential store this function verified against -- so a node whose two
+     * files disagree about `alice` logs her in as nobody rather than logging her
+     * in as an account that does not exist. That is the fail-closed direction and
+     * it costs one bounded constant-time walk on a path that runs once per login.
+     *
+     * A REFUSAL HERE IS NOT AN AUTHENTICATION FAILURE. The credential verified;
+     * the client is authenticated and is simply not identified to an account,
+     * which is the same state as a client that declined to authenticate. So
+     * `c->sasl` stays COMPLETED, registration proceeds, and the node says why on
+     * its own output -- because the alternative (refusing the whole exchange
+     * because an account was not configured) would make adding an account
+     * registry a change to who can log in, and it must not be.
+     */
     c->sasl = (int)SASL_COMPLETED;
     s->n_sasl_ok++;
-    printf("[observable] sasl: fd=%d authcid=%s outcome=COMPLETED granted=0\n",
-           c->fd, authcid);
+    if (account_set(s, c, authcid, passwd) != 0) {
+        s->n_account_refused++;
+        printf("[observable] account: fd=%d authcid=%s outcome=REFUSED reason=%s "
+               "registry=%s\n",
+               c->fd, authcid,
+               (s->account_store == NULL) ? "NO_REGISTRY" : "NOT_IN_REGISTRY",
+               (s->account_store != NULL) ? "loaded" : "none");
+    }
+    /* TWO KEYS AND NOT ONE, and the split is deliberate: `logged_in` is the
+     * BOOLEAN and `account=` on account_set()'s line is a NAME. Rendering both
+     * as `account=` would put a name and a 0/1 behind one key on two different
+     * lines, and a reader (or a grep, or a test) asking "what is this user's
+     * account" would have to know which of the two it had found. */
+    printf("[observable] sasl: fd=%d authcid=%s outcome=COMPLETED granted=0 "
+           "logged_in=%d\n",
+           c->fd, authcid, account_logged_in(c));
     /* Registration is not forced here. A client that sent NICK and USER before
      * its AUTHENTICATE has already satisfied the state machine, and if it was
      * held for CAP it is still held -- so the gate is re-evaluated rather than
@@ -1237,7 +1974,35 @@ static const command_t k_commands[] = {
     { "LUSERS",  handle_lusers,  0 },
     { "ADMIN",   handle_admin,   0 },
     { "INFO",    handle_info,    0 },
-    { "CHOPER",  handle_choper,   0 }
+    { "CHOPER",  handle_choper,   0 },
+    /* 7/Phase 10.1: the account-registration pair, REFUSED rather than
+     * unimplemented, and in the table rather than left to the 421 path for the
+     * reason handle_register()/handle_unregister() give. A client that sends
+     * REGISTER and gets 421 would read "this server has never heard of
+     * REGISTER"; this node HAS heard of it and has decided. The distinction is
+     * the whole of what a refusal is, and 421 cannot express it. */
+    { "REGISTER",   handle_register,   0 },
+    { "UNREGISTER", handle_unregister, 0 },
+    /* 7/Phase 10.6: IRCv3's `setname`. NOT `pre_reg`, which is gate 1 of the three
+     * in handle_setname() -- an unregistered connection has an EMPTY realname, so
+     * without the gate a SETNAME would "succeed" at setting state that does not
+     * exist yet. The verb is IN the table even though the capability gates what it
+     * does, because the specification requires the command to be supported whether
+     * or not the client negotiated it: a client that sent SETNAME and got 421 would
+     * read "this server has never heard of it". */
+    { "SETNAME",    handle_setname,    0 },
+    /* 7/Phase 10.12: IRCv3 `batch`. `pre_reg`, and that is a decision worth the
+     * comment: a client that batches its OWN registration lines is legal -- the
+     * reference tags are a property of any command -- and holding the gate closed
+     * until `001` would mean the `001`-`005` burst escaped the batch a client had
+     * legitimately opened around it. The batch state is per connection and lives in
+     * conn_t, so nothing here can reach another client's. */
+    { "BATCH",      handle_batch,      1 },
+    /* 7/Phase 10.2b: the account-notify query. NOT `pre_reg`, because the answer
+     * carries this connection's hostmask and a pre-registration connection has no
+     * nickname to put in it -- an unregistered client sending ACCOUNT gets 451,
+     * which is the RFC's own answer for "you have not registered yet". */
+    { "ACCOUNT",    handle_account,    0 }
 };
 
 static const command_t *lookup(const char *verb)
@@ -1333,5 +2098,42 @@ void commands_dispatch(server_t *s, conn_t *c, const message_t *m)
         return;
     }
 
+    /* THE `batch` HOOK, AND WHY IT BRACKETS THE HANDLER RATHER THAN PRECEDING IT.
+     *
+     * `batch_begin_command()` is what turns an inbound line's `@`/`+` reference tags
+     * into two things this dispatch then makes true: a `batch=` tag on the response
+     * (a one-shot, consumed by the reply path) and a SUPPRESSION that lasts exactly as
+     * long as the command. Both have to be set BEFORE `cmd->fn` runs -- a handler's
+     * first byte of output is already too late for the first, and the second would be
+     * cleared by `batch_end_command()` before it was ever set.
+     *
+     * AND `batch_end_command()` IS NOT OPTIONAL ON ANY PATH, which is why it is after
+     * the call rather than inside an error branch: a suppressed flag that survived a
+     * command would swallow the NEXT command's replies too, and the symptom would be
+     * a client that goes silent for no reason it can see. There is exactly one exit
+     * from `cmd->fn()` that is not a `return`, because every handler returns.
+     *
+     * IT IS HERE AND NOT IN reply.c, because reply.c cannot know when a command
+     * starts: it only sees outbound lines, and "which of them is the FIRST line of
+     * this command's response" is not a property of any one of them. */
+    batch_begin_command(c, m);
+    label_begin_command(c, m);
     cmd->fn(s, c, m);
+    /* THE TAIL. Two things have to happen after the handler and not inside it, and both
+     * are "what remains to be said" questions that a handler cannot answer because it
+     * does not know what the handler emitted:
+     *
+     *   label_finish_command()  closes the `labeled-response` batch if one was opened,
+     *                           or answers `ACK` if the command produced nothing. A
+     *                           handler returning early on a refusal has still produced
+     *                           a response -- the refusal -- so the label goes on THAT,
+     *                           which is why the tail asks what was emitted rather than
+     *                           asking whether the handler returned.
+     *   batch has no tail       a client batch is closed by the client.
+     *
+     * IT IS NOT OPTIONAL ON ANY PATH, and every path here ends in this call: a
+     * `label_live` that outlived its command would label the NEXT command's first line
+     * with a value the client was already told was finished.
+     */
+    label_finish_command(s, c);
 }

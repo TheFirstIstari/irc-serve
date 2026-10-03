@@ -52,12 +52,32 @@
  * forward, for the originating case -- and carried where the message already
  * has one, because a restamp would give a relayed copy an identity the far
  * side's dedup store has never seen, which is the loop. See fanout.h.
+ *
+ * ---------------------------------------------------------------------------
+ * AND WHERE THE `account` TAG IS STAMPED, WHICH IS THE SAME QUESTION
+ * ---------------------------------------------------------------------------
+ * 2.4's (origin, epoch, id) and IRCv3's `account` are both properties of ONE
+ * EMISSION, and both are resolved at the single point above the switch in
+ * fanout_deliver(): `ident` by fanout_stamp(), and the account by
+ * fanout_emitter_account() beside it. Neither is asked again per destination --
+ * only the DECISION to render it is per destination, in fanout_tag_block().
+ *
+ * WHY PER-FORWARD-TARGET RESOLUTION WOULD BE A BUG RATHER THAN A WASTE. The
+ * tempting wrong shape is to resolve the sender at each destination, which asks
+ * "whoever is at the other end" rather than "who sent this". On the local leg the
+ * two happen to agree, so the node looks correct; then a relayed SPRIVMSG -- prefix
+ * `:bob@irc.b`, no local connection by that name -- resolves to nothing and the tag
+ * silently disappears for exactly the messages whose sender identity is in
+ * question. The value has to come from the ONE place that knows who sent it, and
+ * there is one such place: fanout_deliver(), above the switch, where `ident`
+ * already lives.
  */
 #include "core/fanout.h"
 
 #include <stdio.h>
 #include <string.h>
 
+#include "core/account.h"
 #include "core/cap.h"
 #include "core/reply.h"
 /* Phase 9: 2.1's remote-nick registry, which is what turns 3.1's `nick@server`
@@ -382,6 +402,12 @@ int fanout_is_member(const fanout_target_t *t, const conn_t *c)
     return (t->chan != NULL && chan_find_member(t->chan, c) != NULL) ? 1 : 0;
 }
 
+/* The worst-case client-visible tag block is FANOUT_TAG_BLOCK_MAX, and it now lives
+ * in fanout.h rather than here: Phase 10.12's `batch=` tag is prepended to a block
+ * THIS file renders, by reply.c, so the two modules have to agree on how wide one is
+ * and the only way to arrange that is one declaration both can see. The derivation and
+ * the argument for deriving it are at the definition. */
+
 /* ---------------------------------------------------------------------------
  * 3.2's client-facing cap
  * ---------------------------------------------------------------------------
@@ -393,8 +419,8 @@ int fanout_is_member(const fanout_target_t *t, const conn_t *c)
  * and not a metric. A client that sent a long message is not a bug, it is a
  * limit, and a limit answers with a numeric.
  *
- * The number subtracted is 3.2's IRC_MAX_RELAY_LINE, and it is subtracted from
- * the FULL line rather than from the message alone. Two reasons that is the
+ * The number subtracted is 3.2's IRC_MAX_RELAY_LINE, and it is subtracted from the
+ * FULL line rather than from the message alone. Two reasons that is the
  * conservative direction:
  *
  *   - the tag block is added on the relay path, which is Phase 6, so a message
@@ -409,6 +435,7 @@ int fanout_is_member(const fanout_target_t *t, const conn_t *c)
  * The remaining envelope -- prefix, verb, target -- is charged at its maximum,
  * written as the struct widths the two of them come from, so raising
  * conn_t::nick or chan_t::name cannot leave the arithmetic short. */
+
 int fanout_line_fits_n(const char *prefix, const char *verb, size_t target_len,
                        size_t params_bytes)
 {
@@ -451,8 +478,31 @@ int fanout_line_fits(const char *prefix, const char *verb, const char *target,
     if (verb == NULL || text == NULL) {
         return 0;
     }
+    /* THE CLIENT-FACING CAP CHARGES THE LARGEST CLIENT-VISIBLE TAG BLOCK, and
+     * charging it is the only difference from fanout_line_fits_n(). The arithmetic
+     * in that function is the shared envelope -- prefix, verb, target -- against
+     * IRC_MAX_RELAY_LINE, which is IRC_MAX_LINE minus IRC_MAX_TAG_OVERHEAD: 3.2
+     * reserves exactly that much for whatever tag block the outbound line carries,
+     * and for a PEER line it is the 2.4 internal block, which is bounded by the
+     * same reserve. A CLIENT line's block is a different one and it is NOT bounded
+     * by that reserve: this node may write `msgid` AND `account`, and
+     * FANOUT_TAG_BLOCK_MAX is larger than IRC_MAX_TAG_OVERHEAD.
+     *
+     * SO IT IS CHARGED HERE, in full, rather than left to the render. The
+     * alternative -- discovering the overflow when message_format() refuses the
+     * line -- is a refusal counted on n_reply_refused, which reply.c documents as
+     * a bug report, and it would cost a user their message to save 250 bytes of
+     * headroom. reply.c's comment already names this as the obligation: "whoever
+     * adds such an emission must charge the tag against IRC_MAX_RELAY_LINE where
+     * fanout_line_fits() is applied."
+     *
+     * The cost is a smaller maximum message: this charges 2 + FANOUT_TAG_BLOCK_MAX
+     * (250 bytes today) against the 8013 of IRC_MAX_RELAY_LINE, so the longest
+     * PRIVMSG this node relays is 250 bytes shorter than it was. That is a limit,
+     * stated at the point it is applied, and the alternative is losing messages at
+     * the cap. */
     return fanout_line_fits_n(prefix, verb, (target != NULL) ? strlen(target) : 0u,
-                              strlen(text));
+                              strlen(text) + (2u + FANOUT_TAG_BLOCK_MAX));
 }
 
 /* ---------------------------------------------------------------------------
@@ -545,35 +595,196 @@ static void fanout_stamp(server_t *s, const irc_serve_tags_t *carry,
     *relayed = 1;
 }
 
-/* The client-visible `msgid` tag for one DESTINATION, or NULL when this
- * destination gets none.
+/* THE SENDER'S ACCOUNT, RESOLVED ONCE FOR THE EMISSION, or "" when this
+ * emission has none to assert: a relay (see the decision below), a SERVER prefix
+ * with no local connection behind it, or a local sender that is simply not logged
+ * in.
  *
- * PER DESTINATION, because the capability is per connection: two members of one
- * channel can disagree about `message-tags` and the block is written per member
- * inside the member walk rather than once for the emission. That is why this
- * takes the conn_t and not just the stamp.
+ * WHY THE PREFIX IS THE SUBJECT. Every emission this node ORIGINATES carries the
+ * acting client's `nick!user@host` -- RFC 2812 3.3.1 requires it on the JOIN,
+ * PART, TOPIC, KICK and MODE echoes and PRIVMSG/NOTICE carry it by the same rule,
+ * and conn_hostmask() is the one renderer -- so the prefix IS the identity the
+ * emission is about, and it is already an argument to this function. A `conn_t *`
+ * parameter would have to be threaded through fanout_deliver(), write_to_members()
+ * and every call site of the forward for one value this node can read from what
+ * it was handed, and each of those additions is a chance for a caller to pass a
+ * different connection than the one the prefix names.
  *
- * The failure branch is a BUG REPORT and not a fallback. irc_serve_msgid_tag()
+ * IT IS A CONNECTION-LOCAL LOOKUP AND NOT A REGISTRY ASK, for the same reason
+ * fanout_resolve()'s local branch is: server_nick_lookup() holds exactly this
+ * node's own clients, so a prefix naming a REMOTE user finds nothing and there is
+ * nothing to say. That is the correct answer rather than a gap, and it is the
+ * federation decision below arriving structurally instead of as a check.
+ *
+ * ---------------------------------------------------------------------------
+ * `+account` DOES NOT CROSS TO PEERS. A deliberate decision, stated here because
+ * the alternative is defensible and a reader deserves to know which was chosen.
+ * ---------------------------------------------------------------------------
+ * An account registry is PER NODE and PER OPERATOR: design 2.5.1 says so, and two
+ * nodes whose operators each wrote their own --account-store will disagree about
+ * who somebody is, with nothing to arbitrate. Forwarding one node's account claim
+ * would hand the far side's clients an identity that no registry they can consult
+ * holds, and the client has no way to check it -- the `account` tag is precisely
+ * the assertion a client trusts. This node asserts only what IT verified.
+ *
+ * The cost is real and it is worth naming: a member of a shared channel on a peer
+ * sees no `account` tag on the peer's messages, so per-message identity stops at
+ * the node that authenticated the sender. `extended-join` (Phase 10.3) carries the
+ * account as MEMBERSHIP state, which is the claim federation does have a channel
+ * for, and closing the per-message gap needs an account authority both nodes trust
+ * -- a services registry, not a tag.
+ *
+ * IT IS ENFORCED BY `relayed` RATHER THAN BY A STRING TEST, so the decision is one
+ * branch rather than a property of which characters the prefix happens to hold: a
+ * RELAYED emission is never stamped with an account, whatever its prefix says. */
+static const char *fanout_emitter_account(server_t *s, const char *prefix,
+                                          int relayed)
+{
+    char nick[IRC_MAX_NICK + 1];
+    const char *bang;
+    const conn_t *local;
+    size_t nlen;
+
+    if (relayed != 0 || s == NULL || prefix == NULL) {
+        return "";
+    }
+    /* The nick is the part before '!', and a prefix with no '!' is the name itself
+     * -- which is a SERVER prefix (a relayed state verb, or one forwarded with no
+     * actor) and is looked up anyway and finds nothing. The lookup is one walk of
+     * the nick table per EMISSION, not per destination, which is noise beside the
+     * render it feeds. */
+    bang = strchr(prefix, '!');
+    nlen = (bang != NULL) ? (size_t)(bang - prefix) : strlen(prefix);
+    if (nlen == 0u || nlen > (size_t)IRC_MAX_NICK) {
+        return "";
+    }
+    memcpy(nick, prefix, nlen);
+    nick[nlen] = '\0';
+    local = server_nick_lookup(s, nick);
+    if (local == NULL) {
+        return "";
+    }
+    /* account_name() rather than the field, so the empty-means-anonymous
+     * distinction is read through the predicate that owns it: an unidentified
+     * client yields "" and an unidentified client gets no tag. */
+    return account_name(local);
+}
+
+/* The tag block for ONE DESTINATION, or NULL when that destination gets none.
+ *
+ * PER DESTINATION, twice over and for the same reason both times: the capability
+ * is per connection, so two members of one channel can disagree about whether
+ * they want to be told who sent a message. The block is therefore written per
+ * member INSIDE the member walk rather than once for the emission -- and that is a
+ * statement about WHEN the bytes are rendered, not about where the ACCOUNT NAME
+ * comes from. The name was resolved once, by fanout_emitter_account(), and every
+ * destination below is handed that same value. That is the whole distinction and
+ * it is the one a per-target lookup gets wrong.
+ *
+ * ORDER IS msgid THEN account, and it is fixed rather than incidental: the block
+ * is a byte string, and a test that asserts one tag must not be sensitive to
+ * which order the node happened to choose.
+ *
+ * The failure branch is a BUG REPORT and not a fallback. irc_serve_msgid_value()
  * returns 0 only for a stamp 2.4's grammar would refuse or a buffer one byte too
  * small, and both are impossible here (the stamp was just computed by
- * fanout_stamp() from s->epoch and the counter, so it is legal; the buffer is
- * sized from the derivation in message.h). Emitting the line untagged would be
+ * fanout_stamp() from s->epoch and the counter, so it is legal; the buffer is sized
+ * from FANOUT_TAG_BLOCK_MAX above). Emitting the line with neither tag would be
  * the quiet half of a claim this file makes -- "a client that asked for msgids
- * gets them" -- so it is refused loudly instead and the caller sends nothing. */
-static const char *fanout_msgid_tag(const conn_t *dst,
-                                    const irc_serve_tags_t *ident, char *out,
-                                    size_t cap)
+ * gets them" -- so the refusal is reported loudly on the node's own output and the
+ * block is left empty, which is what send_line_tagged() reads as "no block". The
+ * MESSAGE still goes out: a decoration this node failed to render must never cost
+ * a user their message, and the diagnostic is what turns an unreachable branch
+ * into something a reader would notice rather than something to rediscover. */
+static const char *fanout_tag_block(const conn_t *dst,
+                                    const irc_serve_tags_t *ident,
+                                    const char *account, char *out, size_t cap)
 {
-    if (cap_message_ids_enabled(dst) == 0) {
+    char msgid[IRC_MAX_MSGTAG + 1u];
+    char acct[ACCOUNT_TAG_MAX];
+    size_t n = 0;
+
+    if (out == NULL || cap == 0u) {
         return NULL;
     }
-    if (irc_serve_msgid_tag(ident, out, cap) == 0u) {
-        printf("[observable] msgid_refused: fd=%d origin=%s id=%llu\n",
-               (dst != NULL) ? dst->fd : -1, ident->origin,
-               (unsigned long long)ident->id);
-        return NULL;
+    out[0] = '\0';
+
+    if (cap_message_ids_enabled(dst) != 0) {
+        if (irc_serve_msgid_value(ident, msgid, sizeof msgid) == 0u) {
+            printf("[observable] msgid_refused: fd=%d origin=%s id=%llu\n",
+                   (dst != NULL) ? dst->fd : -1, ident->origin,
+                   (unsigned long long)ident->id);
+            out[0] = '\0';
+            return NULL;
+        }
+        /* snprintf rather than a hand-rolled append, and its return is CHECKED
+         * rather than cast: the length it reports is what says the block fits, and
+         * an unchecked accumulation is the three-bugs-in-one-expression cap.h
+         * documents for CAP_LS_MAX. */
+        {
+            const int w = snprintf(out, cap, "%s=%s", IRCV3_TAG_MSGTAG, msgid);
+
+            if (w < 0 || (size_t)w >= cap) {
+                out[0] = '\0';
+                return NULL;
+            }
+            n = (size_t)w;
+        }
     }
-    return out;
+
+    /* NO ACCOUNT, NO TAG -- and the first test is on the VALUE, not on the sender's
+     * logged-in flag. account_name() already returns "" for a connection that is
+     * not identified, and the specification says the tag MUST NOT be sent for such
+     * a user, so an empty name is a tag that must not EXIST rather than a tag with
+     * an empty value. The capability gate is per DESTINATION and comes second, so
+     * a client that did not ask is never asked about this node's internals. */
+    if (account != NULL && account[0] != '\0' &&
+        cap_account_tag_enabled(dst) != 0) {
+        if (account_tag_block(account, acct, sizeof acct) == 0u) {
+            /* The same shape as the msgid refusal above: a bug report, and the
+             * message still goes out. account_tag_block() cannot fail for a name
+             * account_name() produced -- it is non-empty and shorter than
+             * ACCOUNT_MAX_NAME, which is half ACCOUNT_TAG_MAX's value budget even
+             * with every byte escaped -- so this arm is a bound that moved. */
+            printf("[observable] account_tag_refused: fd=%d\n",
+                   (dst != NULL) ? dst->fd : -1);
+            out[0] = '\0';
+            return NULL;
+        }
+        /* The ';' goes in front of the pair rather than behind the one already
+         * written, so a separator is only ever emitted when there is something on
+         * BOTH sides of it -- which is the whole of why this is a branch and not a
+         * constant prefix. */
+        {
+            const int w = snprintf(out + n, cap - n, "%s%s", (n > 0u) ? ";" : "", acct);
+
+            if (w < 0 || (size_t)w >= cap - n) {
+                out[0] = '\0';
+                return NULL;
+            }
+            n += (size_t)w;
+        }
+    }
+    return (out[0] != '\0') ? out : NULL;
+}
+
+/* WHICH OF TWO PARAMETER LISTS DOES THIS DESTINATION GET?
+ *
+ * One function, called from the member walk and from the single-user row, because
+ * the two arms of the switch are two destinations in all but name and a capability
+ * question answered twice is a capability question that can be answered two ways.
+ *
+ * A NULL or empty `extended` means there is only one shape, which is every
+ * emission in this file except the extended JOIN. */
+static void fanout_form_for(const conn_t *dst, const fanout_form_t *extended,
+                            const char *const **params, int *nparams)
+{
+    if (extended == NULL || extended->params == NULL ||
+        cap_extended_join_enabled(dst) == 0) {
+        return;
+    }
+    *params = extended->params;
+    *nparams = extended->nparams;
 }
 
 /* Write one line to every local member of `t->chan`, minus `exclude`.
@@ -583,12 +794,27 @@ static const char *fanout_msgid_tag(const conn_t *dst,
  * be written to, and attempting it is a guaranteed n_reply_refused -- a
  * non-zero value of the counter reply.c keeps at zero precisely because a
  * non-zero value means a bug. A teardown that is correct in every other respect
- * must not manufacture one. */
+ * must not manufacture one.
+ *
+ * `gate` IS ASKED HERE, PER MEMBER, and this is the whole of the third outcome:
+ * a member it refuses is skipped before `all` is built, so it gets no line and
+ * no tag block and is not counted. See fanout.h for why it is a predicate and
+ * not a third shape, and for the order it is asked in relative to liveness and
+ * `exclude` -- the three tests run in that order and each is cheaper than the
+ * next. */
 static int write_to_members(server_t *s, const fanout_target_t *t,
                             const char *prefix, const char *verb,
                             const char *const *params, int nparams,
-                            conn_t *exclude, const irc_serve_tags_t *ident)
+                            conn_t *exclude, const irc_serve_tags_t *ident,
+                            const char *account, const fanout_form_t *extended,
+                            fanout_gate_fn gate, void *gate_ctx)
 {
+    /* THE SHAPE IS DECIDED PER MEMBER AND EVERYTHING ELSE IS NOT, which is the
+     * whole of what `extended` adds to this function. The parameter list, the
+     * verb, the prefix, the 2.4 stamp and the account name are one emission's
+     * facts and are the same for every member; only the recipient's negotiation
+     * decides which of two lists of parameters it will be handed. */
+
     /* The target is `t->name` -- 2.2's CANONICAL form -- and not whatever the
      * caller typed, PREPENDED to the caller's own parameters. That is why the
      * caller's list is the parameters AFTER the target: it is the same
@@ -623,18 +849,30 @@ static int write_to_members(server_t *s, const fanout_target_t *t,
     if (t->chan == NULL || nparams < 0 || nparams >= IRC_MAX_PARAMS) {
         return 0;
     }
-    all[0] = t->name;
-    for (int i = 0; i < nparams; i++) {
-        all[i + 1] = params[i];
-    }
     for (size_t i = 0; i < t->chan->nmembers; i++) {
         conn_t *m = t->chan->members[i].c;
-        char msgid[IRC_MAX_MSGTAG + 1u];
+        char tags[FANOUT_TAG_BLOCK_MAX + 1u];
+        const char *const *use = params;
+        int nuse = nparams;
 
         if (!chan_member_live(&t->chan->members[i])) {
             continue;
         }
         if (exclude != NULL && m == exclude) {
+            continue;
+        }
+        /* AND THE GATE, AFTER `exclude` AND BEFORE ANY RENDERING, which is the
+         * order that matters twice over. Asking it last means a member this
+         * emission was never going to reach is not asked a question about it,
+         * and asking it before the shape is resolved means a gated-off member
+         * cannot influence anything -- not the `use`/`nuse` locals, not the
+         * arity report below, not the tag buffer. A node that asked the gate
+         * LAST would still send the right bytes, but it would have rendered a
+         * tag block and possibly reported a `fanout_unhandled_form` for a
+         * destination that was never going to be written to, and the second of
+         * those is a bug report on the node's observable output caused by a
+         * member who was never in the conversation. */
+        if (gate != NULL && gate(m, gate_ctx) == 0) {
             continue;
         }
         /* PER MEMBER, and the buffer is per member too rather than hoisted: the
@@ -644,9 +882,41 @@ static int write_to_members(server_t *s, const fanout_target_t *t,
          * block is a pointer into this frame, so one buffer re-used across the
          * walk is a buffer whose contents change while the previous member's
          * line is already queued (which is harmless) but whose NUL is assumed by
-         * send_line_tagged() (which is not, and would be the bug). */
-        (void)send_line_tagged(s, m, prefix, verb, all, nparams + 1,
-                               fanout_msgid_tag(m, ident, msgid, sizeof msgid));
+         * send_line_tagged() (which is not, and would be the bug).
+         *
+         * `account` IS NOT PER MEMBER, and that is the point of the whole
+         * function: it is the SAME resolved name for every destination here and
+         * for the forward below. What varies per member is whether it is rendered
+         * at all. */
+        /* THE SHAPE, RESOLVED. fanout_form_for() is the ONE place that asks a
+         * destination which of two parameter lists it gets, and it is a function
+         * rather than an inline test so that the user row below cannot answer the
+         * question differently from this one. */
+        fanout_form_for(m, extended, &use, &nuse);
+        /* AND THE EXTENDED LIST IS ARITY-CHECKED PER MEMBER, because the guard
+         * above ran on the PLAIN one and an extended list can be longer. Unreachable
+         * today -- the only extended caller adds two parameters to a verb that had
+         * none -- and reported rather than assumed, for the reason write_to_members()
+         * reports its other refusals: a caller that outgrew the array is a bug and
+         * this node does not silently drop a member's copy of a line to hide one. */
+        if (nuse >= IRC_MAX_PARAMS) {
+            printf("[observable] fanout_unhandled_form: verb=%s target=%s "
+                   "nparams=%d\n", verb, t->name, nuse);
+            continue;
+        }
+        /* AND `all` IS BUILT PER MEMBER, INSIDE the walk, which it did not have to
+         * be before this pass. It is the target plus whichever of the two shapes
+         * this member gets, so hoisting it would have baked in whichever shape the
+         * function was called with and quietly given every member the same one --
+         * which is the bug fanout_form_for()'s comment says this shape decision
+         * exists to prevent, reached by the other road. */
+        all[0] = t->name;
+        for (int k = 0; k < nuse; k++) {
+            all[k + 1] = use[k];
+        }
+        (void)send_line_tagged(s, m, prefix, verb, all, nuse + 1,
+                               fanout_tag_block(m, ident, account, tags,
+                                                sizeof tags));
         n++;
     }
     return n;
@@ -656,13 +926,42 @@ int fanout_deliver_local(server_t *s, const fanout_target_t *t, const char *pref
                          const char *verb, const char *const *params, int nparams,
                          conn_t *exclude)
 {
+    const fanout_form_t plain = { params, nparams };
+
+    /* ONE SHAPE, expressed as the two-shape call, for the reason fanout_deliver()
+     * gives. */
+    return fanout_deliver_local_forms(s, t, prefix, verb, &plain, NULL, exclude);
+}
+
+int fanout_deliver_local_forms(server_t *s, const fanout_target_t *t,
+                               const char *prefix, const char *verb,
+                               const fanout_form_t *plain,
+                               const fanout_form_t *extended, conn_t *exclude)
+{
+    /* NO GATE, which is what "one shape for everybody" and "everybody gets it"
+     * both mean here -- the two sentences are the same sentence now, and they
+     * were two independent NULLs before the gate existed. */
+    return fanout_deliver_local_gated(s, t, prefix, verb, plain, extended, NULL, NULL,
+                                      exclude);
+}
+
+int fanout_deliver_local_gated(server_t *s, const fanout_target_t *t,
+                               const char *prefix, const char *verb,
+                               const fanout_form_t *plain,
+                               const fanout_form_t *extended, fanout_gate_fn gate,
+                               void *gate_ctx, conn_t *exclude)
+{
+    const char *const *params = (plain != NULL) ? plain->params : NULL;
+    int nparams = (plain != NULL) ? plain->nparams : 0;
     irc_serve_tags_t ident;
     int relayed = 0;
+    const char *account;
 
     if (s == NULL || t == NULL || verb == NULL || (params == NULL && nparams != 0) ||
         nparams < 0) {
         return 0;
     }
+
     /* THE STAMP IS MINTED AND THEN NOT USED, and that is deliberate: a local-only
      * emission still needs an identity because a member's client may be tracking
      * 2.4's msgid, and the one this function computes is the one the SAME
@@ -670,6 +969,15 @@ int fanout_deliver_local(server_t *s, const fanout_target_t *t, const char *pref
      * because write_to_members() takes it as a parameter, and a NULL there would
      * be a second thing to decide about. */
     fanout_stamp(s, NULL, &ident, &relayed);
+    /* AND THE ACCOUNT, resolved once for the same reason. IT RESOLVES TO NOTHING
+     * for this function's only caller, and that is right independently of the
+     * lookup: a rename echo is sent by the NODE, not by a user, and the
+     * specification's rule is about commands sent BY A USER. (The lookup agrees --
+     * nickreg.c passes the connection's OLD nickname as the prefix, because the
+     * field has already been overwritten by then, and that name is no longer in
+     * the registry.) Passing it through rather than hard-coding "" keeps the
+     * answer a property of the emission rather than a thing this wrapper asserts. */
+    account = fanout_emitter_account(s, prefix, relayed);
 
     switch ((int)t->kind) {
     case FANOUT_LOCAL_USER:
@@ -681,6 +989,16 @@ int fanout_deliver_local(server_t *s, const fanout_target_t *t, const char *pref
             return 0;
         }
         if (exclude != NULL && t->user == exclude) {
+            return 0;
+        }
+        /* THE GATE IS ASKED HERE TOO, and it is the row where skipping it would
+         * be least visible and most wrong: a `nick@server`-free direct delivery
+         * writes to exactly one connection, so a node that honoured the gate for
+         * channels and not for users would be a node whose unsolicited
+         * notification reaches every member of a channel and one named
+         * individual. "One question per destination" has to mean it for both
+         * kinds of destination, or the contract is a contract about channels. */
+        if (gate != NULL && gate(t->user, gate_ctx) == 0) {
             return 0;
         }
         {
@@ -702,7 +1020,8 @@ int fanout_deliver_local(server_t *s, const fanout_target_t *t, const char *pref
          * no forward has already decided it does not want one, so asking it which
          * kind of channel it resolved would be asking a question with no answer
          * that changes anything. */
-        return write_to_members(s, t, prefix, verb, params, nparams, exclude, &ident);
+        return write_to_members(s, t, prefix, verb, params, nparams, exclude, &ident,
+                                account, extended, gate, gate_ctx);
 
     case FANOUT_REMOTE_USER:
     case FANOUT_NONE:
@@ -716,10 +1035,153 @@ int fanout_deliver_local(server_t *s, const fanout_target_t *t, const char *pref
     }
 }
 
+int fanout_deliver_union_local_gated(server_t *s, struct chan *const *chans,
+                                     size_t nchans, const char *prefix,
+                                     const char *verb, const fanout_form_t *plain,
+                                     const fanout_form_t *extended,
+                                     fanout_gate_fn gate, void *gate_ctx,
+                                     conn_t *exclude)
+{
+    irc_serve_tags_t ident;
+    int relayed = 0;
+    const char *account;
+    int n = 0;
+
+    if (s == NULL || chans == NULL || verb == NULL || plain == NULL) {
+        return 0;
+    }
+    /* THE ARITY GUARD IS write_to_members()'s, including its `>=` and the reason
+     * the target slot is not counted here: this emission has NO target. Every
+     * parameter the caller hands over is a parameter of the line, so the bound is
+     * simply "as many as the builder takes" -- IRC_MAX_PARAMS, and no +1 for a
+     * name that is not there. A caller that outgrew it gets zero writes rather
+     * than a refusal counted on n_reply_refused, for the same reason. */
+    if ((plain->params == NULL && plain->nparams != 0) || plain->nparams < 0 ||
+        plain->nparams >= IRC_MAX_PARAMS) {
+        return 0;
+    }
+    /* ONE IDENTITY FOR THE WHOLE EMISSION, computed once above the loops for the
+     * reason fanout_deliver_forms() computes it once above its switch: the 2.4
+     * stamp and the account name are facts about the EMISSION, not about a
+     * destination, and every copy of this line -- to a member of the first channel
+     * and to a member of the last -- must be the same emission. Minting per
+     * channel would give one SETNAME two msgids. */
+    fanout_stamp(s, NULL, &ident, &relayed);
+    account = fanout_emitter_account(s, prefix, relayed);
+
+    for (size_t i = 0; i < nchans; i++) {
+        chan_t *ch = chans[i];
+
+        if (ch == NULL) {
+            continue; /* a chan_t this node no longer holds: nothing to address */
+        }
+        for (size_t k = 0; k < ch->nmembers; k++) {
+            conn_t *m = ch->members[k].c;
+            const char *const *use = plain->params;
+            int nuse = plain->nparams;
+            char tags[FANOUT_TAG_BLOCK_MAX + 1u];
+            int already = 0;
+
+            /* THE ORDER IS THE SAME FOUR QUESTIONS write_to_members() asks, in the
+             * same order, and the new one is LAST of the pre-render checks: is this
+             * member addressable, is it the excluded one, has this emission already
+             * reached it under an earlier channel, and does the gate allow it. The
+             * gate stays after `exclude` for the reason fanout.h gives -- asking it
+             * last means a member the emission was never going to reach is not
+             * asked a question about it -- and the de-duplication stays before the
+             * gate for the same shape of reason: a member already written to needs
+             * no capability question asked about a line it is not going to get. */
+            if (!chan_member_live(&ch->members[k])) {
+                continue;
+            }
+            if (exclude != NULL && m == exclude) {
+                continue;
+            }
+            /* ONCE PER DESTINATION, and this is the whole reason this entry point
+             * exists rather than a loop of fanout_deliver_local_gated() in the
+             * handler. A SETNAME line is `:nick!user@host SETNAME :<realname>` --
+             * the specification's shape has NO CHANNEL PARAMETER -- so a per-channel
+             * emission would put a *channel name* where a client expects the
+             * realname, and would hand a member of three shared channels three
+             * byte-identical copies of one fact. Neither is the specification, and
+             * the second is the same defect echo-message's fault was: one
+             * announcement, delivered more than once.
+             *
+             * THE ANSWER IS A SEARCH, NOT A SET. "Has this emission already reached
+             * `m`?" is "is `m` a member of one of the channels at a LOWER index?",
+             * and `chans` is the caller's own `conn_t::chans` -- 2.2's second index,
+             * which exists for exactly this kind of walk and is kept in step with the
+             * channel's list by chan_attach_conn()/chan_detach_conn(). So the test is
+             * a bounded search over at most `nchans * nmembers` records and there is
+             * no allocation, no cache, and therefore no teardown arm: the structure
+             * this reads is owned and freed by the channel layer.
+             *
+             * IT IS EXACT RATHER THAN APPROXIMATE, and that is a property of liveness
+             * rather than luck: `chan_member_live()` only ever goes from 1 to 0, so a
+             * member that was addressable at an earlier channel was written to, and a
+             * member that was not is not addressable now either -- so the raw pointer
+             * comparison below is sufficient and needs no second liveness test. */
+            for (size_t j = 0; j < i && already == 0; j++) {
+                chan_t *earlier = chans[j];
+
+                if (earlier == NULL) {
+                    continue;
+                }
+                for (size_t q = 0; q < earlier->nmembers; q++) {
+                    if (earlier->members[q].c == m) {
+                        already = 1;
+                        break;
+                    }
+                }
+            }
+            if (already != 0) {
+                continue;
+            }
+            if (gate != NULL && gate(m, gate_ctx) == 0) {
+                continue;
+            }
+            /* THE SHAPE AND THE ARITY, per destination, from the same two helpers
+             * every other row uses -- so a per-destination form cannot answer the
+             * shape question differently here than it does in a channel emission. */
+            fanout_form_for(m, extended, &use, &nuse);
+            if (nuse >= IRC_MAX_PARAMS) {
+                printf("[observable] fanout_unhandled_form: verb=%s target=UNION "
+                       "nparams=%d\n", verb, nuse);
+                continue;
+            }
+            /* NO `all[]`, and the absence is the point: there is no target to
+             * prepend, so the caller's list IS the line. */
+            (void)send_line_tagged(s, m, prefix, verb, use, nuse,
+                                   fanout_tag_block(m, &ident, account, tags,
+                                                    sizeof tags));
+            n++;
+        }
+    }
+    return n;
+}
+
 int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
                    const char *verb, const char *const *params, int nparams,
                    conn_t *exclude, const irc_serve_tags_t *carry)
 {
+    const fanout_form_t plain = { params, nparams };
+
+    /* THE WHOLE OF THIS FUNCTION IS ONE LINE, and it is here so that the single
+     * shape case is expressed in terms of the two-shape one rather than the other
+     * way round: a NULL `extended` IS "one shape for everybody", and a caller that
+     * reached fanout_deliver() gets exactly the behaviour it had before the
+     * extension existed. */
+    return fanout_deliver_forms(s, t, prefix, verb, &plain, NULL, exclude, carry);
+}
+
+int fanout_deliver_forms(server_t *s, const fanout_target_t *t, const char *prefix,
+                         const char *verb, const fanout_form_t *plain,
+                         const fanout_form_t *extended, conn_t *exclude,
+                         const irc_serve_tags_t *carry)
+{
+    const char *const *params;
+    int nparams;
+    const char *account;
     /* Switched on an int, not on the enum, and that is deliberate rather than
      * lazy.
      *
@@ -751,17 +1213,27 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
     irc_serve_tags_t ident;
     int relayed;
 
-    if (s == NULL || t == NULL || verb == NULL || (params == NULL && nparams != 0) ||
-        nparams < 0) {
+    if (s == NULL || t == NULL || verb == NULL || plain == NULL) {
+        return 0;
+    }
+    params = plain->params;
+    nparams = plain->nparams;
+    if ((params == NULL && nparams != 0) || nparams < 0) {
         return 0;
     }
     kind = (int)t->kind;
     fanout_stamp(s, carry, &ident, &relayed);
+    /* AND THE `account` NAME, AT THE SAME POINT AND FOR THE SAME REASON: it is the
+     * other property of THIS emission that both the local write and the forward
+     * consume, and both must be handed the same value. `relayed` decides it, so a
+     * relay stamps nothing and the decision is one branch rather than a property
+     * of the prefix's bytes. See fanout_emitter_account(). */
+    account = fanout_emitter_account(s, prefix, relayed);
 
     switch (kind) {
     case FANOUT_LOCAL_USER: {
         const char *all[IRC_MAX_PARAMS + 1];
-        char msgid[IRC_MAX_MSGTAG + 1u];
+        char tags[FANOUT_TAG_BLOCK_MAX + 1u];
         int n = 0;
 
         /* The same `>=` and the same reason as write_to_members() above: the
@@ -770,6 +1242,20 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
          * See the comment there for why the claim and the code used to disagree
          * without anything noticing. */
         if (t->user == NULL || nparams >= IRC_MAX_PARAMS) {
+            return 0;
+        }
+        /* THE SHAPE IS RESOLVED BEFORE `all` IS BUILT, and for the same reason it
+         * is resolved per member in write_to_members(): this row is a destination
+         * like any other, and a capability question answered in one arm of this
+         * switch and not the other is a JOIN that changes shape depending on
+         * whether the caller resolved a channel or a nickname. No current caller
+         * passes `extended` for a user target -- a JOIN never has one -- and
+         * resolving it here anyway costs one AND rather than leaving the question
+         * open for the next caller. The arity check is repeated afterwards because
+         * the extended list can be longer than the plain one and `all` is one slot
+         * longer than the cap. */
+        fanout_form_for(t->user, extended, &params, &nparams);
+        if (nparams >= IRC_MAX_PARAMS) {
             return 0;
         }
         all[0] = t->name;
@@ -785,23 +1271,36 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
              * what lets a client confirm delivery without a second command. */
             return 0;
         }
-        /* The msgid gate, asked about THIS destination, which is the one
-         * connection this row writes to. A PRIVMSG to a user rather than to a
-         * channel is still one emission with one 2.4 identity, and the stamp the
-         * identity came from is the same one a channel row would have forwarded,
-         * so the value a user sees and the value a peer would see for the same
-         * message are the same string. */
+        /* The tag gate, asked about THIS destination, which is the one connection
+         * this row writes to. A PRIVMSG to a user rather than to a channel is still
+         * one emission with one 2.4 identity, and the stamp the identity came from
+         * is the same one a channel row would have forwarded, so the value a user
+         * sees and the value a peer would see for the same message are the same
+         * string -- and the account name, resolved once above, is the same string
+         * too. */
         (void)send_line_tagged(s, t->user, prefix, verb, all, nparams + 1,
-                               fanout_msgid_tag(t->user, &ident, msgid, sizeof msgid));
+                               fanout_tag_block(t->user, &ident, account, tags,
+                                                sizeof tags));
         n = 1;
         return n;
     }
 
     case FANOUT_LOCAL_CHANNEL: {
+        /* NO GATE, and the reason is fanout.h's: a gate is asked about a LOCAL
+         * DESTINATION and this row also forwards, so the two questions have
+         * different destinations and a gate here would be set by a caller
+         * believing it reached the members rather than the peers. */
         int n = write_to_members(s, t, prefix, verb, params, nparams, exclude,
-                                 &ident);
+                                 &ident, account, extended, NULL, NULL);
 
         /* 3.1's two owned rows, AND THEY NOW SHARE ONE FORWARD ARM.
+         *
+         * AND THE FORWARD GETS `params`, NEVER `extended`. That is not an
+         * oversight and it is the whole of fanout.h's argument for this entry
+         * point: the peer-facing shape of a JOIN is 4.3's SJOIN, built by
+         * federation/verbs.c from the channel's membership, and it is one frozen
+         * shape for every peer. Which of a node's CLIENTS negotiated
+         * `extended-join` must not change what that node says to a peer.
          *
          * The local write is the only thing the verb class changes here, and the
          * forward is unconditional for both. The forward half is
@@ -866,7 +1365,7 @@ int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
          * that do. */
         {
             int n = write_to_members(s, t, prefix, verb, params, nparams, exclude,
-                                     &ident);
+                                     &ident, account, extended, NULL, NULL);
 
             (void)fanout_forward_channel(s, t->chan, t->vclass, verb, prefix, params,
                                          nparams, &ident, relayed);

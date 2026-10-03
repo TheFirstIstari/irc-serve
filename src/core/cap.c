@@ -17,6 +17,7 @@
 
 #include "core/commands.h"
 #include "core/reply.h"
+#include "account_store.h"
 #include "sasl_framework.h"
 
 /* --------------------------------------------------------------------------
@@ -31,7 +32,18 @@ enum {
     CAPBIT_MULTIPREFIX = 1u << 0,
     CAPBIT_MESSAGE_TAGS = 1u << 1,
     CAPBIT_MESSAGE_IDS = 1u << 2,
-    CAPBIT_SASL = 1u << 3
+    CAPBIT_SASL = 1u << 3,
+    CAPBIT_ACCOUNT_TAG = 1u << 4,
+    CAPBIT_ACCOUNT_NOTIFY = 1u << 5,
+    CAPBIT_EXTENDED_JOIN = 1u << 6,
+    CAPBIT_USERHOST_IN_NAMES = 1u << 7,
+    CAPBIT_SETNAME = 1u << 8,
+    CAPBIT_ECHO_MESSAGE = 1u << 9,
+    CAPBIT_STANDARD_REPLIES = 1u << 10,
+    CAPBIT_AWAY_NOTIFY = 1u << 11,
+    CAPBIT_BATCH = 1u << 12,
+    CAPBIT_LABELED_RESPONSE = 1u << 13,
+    CAPBIT_INVITE_NOTIFY = 1u << 14
 };
 
 /* THE BIT ORDER IS FIXED AND THE TABLE BELOW IS THE CLAIM.
@@ -57,7 +69,18 @@ static const cap_def_t k_caps[] = {
     { CAP_MULTIPREFIX, CAPBIT_MULTIPREFIX },
     { CAP_MESSAGE_TAGS, CAPBIT_MESSAGE_TAGS },
     { CAP_MESSAGE_IDS, CAPBIT_MESSAGE_IDS },
-    { CAP_SASL, CAPBIT_SASL }
+    { CAP_SASL, CAPBIT_SASL },
+    { CAP_ACCOUNT_TAG, CAPBIT_ACCOUNT_TAG },
+    { CAP_ACCOUNT_NOTIFY, CAPBIT_ACCOUNT_NOTIFY },
+    { CAP_EXTENDED_JOIN, CAPBIT_EXTENDED_JOIN },
+    { CAP_USERHOST_IN_NAMES, CAPBIT_USERHOST_IN_NAMES },
+    { CAP_SETNAME, CAPBIT_SETNAME },
+    { CAP_ECHO_MESSAGE, CAPBIT_ECHO_MESSAGE },
+    { CAP_STANDARD_REPLIES, CAPBIT_STANDARD_REPLIES },
+    { CAP_AWAY_NOTIFY, CAPBIT_AWAY_NOTIFY },
+    { CAP_BATCH, CAPBIT_BATCH },
+    { CAP_LABELED_RESPONSE, CAPBIT_LABELED_RESPONSE },
+    { CAP_INVITE_NOTIFY, CAPBIT_INVITE_NOTIFY }
 };
 
 static const size_t k_ncaps = sizeof k_caps / sizeof k_caps[0];
@@ -80,6 +103,33 @@ static int sasl_possible(const server_t *s)
     return (s != NULL && sasl_store_count(s->sasl_store) > 0u) ? 1 : 0;
 }
 
+/* Is this node able to say WHO somebody is? `account-tag`, and the question is
+ * asked of the REGISTRY rather than of the credential store, because the two files
+ * answer different things and only one of them is about identity: --sasl-store
+ * says who may AUTHENTICATE, --account-store says which accounts EXIST (design
+ * 2.5.1).
+ *
+ * IT IS sasl_possible()'s SHAPE AND sasl_possible()'s REASON. A node with no
+ * registry cannot establish an account on ANY connection -- account_set()'s
+ * second check consults it and a missing registry fails that check -- so a CAP LS
+ * that listed `account-tag` there would be a client switching on a tag this node
+ * will never write, and the specification's "the tag MUST NOT be sent" for an
+ * unidentified user means the only lines it could ever see are ones whose silence
+ * it would read as "anonymous". Withholding the name is the same answer as
+ * withholding `sasl` with no credential store.
+ *
+ * THE COST, stated rather than implied: an operator who loads a registry and
+ * whose credential store FAILED to load has accounts nobody can log in to, so
+ * nobody is ever identified, so this returns 1 and the tag is advertised -- and
+ * every client that negotiates it correctly sees no tag. That is the truth about
+ * the node, and the alternative (refusing the name because a different file
+ * failed) would be a capability gated on something that does not decide whether
+ * this one is real. */
+static int account_possible(const server_t *s)
+{
+    return (s != NULL && account_store_count(s->account_store) > 0u) ? 1 : 0;
+}
+
 int cap_known(const char *name)
 {
     if (name == NULL || name[0] == '\0') {
@@ -100,6 +150,9 @@ int cap_available(const server_t *s, const char *name)
     }
     if (strcasecmp(name, CAP_SASL) == 0) {
         return sasl_possible(s);
+    }
+    if (strcasecmp(name, CAP_ACCOUNT_TAG) == 0) {
+        return account_possible(s);
     }
     return 1;
 }
@@ -201,6 +254,203 @@ int cap_message_ids_enabled(const conn_t *c)
             cap_enabled(c, CAP_MESSAGE_TAGS) != 0)
                ? 1
                : 0;
+}
+
+/* account-tag: BOTH GATES, and the second for the same reason as above -- the
+ * `account` tag is a message tag, and 3.2's parser reads a block or it does not.
+ *
+ * THE FIRST GATE IS THE ONE THE SPECIFICATION IS ABOUT. `account-tag` names the
+ * account of the SENDER, so a client that did not ask must not be told: the tag is
+ * not decoration, its ABSENCE is the assertion that a sender is anonymous, and
+ * writing it to a client that declined to negotiate tags is a node putting a block
+ * on a line the client has said it does not want to parse.
+ *
+ * THE COST, stated because it is a cost: a client that sends
+ * `CAP REQ :account-tag` without `message-tags` gets an ACK for account-tag and no
+ * tag on any line. That is the honest answer -- the REQ said it wanted one tag
+ * inside a tag support it declined -- and it is the same answer
+ * cap_message_ids_enabled() gives for the same reason. */
+int cap_account_tag_enabled(const conn_t *c)
+{
+    return (cap_enabled(c, CAP_ACCOUNT_TAG) != 0 &&
+            cap_enabled(c, CAP_MESSAGE_TAGS) != 0)
+               ? 1
+               : 0;
+}
+
+/* account-notify: ONE GATE, and there is no second one because there is no
+ * message tag involved. The line this capability turns on is a plain IRC command,
+ * so there is no `message-tags` question to ask -- which is also why it needs no
+ * per-destination render and why it is not this file's problem at all beyond the
+ * bit.
+ *
+ * It is NOT gated on the account system, and the reason is cap.h's: `ACCOUNT *` is
+ * an answer this node can give truthfully on a node with no registry, so the
+ * availability check that account-tag has would make this node keep a true fact
+ * from a client that asked for it. */
+int cap_account_notify_enabled(const conn_t *c)
+{
+    return cap_enabled(c, CAP_ACCOUNT_NOTIFY);
+}
+
+/* extended-join: ONE GATE AND NO AVAILABILITY CHECK, and the absence is the point.
+ *
+ * The line this capability turns on is a JOIN this node emits EITHER WAY, and the
+ * `*` account form is a complete answer on a node with no registry -- so there is
+ * no configuration in which this node cannot honour the capability. A store check
+ * here would mean a node with accounts silently sends a plainer JOIN to every
+ * client, which is a capability advertised and then declined rather than one
+ * advertised and honoured. */
+int cap_extended_join_enabled(const conn_t *c)
+{
+    return cap_enabled(c, CAP_EXTENDED_JOIN);
+}
+
+/* userhost-in-names: ONE GATE AND NO AVAILABILITY CHECK. The capability is a
+ * question about what a `353` may DRAW, and every member this node can draw has a
+ * host: a local one had accept() fill `c->host` before it had a nickname, and a
+ * remote one has the host 4.3's SBURSTN carries. There is no configuration under
+ * which this node has a roster and no host in it, so there is nothing to withhold
+ * the name over -- which is the same shape as account-notify's answer and the
+ * opposite of account-tag's.
+ *
+ * THE PRIVACY IS THE DOCUMENTATION, and cap.h carries it in full. What is worth
+ * saying here is where the gate is READ: `chan_verbs.c`'s `send_names_list()`,
+ * once per destination, for the connection being answered. A node that asked once
+ * per channel -- or once per node -- would hand every member's hostmask to every
+ * member whether they negotiated it or not. */
+int cap_userhost_in_names_enabled(const conn_t *c)
+{
+    return cap_enabled(c, CAP_USERHOST_IN_NAMES);
+}
+
+/* setname: ONE GATE, and the asymmetry that the NAME is advertised while this
+ * gates is the specification's rather than this file's -- the command has to work
+ * whether or not the client negotiated it, and a non-negotiating client's SETNAME
+ * is handled SILENTLY. So the name is in `k_caps[]` (the verb exists) and this
+ * decides whether this connection's SETNAME changes anything or produces no line at
+ * all. See cap.h for why a silent refusal is the specified behaviour rather than a
+ * gap in this implementation. */
+int cap_setname_enabled(const conn_t *c)
+{
+    return cap_enabled(c, CAP_SETNAME);
+}
+
+/* echo-message: ONE GATE. Whether the SENDER stays in the audience of the delivery
+ * that is happening anyway is decided in msg_verbs.c and nowhere else; this
+ * function exists so the answer has a name in cap.h beside the others and so no
+ * caller spells the capability string out a second time. See cap.h for why there is
+ * no second emission here. */
+int cap_echo_message_enabled(const conn_t *c)
+{
+    return cap_enabled(c, CAP_ECHO_MESSAGE);
+}
+
+/* standard-replies: ONE GATE, AND IT IS THE ONLY ONE THAT CHANGES A SHAPE A
+ * CLIENT CAN ALREADY PARSE.
+ *
+ * Every other capability in this file decides what this node DRAWS -- an extra
+ * parameter on a JOIN, a tag block, a sigil run, a roster entry. This one decides
+ * whether a refusal arrives as `417` or as `FAIL KICK ERR_INPUTTOOLONG`, which is
+ * a different message with a different command word. That is why the gate is
+ * asked in `reply.c` rather than at a handler: the reply path is the one place
+ * that says what an outbound message to a client MAY BE, and a capability that
+ * could be honoured or ignored per handler would be honoured on one path and
+ * forgotten on the next.
+ *
+ * ONE GATE AND NO AVAILABILITY CHECK, for the reason `extended-join` gives: what
+ * there is to say is not a property of an operator file. Every refusal on this
+ * node has something truthful to render, and `FAIL` is a rendering of the same
+ * refusal rather than a new one. */
+int cap_standard_replies_enabled(const conn_t *c)
+{
+    return cap_enabled(c, CAP_STANDARD_REPLIES);
+}
+
+/* away-notify: whether this node tells THIS client, unprompted, when a user it
+ * shares a channel with sets, changes or removes their away state.
+ *
+ * ONE GATE AND NO AVAILABILITY CHECK, and the question is not "is there an away
+ * message to report" but "is there away STATE to report at all". `conn_t::away`
+ * exists on every connection from accept() and `AWAYLEN` is advertised from
+ * `CONN_MAX_AWAY`, so this node has away state whether or not any client is
+ * currently away -- which is the same shape of answer as `userhost-in-names`
+ * (does the data exist) and the opposite of `account-tag` (is there something to
+ * SAY). A node that withheld the name whenever nobody happened to be away would be
+ * a capability that appears and disappears with the traffic.
+ *
+ * IT IS HANDED TO `fanout.c` DIRECTLY, through `cap_gate_away_notify()` below
+ * rather than through a wrapper in msg_verbs.c, so that the adaptation between
+ * this file's one-argument predicates and fanout.h's two-argument gate lives in
+ * ONE place next to the capability it is about. */
+int cap_away_notify_enabled(const conn_t *c)
+{
+    return cap_enabled(c, CAP_AWAY_NOTIFY);
+}
+
+/* fanout.h's `fanout_gate_fn` is `int (*)(const conn_t *, void *)`; every
+ * predicate in this file is `int (*)(const conn_t *)`. The gate's second argument
+ * is per-EMISSION context and none of this file's predicates wants any, but the
+ * signature is not changed for them: five other callers already hold the one-
+ * argument shape and it is the shape cap.h's own table documents. So the
+ * adaptation is a named function rather than a macro, and it lives here rather
+ * than at the call site so that "every capability predicate here is one-argument,
+ * and the gate that adapts them is this" is a single readable claim. */
+int cap_gate_away_notify(const conn_t *dst, void *ctx)
+{
+    (void)ctx;
+    return cap_away_notify_enabled(dst);
+}
+
+/* setname: the SAME adaptation, for the common-channel fan-out. `cap.c`'s
+ * away-notify comment above says the adaptation lives here rather than at the
+ * call site so that "every capability predicate here is one-argument, and the
+ * gate that adapts them is this" is one readable claim; this is the second user
+ * of that claim and it is why the claim was written that way.
+ *
+ * WHICH SIDE THE GATE IS ASKED ABOUT IS A DISCLOSURE DECISION, and it is the
+ * specification's: "The SETNAME message MUST NOT be sent to clients which do not
+ * have the setname capability negotiated." Clients, plural, and the gate takes the
+ * DESTINATION -- so a realname reaches a member who asked to learn about realnames
+ * and nobody else.
+ *
+ * THE SENDER'S NEGOTIATION IS NOT THE RIGHT ANSWER, and saying why is the point:
+ * gating on the sender would let one client put a member's realname on the wire to
+ * every other member of a shared channel by asking for a capability the RECIPIENT
+ * never requested, which is a disclosure nobody agreed to and would also contradict
+ * `cap.h`'s own rule that the CONFIRMATION is gated on the recipient -- so the two
+ * halves of one specification would decide opposite questions about the same field.
+ * A realname is personal data, and the per-destination answer is the only one that
+ * does not require trusting the person disclosing it to be careful. */
+int cap_invite_notify_enabled(const conn_t *c)
+{
+    return cap_enabled(c, CAP_INVITE_NOTIFY);
+}
+
+/* labeled-response. One predicate for all three of the specification's effects -- the
+ * label, the grouping batch and the `ACK` -- because the specification puts all three in
+ * one sentence about what a client "requesting this capability" can handle, and
+ * separating them would mean deciding that a client could handle a label but not the
+ * `ACK` it exists to be correlated with. */
+int cap_labeled_response_enabled(const conn_t *c)
+{
+    return cap_enabled(c, CAP_LABELED_RESPONSE);
+}
+
+/* invite-notify. `cap.c`'s away-notify comment says the gate adaptation lives here
+ * rather than at the call site so that the claim about one-argument predicates is one
+ * readable sentence; this is the third user of that claim and the reason it was written
+ * that way. */
+int cap_gate_invite_notify(const conn_t *dst, void *ctx)
+{
+    (void)ctx;
+    return cap_invite_notify_enabled(dst);
+}
+
+int cap_gate_setname(const conn_t *dst, void *ctx)
+{
+    (void)ctx;
+    return cap_setname_enabled(dst);
 }
 
 /* --------------------------------------------------------------------------

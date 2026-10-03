@@ -67,6 +67,17 @@
  * capability would become a privilege, and it should be added when there is a
  * privilege to grant.
  *
+ * PHASE 10.1 ADDS ONE AND IT GRANTS NOTHING EITHER, which is worth saying in
+ * this same block because the paragraph above reads like a permanent position.
+ * `account`/`logged_in` are a NAME and a VERIFICATION, not a privilege: being
+ * logged in to an account on this node authorises nothing here, no operator
+ * flag, no channel privilege, no mode, no exemption. What it will eventually buy
+ * is VISIBILITY -- `account-tag` stamping it on lines so other users can see who
+ * is who -- and that is a different thing from authority, which is why the field
+ * could be added without anyone having to decide what a logged-in client may do.
+ * If a later phase wants `logged_in` to mean a privilege, that is the change
+ * that needs a threat model, and it does not belong in a field.
+ *
  * ---------------------------------------------------------------------------
  * THE WRITE QUEUE
  * ---------------------------------------------------------------------------
@@ -107,6 +118,56 @@ struct chan; /* opaque until Phase 4 (2.2) */
 #define CONN_REG_READY 3
 #define CONN_CLOSING 4
 
+/* ---------------------------------------------------------------------------
+ * THE `batch` REFERENCE TAG BOUND, and why there is one
+ * ---------------------------------------------------------------------------
+ * IRCv3's `batch` specification constrains a reference tag to "ASCII letters,
+ * numbers, and/or hyphen", case-sensitive, and says nothing about its LENGTH. So
+ * the character class is a validation and this constant is a bound this node
+ * imposes, and the distinction is worth making rather than blurring: a
+ * specification with no length bound does not license unbounded state.
+ *
+ * 64 is IRC's own nickname bound (`IRC_MAX_NICK`, 63) plus one, and it is the
+ * bound IRCv3's own reference-tag vocabulary converges on in practice. What
+ * matters for the argument is not the number but that it is a COMPILE-TIME
+ * CONSTANT in a fixed-size array on `conn_t`: a client cannot grow it, so
+ * `batch_open` is a field with a compile-time bound rather than an allocation,
+ * which is what makes "there is nothing to free" a structural fact and not a
+ * promise.
+ *
+ * THE COST: a reference tag of 65 bytes is REFUSED (`417`), not truncated. 3.2
+ * forbids delivering a shortened value, and a truncated reference tag would be a
+ * tag that names a batch nobody opened.
+ */
+#define CONN_MAX_BATCH_REF 64
+
+/* The batch TYPE, which the specification calls "an opaque identifier" and does
+ * not bound. Bounded for the same reason and with the same cost. `batch/react`
+ * and `draft/multiline-concat` are the longest names in the vocabulary this node
+ * has any reason to meet, and both are well inside 96.
+ *
+ * IT IS STORED AND THEN NOT USED, and that is worth saying rather than leaving
+ * a reader to wonder: a batch type describes how a CLIENT should present the
+ * events inside a batch, and this node emits no batch types of its own. The
+ * field exists so that the log can say which type a client declared and so that
+ * a future type has somewhere to be read from; nothing branches on it. */
+/* ---------------------------------------------------------------------------
+ * `labeled-response`'s LABEL BOUND, and it is the SPECIFICATION'S and not ours
+ * ---------------------------------------------------------------------------
+ * "The value MUST NOT exceed 64 bytes." Unlike `CONN_MAX_BATCH_REF`, which the batch
+ * specification does not bound and this node bounds itself, this number is quoted, and
+ * it is quoted at the constant so that raising it is visibly a departure from a
+ * specification rather than a tuning decision.
+ *
+ * WHAT HAPPENS TO A LONGER VALUE IS `label.c`'s decision and the reason is there; the
+ * short version is that it is IGNORED rather than truncated, because 3.2 forbids
+ * delivering a shortened value and a truncated label is a value the client did not send
+ * -- and a client correlating by label would silently correlate against the wrong one.
+ */
+#define CONN_MAX_LABEL 64
+
+#define CONN_MAX_BATCH_TYPE 96
+
 /* Bounded write queue, 3.4: "~256 KB per connection". The cap is on the
  * UNSENT tail (wlen - woff), not on the allocation, so a long-lived
  * connection that keeps draining does not eventually fail on its own history.
@@ -146,6 +207,124 @@ struct chan; /* opaque until Phase 4 (2.2) */
  * describe_peer() and this is that width. */
 #define CONN_USER_MAX (sizeof(((conn_t *)0)->user) - 1u)
 #define CONN_HOST_MAX (sizeof(((conn_t *)0)->host) - 1u)
+
+/* conn_t::realname, the GECOS field USER's fourth parameter carries and the one
+ * IRCv3's `setname` changes in place.
+ *
+ * WHY IT IS 255 AND NOT A `sizeof()` EXPRESSION, which the two constants above
+ * both are. Three things already agree on 255 for "a sentence a user typed":
+ *
+ *   1. the field is char[256], so the value bound is one less than the field --
+ *      the same relationship IRC_MAX_NICK has to conn_t::nick.
+ *   2. realname is 005's NAMELEN, which IRCv3's `setname` specification makes
+ *      MANDATORY for a node advertising that capability, so the number has to
+ *      exist whether or not the command does.
+ *   3. it equals CHAN_MAX_TOPIC and CONN_MAX_AWAY, the other two client-supplied
+ *      free-text fields this node stores. One bound for "a sentence a user
+ *      typed", not three that differ for no stated reason.
+ *
+ * AND THE REAL REASON, WHICH IS A COMPILER FACT: 005 renders this number with
+ * commands.c's IRC_STR(), and `#x` stringifies an argument's TOKEN SEQUENCE
+ * rather than evaluating it. A `sizeof(((conn_t *)0)->realname) - 1u` in this
+ * position renders the 43-character string
+ *
+ *     sizeof(((conn_t *)0)->realname) - 1u
+ *
+ * as the token's value, which contains spaces -- and a middle parameter holding
+ * a space is `unrepresentable`, so the whole 005 is REFUSED and every client
+ * connecting to the node gets no ISUPPORT at all. This is the same bound
+ * CONN_MAX_AWAY already carries as a literal for a related reason, and it is
+ * why the token is derived from a NUMBER here and the number is written down
+ * here: the derivation that can be stringified runs one level up, in k_005[].
+ *
+ * Raising conn_t::realname therefore means changing this AND the NAMELEN token,
+ * and tests/integration/test_registration.c asserts NAMELEN=255 as a literal
+ * precisely so that a change to the field without a change to 005 fails a test.
+ *
+ * IT IS A CAP NOT A TRUNCATION POINT, and that is the part with teeth. USER's
+ * realname is truncated into this field rather than refused, because a client
+ * that has sent NICK and USER is otherwise left half-registered with no way to
+ * recover (see handle_user()); SETNAME, which arrives on an already-registered
+ * connection, REFUSES rather than truncates, for the reason 3.2 states -- a
+ * truncated realname is one the user did not write, and it is reported to every
+ * member of every channel they are on as though it were theirs. */
+#define CONN_MAX_REALNAME 255
+
+/* The verdict on a candidate realname. Only CONN_REALNAME_OK may be stored, and
+ * each other value names WHICH refusal it was rather than only that there was one:
+ * the two have different reasons on the wire (one is a limit, the other is a
+ * character that must never be logged) and a caller that cannot tell them apart
+ * reports a vague message and learns nothing.
+ *
+ * The function is here, in connection.h, rather than in a command handler, because
+ * `conn_t::realname` is a CONNECTION field with two writers -- `USER` and IRCv3's
+ * `SETNAME` -- and the whole point of one predicate is that neither writer can
+ * drift from the other. See conn_realname_check(). */
+typedef enum {
+    CONN_REALNAME_OK = 0,
+    CONN_REALNAME_TOO_LONG = 1,
+    CONN_REALNAME_BAD_BYTE = 2
+} conn_realname_verdict_t;
+
+/* May `name` be stored in `conn_t::realname`? CONN_REALNAME_OK for yes.
+ *
+ * An EMPTY (or NULL) name is admissible: an empty realname is a legal state this
+ * node already renders, and a client clearing its own realname has to be able to
+ * say so. The two refusals are CONN_REALNAME_TOO_LONG (longer than
+ * CONN_MAX_REALNAME, which 005 advertises as NAMELEN) and CONN_REALNAME_BAD_BYTE
+ * (a C0 control or DEL -- the log-injection set; CR, LF and NUL cannot arrive
+ * because the parser refuses them first, but the rest can).
+ *
+ * Never truncates and never rewrites. The argument for both refusals is at the
+ * definition. */
+conn_realname_verdict_t conn_realname_check(const char *name);
+
+/* conn_t::account -- the second axis of scoped identity (2.1), added in Phase
+ * 10.1.
+ *
+ * ---------------------------------------------------------------------------
+ * TWO AXES, AND WHY 2.1's SCOPED NICK ALONE IS NOT AN IDENTITY
+ * ---------------------------------------------------------------------------
+ * 2.1 makes identity `nick@server`: two clients on two nodes may both be `bob`,
+ * they are distinct, and no policy or lock is needed to say so. That is a
+ * correct answer to "how does this node address a user" and it is NOT an answer
+ * to "who is this person" -- `bob@irc.a` and `bob@irc.b` are two registry keys,
+ * and both are true, and neither of them survives the person reconnecting.
+ *
+ * An ACCOUNT is the other axis: a name that outlives the socket and is the same
+ * on every node that knows about it. It is the difference between an address and
+ * an identity, and 2.1's rename-the-loser policy is exactly what the account
+ * axis makes survivable -- a user who loses a duplicate nick is still the same
+ * account afterwards.
+ *
+ * ---------------------------------------------------------------------------
+ * THE BOUND, DERIVED RATHER THAN PICKED
+ * ---------------------------------------------------------------------------
+ * The field is 64 wide, so CONN_MAX_ACCOUNT is 63, and 63 is ACCOUNT_MAX_NAME in
+ * account_store.h. The derivation runs one way only: an account on a connection
+ * is written by exactly one function (account_set(), in core/account.h), whose
+ * only source of a name is the authcid of a completed SASL exchange, and
+ * SASL_MAX_AUTHCID is 63 because conn_t::nick's bound minus one is. So 63 is the
+ * LONGEST VALUE THAT CAN REACH THIS FIELD AT ALL. A wider field would be bytes
+ * nothing could ever fill and a narrower one would refuse a client that
+ * successfully authenticated -- which would be worse than the truncation the
+ * design refuses everywhere else, because it would tell somebody their account
+ * does not exist.
+ *
+ * ---------------------------------------------------------------------------
+ * `logged_in` IS NOT DERIVABLE FROM THE NAME AND IS NOT REDUNDANT WITH IT
+ * ---------------------------------------------------------------------------
+ * Empty means "not logged in", exactly as `nick[0]` means "no nickname chosen
+ * yet" and `away[0]` means "not away" -- the idiom this struct already uses so
+ * that a field and a fact about it cannot drift apart. `logged_in` is
+ * nevertheless a separate field, and the reason is which question each answers:
+ * the NAME is a claim the connection makes about itself, and the FLAG is a
+ * verification this node performed. core/account.h's account_logged_in() is the
+ * conjunction of the two, which is what makes "an empty account" and "a real
+ * account named the empty string" not merely equal but UNREPRESENTABLE: there is
+ * no sequence of bytes that leaves this struct meaning "logged in as nothing".
+ */
+#define CONN_MAX_ACCOUNT 63
 
 /* conn_t::away, the AWAY message. Empty means "not away", the same idiom
  * nick[0]/user[0] already use for "this fact is not established yet", so no
@@ -232,9 +411,98 @@ typedef struct conn {
     unsigned    caps;              /* negotiated capabilities; core/cap.h bits */
     int         cap_negotiating;   /* CAP LS/REQ in flight; CAP END clears it */
     int         sasl;              /* sasl_state_t; FAILED is terminal */
+    /* Phase 10.1: the account identity, which is what `c->sasl` was missing.
+     * An ADDITION and not a rearrangement, like the three fields above, and for
+     * the same reason: it is a fact another module has to ask about and one
+     * place has to own. `logged_in` is written only by account_set() in
+     * core/account.c and cleared only by account_clear(); a caller reads
+     * account_logged_in()/account_name() rather than these fields, so that the
+     * two can never be read apart. See the CONN_MAX_ACCOUNT block above. */
+    char        account[CONN_MAX_ACCOUNT + 1];
+    int         logged_in;
     struct chan **chans;           /* channels joined; Phase 4 */
     size_t      nchans;
     size_t      cap;
+    /* Phase 10.12: IRCv3 `batch`, the client-facing half. FOUR fields, and each
+     * answers one question; the batch capability's whole protocol surface is the
+     * difference between them.
+     *
+     *   batch_ref      the reference tag of the batch this client has OPEN, or ""
+     *                  empty for none. Non-empty means "every line this node emits
+     *                  to this connection is inside that batch", which is what a
+     *                  client asked for by sending `BATCH +ref <type>`.
+     *   batch_type     the type that batch was opened with. Logged, never branched
+     *                  on -- see CONN_MAX_BATCH_TYPE.
+     *   batch_once     a ONE-SHOT reference from a `+<ref>` tag on a single
+     *                  command: the NEXT line emitted to this connection carries
+     *                  `batch=<ref>` and the reference is consumed. This is the form
+     *                  the modern message-tag grammar preserves (batch.c's header has
+     *                  the parser probe that established it) and it is what lets a
+     *                  client group the response to ONE command without holding a
+     *                  batch open.
+     *
+     * THERE IS NO `@<ref>` FIELD, and its absence is a FINDING rather than an
+     * oversight. The retired `reference-tags` specification defined `@<ref>` as "send
+     * the response nowhere", but on the wire `@` is the TAG-BLOCK MARKER: this node's
+     * parser consumes exactly one leading `@` and keeps the rest as keys, so
+     * `@ref WHOIS bob` parses to the valueless tag `ref` and `@@ref WHOIS bob` is
+     * **refused outright** by `message_parse_n()`. Both were checked, not reasoned
+     * about -- see batch.c. Making the form work would mean changing what the framing
+     * layer keeps, which 3.2 owns and which every peer line depends on, so the drop
+     * form is not implemented and the reason is written where a future editor reads.
+     *
+     * ALL THREE ARE FIXED-SIZE FIELDS IN A CALLOC'D STRUCT. That is deliberate and it
+     * is why there is no teardown arm for any of them: `conn_new()` zeroes the
+     * struct and `conn_free()` frees it whole, so "a batch reference cannot
+     * outlive its connection" is a property of the allocation rather than of a
+     * cache somebody has to remember to empty. The same paragraph applies to the
+     * `label` field Phase 10.13 adds beside them. */
+    /* Phase 10.13: IRCv3 `labeled-response`. FOUR fields, and they are a small state
+     * machine rather than a flag, because the specification's requirement is not "echo
+     * the tag" but "the tag appears in EXACTLY ONE LOGICAL MESSAGE" -- and on this node
+     * a response is frequently several lines, which the specification says MUST then be
+     * grouped in a batch whose START carries the label.
+     *
+     *   label            the client's `label=` value, COPIED, for the command in flight.
+     *                   The copy is the whole of the lifetime argument: `m->tags` points
+     *                   into the parser's heap and the command's response outlives the
+     *                   message, so a stored POINTER is a use-after-free. It is a
+     *                   fixed-size field rather than a pointer for the second half of
+     *                   the same reason -- nothing to free, nothing to leak.
+     *   label_live       1 while a label is owed a response. Cleared at the end of the
+     *                   command by `label_finish_command()`.
+     *   label_batch      the reference tag of the `labeled-response` batch this node
+     *                   minted for this command, or empty.
+     *   label_batch_open 1 once that batch has been STARTED on the wire. The distinction
+     *                   matters: a command that produced ONE line must not emit an empty
+     *                   batch, and the only way to know the response was one line is to
+     *                   discover it by emitting the first one.
+     *
+     * ALL FOUR ARE FIXED-SIZE FIELDS IN A CALLOC'D STRUCT, like batch's, so there is no
+     * teardown arm for any of them: `conn_new()` zeroes the struct and `conn_free()`
+     * frees it whole. */
+    char        label[CONN_MAX_LABEL + 1];
+    int         label_live;
+    char        label_batch[CONN_MAX_LABEL + 1];
+    int         label_batch_open;
+    /* 1 while the command in flight is a message the client ADDRESSED TO ITSELF, which
+     * is what `labeled-response` means by "a client sends a message to itself" -- and
+     * which is NOT the same as "a line whose source is this client", which is true of
+     * every echo-message copy this node makes. The first version of label.c decided it
+     * by comparing the line's PREFIX against the destination's own hostmask, and that
+     * withheld the label from the echo of a channel message as well -- so a labelled
+     * `PRIVMSG #chan` got an unlabelled echo and an `ACK`, which is the opposite of what
+     * the specification asks for and was caught by `test_labeled_response.c` case 7.
+     *
+     * IT IS SET BY `msg_verbs.c` AND BY NOTHING ELSE, because the reply path cannot know
+     * a message's target: `emit_built_ex()` has the line and the destination and no
+     * third thing. */
+    int         label_self;
+    unsigned    label_seq;          /* per-connection counter; see label.c */
+    char        batch_ref[CONN_MAX_BATCH_REF + 1];
+    char        batch_type[CONN_MAX_BATCH_TYPE + 1];
+    char        batch_once[CONN_MAX_BATCH_REF + 1];
+    int         batch_suppress;
     char       *rbuf;              /* read buffer */
     size_t      rlen;
     size_t      rcap;
