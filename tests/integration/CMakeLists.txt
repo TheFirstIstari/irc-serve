@@ -474,3 +474,16 @@ irc_add_integration_test(test_autoscale test_autoscale.c)
 # account system" invariant), and the only way to assert that is to run one set of
 # assertions over both configurations.
 irc_add_integration_test(test_account test_account.c)
+
+# 7/Phase 10.8a: the fanout contract's THIRD outcome. `fanout_form_t` chose
+# between two wire SHAPES per destination, which cannot express "send this member
+# nothing" -- and `setname`, `chghost` and `away-notify` all need to publish to a
+# SUBSET of a channel's members. So the routing module grew a per-destination
+# GATE rather than three handlers growing three member walks.
+#
+# Its own file because nothing on the wire produces a gated emission until
+# away-notify lands, and the contract is load-bearing for three specifications
+# that do: the assertion has to be against the API, which is the same argument
+# test_nick_index.c makes for the nick enumeration. Phase 10.8b then adds the
+# wire-level case on top of it.
+irc_add_integration_test(test_fanout_gate test_fanout_gate.c)

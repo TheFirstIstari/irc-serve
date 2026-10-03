@@ -337,9 +337,87 @@ int fanout_deliver_forms(server_t *s, const fanout_target_t *t, const char *pref
  * `carry` is still not a parameter, for fanout_deliver_local()'s reason: a
  * local-only emission originates here. */
 int fanout_deliver_local_forms(server_t *s, const fanout_target_t *t,
-                              const char *prefix, const char *verb,
-                              const fanout_form_t *plain,
-                              const fanout_form_t *extended, conn_t *exclude);
+                               const char *prefix, const char *verb,
+                               const fanout_form_t *plain,
+                               const fanout_form_t *extended, conn_t *exclude);
+
+/* ---------------------------------------------------------------------------
+ * THE THIRD OUTCOME: "SEND THIS MEMBER NOTHING"
+ * ---------------------------------------------------------------------------
+ * The two wire SHAPES above answer "which of these two lines does this
+ * destination get", which is a choice between two answers and therefore cannot
+ * express a third one: a member who is not supposed to hear about an emission
+ * at all. Three specifications need that third answer, and each needs it for the
+ * same reason -- the notification is UNSOLICITED and goes only to clients that
+ * asked for it:
+ *
+ *   setname        "to all clients in common channels, as well as to the client
+ *                   from which it originated"
+ *   chghost        "to other clients who share channels with the target client
+ *                   and who have enabled the `chghost` capability"
+ *   away-notify    "clients will be sent an AWAY message when a user sharing a
+ *                   channel with them sets, changes or removes their away state"
+ *
+ * THREE HANDLERS WALKING THE ROSTER THEMSELVES IS THE ALTERNATIVE, and it is the
+ * one this module exists to prevent: chan_verbs.c grew a broadcast helper in
+ * Phase 4 for the same reason this file exists (see the header), and it had no
+ * forward arm, and the missing forward was lost. A second walk in a handler is a
+ * walk that can drift from the first, and a walk that skips `chan_member_live()`
+ * is a refusal counted on n_reply_refused -- the counter reply.c keeps at zero
+ * because a non-zero value is a bug report. So the audience question is asked
+ * HERE, once per destination, in the one place that already asks the shape
+ * question once per destination.
+ *
+ * WHY IT IS A PREDICATE AND NOT A THIRD FORM. A third `fanout_form_t` holding an
+ * empty parameter list would still be a LINE: `nick!user@host AWAY #chan` with no
+ * trailing text says "this user is not away" whether it was sent because they
+ * stopped being away or because the client was never told. Absence is the
+ * assertion here, exactly as it is for `account-tag`'s tag, so the outcome has to
+ * be the absence of a line and not a line that means nothing. (The away case is
+ * the sharp one: `AWAY` with no parameter means "no longer away", so a node that
+ * sent it to a client which did not ask would be asserting a state change that
+ * did not happen.)
+ *
+ * THE SIGNATURE, and why `dst` is the only destination-side datum: a gate is
+ * asked once per destination from inside the walk, so a predicate taking only the
+ * destination can be an ordinary function -- `cap_away_notify_enabled` has exactly
+ * this shape and is handed over with no glue at all. Everything about the
+ * EMISSION that the audience depends on arrives through `ctx`, because the
+ * alternative would be a per-emission closure and C has no room for one here.
+ *
+ * A NULL `gate` means "every destination the emission reaches", and is exactly
+ * fanout_deliver_local_forms(). The same sentence, for the same reason: a NULL is
+ * the case that already works rather than a second implementation of it.
+ *
+ * WHAT THE GATE DOES NOT DO. It does not affect the forward arm, and there is
+ * nothing for it to affect: a gate is asked about a LOCAL DESTINATION, and the
+ * forward arm has none -- a peer is not a client that negotiated anything. That
+ * is also why there is no gated variant of fanout_deliver_forms(): the question
+ * is unaskable there rather than answerable-but-ignored, and a parameter a caller
+ * can set on a path where it cannot mean anything is a parameter that will be set
+ * and believed.
+ *
+ * The order inside the walk is liveness, then `exclude`, then the gate, and it is
+ * cheapest-first: a member whose descriptor the loop has already dropped, and a
+ * member the caller excluded, are not asked a question about an emission they
+ * were never going to receive.
+ */
+typedef int (*fanout_gate_fn)(const conn_t *dst, void *ctx);
+
+/* As fanout_deliver_local_forms(), and a destination for which `gate` returns 0
+ * receives NOTHING: no line, no tag block, no entry in the returned count.
+ *
+ * Returns the number of CLIENTS the line was queued for, which -- as everywhere
+ * else in this file -- is a count of deliveries and not a count of destinations
+ * reached. A gated-off member is not a destination that was reached and declined,
+ * so a caller cannot tell the two apart from the number; nothing needs to, and a
+ * caller that did would be asking the count a question it cannot answer. */
+int fanout_deliver_local_gated(server_t *s, const fanout_target_t *t,
+                               const char *prefix, const char *verb,
+                               const fanout_form_t *plain,
+                               const fanout_form_t *extended, fanout_gate_fn gate,
+                               void *gate_ctx, conn_t *exclude);
+
 
 
 /* ---------------------------------------------------------------------------
