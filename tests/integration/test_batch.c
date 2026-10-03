@@ -620,6 +620,28 @@ static void case_refusals_and_bounds(void)
     expect_only_replies(&c, mark, "bare BATCH", 1u);
 
     tc_close(&c);
+    /* `d` TOO, and it is here because this is the one client in the file that a
+     * teardown pass kept missing.
+     *
+     * `d` IS OPENED -- at the top of this case, for the `WHOIS bt_d` that makes a
+     * four-numeric count a claim about somebody ELSE -- and this case closes `c`
+     * three times over (the client that negotiated, the one that negotiated
+     * nothing, and the one that negotiated again) and `d` not at all. The receive
+     * buffer `d` accumulated is then unreachable: `test_client_t` is a local, so
+     * the struct dies with the frame while the `realloc`'d block it points at does
+     * not. Linux CI's LeakSanitizer job is what sees it, and it reported exactly
+     * this: one 4096-byte object from `append()` <- `read_once()` <- `tc_expect()`
+     * <- `register_caps()` <- this case. LeakSanitizer cannot run on Darwin, so
+     * the local argument is the reachability one: nothing else holds that pointer.
+     *
+     * THE COUNT IS NOT THE TEST. A sweep that counts registrations against closes
+     * per name scores this case `c` as three-and-three and calls it balanced, which
+     * it is; `d` is one-and-zero, which is the whole of it. What matters is that
+     * EVERY open is followed by a close before the next open -- `tc_close()` frees
+     * what the struct holds at that moment, and `tc_connect()` zeroes the struct, so
+     * an open with no intervening close drops the previous buffer on the floor no
+     * matter how the totals add up. See the TEETH block. */
+    tc_close(&d);
     TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
     nf_free(&node);
 }
@@ -819,6 +841,23 @@ static void case_no_nesting(void)
  *       freed bytes still hold the right string. That is the whole reason the field is a
  *       fixed array rather than a pointer, and it is recorded here as a claim about the
  *       sanitizer run rather than as a passing test.
+ *
+ *   THE CLIENT `d` NEVER CLOSED -- case_refusals_and_bounds(): the `tc_close(&d)` at the
+ *       end of the case deleted. **Build 0/0, and `batch` is still GREEN** -- which is
+ *       the whole of it. A leaked receive buffer is invisible to every assertion in the
+ *       file; only Linux CI's LeakSanitizer job sees it, and it cannot run on Darwin, so
+ *       the check that found it is a static one: a sweep that pairs each OPEN with the
+ *       NEXT close, per (function, object). Re-run with the `tc_close(&d)` removed, it
+ *       reports `test_batch.c:485 OPENED_NEVER_CLOSED case_refusals_and_bounds() obj=d`
+ *       -- the same site, and the same frame, as the LeakSanitizer trace CI produced.
+ *
+ *       AND THAT SWEEP IS SCOPED PER FUNCTION BECAUSE OF THE NEAR MISS IN THIS FILE.
+ *       `case_no_nesting()` has a `d` of its own and closes it, so a sweep keyed on the
+ *       NAME alone sees two `tc_close(&d)` in test_batch.c and no leak. The two `d`s are
+ *       unrelated objects in unrelated frames and only one of them was ever closed. The
+ *       same is why the sweep must not attribute a helper's `tc_close(&cl->c)` to a local
+ *       the helper was handed: the helper does not own it, and Phase 9's sweep produced
+ *       nine false positives that way.
  */
 int main(void)
 {
