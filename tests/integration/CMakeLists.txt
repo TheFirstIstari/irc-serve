@@ -524,3 +524,10 @@ irc_add_integration_test(test_batch test_batch.c)
 # substring, and because it is the only place the `labeled-response` grouping batch and
 # the `ACK` are tested at all.
 irc_add_integration_test(test_labeled_response test_labeled_response.c)
+
+# IRCv3 `invite-notify` (Phase 10.14). Its own file because the specification's AUDIENCE
+# is the thing being asserted -- the members of one channel, not the invitee's other
+# connections and not the node -- and because `test_invite.c` already asserts that an
+# INVITE reaches the INVITEE, so a substring search for "INVITE" on any socket here is
+# satisfied by the delivery and every claim has to be a count.
+irc_add_integration_test(test_invite_notify test_invite_notify.c)

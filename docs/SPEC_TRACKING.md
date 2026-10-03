@@ -1121,6 +1121,35 @@ same class — *a rule that was true of the code and not of the protocol*:
    labelled `PRIVMSG #chan` returned an unlabelled echo followed by an `ACK`. Fixed by
    `conn_t::label_self`, set where the target is in scope.
 
+### 10.16 Phase 10.14 — `invite-notify`, and a misreading corrected rather than implemented
+
+| Claim | Where | Evidence |
+|---|---|---|
+| The **audience is the channel**, and the line is the specification's | `notify_invite()` in `chan_verbs.c`, through the union entry point with a one-element list | `test_invite_notify.c` case 1, byte for byte: `:in_op!in_op@127.0.0.1 INVITE in_g #I`. **The first version rendered `INVITE #I in_g #I`** — 3.1's row prepends the resolved target and the specification's grammar is the other way round |
+| A member who negotiated is told **exactly once** | `cap_gate_invite_notify()` | case 1: `tf_count(" INVITE ") == 1` |
+| A member who did **not** negotiate is told **nothing** | the same gate | case 1's `blunt`, by line count of 0 |
+| The **inviter** gets its `341` and nothing else, and that is `exclude` not the gate | `notify_invite()`'s last argument | case 1's `op`: the inviter DID negotiate, so the gate would have let it through — which is what makes this the case that proves the two are different questions |
+| The notification is addressed to **one** channel | the one-element channel list | case 2: two channels, three connections; the member of the other channel gets nothing about this one, and the other invitation reaches the other channel |
+| A **refused** INVITE notifies nobody | the call site, after every refusal in `handle_invite()` has returned | case 3: a non-op's `482`, and the channel's member window is empty |
+| **One connection per nickname**, which is why the other reading is vacuous | the nick registry | case 4: a second connection claiming a held nick is `433` |
+| Teeth, build checked before the run was believed | four faults | **4 red, 0/0 each** — the gate ignored, the inviter not excluded, the notification moved above the authority check, and the parameters swapped |
+
+**THE CORRECTION, because it is the substance of the pass.** The plan for this phase
+described `invite-notify` as "`INVITE` reaching a client's other connections", and
+predicted a vacuous result on the grounds that this node has one connection per user.
+**The premise is wrong and the prediction follows from it.** The specification is about
+**channel members**: "allows a client to specify that it would like to be notified when
+users are invited to channels", with the message `:<inviter> INVITE <target> <channel>`.
+The source is the inviter and the subject is a third party doing something to a channel the
+recipient is on; RFC 2812 3.3.6's "Other channel members SHOULD NOT be notified" is the
+rule this capability exists to let a client opt out of. Nothing in it concerns the
+invitee's connections.
+
+The vacuity is still worth recording, and it is recorded as a **fact about the node** rather
+than as the outcome: one connection may hold a nickname (the registry answers `433`), so
+the "other connections" set is empty and case 4 asserts that. Had the feature been built
+to the brief's reading it would have been a no-op with a passing test.
+
 ### 10.11 The honest limits of the account phase
 
 - **The identity is visible on ordinary traffic for LOCAL senders only.**

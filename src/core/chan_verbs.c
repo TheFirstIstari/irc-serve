@@ -1828,6 +1828,9 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
  * nonsense invite of one channel to another either way. No legal line is
  * misread.
  */
+static void notify_invite(server_t *s, conn_t *c, chan_t *ch, const char *prefix,
+                           const char *target);
+
 void handle_invite(server_t *s, conn_t *c, const message_t *m)
 {
     const char *nick_arg;
@@ -1924,13 +1927,86 @@ void handle_invite(server_t *s, conn_t *c, const message_t *m)
     params[0] = ch->name;
     (void)fanout_deliver(s, &t, prefix, "INVITE", params, 1, NULL, NULL);
 
-    /* The inviter is told last, and only the inviter. who->nick is the spelling
+    /* The inviter is told, and only the inviter. t.user->nick is the spelling
      * the INVITEE chose (2.1: the registry folds the key and the display case is
      * the user's), so the 341 names them the way every other numeric does. */
     (void)reply(s, c, "341", (const char *const[]){ ch->name, t.user->nick }, 2,
                 "%s has invited you to channel %s", c->nick, ch->name);
+    notify_invite(s, c, ch, prefix, t.user->nick);
     printf("[observable] chan_invite: channel=%s by=%s target=%s\n", ch->name,
            c->nick, t.user->nick);
+}
+
+/* ---------------------------------------------------------------------------
+ * invite-notify: THE CHANNEL IS TOLD
+ * ---------------------------------------------------------------------------
+ * `:nick!user@host INVITE <target> <channel>`, per destination, to the members of the
+ * channel that negotiated the capability. The SOURCE is the inviter -- which is why this
+ * is not a separate `send_line` but a fan-out carrying the inviter's own hostmask, the
+ * same prefix the invitee's own copy carries and the same prefix `away-notify` uses.
+ *
+ * THE AUDIENCE IS THE CHANNEL, and RFC 2812 3.3.6 is the rule this relaxes: "Other
+ * channel members SHOULD NOT be notified." The specification's whole purpose is to be the
+ * opt-in that lets a client say it wants them, which is why the gate is the RECIPIENT's
+ * negotiation and not the inviter's -- a sender-gated notification would put the fact on
+ * the wire to members who never asked, which is the defect Phase 10.8a's gate was built
+ * to prevent and which §9's risk row names.
+ *
+ * THE INVITER IS EXCLUDED, and it is excluded rather than gated because the gate would
+ * have let it through if it negotiated. Two reasons: the `341` above IS the inviter's
+ * answer -- "You have invited <nick> to <channel>" says exactly what this line would say
+ * -- and the specification's own phrase is "a standard way that allows clients to learn
+ * when ANOTHER client does an /INVITE". One line per event, to the audience it is for.
+ *
+ * NOT FORWARDED, for the reason `notify_away()` is not forwarded: this is an originating
+ * emission and the local-only entry point has no forward arm. The cost is stated at
+ * `away-notify`'s §3.1.1 note and applies verbatim -- away STATE federates through 4.3's
+ * SBURST and a notification is not state; the same is true of an invitation, which 4.3's
+ * frozen verb table has no S-verb for at all, so a mesh member's clients learn of an
+ * invitation to a channel they can see by being in it and by nothing else.
+ *
+ * PER CHANNEL, NOT OVER A UNION, and the reason is the shape: the line's own grammar is
+ * `:<inviter> INVITE <target> <channel>` and it NAMES its channel, so a member of three
+ * shared channels gets three true statements about three channels. That is the same
+ * distinction `setname`'s fan-out turned on, in the other direction. */
+static void notify_invite(server_t *s, conn_t *c, chan_t *ch, const char *prefix,
+                          const char *target)
+{
+    const char *params[2];
+    fanout_form_t plain;
+    struct chan *one[1];
+    int delivered;
+
+    /* ONE CHANNEL HANDED TO THE UNION ENTRY POINT, and the reuse is deliberate rather
+     * than convenient. `fanout_deliver_local_gated()` PREPENDS the resolved target, so a
+     * channel-addressed emission renders `:inv!u@h INVITE #chan <target>` -- and this
+     * specification's grammar is `:<inviter> INVITE <target> <channel>`, the other way
+     * round. The first version of this used the channel entry point and the line on the
+     * wire was `INVITE #I in_g` with the parameters the wrong way round.
+     *
+     * `fanout_deliver_union_local_gated()`'s CONTRACT IS ABOUT THE AUDIENCE -- "the local
+     * members of these channels, each written once, with NO target prepended" -- and a
+     * one-element list of one channel is exactly the members of that channel. What it
+     * takes is a list of `chan_t *`, not a connection's own list; the de-duplication it
+     * does inside the walk is a no-op for one channel. So no new entry point and no new
+     * parameter is needed for a line whose shape does not match 3.1's row.
+     *
+     * (This is the second user of that entry point and it is worth noting that the two
+     * have opposite requirements: `setname` needs it because its line names NO channel
+     * and would otherwise carry one, and this needs it because its line names the channel
+     * in a position 3.1's row would have filled with the channel. Both are the same fact
+     * -- the emission's grammar and the routing table's row disagree -- seen from two
+     * sides. `away-notify` is the case where they agree, because `AWAY #chan :message`
+     * happens to put the target first.) */
+    params[0] = target;
+    params[1] = ch->name;
+    plain.params = params;
+    plain.nparams = 2;
+    one[0] = ch;
+    delivered = fanout_deliver_union_local_gated(s, one, 1u, prefix, "INVITE", &plain,
+                                                 NULL, cap_gate_invite_notify, NULL, c);
+    printf("[observable] invite_notify: channel=%s by=%s target=%s recipients=%d\n",
+           ch->name, c->nick, target, delivered);
 }
 
 /* ---------------------------------------------------------------------------

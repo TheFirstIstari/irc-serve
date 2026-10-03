@@ -42,7 +42,8 @@ enum {
     CAPBIT_STANDARD_REPLIES = 1u << 10,
     CAPBIT_AWAY_NOTIFY = 1u << 11,
     CAPBIT_BATCH = 1u << 12,
-    CAPBIT_LABELED_RESPONSE = 1u << 13
+    CAPBIT_LABELED_RESPONSE = 1u << 13,
+    CAPBIT_INVITE_NOTIFY = 1u << 14
 };
 
 /* THE BIT ORDER IS FIXED AND THE TABLE BELOW IS THE CLAIM.
@@ -78,7 +79,8 @@ static const cap_def_t k_caps[] = {
     { CAP_STANDARD_REPLIES, CAPBIT_STANDARD_REPLIES },
     { CAP_AWAY_NOTIFY, CAPBIT_AWAY_NOTIFY },
     { CAP_BATCH, CAPBIT_BATCH },
-    { CAP_LABELED_RESPONSE, CAPBIT_LABELED_RESPONSE }
+    { CAP_LABELED_RESPONSE, CAPBIT_LABELED_RESPONSE },
+    { CAP_INVITE_NOTIFY, CAPBIT_INVITE_NOTIFY }
 };
 
 static const size_t k_ncaps = sizeof k_caps / sizeof k_caps[0];
@@ -420,6 +422,11 @@ int cap_gate_away_notify(const conn_t *dst, void *ctx)
  * halves of one specification would decide opposite questions about the same field.
  * A realname is personal data, and the per-destination answer is the only one that
  * does not require trusting the person disclosing it to be careful. */
+int cap_invite_notify_enabled(const conn_t *c)
+{
+    return cap_enabled(c, CAP_INVITE_NOTIFY);
+}
+
 /* labeled-response. One predicate for all three of the specification's effects -- the
  * label, the grouping batch and the `ACK` -- because the specification puts all three in
  * one sentence about what a client "requesting this capability" can handle, and
@@ -428,6 +435,16 @@ int cap_gate_away_notify(const conn_t *dst, void *ctx)
 int cap_labeled_response_enabled(const conn_t *c)
 {
     return cap_enabled(c, CAP_LABELED_RESPONSE);
+}
+
+/* invite-notify. `cap.c`'s away-notify comment says the gate adaptation lives here
+ * rather than at the call site so that the claim about one-argument predicates is one
+ * readable sentence; this is the third user of that claim and the reason it was written
+ * that way. */
+int cap_gate_invite_notify(const conn_t *dst, void *ctx)
+{
+    (void)ctx;
+    return cap_invite_notify_enabled(dst);
 }
 
 int cap_gate_setname(const conn_t *dst, void *ctx)
