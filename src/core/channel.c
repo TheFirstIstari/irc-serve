@@ -553,6 +553,16 @@ int chan_remote_add(chan_t *ch, const char *server, const char *member_server,
      * member it could not describe to a client -- and because the alternative is a
      * value that arrives intact and then cannot be emitted.
      *
+     * AND "CANNOT BE STORED" IS PART OF THAT, because the field below is
+     * CONN_MAX_NAME wide and a longer value used to be TRUNCATED by the
+     * copy_bounded() whose result both call sites discard: a peer that reported a
+     * 200-byte account got a 63-byte one, under a name it will never be asked
+     * about again, and 3.2's rule against delivering a silently shortened value
+     * exists for exactly that. account_name_wire_safe() refuses an over-long name
+     * for the same reason it refuses a space -- and it is where the bound lives,
+     * rather than here, so that the local writer and the two peer receivers
+     * cannot come to disagree about where the edge is.
+     *
      * `*` IS THE PROTOCOL'S SPELLING OF THE ABSENCE and is translated to "" here,
      * so that the roster holds "no account" rather than an account named "*". And
      * an EMPTY account is the not-told state and is not checked at all -- which is

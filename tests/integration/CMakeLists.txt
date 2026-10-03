@@ -355,6 +355,13 @@ irc_add_integration_test(test_fed_burst test_fed_burst.c)
 # far end of the link has to be a raw socket rather than a second node.
 irc_add_integration_test(test_fed_guards test_fed_guards.c)
 
+# 2.5.7 / 4.3.1: the <account> field of SJOIN and SBURSTM, and the bound it
+# needs. A peer is the only thing that can produce an account name wider than the
+# field -- account_store_add() will not store one -- so this owns one end of a
+# link like test_fed_guards.c does, and asserts the refusal on the node's own
+# output and the resulting roster on a client's socket.
+irc_add_integration_test(test_fed_account test_fed_account.c)
+
 # 2.2 / 4.3: what a node does when a peer goes away and when one comes back.
 # 437 naming the origin on a channel this node cannot route to, NAMES still
 # answered after the drop, NO auto-redial, re-linking a server of the SAME name

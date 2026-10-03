@@ -164,10 +164,27 @@
  * MIDDLE parameter since Phase 10.1, so the exposure was there first and this
  * phase simply gave the name three more parameter positions to be wrong in.
  *
+ * AND THE NAME MUST ALSO FIT, which is a third rule rather than a fourth and is
+ * the one that took a peer to find. "Renderable" is about the BYTES; a name is
+ * also STORED, in a field of ACCOUNT_MAX_NAME bytes -- conn_t::account,
+ * chan_remote_t::account and burst_member_t::account are all that wide and
+ * ACCOUNT_MAX_NAME is defined as conn_t::account's bound minus one. A name longer
+ * than that is one this node cannot hold, whatever it is made of.
+ *
+ * With only the byte rule, the two LOCAL callers were safe (both bounded the
+ * length separately) and the two PEER-side callers were not: channel.c's
+ * copy_bounded() truncated an over-long SJOIN account into the roster, and
+ * federation/burst.c's burst_copy() refused it -- leaving a slot of a realloc'd
+ * array that nothing zeroes holding whatever the allocator had left there. So the
+ * length is HERE rather than at either receiver, which is the argument this
+ * predicate's own header makes: a name it refuses is a name no field can hold,
+ * whichever of the two a caller happened to notice.
+ *
  * THE COST, stated rather than implied: an operator cannot create an account whose
- * name holds a space, and a registry file holding one is REFUSED record by record
- * rather than loaded with a name this node cannot show anybody. That is a
- * restriction, and the alternative is an account that exists and is unreportable.
+ * name holds a space or whose name runs past ACCOUNT_MAX_NAME, and a registry file
+ * holding one is REFUSED record by record rather than loaded with a name this node
+ * cannot show anybody. That is a restriction, and the alternative is an account
+ * that exists and is unreportable.
  */
 int account_name_wire_safe(const char *name);
 #define ACCOUNT_MAX_PASSWORD  128   /* SASL_MAX_PASSWORD, deliberately the same
