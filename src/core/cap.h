@@ -58,8 +58,30 @@
  *
  * The consistency that DOES have to hold is between `CAP LS` and the code: every
  * name in cap_available() must be a name something here implements. That is why
- * there is no `cap-notify` (this node never sends an unsolicited CAP NEW) and no
- * `away-notify` or `chghost` (it sends neither).
+ * there is no `cap-notify` (this node never sends an unsolicited CAP NEW).
+ *
+ * **`chghost` is absent for a reason that is NOT the tidy one, and it is worth the
+ * space.** The specification's trigger is "when a client username or host is
+ * changed". This node cannot change a HOST after accept() -- `describe_peer()` is
+ * its only writer, and `resume.c` *requires* (nick, ident, host) to match to resume,
+ * so a resume refuses rather than applying a new identity -- and there is no
+ * `CHGHOST` verb in `k_commands[]` and no emitter anywhere in `src/`. So there is
+ * nothing to send.
+ *
+ * **But an IDENT *CAN* change, and that is the finding.** `handle_user()` writes
+ * `conn_t::user` unconditionally, and `USER` is a `pre_reg` verb that the dispatch
+ * table still routes for a REGISTERED connection -- so a client may re-send `USER`
+ * and change its own ident at any time, silently, with nothing told to anybody.
+ * `tests/integration/test_chghost.c` makes the whole of that provable: the change
+ * on the wire through a third party's `311`, the absence of any notification on an
+ * idle second connection, and the `421` for a client-sent `CHGHOST`.
+ *
+ * So the capability is absent because **the one thing that changes is not supposed
+ * to be able to** -- which is a defect in `handle_user()`, reported in §9 and not
+ * fixed here, rather than a feature waiting to be notified. No way to move a host
+ * was invented to make the notification implementable: `WEBIRC`/`spoofing` is the
+ * territory that belongs to, and adding a verb that sets `conn_t::host` would be
+ * inventing a spoofing surface to satisfy a specification.
  *
  * **Phase 10.5 and 10.6 retired two names from that sentence.** It used to read
  * "and no `server-time` or `userhost-in-names` (it stamps neither)" — true when

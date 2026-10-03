@@ -495,3 +495,11 @@ irc_add_integration_test(test_fanout_gate test_fanout_gate.c)
 # node's numerics are ambiguous enough to be worth rendering as a `FAIL` for a
 # client that negotiated the capability.
 irc_add_integration_test(test_standard_replies test_standard_replies.c)
+
+# 7/Phase 10.8: `chghost`, and the finding that is its deliverable. There is no
+# CHGHOST verb on this node and no CHGHOST emitter, so the capability is ABSENT
+# and the file's job is to make the absence provable and the reason precise: a
+# HOST cannot move after accept(), but an IDENT CAN -- `USER` is a pre-registration
+# verb the dispatch table still routes for a registered connection -- and nothing
+# tells anybody when it does.
+irc_add_integration_test(test_chghost test_chghost.c)
