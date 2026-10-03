@@ -311,9 +311,17 @@ static void case_set_and_cleared(void)
                        ":" SRV " 301 watcher setter :going to lunch\r\n");
         expect_line_since(&watcher, m_watcher, "WHOIS of an away user", want);
     }
-    /* 311, 312, 317, 318 plus the 301 is five lines, and counting them closes the
-     * next window cleanly rather than leaving a stray 301 in it. */
-    expect_only_replies(&watcher, m_watcher, "watcher's WHOIS of an away user", 5u);
+    /* 311, 312, 319, 317, 318 plus the 301 is SIX lines, and counting them closes
+     * the next window cleanly rather than leaving a stray 301 in it.
+     *
+     * THE COUNT IS SIX BECAUSE `319 RPL_WHOISCHANNELS` EXISTS, and it was FIVE
+     * until Phase 11 added it. This assertion is a count and not a search on
+     * purpose, so it is the assertion that notices: a new WHOIS numeric has to
+     * be accounted for here rather than tolerated, or the count quietly stops
+     * meaning "every line this WHOIS produced". `setter` is in a channel (the
+     * whole point of the file), so 319 is emitted; a WHOIS of a user in no
+     * channel is one line shorter, which is what `handle_whois()` documents. */
+    expect_only_replies(&watcher, m_watcher, "watcher's WHOIS of an away user", 6u);
 
     /* ---- THE SECOND AWAY EDGE: CLEARED ---- */
     m_setter = tc_received(&setter);
@@ -340,12 +348,16 @@ static void case_set_and_cleared(void)
                         0u);
 
     /* ---- AND THE STATE REALLY IS EMPTY NOW. `301`'s ABSENCE is what says the field
-     * was cleared, and a WHOIS with no 301 in it is FOUR lines rather than five --
+     * was cleared, and a WHOIS with no 301 in it is FIVE lines rather than six --
      * so this is the same probe as above with the count one lower, which is what
-     * makes it a claim about the node rather than about the substring. ---- */
+     * makes it a claim about the node rather than about the substring.
+     *
+     * FIVE, not four: the 311, 312, 319, 317 and 318 are all still there. Only the
+     * 301 is gone, so the delta between this count and the one above is exactly
+     * the away state and nothing else. ---- */
     m_watcher = tc_received(&watcher);
     TF_CHECK_MSG(tc_send(&watcher, "WHOIS setter") == 0, "the second WHOIS send failed");
-    expect_only_replies(&watcher, m_watcher, "watcher's WHOIS after the clear", 4u);
+    expect_only_replies(&watcher, m_watcher, "watcher's WHOIS after the clear", 5u);
     TF_CHECK_MSG(strstr(tc_buffer(&watcher) + m_watcher, " 301 ") == NULL,
                  "a 301 RPL_AWAY is still being reported for a user who is no longer "
                  "away. `handle_away()` clears `conn_t::away` before it notifies, so "

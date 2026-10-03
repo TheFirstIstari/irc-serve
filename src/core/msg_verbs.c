@@ -444,18 +444,142 @@ void handle_who(server_t *s, conn_t *c, const message_t *m)
 }
 
 /* ---------------------------------------------------------------------------
+ * 319 RPL_WHOISCHANNELS
+ * ---------------------------------------------------------------------------
+ *   :<server> 319 <client> <nick> :<sigil><channel> <sigil><channel> ...
+ *
+ * RFC 2812 5.1 gives the field list as "<nick> :*( ( "@" / "+" ) <channel> " " )",
+ * so the NICK is a MIDDLE parameter and the channel run is the trailing one, and
+ * the grammar has three states per channel: '@' for an operator, '+' for a voice,
+ * and nothing at all for neither. It is a three-way choice rather than two
+ * independent sigils -- the same "op wins over voice" rendering 353 does without
+ * `multi-prefix`, and for the same reason: the grammar has one slot.
+ *
+ * ONE SIGIL, HIGHEST FIRST. '@' when the user holds CHAN_MEMBER_OP, else '+'
+ * when it holds CHAN_MEMBER_VOICE, else nothing. That is RFC 2812 3.3.4's own
+ * rule for 319 as well as 353 ("The '@' and '+' characters next to the channel
+ * name indicate whether a client is a channel operator or has been granted
+ * permission to speak"), and it is deliberately NOT this node's `multi-prefix`
+ * behaviour: 319 has no capability that widens it, and rendering "@+" here would
+ * be outside the grammar rather than a richer answer inside it.
+ *
+ * THE WALK IS OVER `who->chans` -- THE SUBJECT'S OWN MEMBERSHIP LIST, not the
+ * destination's and not the channel registry. That is the difference between
+ * answering "where is this person" and answering "where am I", and it is the
+ * whole content of this numeric. `conn_t::chans` is the second of 2.2's two
+ * membership lists and it is maintained by channel.c's join/leave on both the
+ * local and the remote side, so a user learned from an SJOIN is reported here
+ * exactly as a local member is.
+ *
+ * WHY THIS WAS THE ONE REAL GAP IN handle_whois(). Until this phase the handler
+ * emitted 311, 312, 301 and 317 and then 318, and every one of those answers a
+ * question about a person -- who they are, where they are connected, whether
+ * they are away, when they signed on. NONE of them says where they are. A
+ * `away-notify` client could learn that a friend went away and could not learn
+ * where to find them; a client that had not negotiated `away-notify` could not
+ * learn either. The claim that WHOIS "reflects" the node's state was true of
+ * every field except the one a client uses WHOIS for.
+ *
+ * IT IS ALSO WHAT MAKES `away-notify`'s OWN DOCUMENTED PROMISE TRUE. The
+ * specification's reason for excluding the setter from the notification is that
+ * "they can rely on RPL_NOWAWAY and RPL_UNAWAY" -- and the comment above
+ * notify_away() says the same. Those two numerics tell the SETTER their own
+ * state; they tell nobody else where that person is, which is the question a
+ * third party actually has after seeing the notification. 319 is the answer to
+ * that question, and without it the notification reported a state change with
+ * no way to act on it.
+ *
+ * CHUNKED AT `WHOIS_CHANNELS_LINE`, and RFC 2812 3.3.4 sanctions it in the same
+ * sentence that defines the numeric: "For each reply set, only
+ * RPL_WHOISCHANNELS may appear more than once (for long lists of channel
+ * names)." Without the chunk a user in nine channels would produce a trailing
+ * value reply() REFUSES rather than reshapes -- which is a refusal on
+ * `n_reply_refused`, the counter reply.c holds at zero because a non-zero value
+ * is a bug report. One entry can never be longer than WHOIS_CHANNELS_LINE (see
+ * the constant), so the "flush before append" guard is sufficient and no single
+ * channel can overflow the buffer.
+ *
+ * NOTHING AT ALL WHEN THE USER IS IN NO CHANNELS, and that is a real decision
+ * rather than an omission. An empty 319 would be a line whose only content is a
+ * nick, and a client that renders "is in:" for every WHOIS would print a
+ * dangling label for every user who happens not to be in a channel -- which on
+ * this node is every client until it joins one. Absence is the RFC-conventional
+ * "none", and it is the same reasoning 330's absence uses for "no account".
+ * The cost is that a client cannot distinguish "no channels" from "a node too
+ * old to answer", which is the cost every absence on this node already pays.
+ */
+#define WHOIS_CHANNELS_LINE 400
+
+static void send_whois_channels(server_t *s, conn_t *dst, const conn_t *who)
+{
+    char line[WHOIS_CHANNELS_LINE + 1];
+    size_t used = 0;
+    int lines = 0;
+
+    for (size_t i = 0; i < who->nchans; i++) {
+        const chan_t *ch = who->chans[i];
+        const char *sigil;
+        size_t slen;
+        size_t nlen;
+
+        if (ch == NULL || ch->name[0] == '\0') {
+            continue; /* a chan_t this node no longer holds: nothing to name */
+        }
+        if (chan_has_flag(ch, who, CHAN_MEMBER_OP) != 0) {
+            sigil = "@";
+        } else if (chan_has_flag(ch, who, CHAN_MEMBER_VOICE) != 0) {
+            sigil = "+";
+        } else {
+            sigil = "";
+        }
+        slen = strlen(sigil);
+        nlen = strlen(ch->name);
+        /* One entry is at most strlen("@") + CHAN_MAX_NAME (63) = 64 bytes, plus
+         * the joining space, which is inside WHOIS_CHANNELS_LINE with room to
+         * spare. That is what makes the `used != 0u` guard below sufficient: a
+         * line is only flushed when it already holds something, so the append
+         * that follows is always of a value known to fit. */
+        if (used != 0u && used + slen + nlen + 1u > WHOIS_CHANNELS_LINE) {
+            (void)reply(s, dst, "319", (const char *const[]){ who->nick }, 1, "%s", line);
+            lines++;
+            used = 0;
+        }
+        if (used != 0u) {
+            line[used++] = ' ';
+        }
+        memcpy(line + used, sigil, slen);
+        used += slen;
+        memcpy(line + used, ch->name, nlen);
+        used += nlen;
+        line[used] = '\0';
+    }
+    if (used != 0u) {
+        (void)reply(s, dst, "319", (const char *const[]){ who->nick }, 1, "%s", line);
+        lines++;
+    }
+    printf("[observable] whois_channels: by=%s nick=%s chans=%zu lines=%d\n",
+           dst->nick, who->nick, who->nchans, lines);
+}
+
+/* ---------------------------------------------------------------------------
  * WHOIS
  * ---------------------------------------------------------------------------
- * 311, 312, 317, 318, and 301 when the target is away.
+ * 311, 312, 319, 317, 318, plus 301 when the target is away and 330 when it is
+ * identified. RFC 2812 3.3.4's own order is 311, 312, 313, 319, 317, 318, and
+ * this is that order with 313 absent (there are no IRC operators -- 258 says so)
+ * and 301/330 inserted next to the fact they carry: 301 with 319 because away and
+ * presence are what a client reads together, and 330 after 317 because it is
+ * supplementary.
  *
- * 301 is NOT in 4.4's list, and the reason for using it is the one Phase 3 gave
- * for 432: the LIST has a hole, the protocol does not. RFC 2812 3.3.4 requires
- * 301 for an away user and it is the ONLY numeric that can carry the fact at
- * all -- 311 holds user/host/realname, 312 holds a server name, 317 holds two
- * timestamps, and none of them has a field for away. Without it, "WHO/WHOIS
- * reflect AWAY" -- this phase's own acceptance criterion -- is not implementable
- * and the alternative is a WHOIS that silently omits the one thing it was asked
- * about. Flagged here and in the report rather than papered over. */
+ * 301 and 319 and 330 are all NOT in 4.4's list, and the reason for using them
+ * is the one Phase 3 gave for 432: the LIST has a hole, the protocol does not.
+ * For 301 the RFC is not optional -- RFC 2812 3.3.4 requires it for an away user
+ * and it is the ONLY numeric that can carry the fact at all: 311 holds
+ * user/host/realname, 312 holds a server name, 317 holds two timestamps, and none
+ * of them has a field for away. For 319 the same argument is stronger still,
+ * because nothing else in the reply set names a channel at all. Flagged here and
+ * in the conformance document rather than papered over.
+ */
 void handle_whois(server_t *s, conn_t *c, const message_t *m)
 {
     conn_t *who;
@@ -504,10 +628,72 @@ void handle_whois(server_t *s, conn_t *c, const message_t *m)
                     who->away);
     }
 
-    /* 317: <idle> <signon>, both real values. conn_t records them at accept and
+    /* 319 BEFORE 317, because that is RFC 2812 3.3.4's order (311, 312, 313, 319,
+     * 317, 318) and because a client reading a WHOIS left to right reads "who,
+     * where from, away, where, idle" and 319 is the "where". See
+     * send_whois_channels() for the grammar and the chunking argument. */
+    send_whois_channels(s, c, who);
+
+    /* ------------------------------------------------------------------------
+     * 317: <idle> <signon>, both real values. conn_t records them at accept and
      * on every read (see connection.c), so neither number is a placeholder --
      * which is the standard Phase 4 set for 329, where borrowing topic_when
-     * would have been "a numeric that lies about what it is". */
+     * would have been "a numeric that lies about what it is".
+     *
+     * ------------------------------------------------------------------------
+     * TWO MIDDLE PARAMETERS WHERE RFC 2812 3.3.4 SPECIFIES ONE, AND THE
+     * TRAILING TEXT IS DELIBERATELY LEFT AT THE RFC'S OWN LITERAL STRING.
+     * ------------------------------------------------------------------------
+     * Both halves of that are decisions this phase took and is recording rather
+     * than accidents, so here is the argument.
+     *
+     * THE EXTRA NUMBER. RFC 2812 5.1 writes 317 as "<nick> <integer> :seconds
+     * idle" -- one number. This line carries <nick> <idle> <signon>, two. That is
+     * the de-facto convention every widely deployed client parses (irssi,
+     * weechat and hexchat all read two, and fall back gracefully), and it is the
+     * form that makes 317 carry the signon time at all: 311 gives a real name,
+     * 312 gives a server, 317 is the only place a WHOIS reply carries a
+     * timestamp of any kind, and dropping <signon> to satisfy the RFC's field
+     * count would delete the only signon information on the wire. The cost is
+     * that a client reading 317 STRICTLY positionally against the RFC's field
+     * list will find a second number where it expected the trailing parameter.
+     * The mitigating fact is that <signon> is a middle parameter, not text, so
+     * the trailing text stays exactly where the RFC puts it and a client that
+     * reads only the trailing text is unaffected. That is the shape the whole
+     * reply path is built around -- 3.2 will not format a number into a
+     * non-final position -- so <signon> had to be a parameter rather than be
+     * folded into the sentence.
+     *
+     * THE TRAILING TEXT, which is the question the phase asked and the one worth
+     * being explicit about because "seconds idle, signon time" is the other
+     * convention in circulation. RFC 2812 3.3.4 makes the trailing parameter
+     * free text, so BOTH strings are conformant, and the choice between them
+     * cannot be made on conformance grounds. It is left as "seconds idle" for
+     * three reasons, in descending order of weight:
+     *
+     *   1. It is the RFC's OWN literal string for this numeric. A client whose
+     *      numeric table carries the RFC's text matches this line byte for byte,
+     *      and would not match a rewritten sentence. When two forms are equally
+     *      legal, the one that is the specification's literal is the one that
+     *      cannot lose.
+     *   2. Clients do not read it. Every client that matters dispatches 317 on
+     *      the NUMERIC and reads the middle parameters by position; none parses
+     *      the trailing text of 317, because the numeric exists to carry two
+     *      numbers and the text is decoration. Changing decoration that nothing
+     *      reads buys no compatibility.
+     *   3. An anchored match is the only consumer the rewrite would help, and
+     *      anchored matches break. A client, script or log parser anchored on
+     *      ":seconds idle" -- a suffix, not a substring -- is a real thing in
+     *      the wild, and "seconds idle, signon time" does not satisfy it. The
+     *      rewrite trades a hypothetical reader who reads decoration for a
+     *      concrete reader who matches it.
+     *
+     * The observation behind the question -- that a line carrying two numbers
+     * reads oddly against a sentence describing one -- is fair, and the reason
+     * it is not acted on is that the sentence is not this numeric's contract.
+     * RFC 2812 3.3.4's field list is, and it is satisfied. A reader who wants
+     * both numbers already has both.
+     */
     now = time(NULL);
     secs = (long)(now - who->last_active);
     if (secs < 0) {

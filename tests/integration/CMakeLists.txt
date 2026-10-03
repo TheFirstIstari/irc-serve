@@ -538,3 +538,13 @@ irc_add_integration_test(test_labeled_response test_labeled_response.c)
 # INVITE reaches the INVITEE, so a substring search for "INVITE" on any socket here is
 # satisfied by the delivery and every claim has to be a count.
 irc_add_integration_test(test_invite_notify test_invite_notify.c)
+
+# RFC 2812 conformance (Phase 11), split into one file per numeric group rather than
+# one file for the whole phase, because each group is a different subsystem and each
+# wants to be able to fail on its own. See docs/RFC2812_CONFORMANCE.md.
+
+# 319 RPL_WHOISCHANNELS in WHOIS. Its own file because it is the one numeric whose
+# ABSENCE was a defect: until Phase 11 a WHOIS named a person and never named a
+# channel, which is the whole content of a WHOIS to a client looking for somebody.
+irc_add_integration_test(test_whois_channels test_whois_channels.c)
+
