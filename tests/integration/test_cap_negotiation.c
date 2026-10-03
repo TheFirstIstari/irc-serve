@@ -240,9 +240,8 @@ static void test_negotiation(void)
                 TF_CHECK_MSG(strstr(line, "userhost-in-names") != NULL,
                              "CAP LS does not advertise userhost-in-names, which "
                              "this node implements for every 353 it draws");
-                /* NOT ADVERTISED, and each of these is a capability a client
-                 * would act on: cap-notify expects unsolicited CAP NEW lines and
-                 * away-notify expects an AWAY you did not ask for.
+                /* NOT ADVERTISED, and this one is a capability a client would
+                 * act on: cap-notify expects unsolicited CAP NEW lines.
                  *
                  * `echo-message` WAS on this list, under a comment reading "expects
                  * your own PRIVMSG back" -- which is a DESCRIPTION of the feature
@@ -256,8 +255,21 @@ static void test_negotiation(void)
                 TF_CHECK_MSG(strstr(line, "cap-notify") == NULL,
                              "CAP LS advertises cap-notify, which nothing here "
                              "sends CAP NEW for");
-                TF_CHECK_MSG(strstr(line, "away-notify") == NULL,
-                             "CAP LS advertises away-notify");
+                /* `away-notify` WAS here and Phase 10.8 is why it is not any
+                 * more, on the same shape as `echo-message` above: the refusal was
+                 * a DESCRIPTION of the feature presented as a reason for withholding
+                 * it ("expects an AWAY you did not ask for"), and the correct
+                 * question is whether this node can produce one at all. It can --
+                 * `conn_t::away` exists on every connection, `AWAYLEN` is advertised
+                 * from `CONN_MAX_AWAY`, and `handle_away()` now notifies the users
+                 * sharing a channel with the setter, per destination and excluding
+                 * the setter. The behaviour is asserted in test_away_notify.c,
+                 * which is where the SET and the CLEARED cases can each be a count
+                 * rather than a substring. */
+                TF_CHECK_MSG(strstr(line, "away-notify") != NULL,
+                             "CAP LS does not advertise away-notify, which this node "
+                             "implements: a user who sets or clears an away state "
+                             "notifies the users sharing a channel with them");
                 TF_CHECK_MSG(strstr(line, "echo-message") != NULL,
                              "CAP LS does not advertise echo-message, which this node "
                              "implements -- a sender that negotiated it gets its own "

@@ -83,12 +83,13 @@
  * territory that belongs to, and adding a verb that sets `conn_t::host` would be
  * inventing a spoofing surface to satisfy a specification.
  *
- * **Phase 10.5 and 10.6 retired two names from that sentence.** It used to read
+ * **Phase 10.5 onward retired several names from that sentence.** It used to read
  * "and no `server-time` or `userhost-in-names` (it stamps neither)" — true when
- * written, and no longer true of `userhost-in-names` (Phase 10.5) or `setname`
- * (Phase 10.6), and `echo-message` (Phase 10.7), all of which are in the
- * table above and implemented behind it.
- * `server-time` is still absent, because this node stamps no time tag on anything.
+ * written, and no longer true of `userhost-in-names` (Phase 10.5), `setname`
+ * (Phase 10.6), `echo-message` (Phase 10.7), `standard-replies` (Phase 10.9) or
+ * `away-notify` (Phase 10.8b), all of which are in the table above and implemented
+ * behind it. `server-time` is still absent, and `chghost` is still absent for the
+ * reason its own paragraph below gives, which is not the tidy one.
  * The line is corrected rather than deleted because an out-of-date "and no X" in a
  * header is the exact shape of the incoherence this file exists to prevent, and the
  * build cannot see it.
@@ -159,6 +160,7 @@
 #define CAP_SETNAME "setname"
 #define CAP_ECHO_MESSAGE "echo-message"
 #define CAP_STANDARD_REPLIES "standard-replies"
+#define CAP_AWAY_NOTIFY "away-notify"
 
 /* 410 ERR_INVALIDCAPSUBCOMMAND. Not in design 4.4's numeric list, which is a gap
  * in the list rather than in the protocol, for the same reason 301, 303, 417,
@@ -464,6 +466,46 @@ int cap_echo_message_enabled(const conn_t *c);
  * exception clause covers outright, because its own specification names the
  * replacement. */
 int cap_standard_replies_enabled(const conn_t *c);
+
+/* away-notify: whether this node tells THIS client, unprompted, when a user it
+ * shares a channel with sets, changes or removes their away state.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT IT SENDS, AND WHY THE CLEARED CASE IS THE INTERESTING ONE
+ * ---------------------------------------------------------------------------
+ * `:nick!user@host AWAY [:message]`. **The message is present when the user is
+ * GOING away and ABSENT when they are removing their away state** -- one verb with
+ * two shapes, decided by whether the value is there, and the absence is what makes
+ * it a notification rather than an echo. `handle_away()` already produces exactly
+ * those two states; this capability is what puts them on somebody else's wire.
+ *
+ * IT IS A NOTIFICATION AND NOT AN ECHO, and the difference is who gets it:
+ * "clients will be sent an AWAY message when a user **sharing a channel with
+ * them** sets, changes or removes their away state", and the specification is
+ * explicit that the user themselves "SHOULD NOT be sent AWAY messages to notify
+ * them of their own away status (as they can rely on `RPL_NOWAWAY` and
+ * `RPL_UNAWAY`)" -- which is `305`/`306`, and this node answers both. So the
+ * setter is EXCLUDED, and the exclusion is `exclude` rather than the gate: a member
+ * who asked for the capability is still not told their own state, and a member who
+ * did not ask is told nothing at all. Two different questions, two different
+ * parameters.
+ *
+ * ONE GATE AND NO AVAILABILITY CHECK: `conn_t::away` exists on every connection,
+ * so there is no configuration in which this node cannot honour the capability.
+ * A node that advertised it and then sent nothing would be a client waiting for a
+ * message that never comes, and one that withheld it whenever nobody happened to
+ * be away would be a capability that appears and disappears with the traffic. */
+int cap_away_notify_enabled(const conn_t *c);
+
+/* `cap_away_notify_enabled()` in the shape `fanout.h`'s `fanout_gate_fn` wants --
+ * `int (*)(const conn_t *, void *)` -- so the away notification can be handed to
+ * `fanout_deliver_local_gated()` with no glue at the call site.
+ *
+ * IT LIVES HERE AND NOT IN msg_verbs.c, because the adaptation between this file's
+ * one-argument predicates and the gate's two-argument signature is a fact about
+ * this file, and one readable place is better than a wrapper per future caller. */
+int cap_gate_away_notify(const conn_t *dst, void *ctx);
+
 
 
 /* Handle one `CAP` line. Returns 1 if it was handled, 0 if it was not a CAP at

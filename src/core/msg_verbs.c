@@ -637,13 +637,111 @@ void handle_ison(server_t *s, conn_t *c, const message_t *m)
  * 303: the list has a gap rather than the protocol doing so. RFC 2812 3.3.1
  * defines 417 ERR_INPUTTOOLONG and every client understands it, while 4.4's own
  * candidates are all false here -- 461 says "you did not send enough", and the
- * client sent exactly what it meant to.
+ * client sent exactly what it meant to. Since Phase 10.9 it is a `FAIL AWAY
+ * ERR_INPUTTOOLONG` for a client that negotiated `standard-replies` and the same
+ * 417 for one that did not; design 4.4.3 has the migration rule.
  *
  * 305 and 306 are not in 4.4 either, and this one is not a close call. A
  * state-changing command that answers nothing leaves a client unable to tell
  * success from a dropped line, which is precisely the silence 4.4's numerics
  * exist to prevent; Phase 4's 472, 474, 696 and 368 took the same decision for
- * the same reason. */
+ * the same reason.
+ *
+ * ---------------------------------------------------------------------------
+ * away-notify: THE NOTIFICATION, AND WHY IT IS A SEPARATE FUNCTION
+ * ---------------------------------------------------------------------------
+ * `notify_away()` is called on BOTH edges of the change and is the whole of
+ * `away-notify`. It walks the user's own channel list and asks `fanout.c` to tell
+ * each channel's members -- and the two things it does NOT do are the interesting
+ * half:
+ *
+ *   THE SETTER IS EXCLUDED. The specification says so directly ("Clients SHOULD
+ *   NOT be sent AWAY messages to notify them of their own away status (as they
+ *   can rely on RPL_NOWAWAY and RPL_UNAWAY)"), and `305`/`306` above are those
+ *   two numerics. So `exclude` is the setter: a member who negotiated the
+ *   capability is still not told their own state. That is `exclude` and not the
+ *   gate, and the two are different questions -- the gate asks "did this
+ *   destination ask?", `exclude` asks "is this the author?" -- which is why both
+ *   exist and why neither is expressed with the other.
+ *
+ *   THE NOTIFICATION IS NOT FORWARDED. It goes out through
+ *   `fanout_deliver_local_gated()`, the LOCAL-ONLY entry point, so there is no
+ *   forward arm and no question about whether a peer should be told: a peer is not
+ *   a client that negotiated anything, and design 3.1.1's argument for there being
+ *   no gated variant of the forwarding path is exactly this case. Away STATE
+ *   federates -- 4.3's SBURST carries it and a resync rebuilds it -- and a
+ *   notification is not state.
+ *
+ * THE CLEARED CASE IS NOT AN OMISSION, and it is the half implementations get
+ * wrong: `AWAY` with no message must still notify, because the notification is the
+ * only thing that tells a client the user is BACK. A node that emitted the
+ * notification only on the way out would leave every member believing their friend
+ * was still at lunch for ever. So the notification is one call on both edges and
+ * the wire shape is decided by whether the parameter list has anything in it.
+ *
+ * NO CHANNEL MEANS NO NOTIFICATION, and that is `c->nchans` rather than a check
+ * anywhere else: the audience is "users sharing a channel", so with no channels
+ * there is no audience, and the 305/306 above are the whole answer. There is no
+ * loop over the connection registry here and there never will be one -- that walk
+ * is `fanout.c`'s. */
+static void notify_away(server_t *s, conn_t *c, const char *message)
+{
+    const char *params[1];
+    fanout_form_t plain;
+    char prefix[CONN_HOSTMASK_MAX];
+    int delivered = 0;
+
+    if (c->nchans == 0u) {
+        printf("[observable] away_notify: nick=%s recipients=0 reason=NO_SHARED_CHANNEL\n",
+               c->nick);
+        return;
+    }
+    /* THE PREFIX IS THE SETTER'S OWN HOSTMASK, for the reason every server-to-client
+     * line this node emits uses one: the notification NAMES who changed, and
+     * `conn_hostmask()` renders it from the fields §2.1 owns -- including the
+     * OBSERVED host, which USER does not touch. */
+    if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
+        printf("[observable] away_notify: nick=%s reason=UNRENDERABLE\n", c->nick);
+        return;
+    }
+    /* THE TWO SHAPES, AND NOTHING ELSE. With a message the line carries it as the
+     * trailing parameter (`:nick!user@host AWAY #chan :message`); without one the
+     * parameter list is EMPTY and the line is `:nick!user@host AWAY #chan`, which
+     * is what "the user is removing their away state" looks like on the wire. A
+     * third shape -- an empty string in the parameter list -- would render as
+     * `AWAY #chan :`, and 3.2 says an empty value is not representable in a
+     * non-final position, so the formatter would refuse the whole line rather than
+     * sending it. Emptiness is expressed by ABSENCE and that is not an accident of
+     * the shape. */
+    plain.params = (message != NULL) ? params : NULL;
+    plain.nparams = (message != NULL) ? 1 : 0;
+    if (message != NULL) {
+        params[0] = message;
+    }
+
+    /* ONE FANOUT CALL PER CHANNEL, and the walk is over `c->chans` -- the
+     * connection's own membership, which 2.2 keeps as a second list beside the
+     * channel's for exactly this kind of teardown-and-notification use. Each
+     * channel is resolved through `fanout_resolve()` rather than looked up in the
+     * registry, because resolution is the only place that answers "is this a
+     * channel" and a caller that went around it would have to answer the question
+     * a second way. The class is `message`: this is not a state change, it is an
+     * observation, and the class decides the forward arm -- which the local-only
+     * entry point does not have. */
+    for (size_t i = 0; i < c->nchans; i++) {
+        fanout_target_t t;
+
+        if (c->chans[i] == NULL ||
+            fanout_resolve(s, c, c->chans[i]->name, FANOUT_MESSAGE, &t) == 0) {
+            continue; /* a chan_t this node no longer holds: nothing to address */
+        }
+        delivered += fanout_deliver_local_gated(s, &t, prefix, "AWAY", &plain, NULL,
+                                                cap_gate_away_notify, NULL, c);
+    }
+    printf("[observable] away_notify: nick=%s channels=%zu recipients=%d state=%s\n",
+           c->nick, c->nchans, delivered, (message != NULL) ? "set" : "cleared");
+}
+
 void handle_away(server_t *s, conn_t *c, const message_t *m)
 {
     const char *message;
@@ -659,9 +757,17 @@ void handle_away(server_t *s, conn_t *c, const message_t *m)
         /* Bare AWAY, and `AWAY :` which parses to one empty parameter. Both
          * mean "not away": RFC 1459 2.4.2 has no separate syntax for clearing,
          * so a client that sends an empty trailing parameter means exactly what
-         * a client that sends none does. */
+         * a client that sends none does.
+         *
+         * AND THE NOTIFICATION FIRES ON THIS EDGE TOO, which is the half that is
+         * usually missed: without it a member's client believes the user is still
+         * away for ever, because the ONLY thing that tells it otherwise is the
+         * parameterless `AWAY` and nothing else carries the fact. The `305` below
+         * is for the user and the notification is for everybody else; neither
+         * substitutes for the other. */
         c->away[0] = '\0';
         (void)reply(s, c, "305", NULL, 0, "You are no longer marked as being away");
+        notify_away(s, c, NULL);
         printf("[observable] away: nick=%s state=clear\n", c->nick);
         return;
     }
@@ -669,7 +775,8 @@ void handle_away(server_t *s, conn_t *c, const message_t *m)
     message = m->params[0];
     len = strlen(message);
     if (len > (size_t)CONN_MAX_AWAY) {
-        (void)reply_refused(s, c, "AWAY", NULL, "417", NULL, 0, "Away message is too long");
+        (void)reply_refused(s, c, "AWAY", NULL, "417", NULL, 0,
+                            "Away message is too long");
         printf("[observable] away: nick=%s state=refused reason=too_long "
                "len=%zu max=%d\n",
                c->nick, len, CONN_MAX_AWAY);
@@ -678,6 +785,7 @@ void handle_away(server_t *s, conn_t *c, const message_t *m)
 
     memcpy(c->away, message, len + 1u);
     (void)reply(s, c, "306", NULL, 0, "You have been marked as being away");
+    notify_away(s, c, c->away);
     printf("[observable] away: nick=%s state=set len=%zu\n", c->nick, len);
 }
 
