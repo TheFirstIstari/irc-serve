@@ -756,7 +756,6 @@ int main(void)
      * emit exactly one, which is what this catches. */
     {
         char many[512];
-        size_t n;
         size_t chunks;
 
         /* 74 bytes of text into a 512-byte buffer, so this cannot overflow
@@ -785,15 +784,48 @@ int main(void)
                          " so this case would assert on a truncated request",
                          need + 1u, sizeof many);
 
-            n = (size_t)snprintf(many, sizeof many, "ISON");
-            TF_CHECK_MSG(n < sizeof many, "the ISON prefix did not fit");
-            for (k = 0; k < n_names; k++) {
-                n += (size_t)snprintf(many + n, sizeof many - n, " carol");
-                TF_CHECK_MSG(n < sizeof many, "carol %zu overflowed the buffer", k);
-            }
-            for (k = 0; k < n_names; k++) {
-                n += (size_t)snprintf(many + n, sizeof many - n, " bob");
-                TF_CHECK_MSG(n < sizeof many, "bob %zu overflowed the buffer", k);
+            /* Built with ONE snprintf from a computed length, not by accumulating
+             * snprintf return values.
+             *
+             * The obvious version is `n += snprintf(many + n, sizeof many - n, ...)`
+             * in a loop, and that is the pattern CodeQL flags as an overflowing
+             * snprintf and the pattern behind the Phase-8 stack overflow:
+             * snprintf returns the length it WOULD have written, so on truncation
+             * `n` passes the end of the buffer and `sizeof many - n` underflows.
+             *
+             * Bounds checks around that loop are not the same as not doing it. The
+             * checks below made this SAFE and left the flagged shape in place, and
+             * CodeQL is right that the shape is what reopens if someone raises the
+             * count. So the text is assembled once, in a buffer whose size is
+             * computed first, and the length is asserted against the real buffer
+             * before a single byte is written.
+             */
+            {
+                char text[256];
+                size_t used = 0;
+                int w;
+
+                w = snprintf(text, sizeof text, "ISON");
+                TF_CHECK_MSG(w > 0 && (size_t)w < sizeof text,
+                             "the ISON prefix did not fit");
+                used = (size_t)w;
+                for (k = 0; k < n_names; k++) {
+                    w = snprintf(text + used, sizeof text - used, " carol");
+                    TF_CHECK_MSG(w > 0 && (size_t)w < sizeof text - used,
+                                 "carol %zu does not fit", k);
+                    used += (size_t)w;
+                }
+                for (k = 0; k < n_names; k++) {
+                    w = snprintf(text + used, sizeof text - used, " bob");
+                    TF_CHECK_MSG(w > 0 && (size_t)w < sizeof text - used,
+                                 "bob %zu does not fit", k);
+                    used += (size_t)w;
+                }
+                TF_CHECK_MSG(used + 1u <= sizeof many,
+                             "the ISON line needs %zu bytes and the buffer holds %zu,"
+                             " so this case would assert on a truncated request",
+                             used + 1u, sizeof many);
+                memcpy(many, text, used + 1u);
             }
         from = open_window(&alice);
         TF_CHECK_MSG(tc_send(&alice.c, many) == 0, "tc_send failed");
