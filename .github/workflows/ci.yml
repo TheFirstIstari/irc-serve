@@ -132,6 +132,23 @@ jobs:
       - name: Skip gate (ratchet)
         run: ./scripts/check-skips.sh -b build build/ctest.log
 
+      # No AI attribution in this repository's history. Attribution was stripped
+      # from main twice by rewriting history and came back both times, because a
+      # rewrite only says something about the PAST and nothing about the next
+      # commit. This says something about the next commit, which is the part that
+      # was still unguarded.
+      #
+      # The range is the merge base with the base branch, so an ordinary PR is
+      # checked for what it ADDS rather than for all of history. Copilot is
+      # deliberately NOT matched: those are the operator's own commits made in
+      # GitHub's editor, and they are wanted.
+      - name: Attribution gate (this PR)
+        if: github.event_name == 'pull_request'
+        run: ./scripts/check-attribution.sh "origin/${{ github.base_ref }}" HEAD
+      - name: Attribution gate (this push)
+        if: github.event_name == 'push'
+        run: ./scripts/check-attribution.sh "origin/${{ github.ref_name }}" HEAD
+
   # --- macOS: cannot run on the self-hosted machine -----------------------
   ci_macos:
     runs-on: macos-latest

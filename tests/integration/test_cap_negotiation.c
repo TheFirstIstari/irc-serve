@@ -45,6 +45,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -97,19 +98,40 @@ static void expect_absent(test_client_t *c, const char *what, const char *hay,
  * refusal path and calling it a success. */
 static int write_store(const char *path, const char *records)
 {
-    FILE *f = fopen(path, "w");
+    /* THE MODE IS SET AT CREATION, not applied afterwards.
+     *
+     * This used to fopen(path, "w"), fclose, and then chmod(path, 0600) -- which
+     * is the same stat-then-act shape sasl_store_load() was hardened against, in
+     * the test that exercises that hardening: between the fclose and the chmod
+     * the file exists at whatever the umask said, and between the fopen and the
+     * chmod the PATH can be replaced by something this process then chmods. CodeQL
+     * flags it as a TOCTOU race, and it is one.
+     *
+     * open() with an explicit mode sets the permissions as part of creating the
+     * file, so there is no interval in which it exists with the wrong mode, and
+     * O_NOFOLLOW refuses a symlink at the path rather than following it. The
+     * refusal the comment above cares about is now also untestable-by-accident:
+     * a store written any other way is a different code path in this file, not a
+     * window inside this one. */
+    const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW,
+                        S_IRUSR | S_IWUSR);
+    FILE *f;
 
+    if (fd < 0) {
+        return -1;
+    }
+    f = fdopen(fd, "w");
     if (f == NULL) {
+        (void)close(fd);
         return -1;
     }
     if (fputs(records, f) == EOF) {
         (void)fclose(f);
         return -1;
     }
-    if (fclose(f) != 0) {
-        return -1;
-    }
-    return chmod(path, S_IRUSR | S_IWUSR);
+    /* fclose() closes the descriptor too, so there is no second close here and no
+     * path to chmod: the mode was never anything else. */
+    return (fclose(f) == 0) ? 0 : -1;
 }
 
 /* base64 of "authzid\0authcid\0passwd", for a PLAIN payload.
