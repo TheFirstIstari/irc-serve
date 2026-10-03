@@ -1140,7 +1140,14 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
      * the FORMAT's and is enforced here rather than defaulted, for the reason the
      * 4.3.1 `<server>` paragraph gives: a member record that is missing a field is
      * a peer running a different format, and the safe direction is to refuse it
-     * rather than install a member whose account this node cannot tell. */
+     * rather than install a member whose account this node cannot tell.
+     *
+     * `<account>` GOES THROUGH account_name_wire_safe(), and that is the SECOND
+     * bound on it: the predicate refuses a name wider than the field it is about
+     * to be copied into, so the burst_copy() of it below cannot fail. That is the
+     * half of the rule that makes this function's own slot well-defined -- with
+     * only a byte check here, a value too long for the field reached a copy whose
+     * result is discarded, and the field kept whatever the realloc left in it. */
     if (sc == NULL || m->nparams != 5 || !irc_serve_server_name_valid(m->params[1]) ||
         !valid_nick(m->params[2]) || !chan_name_valid(m->params[0]) ||
         (m->params[4][0] != '*' && account_name_wire_safe(m->params[4]) == 0)) {
@@ -1209,7 +1216,22 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
         sc->members = grown;
         sc->mcap = want;
     }
+    /* THE SLOT IS ZEROED BEFORE IT IS WRITTEN, and this is the third of the three
+     * record functions in this file that does it -- apply_nick() memsets, and
+     * apply_chan() zeroes the region it grows into. It is here because
+     * realloc() does not, and because the three burst_copy() calls below are all
+     * `(void)`: <nick> and <server> are bounded by their own validators, so those
+     * two always land, but the pattern of "a copy whose failure is discarded
+     * writes into a field nothing has initialised" is exactly the one that turns a
+     * refusal into an uninitialised READ rather than into an absent value.
+     *
+     * The two siblings say the same thing in their own words at their own lines:
+     * a RECYCLED element carrying the previous member's field is impersonation
+     * wearing a memory bug's clothes. `account` is the field that can be left
+     * unwritten, and channel.c's chan_remote_add() is where a garbage value read
+     * out of here becomes a roster entry. */
     slot = &sc->members[sc->nmembers++];
+    memset(slot, 0, sizeof *slot);
     (void)burst_copy(slot->nick, sizeof slot->nick, m->params[2]);
     (void)burst_copy(slot->server, sizeof slot->server, m->params[1]);
     /* `*` BECOMES "" on the way in, for the reason channel.h's chan_remote_add()

@@ -720,9 +720,21 @@ escape nothing at all. This was already true of `330 RPL_WHOISACCOUNT`, which ha
 carried the account as a middle parameter since Phase 10.1; Phase 10.3 gave the
 name three more parameter positions to be wrong in, which is what made it visible.
 **The cost is stated: an operator cannot create an account whose name holds a
-space, and a registry record holding one is REFUSED rather than loaded with a name
-this node could not publish to anybody.** A restriction, enforced at the one writer
-of the field rather than discovered at a renderer.
+space or runs past `ACCOUNT_MAX_NAME`, and a registry record holding one is REFUSED
+rather than loaded with a name this node could not publish to anybody.** A
+restriction, enforced at the one writer of the field rather than discovered at a
+renderer.
+
+**AND THE RULE BOUNDS LENGTH AS WELL AS BYTES, which is the half that took a peer
+to find.** When this subsection was written the predicate checked every *byte* and
+no *length*, because both of its callers were local and each bounded the length
+separately. The two receivers Phase 10.3 added had nothing to bound it with, and
+they failed in opposite ways: `chan_remote_add()` truncated an over-long SJOIN
+account into the roster -- a name the peer never reported -- and `apply_member()`'s
+`burst_copy()` **refused** one, writing nothing into a `burst_member_t` slot that
+nothing zeroes, so the resync installed whatever the allocator had left there. Both
+are closed by one bound in the one predicate, because "a name it refuses" has to
+mean "a name no field can hold" and not only "a name no parameter can carry".
 
 **WHAT IT FEDERATES, AND WHAT IT STILL DOES NOT.** `SJOIN` is now
 `<channel> <member> <flags> <account>` — four parameters, the fourth derived from

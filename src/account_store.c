@@ -133,6 +133,38 @@ int account_name_wire_safe(const char *name)
     if (name == NULL || name[0] == '\0') {
         return 0;
     }
+    /* AND THE LENGTH, WHICH IS PART OF THE SAME RULE AND WAS MISSING FROM IT.
+     *
+     * Every field this name reaches is ACCOUNT_MAX_NAME wide -- conn_t::account,
+     * chan_remote_t::account, burst_member_t::account -- and a name longer than
+     * that is one this node cannot HOLD, which is a stronger statement than one
+     * it cannot render. Rendering was the whole of the predicate when there were
+     * two callers, both of them on the LOCAL side: account_set() and
+     * account_store_add(), and both already bounded the length separately. The
+     * two PEER-side callers came with Phase 10.3 and neither had anywhere to
+     * bound it, because the rule they were handed says nothing about length:
+     *
+     *   chan_remote_add()  copy_bounded() TRUNCATES and returns 0, which both call
+     *                      sites discard -- so the roster ended up holding a
+     *                      DIFFERENT NAME from the one the peer reported, under a
+     *                      name that peer will never be asked about again.
+     *   burst.c's apply_member()  burst_copy() REFUSES rather than truncating, and
+     *                      writes NOTHING -- into a slot of a realloc'd array that
+     *                      nothing zeroes. So what the resync went on to install
+     *                      was whatever the allocator had left there.
+     *
+     * Both are the same defect seen from two receivers, and both are closed by
+     * one bound in one place, which is what this predicate is FOR: the account
+     * header's argument is that a name it refuses is a name no connection can be
+     * logged in as, and a name that does not FIT is a name no field can hold,
+     * whichever of the two the caller happened to notice.
+     *
+     * The bound is ACCOUNT_MAX_NAME and not a literal, for the reason the constant
+     * is documented with: it is "conn_t::account's bound minus one", so the three
+     * fields and the predicate cannot come to disagree about where the edge is. */
+    if (strlen(name) > (size_t)ACCOUNT_MAX_NAME) {
+        return 0;
+    }
     if (name[0] == ':') {
         /* A LEADING colon is the marker 3.2 writes itself; a value that starts
          * with one cannot be told apart from a marker by a parser, and
