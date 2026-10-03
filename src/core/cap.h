@@ -506,6 +506,23 @@ int cap_away_notify_enabled(const conn_t *c);
  * this file, and one readable place is better than a wrapper per future caller. */
 int cap_gate_away_notify(const conn_t *dst, void *ctx);
 
+/* setname: `cap_setname_enabled()` in the shape `fanout.h`'s `fanout_gate_fn`
+ * wants, for the COMMON-CHANNEL FAN-OUT rather than for the confirmation.
+ *
+ * THE GATE IS ASKED ABOUT THE DESTINATION, and this is the specification's own
+ * condition rather than a choice: "The SETNAME message MUST NOT be sent to clients
+ * which do not have the `setname` capability negotiated." A realname is personal
+ * data, so who hears about a change is decided by the person hearing it -- and
+ * `cap.h`'s rule for the confirmation above already decides it that way, so
+ * gating the fan-out on the SENDER would make the two halves of one specification
+ * answer opposite questions about the same field.
+ *
+ * THE COST, stated rather than discovered: a member who wants to watch realnames
+ * change must ask for `setname` first, and a deployment whose operators want it
+ * observed by default gets nothing -- which is the disclosure decision stated
+ * plainly rather than a limitation. */
+int cap_gate_setname(const conn_t *dst, void *ctx);
+
 
 
 /* Handle one `CAP` line. Returns 1 if it was handled, 0 if it was not a CAP at

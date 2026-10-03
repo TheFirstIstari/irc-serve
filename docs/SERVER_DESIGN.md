@@ -1202,20 +1202,52 @@ sends. Registration therefore completes with an empty realname, which is already
 legal state here (`extended-join` renders it as a bare `:`), and the refusal is
 reported on the node's own output rather than being invisible.
 
-**What is NOT implemented, and it is the specification's MUST.** On success this node
-sends the server-to-client form
+**The common-channel fan-out — Phase 10.11, and the disclosure decision in it.** On
+success this node sends the server-to-client form
 
 ```
 :nick!user@host SETNAME :<new realname>
 ```
 
-to the **originating client**. It does **not** send it to the clients in common
-channels. `core/fanout.c`'s per-destination decision is a choice between two wire
-**shapes** — the `fanout_form_t` the extended `JOIN` introduced — and "send this
-member **nothing**" is a *third* outcome that the form cannot express. Adding it is
-a contract change to the routing module; the alternative, a second member walk
-inside a handler, is exactly the duplication `fanout.c` exists to prevent. So the
-limitation is named rather than faked (SPEC_TRACKING §10.5).
+to the originating client **and to every client in a common channel**, per destination,
+on that destination's own `setname` negotiation.
+
+**THE GATE IS THE RECIPIENT'S, and that is the specification's condition read
+literally**: "The `SETNAME` message **MUST NOT** be sent to clients which do not have
+the `setname` capability negotiated." Clients, plural — so who hears is decided by the
+person hearing, not by the person disclosing. `cap.h` already gated the *confirmation*
+that way, so sender-gating the fan-out would make the two halves of one specification
+answer opposite questions about the same field. Concretely: sender-gating is one line,
+and it is the wrong one — it lets a client that negotiated `setname` put a member's
+realname on the wire to every other member of a shared channel by asking for a
+capability **those members never requested**. A realname is personal data, and the
+per-destination answer is the only one that does not require trusting the discloser to
+be careful about who finds out. The origin is `exclude`d — not because an author may not
+be told, but because the confirmation has already answered it, and leaving it in the
+audience would deliver the same line twice.
+
+**THE SHAPE IS WHY IT IS NOT ONE CALL PER CHANNEL**, and this is the part §3.1.1's gate
+did not by itself answer. The line above has **no channel parameter** — it is a
+statement about a *person*, not about a channel — and 3.1's row prepends the resolved
+target. So a per-channel emission puts a `#channel` where a client expects the realname,
+**and** hands a member of three shared channels three byte-identical copies of one fact.
+The second of those is `echo-message`'s defect reached from the other side: one
+announcement, delivered more than once.
+
+`fanout_deliver_union_local_gated()` is the one walk that gets both right: it addresses
+the **union** of the connection's `conn_t::chans` and writes each destination **once**.
+De-duplication is a **search and not a set** — "already reached?" is "is this member of
+a channel at a lower index?", answered against structures the channel layer already
+owns and frees — so there is no bounded cache here and therefore no teardown arm to
+forget. `test_setname.c`'s fan-out case asserts **both** halves: the exact
+specification-shaped line, and a **count** of exactly 1 for a member of two channels,
+because two identical copies are indistinguishable from one to a substring search.
+
+**NOT FORWARDED**, like every other originating notification, and the cost is named:
+4.3's frozen `SBURSTN` carries no realname, so a mesh member's clients learn a peer's
+realname from its own roster (`extended-join`) and never learn that it *changed*.
+Closing that needs a new 4.3 verb and a version bump, not a decision (§6 says a wire
+format cannot be invented later).
 
 ### 4.3 Server-to-server (internal, not client-facing)
 

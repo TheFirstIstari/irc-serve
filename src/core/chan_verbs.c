@@ -902,7 +902,36 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
  *      the local one already happened, and the non-owned row is "forward ONLY"
  *      precisely so that the ORIGIN is the node that emits to its members.
  *
- *   3. THE JOINER'S OWN FOUR NUMERICS, in the order a client parses them:
+ *   3. THE AWAY-NOTIFY ANNOUNCEMENT, IF THE JOINER IS AWAY. `away-notify` says a
+ *      user joining with an away message set is announced to the users it shares the
+ *      channel with. It goes out AFTER the JOIN echo and BEFORE the joiner's own
+ *      numerics, which is the order a client renders: first that the person arrived,
+ *      then that they are away, then the joiner's own view of the channel.
+ *
+ *      IT IS A SEPARATE EMISSION AND NOT ANOTHER PARAMETER, and the specification
+ *      requires that rather than this file preferring it. The two messages have
+ *      different grammars and different audiences: the extended JOIN is
+ *      `:nick!user@host JOIN #chan <account> :<realname>` and is a statement about
+ *      the roster, while the announcement is `:nick!user@host AWAY #chan [:message]`
+ *      and is a statement about ONE user's away STATE. Folding the away message into
+ *      the JOIN would make a line a client parses as a roster carry a fourth field,
+ *      and would mean every member learned the away message whether or not it
+ *      negotiated `away-notify` -- which is exactly the unsolicited-notification
+ *      defect Phase 10.8a's gate exists to prevent.
+ *
+ *      THE JOINER IS EXCLUDED, for msg_verbs.c's notify_away() reason: a user should
+ *      not be sent an AWAY message about their own away status, and on this node they
+ *      have `301` and `305` for that. It is `exclude` rather than the gate -- a
+ *      different question from "did this destination ask?", which is why both exist.
+ *
+ *      GATED ON `c->away[0] != '\0'` AND NOTHING ELSE. There is no "is anybody
+ *      currently away" question to ask: `conn_t::away` exists on every connection from
+ *      accept(), so the only question is whether THIS joiner has a message, and a
+ *      joiner with none produces no line at all. A third shape -- an `AWAY` with an
+ *      empty trailing parameter -- would render as `AWAY #chan :`, which 3.2 does not
+ *      represent in a non-final position and the formatter would refuse.
+ *
+ *   4. THE JOINER'S OWN FOUR NUMERICS, in the order a client parses them:
  *      topic, names, creation time, end of names. This is what makes a JOIN
  *      self-describing, and it is why a restore can hand a client back its
  *      channels without the client having to ask for anything.
@@ -916,6 +945,8 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
  * second definition of local membership, with its own ban check to forget and
  * its own idea of which mesh to tell. Both callers ask the same question of the
  * same channel, so both ask it here. */
+static void announce_join_away(server_t *s, conn_t *c, chan_t *ch, const char *prefix);
+
 int chan_admit(server_t *s, conn_t *c, chan_t *ch, unsigned flags)
 {
     char prefix[CONN_HOSTMASK_MAX];
@@ -984,11 +1015,57 @@ int chan_admit(server_t *s, conn_t *c, chan_t *ch, unsigned flags)
     extended.nparams = 2;
     deliver_state_change_forms(s, c, ch, "JOIN", prefix, &plain, &extended);
 
+    announce_join_away(s, c, ch, prefix);
     send_topic(s, c, ch);
     send_names_list(s, c, ch);
     send_creation_time(s, c, ch);
     send_end_of_names(s, c, ch->name);
     return 0;
+}
+
+/* The AWAY-NOTIFY announcement for a user who JOINED while away. Called only from
+ * chan_admit(), immediately after the JOIN echo, and the header above carries the
+ * argument for its position, its separate shape and its two exclusions.
+ *
+ * IT IS NOT msg_verbs.c's notify_away() CALLED DIFFERENTLY, and the reason is the
+ * count again: notify_away() walks `c->chans` and emits once per channel, which is
+ * right for the away STATE CHANGE -- its line names the channel, so a member of three
+ * shared channels gets three lines about three different channels, all of them true.
+ * Here there is exactly one channel and one fact, so the walk would be a loop of one
+ * and the helper would have grown a parameter for a case it does not have. One
+ * `fanout_deliver_local_gated()` call is the whole of it, and the gate and the
+ * liveness question are inside fanout.c where every other emission asks them.
+ *
+ * THE PARAMETER LIST IS BUILT HERE, IN THE CALLER'S FRAME, because the emission
+ * happens inside fanout: `c->away` is read there and `message_format()` renders
+ * there, so a pointer into this frame has to outlive this function, and it does
+ * because the call is synchronous. That is the same reason chan_admit()'s extended
+ * JOIN parameters are locals. */
+static void announce_join_away(server_t *s, conn_t *c, chan_t *ch, const char *prefix)
+{
+    const char *params[1];
+    fanout_form_t plain;
+    fanout_target_t t;
+    int delivered;
+
+    if (c->away[0] == '\0') {
+        return; /* not away: the specification announces an AWAY MESSAGE, not a JOIN */
+    }
+    if (fanout_resolve(s, c, ch->name, FANOUT_MESSAGE, &t) == 0) {
+        return; /* a chan_t this node no longer holds: nothing to address */
+    }
+    params[0] = c->away;
+    plain.params = params;
+    plain.nparams = 1;
+    /* The class is `message` and not `state_change` for the reason notify_away()
+     * gives: this is not a change to the channel's state -- the roster already says
+     * the user is on it -- it is an observation about that user. The class decides
+     * the forward arm, and the local-only entry point has none to decide. */
+    /* FAULT: the joiner is not excluded from the join-time announcement. */
+    delivered = fanout_deliver_local_gated(s, &t, prefix, "AWAY", &plain, NULL,
+                                            cap_gate_away_notify, NULL, c);
+    printf("[observable] away_notify: nick=%s join=1 channel=%s recipients=%d\n",
+           c->nick, ch->name, delivered);
 }
 
 /* ---------------------------------------------------------------------------

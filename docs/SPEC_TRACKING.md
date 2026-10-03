@@ -893,9 +893,11 @@ indefinitely.
 
 ### 10.7 The honest limits of these four
 
-- **`setname` does not fan out to common channels.** Named above, with the reason.
-  A client in a shared channel is not told the realname changed; the originating
-  client is.
+- ~~**`setname` does not fan out to common channels.**~~ **CLOSED IN PHASE 10.11.**
+  It does now, per destination, on the RECIPIENT's own `setname` negotiation. The gate
+  side was the open question, not the mechanism; §10.10 records the decision and §4.2.1
+  carries the shape argument for why it needed a union walk rather than one
+  `fanout_deliver_local_gated()` call per channel.
 - **`echo-message` is not implemented for a `nick@server` target.** 3.1's last row
   is forward-only, so there is no local destination to acknowledge to. The
   acknowledgement would have to be a local-only emission invented here.
@@ -955,14 +957,23 @@ what was read. So `462` is not a judgement call here; it is the RFC's own answer
 
 ### 10.10 The honest limits of the fanout contract
 
-- **`setname`'s common-channel broadcast is still not implemented**, and the
-  reason has changed. It is no longer "the contract cannot express it" — the
-  contract can, and a caller needs a gate predicate and a walk of `c->chans[]`. It
-  is not landed, and §3.1.1 names the mechanism. What is still undecided is
-  whether the broadcast is gated on the destination's own `setname` negotiation:
-  `cap.h` gates the **confirmation** that way, on the grounds that a `SETNAME`
-  echo must not reach a client that did not ask, and the common-channel half has
-  to make the same decision or contradict it.
+- ~~**`setname`'s common-channel broadcast is still not implemented.**~~
+  **CLOSED IN PHASE 10.11**, and this row's own prediction turned out to be incomplete
+  in a way worth recording. It said "a caller needs a gate predicate and a walk of
+  `c->chans[]`", which is right about the gate and wrong about the walk: `setname`'s
+  server-to-client line has **no channel parameter**
+  (`:nick!user@host SETNAME :<realname>`), and 3.1's row prepends the resolved target —
+  so one call per channel would put `#chan` where a client expects the realname **and**
+  would hand a member of three shared channels three copies of one fact. **The gate was
+  necessary and not sufficient**, which is the lesson: "express the audience question
+  once, inside the routing module" says nothing about whether the LINE is per channel.
+  The gate side is now decided too — **the RECIPIENT's negotiation**, because the
+  specification says the message MUST NOT be sent to clients which did not negotiate it
+  and because `cap.h` already gates the confirmation that way, so a sender-gated
+  fan-out would make the two halves of one specification contradict each other.
+  `fanout_deliver_union_local_gated()` is the mechanism: the union of `c->chans`, each
+  destination written once, de-duplication by search so there is no cache and therefore
+  no teardown arm.
 - **The gate answers about a destination, not about a peer's clients.** A relayed
   emission is never gated, so in a mesh a notification reaches peers' clients
   according to what THEY negotiated, with no way for the originating node to know.
@@ -972,17 +983,25 @@ what was read. So `462` is not a judgement call here; it is the RFC's own answer
 
 ### 10.12 The honest limits of `away-notify`
 
-- **A user who JOINS with an away message set is not announced.** The
-  specification's second sentence is "clients will be sent an AWAY message when a
-  user sharing a channel with them sets, changes or removes their away state, **as
-  well as when a user joins and has an away message set**", and `chan_admit()` does
-  not do it. The reason is a shape, not an oversight: the extended JOIN is
-  `:nick!user@host JOIN #chan <account> :<realname>` and has no slot for an away
-  message, so the announcement has to be a **second** emission rather than another
-  parameter — and the second emission would be another place that decides who hears
-  about a change, which is what Phase 10.8a's gate exists to prevent. It is one
-  `fanout_deliver_local_gated()` call in `chan_admit()`, gated on `c->away[0] !=
-  '\0'` and excluded to the joiner, so the mechanism is the one already built.
+- ~~**A user who JOINS with an away message set is not announced.**~~ **CLOSED IN
+  PHASE 10.11**, in the shape this section predicted. It is one
+  `fanout_deliver_local_gated()` call in `chan_admit()` — after the JOIN echo, before
+  the joiner's own numerics — gated on the RECIPIENT's `away-notify`, excluded to the
+  joiner, and conditioned on `c->away[0] != '\0'`.
+  **IT IS A SEPARATE EMISSION RATHER THAN A FOURTH `JOIN` PARAMETER, and the
+  specification requires that rather than this file preferring it:** the two messages
+  have different grammars and different audiences. The extended `JOIN` is a statement
+  about the roster; `away-notify`'s is `:nick!user@host AWAY #chan [:message]`, a
+  statement about ONE user's away STATE. Folding the away message into the `JOIN` would
+  make a line a client parses as a roster carry a fourth field, and would hand every
+  member the away message whether or not it negotiated — the exact
+  unsolicited-notification defect §3.1.1's gate exists to prevent.
+  **AND THE TWO SPECIFICATIONS NEED DIFFERENT WALKS, WHICH IS WHY THE UNION ENTRY
+  POINT EXISTS RATHER THAN A REWRITE OF THE AWAY PATH:** `away-notify`'s line NAMES its
+  channel, so one call per channel is right and a member of three shared channels gets
+  three true statements about three channels; `setname`'s does not, so it needs the
+  union walk. That asymmetry is a property of the two message shapes and is the whole
+  reason there are two entry points.
 - **The notification is not forwarded, and that is not a limitation of the
   mechanism.** Away *state* federates (4.3's `SBURST` carries it and a resync
   rebuilds it), so a mesh member's clients learn an away message the next time they
@@ -992,6 +1011,31 @@ what was read. So `462` is not a judgement call here; it is the RFC's own answer
 - **A member who is in the channel and negotiated the capability still gets nothing
   about their own state**, which is the specification's instruction rather than a
   gap, and is why the setter is excluded by `exclude` rather than by the gate.
+
+### 10.13 Phase 10.11 — the two the fanout gate unblocked, and the disclosure decision
+
+Phase 10.8a built the gate and could not use it twice. Phase 10.11 uses it twice, and
+the interesting half of each is a decision the gate does not make for you.
+
+| Claim | Where | Evidence |
+|---|---|---|
+| The `setname` fan-out is gated on the **RECIPIENT**, not the sender | `cap.c`'s `cap_gate_setname()`, handed to `fanout_deliver_union_local_gated()` by `commands.c`'s `setname_notify_channels()` | `test_setname.c` `case_fanout`: a member who negotiated is told, a member who did **not** is not, by a line count |
+| The line is the specification's shape, with **no channel parameter** | the union entry point builds no `all[]` and prepends no target | the same case, on the literal `:nick!user@host SETNAME :<realname>` |
+| A member of **two** shared channels gets exactly **one** copy | `fanout_deliver_union_local_gated()`'s "already reached?" search | the same case: `tf_count(...) == 1u`, a COUNT because two identical copies are indistinguishable from one to a substring search |
+| The origin gets **one** line, not two | `exclude = c`, because the confirmation already answered it | the same case: the setter's window holds exactly 2 lines (the `SETNAME` and the drain `PONG`) |
+| The join-time `AWAY` announcement is a **separate emission** | `chan_verbs.c`'s `announce_join_away()`, after the `JOIN` echo, before the joiner's numerics | `test_away_notify.c` `case_join_while_away`: the exact line, and the `JOIN` echo at a **LOWER BUFFER OFFSET** than the announcement |
+| A joiner who is **not** away produces **no** line | `if (c->away[0] == '\0') return;` | the same case: a second joiner with no away message, `watcher`'s window holds exactly 3 lines and no ` AWAY ` for them |
+| The joiner is excluded about its **own** state | `exclude = c`, mirroring `notify_away()` | the same case, on a connection that DID negotiate — so the gate would have let it through and only `exclude` keeps it out |
+| Teeth, build checked before the run was believed | four faults | **4 red.** `setname`: gate on the sender, `exclude` → `NULL`, the union's de-dup made unreachable — **0/0 each**. `away-notify`: the join-time `exclude` removed — **0/0**. **Two faults that did not compile or did nothing are recorded rather than dropped** — see `test_setname.c`'s TEETH block for the `for (j = 0; j < 0u; ...)` and `s->name != NULL` attempts, both of which left a GREEN test against a stale binary |
+
+**WHAT THE SHAPE ARGUMENT COST, and it is the finding.** §3.1.1's gate answers *who
+hears about an emission*. It does not answer *whether the emission is per channel*, and
+for `setname` that second question is the one that bites: 3.1's row prepends the
+resolved target, and `setname`'s specified line carries no target. The union entry point
+is therefore **not** a generalisation of the away path — the away path is still one
+`fanout_deliver_local_gated()` per channel, because its line names its channel. Two
+entry points for two message shapes is the honest answer and it is recorded here so a
+future phase does not read the union one as "the way fan-out should now work".
 
 ### 10.11 The honest limits of the account phase
 

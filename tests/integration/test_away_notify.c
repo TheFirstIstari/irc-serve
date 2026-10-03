@@ -551,7 +551,181 @@ static void case_refused_notifies_nobody(void)
  *       twice) and case_no_channel_no_notification() (a user in no channel notifies
  *       the whole node). It is invisible in case_set_and_cleared(), which is why
  *       that case is not the only one.
+ *
+ *   the JOINER NOT EXCLUDED AT THE JOIN -- chan_verbs.c, announce_join_away(): the
+ *       `exclude` argument changed from `c` to `NULL`. Build checked first (0
+ *       errors, 0 warnings), then red in case_join_while_away(): the joiner was told
+ *       about its OWN away state. It is the same fault as the one above in a second
+ *       function, and it is the pair that shows the exclusion is a rule about both
+ *       call sites rather than about one of them.
  */
+/* ---------------------------------------------------------------------------
+ * THE JOIN-TIME HALF: A USER WHO JOINS WHILE AWAY IS ANNOUNCED
+ * ---------------------------------------------------------------------------
+ * The specification's second sentence: clients are sent an AWAY message "as well as
+ * when a user joins and has an away message set". Phase 10.8b landed the two edges
+ * of a CHANGE and named this half as not landed; it is landed here, and it is a
+ * separate EMISSION rather than another parameter, because the extended JOIN is
+ * `:nick!user@host JOIN #chan <account> :<realname>` and has no slot for an away
+ * message -- and because a member who did not negotiate must not learn it either
+ * way.
+ *
+ * FIVE claims, and the order of the connections matters:
+ *
+ *   1. A NEGOTIATING MEMBER IS TOLD, once, with the exact line
+ *      `:nick!user@host AWAY #chan :<message>`, and it arrives AFTER the JOIN echo.
+ *      The order is asserted BY POSITION and not merely by presence: a client renders
+ *      "arrived, then away", and an announcement that arrives first reads as a fact
+ *      about somebody who is not there yet.
+ *   2. A NON-NEGOTIATING MEMBER IS TOLD NOTHING -- by a line COUNT, with the JOIN
+ *      echo it is entitled to included, so the claim is "one line, and it is the
+ *      JOIN" rather than "no line".
+ *   3. THE JOINER IS EXCLUDED, even though it negotiated the capability. This one is
+ *      a needle-absence rather than a count and the reason is the joiner's own
+ *      numerics: a JOIN produces 331/332/333/353/366, so "exactly N lines" here would
+ *      be a claim about how many numerics a JOIN emits rather than about the
+ *      notification. The needle is ` AWAY ` -- the only AWAY-shaped line that could
+ *      appear on that socket is the announcement, because `AWAY` is a verb only the
+ *      client itself sends and this client has not sent one since its own.
+ *   4. A JOINER WHO IS **NOT** AWAY PRODUCES NO LINE AT ALL. The specification
+ *      announces an away MESSAGE; a user with none has nothing to say, and a third
+ *      "empty AWAY" shape would render as `AWAY #T :` and mean "no longer away" --
+ *      which 3.2 does not even represent in a non-final position.
+ *   5. `sober` joins AFTER the away joiner, so `watcher`'s window holds exactly
+ *      three lines -- two JOIN echoes and one announcement -- and the final count is
+ *      a claim about all of them at once.
+ */
+static void case_join_while_away(void)
+{
+    nf_node_t node;
+    test_client_t watcher;   /* negotiated, already on the channel */
+    test_client_t blunt;     /* NOT negotiated, already on the channel */
+    test_client_t joiner;    /* negotiated, away, joins mid-case */
+    test_client_t sober;     /* negotiated, NOT away, joins last */
+    char line[128];
+    size_t mark_w;
+    size_t mark_b;
+    size_t mark_j;
+    const char *join_at;
+    const char *away_at;
+    char want_join[96];
+    char want_away[96];
+
+    TF_CHECK_MSG(nf_spawn_binary(&node) == 0, "could not spawn the node");
+
+    tc_init(&watcher);
+    register_caps(&watcher, node.port, "an_watch", CAP_AWAY_NOTIFY);
+    tc_init(&blunt);
+    register_caps(&blunt, node.port, "an_blunt", NULL);
+    join(&watcher, CHAN);
+    join(&blunt, CHAN);
+
+    /* The joiner sets its away state BEFORE joining, which is the ordinary order a
+     * client does it in: `AWAY :lunch` then `JOIN`. A user who JOINed first and then
+     * went away would be the set edge, which case_set_and_cleared() already covers --
+     * so this case cannot pass on a node that only implements the change. */
+    tc_init(&joiner);
+    register_caps(&joiner, node.port, "an_away", CAP_AWAY_NOTIFY);
+    (void)snprintf(line, sizeof line, "AWAY :at lunch");
+    TF_CHECK_MSG(tc_send(&joiner, line) == 0, "joiner AWAY send failed");
+    /* 306 RPL_NOWAWAY is the SET edge and 305 RPL_UNAWAY the clear edge; asking for
+     * the wrong one would be a test that cannot tell the two states apart. */
+    TF_CHECK_MSG(tc_expect(&joiner, " 306 ", T_IO_MS) == 0,
+                 "the joiner's AWAY was not accepted, so the join-time announcement "
+                 "below would be about a user who is not away");
+    drain(&joiner);
+
+    tc_init(&sober);
+    register_caps(&sober, node.port, "an_sob", CAP_AWAY_NOTIFY);
+
+    /* Everything is settled and drained before any window is opened, so each window
+     * below holds only what its own claim put there. */
+    drain(&watcher);
+    drain(&blunt);
+    mark_w = tc_received(&watcher);
+    mark_b = tc_received(&blunt);
+    mark_j = tc_received(&joiner);
+    (void)snprintf(want_join, sizeof want_join,
+                   ":an_away!an_away@" OBSERVED_HOST " JOIN " CHAN "\r\n");
+    (void)snprintf(want_away, sizeof want_away,
+                   ":an_away!an_away@" OBSERVED_HOST " AWAY " CHAN " :at lunch\r\n");
+
+    /* 1. THE EXACT LINE. The channel is a parameter because `away-notify`'s grammar
+     * is `:nick!user@host AWAY #chan [:message]` -- unlike `setname`, this message
+     * DOES name its channel, which is why this announcement is per channel and needs
+     * no union walk. */
+    TF_CHECK_MSG(tc_send(&joiner, "JOIN " CHAN) == 0, "joiner JOIN failed");
+    expect_line_since(&watcher, mark_w, "the join-time AWAY announcement", want_away);
+    TF_CHECK_MSG(tc_expect(&watcher, want_join, T_IO_MS) == 0,
+                 "the away joiner's JOIN echo never reached the member under test, so "
+                 "the order assertion below would be comparing one line against "
+                 "nothing");
+    drain(&joiner);
+
+    /* 5-ORDER, BY POSITION. */
+    join_at = strstr(tc_buffer(&watcher) + mark_w, want_join);
+    away_at = strstr(tc_buffer(&watcher) + mark_w, want_away);
+    TF_CHECK_MSG(join_at != NULL && away_at != NULL,
+                 "one of the two lines is missing, so their order cannot be compared."
+                 "\n  watcher saw: %s", tc_buffer(&watcher) + mark_w);
+    TF_CHECK_MSG(join_at < away_at,
+                 "the AWAY announcement arrived BEFORE the JOIN echo. `chan_admit()` "
+                 "emits the echo first and the announcement after it, so a client "
+                 "renders \"arrived, then away\"; an announcement that arrives first "
+                 "reads as a statement about somebody who is not there yet.\n"
+                 "  watcher saw: %s", tc_buffer(&watcher) + mark_w);
+
+    /* 2. THE NON-NEGOTIATING MEMBER IS TOLD NOTHING. `blunt` is on the channel, so it
+     * IS entitled to the JOIN echo: the window holds exactly that one line plus the
+     * drain PONG, and an announcement would make it three. */
+    expect_only_replies(&blunt, mark_b, "non-negotiating member at a join-time "
+                        "announcement", 1u);
+    TF_CHECK_MSG(strstr(tc_buffer(&blunt) + mark_b, want_away) == NULL,
+                 "an AWAY line reached a member who did not negotiate away-notify. "
+                 "An unsolicited notification is an ASSERTION about a user, so "
+                 "sending it to a client that did not ask is as wrong as not sending "
+                 "it to one that did.\n  blunt saw: %s", tc_buffer(&blunt) + mark_b);
+
+    /* 3. THE JOINER IS EXCLUDED, even though it negotiated the capability. */
+    TF_CHECK_MSG(tc_expect(&joiner, " 366 ", T_IO_MS) == 0,
+                 "the joiner's own JOIN never completed, so the absence below would "
+                 "be about a client that had not arrived yet");
+    drain(&joiner);
+    TF_CHECK_MSG(strstr(tc_buffer(&joiner) + mark_j, " AWAY ") == NULL,
+                 "the joiner was told about its OWN away state. The specification says "
+                 "a client SHOULD NOT be sent AWAY messages to notify them of their "
+                 "own away status -- on this node `306`/`301` are that answer -- and "
+                 "`exclude` is what enforces it, because the GATE would have let it "
+                 "through: this client negotiated away-notify.\n  joiner saw: %s",
+                 tc_buffer(&joiner) + mark_j);
+
+    /* 4. AND A JOINER WHO IS NOT AWAY PRODUCES NO LINE. `watcher` negotiated the
+     * capability, so a node that announced every join would put a line in front of
+     * it here -- and that line would assert the user is away, which they are not. */
+    TF_CHECK_MSG(tc_send(&sober, "JOIN " CHAN) == 0, "sober JOIN failed");
+    TF_CHECK_MSG(tc_expect(&watcher, ":an_sob!an_sob@" OBSERVED_HOST " JOIN " CHAN,
+                           T_IO_MS) == 0,
+                 "the sober joiner's JOIN echo is missing, so the absence below "
+                 "proves nothing");
+    drain(&sober);
+    expect_only_replies(&watcher, mark_w, "watcher across BOTH joins", 3u);
+    TF_CHECK_MSG(strstr(tc_buffer(&watcher) + mark_w, ":an_sob!an_sob@" OBSERVED_HOST
+                        " AWAY ") == NULL,
+                 "a user who JOINED without an away message was announced as away. "
+                 "The specification announces an AWAY MESSAGE, so a joiner with none "
+                 "has nothing to say -- and an `AWAY` with an empty trailing parameter "
+                 "would read as \"no longer away\", which is a different assertion "
+                 "about a different state.\n  watcher saw: %s",
+                 tc_buffer(&watcher) + mark_w);
+
+    tc_close(&watcher);
+    tc_close(&blunt);
+    tc_close(&joiner);
+    tc_close(&sober);
+    TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
+    nf_free(&node);
+}
+
 int main(void)
 {
     case_advertised();
@@ -559,6 +733,7 @@ int main(void)
     case_no_channel_no_notification();
     case_two_channels();
     case_refused_notifies_nobody();
+    case_join_while_away();
 
     tf_done("away-notify");
     return 0;

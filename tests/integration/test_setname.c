@@ -112,6 +112,26 @@ static size_t lines_since(const test_client_t *c, size_t from)
     return n;
 }
 
+/* Assert that `c` received EXACTLY `n_replies` replies after `mark`, and nothing
+ * else -- the last line in the window being its drain PONG.
+ *
+ * The COUNT is the point, and it is the same argument `lines_since()`'s own comment
+ * makes: a notification whose name nobody thought of would satisfy a list of absent
+ * verbs. `n_replies` is counted ALONG WITH the PONG, so a case expecting one reply
+ * passes 1 and a case expecting none passes 0. */
+static void expect_only_replies(test_client_t *c, size_t mark, const char *what,
+                                size_t n_replies)
+{
+    drain(c);
+    TF_CHECK_MSG(lines_since(c, mark) == n_replies + 1u,
+                 "%s: the window holds %zu lines and it must hold exactly %zu -- the "
+                 "%zu expected replies and the drain PONG. Anything else fails this, "
+                 "which is why it is a COUNT and not a list of verbs somebody thought "
+                 "of.\n  client saw: %s",
+                 what, lines_since(c, mark), n_replies + 1u, n_replies,
+                 tc_buffer(c) + mark);
+}
+
 /* Register `c` as `nick`, negotiating `caps` first (NULL for no CAP exchange). The
  * REQ is ACKed whole, so a capability this node does not have fails the wait rather
  * than being quietly NAKed -- which means no case below can pass because the gate
@@ -493,12 +513,171 @@ static void case_setname(void)
  *   the validation predicate split, so SETNAME is its own path
  *       connection.c: conn_realname_check() made to return OK always, leaving
  *       handle_user() unchanged. Fails the hostile-realname case. This one exists to
- *       show the predicate is shared rather than duplicated -- if the two writers had
- *       each grown their own check, this edit would have had nowhere to go.
+*       show the predicate is shared rather than duplicated -- if the two writers had
+ *       each grown their own check, this edit would have nowhere to go.
+ *
+ *   the fan-out gated on the SENDER -- cap.c: `cap_gate_setname()` changed to consult
+ *       `ctx` (which the handler then hands it, the setter), falling back to `dst`.
+ *       THIS IS THE DISCLOSURE FAULT AND THE HIGHEST-VALUE ONE IN THE FILE: it makes
+ *       the audience depend on whether the person CHANGING their realname asked for
+ *       the capability rather than on whether the person READING it did. Build
+ *       checked first (0 errors, 0 warnings), then red at the fan-out case's
+ *       non-negotiating member -- the window held 2 lines where 1 is required, the
+ *       second being the SETNAME that should never have been sent. Nothing else in
+ *       the suite notices it.
+ *
+ *   THE ORIGIN LEFT IN THE AUDIENCE -- commands.c: `exclude` changed from `c` to
+ *       `NULL` in setname_notify_channels(). Build checked first (0/0), then red at
+ *       the setter's line count (3 where 2 is required -- the confirmation and the
+ *       fan-out copy of the same line). It is the fault that proves the exclusion is
+ *       about the ORDER rather than about authors: the confirmation has already
+ *       answered the origin, so the fan-out must not answer it again.
+ *
+ *   THE UNION WALK'S DE-DUPLICATION DEAD -- fanout.c: the `already` test changed to
+ *       `if (already != 0 && already == 0)`, which no compiler complains about and
+ *       which no reader would spot in review. Build checked first (0/0), then red at
+ *       the fan-out case's COPY COUNT: a member of two shared channels received 2
+ *       copies where exactly 1 is required.
+ *
+ *       IT TOOK THREE EDITIONS TO FIND A COMPILING FAULT FOR THIS ONE, and the
+ *       first two are the interesting part. `for (j = 0; j < 0u; ...)` does not
+ *       build (`-Wtype-limits`), and `&& s->name != NULL` does not either -- clang
+ *       knows `server_t::name` is never NULL (`-Werror=address`). Both left the
+ *       PREVIOUS BINARY in place and the test GREEN, which is precisely the trap this
+ *       repository has hit seven times: a fault that does not build is not a red
+ *       test, it is no test at all. And the second attempt -- inverting the pointer
+ *       comparison inside the search -- DID build and stayed green too, because the
+ *       fixture has exactly two members per channel and the inverted test happens to
+ *       reach the same answer. A fault that builds and changes nothing is the harder
+ *       of the two traps and it is recorded here rather than quietly replaced.
  */
+
+/* ---------------------------------------------------------------------------
+ * THE COMMON-CHANNEL FAN-OUT -- the specification's MUST, and a disclosure
+ * ---------------------------------------------------------------------------
+ * "If they accept the realname change, they MUST send the server-to-client version
+ * of the SETNAME message to all clients in common channels, as well as to the client
+ * from which it originated", and "The SETNAME message MUST NOT be sent to clients
+ * which do not have the `setname` capability negotiated."
+ *
+ * So there are four claims and each has its own connection:
+ *
+ *   1. A MEMBER WHO NEGOTIATED IS TOLD, exactly once, with the specification's shape
+ *      -- `:nick!user@host SETNAME :<realname>`, which has NO CHANNEL PARAMETER.
+ *   2. A MEMBER WHO DID NOT IS TOLD NOTHING, by a LINE COUNT rather than by the
+ *      absence of a needle. A realname is personal data, so this is the disclosure
+ *      claim and it is the one the whole case exists for.
+ *   3. THE ORIGIN GETS ONE, not two. The confirmation above already delivered the
+ *      line to the client that asked; a second copy from the fan-out would be the
+ *      same double-delivery defect `test_echo_message.c` has a fault for.
+ *   4. A MEMBER OF TWO CHANNELS GETS ONE COPY. This is the union-walk claim: the
+ *      line names no channel, so a per-channel emission would hand this member two
+ *      byte-identical copies of one fact -- the defect `fanout_deliver_union_local_
+ *      gated()` exists to prevent. `tf_count` over the window is the assertion,
+ *      because two identical lines are indistinguishable from one to a substring
+ *      search.
+ */
+static void case_fanout(void)
+{
+    nf_node_t node;
+    test_client_t setter;  /* negotiated, so the SETNAME takes effect */
+    test_client_t member;  /* negotiated, in BOTH channels */
+    test_client_t quiet;   /* NOT negotiated, in one channel */
+    size_t mark_setter;
+    size_t mark_member;
+    size_t mark_quiet;
+
+    TF_CHECK_MSG(nf_spawn_binary(&node) == 0, "could not spawn the node");
+
+    tc_init(&setter);
+    register_caps(&setter, node.port, "snm_set", CAP_SETNAME);
+    tc_init(&member);
+    register_caps(&member, node.port, "snm_mem", CAP_SETNAME);
+    tc_init(&quiet);
+    register_caps(&quiet, node.port, "snm_quiet", NULL);
+
+    /* Two channels for the setter and for `member`, ONE for `quiet` -- so `quiet`
+     * is a member of a shared channel who did not negotiate, which is the
+     * disclosure case, and `member` is the duplication case. */
+    TF_CHECK_MSG(tc_send(&setter, "JOIN " CHAN) == 0, "setter JOIN 1 failed");
+    TF_CHECK_MSG(tc_expect(&setter, " JOIN " CHAN, T_IO_MS) == 0, "setter JOIN 1");
+    drain(&setter);
+    TF_CHECK_MSG(tc_send(&setter, "JOIN " CHAN "2") == 0, "setter JOIN 2 failed");
+    TF_CHECK_MSG(tc_expect(&setter, " JOIN " CHAN "2", T_IO_MS) == 0, "setter JOIN 2");
+    drain(&setter);
+    TF_CHECK_MSG(tc_send(&member, "JOIN " CHAN) == 0, "member JOIN 1 failed");
+    drain(&member);
+    TF_CHECK_MSG(tc_send(&member, "JOIN " CHAN "2") == 0, "member JOIN 2 failed");
+    drain(&member);
+    TF_CHECK_MSG(tc_send(&quiet, "JOIN " CHAN) == 0, "quiet JOIN failed");
+    drain(&quiet);
+    /* The setter is a member of both channels, so it heard the other two arrive --
+     * after its own drain above. Draining again here is what makes the window below
+     * a window over the SETNAME and not over the JOINs: `expect_only_replies()`
+     * counts lines, and a JOIN echo in the window is a line this case did not ask
+     * about. */
+    drain(&setter);
+
+    mark_setter = tc_received(&setter);
+    mark_member = tc_received(&member);
+    mark_quiet = tc_received(&quiet);
+    TF_CHECK_MSG(tc_send(&setter, "SETNAME :New Name") == 0, "SETNAME send failed");
+
+    /* 1. THE NEGOTIATING MEMBER IS TOLD, IN THE SPECIFICATION'S SHAPE. The line
+     * carries the realname as its ONLY parameter: a `#chan` in that position would
+     * be a channel name where a client expects the realname, which is the deviation
+     * the union entry point exists to avoid. */
+    TF_CHECK_MSG(tc_expect(&member, ":snm_set!snm_set@" OBSERVED_HOST
+                           " SETNAME :New Name\r\n", T_IO_MS) == 0,
+                 "a member who negotiated setname was not told about the change in "
+                 "the specification's shape, `:nick!user@host SETNAME :<realname>`. "
+                 "A channel name in the parameter list would be a channel where a "
+                 "client expects the realname.\n  member saw: %s", tc_buffer(&member));
+    drain(&member);
+
+    /* 4. AND EXACTLY ONE COPY OF IT, for a member of TWO shared channels. This is a
+     * COUNT because the two copies would be byte-identical and a substring search
+     * reports success for either. */
+    TF_CHECK_MSG(tf_count(tc_buffer(&member) + mark_member, " SETNAME :New Name") == 1u,
+                 "the member of two shared channels received %zu copies of the "
+                 "SETNAME line, and it must be exactly 1. The line names no channel, "
+                 "so a per-channel emission hands one person N copies of one fact -- "
+                 "the same double-delivery defect test_echo_message.c has a fault "
+                 "for.\n  member saw: %s",
+                 tf_count(tc_buffer(&member) + mark_member, " SETNAME :New Name"),
+                 tc_buffer(&member) + mark_member);
+
+    /* 2. THE NON-NEGOTIATING MEMBER IS TOLD NOTHING, by a COUNT. This is the
+     * disclosure claim: `cap.h` gates the CONFIRMATION on the recipient's own
+     * negotiation and the fan-out must decide the same way, or the capability stops
+     * being a disclosure control and becomes a promise one client makes on behalf of
+     * everybody else. */
+    expect_only_replies(&quiet, mark_quiet, "non-negotiating member", 0u);
+    TF_CHECK_MSG(strstr(tc_buffer(&quiet) + mark_quiet, "SETNAME") == NULL,
+                 "a SETNAME line reached a member who did not negotiate the "
+                 "capability. The specification says the message MUST NOT be sent to "
+                 "such a client, and cap.h already gates the confirmation that way -- "
+                 "a fan-out that decided the other way would make the two halves "
+                 "contradict each other.\n  quiet saw: %s",
+                 tc_buffer(&quiet) + mark_quiet);
+
+    /* 3. THE ORIGIN GETS ONE LINE, NOT TWO. */
+    TF_CHECK_MSG(tc_expect(&setter, ":snm_set!snm_set@" OBSERVED_HOST
+                           " SETNAME :New Name\r\n", T_IO_MS) == 0,
+                 "the originating client was not confirmed.");
+    expect_only_replies(&setter, mark_setter, "setter after SETNAME", 1u);
+
+    tc_close(&setter);
+    tc_close(&member);
+    tc_close(&quiet);
+    TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
+    nf_free(&node);
+}
+
 int main(void)
 {
     case_setname();
+    case_fanout();
     tf_done("setname");
     return 0;
 }

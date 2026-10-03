@@ -396,6 +396,32 @@ int cap_gate_away_notify(const conn_t *dst, void *ctx)
     return cap_away_notify_enabled(dst);
 }
 
+/* setname: the SAME adaptation, for the common-channel fan-out. `cap.c`'s
+ * away-notify comment above says the adaptation lives here rather than at the
+ * call site so that "every capability predicate here is one-argument, and the
+ * gate that adapts them is this" is one readable claim; this is the second user
+ * of that claim and it is why the claim was written that way.
+ *
+ * WHICH SIDE THE GATE IS ASKED ABOUT IS A DISCLOSURE DECISION, and it is the
+ * specification's: "The SETNAME message MUST NOT be sent to clients which do not
+ * have the setname capability negotiated." Clients, plural, and the gate takes the
+ * DESTINATION -- so a realname reaches a member who asked to learn about realnames
+ * and nobody else.
+ *
+ * THE SENDER'S NEGOTIATION IS NOT THE RIGHT ANSWER, and saying why is the point:
+ * gating on the sender would let one client put a member's realname on the wire to
+ * every other member of a shared channel by asking for a capability the RECIPIENT
+ * never requested, which is a disclosure nobody agreed to and would also contradict
+ * `cap.h`'s own rule that the CONFIRMATION is gated on the recipient -- so the two
+ * halves of one specification would decide opposite questions about the same field.
+ * A realname is personal data, and the per-destination answer is the only one that
+ * does not require trusting the person disclosing it to be careful. */
+int cap_gate_setname(const conn_t *dst, void *ctx)
+{
+    (void)ctx;
+    return cap_setname_enabled(dst);
+}
+
 /* --------------------------------------------------------------------------
  * The wire
  * ------------------------------------------------------------------------ */
