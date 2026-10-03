@@ -41,7 +41,8 @@ enum {
     CAPBIT_ECHO_MESSAGE = 1u << 9,
     CAPBIT_STANDARD_REPLIES = 1u << 10,
     CAPBIT_AWAY_NOTIFY = 1u << 11,
-    CAPBIT_BATCH = 1u << 12
+    CAPBIT_BATCH = 1u << 12,
+    CAPBIT_LABELED_RESPONSE = 1u << 13
 };
 
 /* THE BIT ORDER IS FIXED AND THE TABLE BELOW IS THE CLAIM.
@@ -76,7 +77,8 @@ static const cap_def_t k_caps[] = {
     { CAP_ECHO_MESSAGE, CAPBIT_ECHO_MESSAGE },
     { CAP_STANDARD_REPLIES, CAPBIT_STANDARD_REPLIES },
     { CAP_AWAY_NOTIFY, CAPBIT_AWAY_NOTIFY },
-    { CAP_BATCH, CAPBIT_BATCH }
+    { CAP_BATCH, CAPBIT_BATCH },
+    { CAP_LABELED_RESPONSE, CAPBIT_LABELED_RESPONSE }
 };
 
 static const size_t k_ncaps = sizeof k_caps / sizeof k_caps[0];
@@ -418,6 +420,16 @@ int cap_gate_away_notify(const conn_t *dst, void *ctx)
  * halves of one specification would decide opposite questions about the same field.
  * A realname is personal data, and the per-destination answer is the only one that
  * does not require trusting the person disclosing it to be careful. */
+/* labeled-response. One predicate for all three of the specification's effects -- the
+ * label, the grouping batch and the `ACK` -- because the specification puts all three in
+ * one sentence about what a client "requesting this capability" can handle, and
+ * separating them would mean deciding that a client could handle a label but not the
+ * `ACK` it exists to be correlated with. */
+int cap_labeled_response_enabled(const conn_t *c)
+{
+    return cap_enabled(c, CAP_LABELED_RESPONSE);
+}
+
 int cap_gate_setname(const conn_t *dst, void *ctx)
 {
     (void)ctx;

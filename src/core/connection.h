@@ -151,6 +151,21 @@ struct chan; /* opaque until Phase 4 (2.2) */
  * events inside a batch, and this node emits no batch types of its own. The
  * field exists so that the log can say which type a client declared and so that
  * a future type has somewhere to be read from; nothing branches on it. */
+/* ---------------------------------------------------------------------------
+ * `labeled-response`'s LABEL BOUND, and it is the SPECIFICATION'S and not ours
+ * ---------------------------------------------------------------------------
+ * "The value MUST NOT exceed 64 bytes." Unlike `CONN_MAX_BATCH_REF`, which the batch
+ * specification does not bound and this node bounds itself, this number is quoted, and
+ * it is quoted at the constant so that raising it is visibly a departure from a
+ * specification rather than a tuning decision.
+ *
+ * WHAT HAPPENS TO A LONGER VALUE IS `label.c`'s decision and the reason is there; the
+ * short version is that it is IGNORED rather than truncated, because 3.2 forbids
+ * delivering a shortened value and a truncated label is a value the client did not send
+ * -- and a client correlating by label would silently correlate against the wrong one.
+ */
+#define CONN_MAX_LABEL 64
+
 #define CONN_MAX_BATCH_TYPE 96
 
 /* Bounded write queue, 3.4: "~256 KB per connection". The cap is on the
@@ -442,6 +457,48 @@ typedef struct conn {
      * outlive its connection" is a property of the allocation rather than of a
      * cache somebody has to remember to empty. The same paragraph applies to the
      * `label` field Phase 10.13 adds beside them. */
+    /* Phase 10.13: IRCv3 `labeled-response`. FOUR fields, and they are a small state
+     * machine rather than a flag, because the specification's requirement is not "echo
+     * the tag" but "the tag appears in EXACTLY ONE LOGICAL MESSAGE" -- and on this node
+     * a response is frequently several lines, which the specification says MUST then be
+     * grouped in a batch whose START carries the label.
+     *
+     *   label            the client's `label=` value, COPIED, for the command in flight.
+     *                   The copy is the whole of the lifetime argument: `m->tags` points
+     *                   into the parser's heap and the command's response outlives the
+     *                   message, so a stored POINTER is a use-after-free. It is a
+     *                   fixed-size field rather than a pointer for the second half of
+     *                   the same reason -- nothing to free, nothing to leak.
+     *   label_live       1 while a label is owed a response. Cleared at the end of the
+     *                   command by `label_finish_command()`.
+     *   label_batch      the reference tag of the `labeled-response` batch this node
+     *                   minted for this command, or empty.
+     *   label_batch_open 1 once that batch has been STARTED on the wire. The distinction
+     *                   matters: a command that produced ONE line must not emit an empty
+     *                   batch, and the only way to know the response was one line is to
+     *                   discover it by emitting the first one.
+     *
+     * ALL FOUR ARE FIXED-SIZE FIELDS IN A CALLOC'D STRUCT, like batch's, so there is no
+     * teardown arm for any of them: `conn_new()` zeroes the struct and `conn_free()`
+     * frees it whole. */
+    char        label[CONN_MAX_LABEL + 1];
+    int         label_live;
+    char        label_batch[CONN_MAX_LABEL + 1];
+    int         label_batch_open;
+    /* 1 while the command in flight is a message the client ADDRESSED TO ITSELF, which
+     * is what `labeled-response` means by "a client sends a message to itself" -- and
+     * which is NOT the same as "a line whose source is this client", which is true of
+     * every echo-message copy this node makes. The first version of label.c decided it
+     * by comparing the line's PREFIX against the destination's own hostmask, and that
+     * withheld the label from the echo of a channel message as well -- so a labelled
+     * `PRIVMSG #chan` got an unlabelled echo and an `ACK`, which is the opposite of what
+     * the specification asks for and was caught by `test_labeled_response.c` case 7.
+     *
+     * IT IS SET BY `msg_verbs.c` AND BY NOTHING ELSE, because the reply path cannot know
+     * a message's target: `emit_built_ex()` has the line and the destination and no
+     * third thing. */
+    int         label_self;
+    unsigned    label_seq;          /* per-connection counter; see label.c */
     char        batch_ref[CONN_MAX_BATCH_REF + 1];
     char        batch_type[CONN_MAX_BATCH_TYPE + 1];
     char        batch_once[CONN_MAX_BATCH_REF + 1];

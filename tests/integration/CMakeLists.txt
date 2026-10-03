@@ -517,3 +517,10 @@ irc_add_integration_test(test_away_notify test_away_notify.c)
 # substring search reports success for both. It is also the only place the `@`/`+`
 # reference tags are tested at all.
 irc_add_integration_test(test_batch test_batch.c)
+
+# IRCv3 `labeled-response` (Phase 10.13). Its own file because the specification's
+# central requirement -- "the tag in EXACTLY ONE LOGICAL MESSAGE" -- is a claim about a
+# MULTI-LINE response, so every assertion in it is a count over a window rather than a
+# substring, and because it is the only place the `labeled-response` grouping batch and
+# the `ACK` are tested at all.
+irc_add_integration_test(test_labeled_response test_labeled_response.c)

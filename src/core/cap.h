@@ -162,6 +162,7 @@
 #define CAP_STANDARD_REPLIES "standard-replies"
 #define CAP_AWAY_NOTIFY "away-notify"
 #define CAP_BATCH "batch"
+#define CAP_LABELED_RESPONSE "labeled-response"
 
 /* 410 ERR_INVALIDCAPSUBCOMMAND. Not in design 4.4's numeric list, which is a gap
  * in the list rather than in the protocol, for the same reason 301, 303, 417,
@@ -523,6 +524,29 @@ int cap_gate_away_notify(const conn_t *dst, void *ctx);
  * observed by default gets nothing -- which is the disclosure decision stated
  * plainly rather than a limitation. */
 int cap_gate_setname(const conn_t *dst, void *ctx);
+
+/* labeled-response: whether this node will stamp a `label=` tag on this client's
+ * responses, and whether it will group a multi-line response in a
+ * `labeled-response` batch and answer `ACK`.
+ *
+ * TWO QUESTIONS AND ONE ANSWER, and the reason they cannot be separated is the
+ * specification: "Clients requesting this capability indicate that they are capable of
+ * handling the message tag, batch type, and ACK response described below from servers."
+ * A client that negotiated this has asked for all three; a client that did not has asked
+ * for none of them, and a `BATCH` or an `ACK` on the wire to such a client is a command
+ * word it was never told to expect -- the same objection 4.4.3 raises against a `FAIL`
+ * reaching a client that negotiated nothing.
+ *
+ * IT IS ASKED ABOUT THE DESTINATION AND NOT ABOUT THE SENDER, for the reason every other
+ * notification on this node is: what reaches a connection is a fact about that connection.
+ * A client that labels a command gets its OWN responses labelled, and nothing about what
+ * any other client is doing.
+ *
+ * THE CAPABILITY DOES NOT DEPEND ON `batch` BEING AVAILABLE, and it cannot: `batch` is a
+ * separate capability this node advertises unconditionally, and the only thing
+ * conditional here is whether the CLIENT negotiated this one. */
+int cap_labeled_response_enabled(const conn_t *c);
+
 
 
 

@@ -1829,6 +1829,70 @@ tag was **silently dropped for exactly the references at the boundary**. The tes
 64-accepted / 65-refused, and the 64 half is there because a bound tested only below its
 own edge passes.
 
+#### 4.4.8 `labeled-response`, and the label that is copied rather than referenced
+
+Phase 10.13 implements IRCv3's `labeled-response`. **It landed after `batch` and that
+order was chosen against the pass plan**, because the specification says so: "This
+specification depends on the `batch` capability which MUST be negotiated to use labeled
+responses", and "If a response consists of more than one message, a batch MUST be used to
+group them into a single logical response. The start of the batch MUST be tagged with the
+label tag."
+
+**THE REQUIREMENT IS NOT "ECHO THE TAG" BUT "EXACTLY ONE LOGICAL MESSAGE"**, and on this
+node a response is frequently several lines — a `WHOIS` is four, a chunked `NAMES` roster
+can be twenty. So the implementation is three things rather than one flag:
+
+- **`conn_t::label`** — the client's value, **COPIED**, with a fixed-size field of
+  `CONN_MAX_LABEL + 1`. `m->tags` points into the parser's heap, the command's response
+  outlives the message, and a stored pointer is a dangling read. The value is *un*escaped
+  on the way in and re-escaped by `message_build()` on the way out, which is
+  `ircv3_tags.c`'s round trip and why the scan cannot hand `m->tags`'s bytes to anybody.
+- **`conn_t::label_batch` / `label_batch_open`** — the grouping batch this node minted,
+  opened **lazily on the first line**. Lazy is forced, not chosen: the `BATCH +` must come
+  *before* the first line, but the node cannot know how many lines a command will produce
+  without running it, and a one-line response must not be wrapped in an empty batch.
+- **`conn_t::label_self`** — the specification's one exception, decided in
+  `msg_verbs.c` where the resolved target and the sender are both in scope.
+
+**A SINGLE-LINE RESPONSE IS WRAPPED TOO, and that is the cost of the lazy batch.** A
+client that negotiated the capability gets `:srv BATCH +<ref> labeled-response`, the
+answer, and `:srv BATCH -<ref>` — three lines for one `404`. The specification's example
+shows exactly that shape for a four-line `WHOIS` and nothing forbids it for one line; the
+alternative was to know the response length in advance, which means a whitelist, and a
+whitelist is a new multi-line command silently failing to group.
+
+**THE LABEL IS ON THE BATCH START AND ON NOTHING ELSE**, which is the specification's
+example verbatim — `@label=…` on the `BATCH +`, `@batch=…` on the `311` — and getting it
+the other way round puts the label on two messages. `ACK` is `:srv ACK` with no
+parameters and **no grouping batch**, because it is the one response that is one line by
+definition.
+
+**PER DESTINATION, AND THE SPLIT IS THREE-WAY.** A client that negotiated gets the label,
+the `BATCH` and the `ACK`. A client that sent a `label=` **without** negotiating gets the
+**label only** — no `BATCH`, no `ACK`. The specification's own sentence is "Clients
+requesting this capability indicate that they are capable of handling the message tag,
+batch type, and ACK response", and a command word on the wire to a client that was never
+told to expect it is §4.4.3's objection applied to two verbs.
+
+**A LABELLED COMMAND THAT PRODUCED NOTHING GETS `ACK`**, and the operational test is
+"produced no response" rather than "normally produces no response", because the distinction
+is not observable from outside a node and this node can only test one of them.
+
+**THE ONE EXCEPTION, AND IT IS ABOUT THE TARGET.** "When a client sends a message to
+itself, the server MUST NOT include the label tag" — and on this node the echo-message
+copy of a message to one's own nickname *is* the acknowledgement the sentence's exception
+contemplates. So the delivery goes unlabelled and the labelled answer becomes the `ACK`.
+The first version decided this by comparing the emitted line's **prefix** against the
+destination's own hostmask, which is a *source* test — and it withheld the label from every
+echo on the node, so a labelled `PRIVMSG #chan` came back unlabelled followed by an `ACK`.
+`conn_t::label_self`, set by `msg_verbs.c`, is the fix and the reason is in
+`label.h`.
+
+**WHAT IS NOT IMPLEMENTED.** `draft/multiline` (the `;draft/multiline-concat` values and
+the splitting of one command into several — the framing this depends on **is** here);
+`TAGMSG` labelled echo; and the `bouncer` routing considerations, which are non-normative
+and are about a bouncer this node is not.
+
 #### 4.4.6 `462 ERR_ALREADYREGISTRED`, and the second `USER`
 
 Phase 10.10 closes the defect §9's risk row recorded: `handle_user()` wrote
