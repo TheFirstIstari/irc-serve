@@ -1713,6 +1713,88 @@ a symptom.
 
 #### 4.4.5 `userhost-in-names`, and the disclosure it makes
 
+#### 4.4.6 `462 ERR_ALREADYREGISTRED`, and the second `USER`
+
+Phase 10.10 closes the defect §9's risk row recorded: `handle_user()` wrote
+`conn_t::user` unconditionally, `USER` is `pre_reg`, and the dispatch table's gate is
+`if (!commands_registered(c) && (cmd == NULL || cmd->pre_reg == 0))` — which a REGISTERED
+connection passes for every row. A client could therefore move its own ident with no line
+to itself and none to the members of its channels.
+
+**THE THREAT MODEL, because it is what picks the fix out of three.** (a) refuse, (b)
+accept and notify, (c) accept and silently re-resolve. The question is who is hurt by a
+client changing its own ident, and on this node:
+
+- **Not impersonation of another user.** Nothing is *granted* to an ident here. No
+  privilege, no account and no operator check reads `c->user` alone; the ident is
+  client-asserted and **unverified at registration**, so two users may already hold the
+  same one and a client could equally have *registered* with the ident it now moves to.
+  The obvious argument for "just refuse it" is therefore not the strongest one, and
+  saying so is what makes the next bullet carry the weight.
+- **Yes — an access-control bypass.** `chan_banned()` runs on every `JOIN` and matches a
+  stored mask against the NICK, the HOST, and the **composite `nick!user@host`**; the
+  suite exercises that composite form (`MODE #mo +b *!*@127.0.0.1` → `474`). A mask of
+  the shape `mallory!*@*` can only match through the composite, so on this node a client
+  that moves its ident, `PART`s and re-`JOIN`s is admitted to a channel it is banned from.
+  A single client command reaches it. **This is why (b) is wrong**: a `CHGHOST` would not
+  stop the rejoin, and (c) has nothing to re-resolve because there is no privilege keyed on
+  the ident to re-resolve *into*.
+- **Yes — the silence, to two audiences.** Every roster (`311`, `352`, `353`, the message
+  prefix, `302`) reports an ident nobody was told about, so a `userhost-in-names` client
+  is shown a hostmask that changed without a word; `resume.c` **requires** (nick, ident,
+  host) to all match to resume, so the write silently invalidates the client's own session
+  record; and on a mesh the peer's roster keeps the old ident until the next `SBURST`.
+
+**THE ANSWER IS (a), REFUSED WITH 462 — AND IT IS NOT A CHOICE.** RFC 2812 3.1.3 lists
+`USER`'s numeric replies as exactly two, `ERR_NEEDMOREPARAMS` and `ERR_ALREADYREGISTRED`,
+and the numeric's own entry in RFC 2812 §9 names the case: *"user details from second USER
+message"*. The previous pass recorded the opposite — that refusing "is a behaviour change to
+an RFC 1459 MUST command with nothing in the RFC requiring it" — and that was **wrong**: it
+had read RFC 1459, whose `USER` section says nothing about a second one, and not RFC 2812
+3.1.3. The finding was right; the reason it did not act on it was not.
+
+**THE GATE IS `commands_registered()`, NOT "HAS SEEN A `USER` BEFORE"**, and that is the
+whole of the compatibility cost. A client that sends `USER` twice *while registering* —
+holding a `CAP` negotiation open, or correcting its own ident — still works, last-one-wins,
+because it is pre-registration in the sense every other gate in this tree means. A client
+that re-sends `USER` *after* `001` gets one numeric it did not ask for and **keeps its
+connection, its nickname, its channels and its realname**: the refusal closes nothing. The
+only thing taken away is the ability to move its own ident, which is the defect. The ident a
+client wants is the one it should have sent at registration, where it can still be refused
+(`417`/empty) rather than silently truncated.
+
+Two smaller decisions, both load-bearing:
+
+- **The gate is before the arity test**, which is the one place `handle_user()` differs from
+  `handle_setname()`'s order. The arity complaint is a fact about the *message*; the
+  registration state is a fact about the *connection*; and for a registered connection the
+  message cannot be processed at all. Answering `461 Not enough parameters` to a client that
+  sent the very same four parameters a moment ago and was answered `001` would be a numeric
+  describing a problem the client does not have.
+- **`462` is NOT migrated**, which looks inconsistent beside the four numerics §4.4.3 does
+  migrate. Those four answer **more than one question** on this node, so the number alone
+  cannot say which refusal happened. `462` answers exactly one — "you are already
+  registered" — so the number is unambiguous and it stays legacy, which is what a NULL
+  `fail_code` selects. The cost is named: a client matching on `462` keeps working.
+
+`tests/integration/test_chghost.c` is the deliverable on both halves. Case 3 is the
+**inversion** of Phase 10.8's hole-proving case — the identical sequence, now requiring the
+ident to be **unchanged**, the sender to be answered `462` exactly once, the second
+connection's socket to hold **zero** lines, and the node's own output to record a refusal
+(`reason=ALREADY_REGISTERED`) and **not** the write (`user=mallory`). Cases 4 and 5 pin the
+two edges: `462` is byte-identical for a client that negotiated `standard-replies`, and a
+pre-registration second `USER` is honoured with the second ident.
+
+**WHAT THIS DOES NOT UNLOCK.** `chghost` stays **unadvertised**, and now for the tidy reason
+Phase 10.8 could not reach: nothing this node shows a third party about a user can change.
+A host is fixed at `accept()`; an ident is fixed at registration and a second `USER` is `462`;
+a realname moves only through `SETNAME`, which is §4.2.1's own notification. There is
+still no `CHGHOST` verb and still no emitter, and **no way to move a host was invented** —
+that is `WEBIRC`/`spoofing`, and a verb that set `conn_t::host` would be a spoofing surface
+invented to satisfy a specification.
+
+#### 4.4.5 `userhost-in-names`, and the disclosure it makes
+
 Phase 10.5 lets a `353` roster carry `nick!user@host` instead of a bare nickname.
 
 **This is a privacy decision and it is stated as one.** What the capability does is
@@ -2609,7 +2691,7 @@ Quality:
 | **`SETNAME` silently ignoring a client that did not negotiate** (Phase 10.6) | read as "the command does not exist" by a client that tried it anyway, which `setname` explicitly permits | **It is the specification's instruction**, and it is implemented rather than worked around: no reply, no change. A `FAIL SETNAME CANNOT_CHANGE_REALNAME` needs `standard-replies`, which this node does not have, and inventing a `FAIL` would put a command word on the wire no client here has been told to expect. The test asserts **exhaustively** — the drain `PONG` must be the only line in the window — because a list of absent numerics is not a test of silence (a `482` fault passed the first version of it) |
 | **A message delivered twice to a client that negotiated `echo-message`** (Phase 10.7) | every message the user sends appears twice, from two different-looking prefixes — the defect the capability exists to remove, arrived at from the other side | **There is no second emission.** The capability decides one thing: whether the sender stays in the audience of the delivery that is happening anyway (`msg_verbs.c`'s `exclude`). The sender of a channel `PRIVMSG` was *already* in the audience, so the copy is that one; only `NOTICE`, which RFC 1459 2.4.2 removes, is affected. `test_echo_message.c` **counts** copies rather than searching for them — the two copies are identical apart from the prefix, so a substring assertion passes — and one of its faults adds exactly the extra emission |
 | **An away notification reaching a client that did not ask** (Phase 10.8b) | the notification is an **assertion about a user** — they are away, or no longer away — so sending it to a client that did not negotiate is as wrong as not sending it to one that did. A client that never asked for `away-notify` would see a line appearing in its event loop with no way to have predicted it | **One per-destination gate, inside the one walk that decides who gets what (§3.1.1), and it is the ABSENCE of a line rather than a third shape.** The specification's grammar is `:nick!user@host AWAY [:message]`, so a notification with no trailing text is how a client learns the user is BACK — a third shape would have been a line that means the same thing to somebody who did not ask. The setter is excluded separately, because "SHOULD NOT be sent AWAY messages to notify them of their own away status" is a different question from "did this destination ask?". `test_away_notify.c` puts a non-negotiating member and a member of another channel in the same channel as the setter and asserts **line counts of zero** on both, because a gate that reached either of them is a different fault from a gate that ignored them and only one of them is what a client would notice |
-| **A client changes its own ident after registration, silently** (Phase 10.8) | `handle_user()` writes `conn_t::user` unconditionally and `USER` is `pre_reg`, so the dispatch table routes it for a REGISTERED connection: a client may re-send `USER` and move its own ident with **no line to anyone** — not to itself and not to the members of its channels. Every roster this node draws (`311`, `352`, `353`, the message prefix, `302`) then reports an ident the target's peers were never told about, so a `userhost-in-names` client is shown a hostmask that changed without a word | **REPORTED, NOT FIXED, and the reason is that the fix is a decision about an RFC 1459 MUST command.** Refusing a second `USER` is a behaviour change with nothing in the RFC requiring it, and it could strand a client that sends `USER` again for its own reasons. `tests/integration/test_chghost.c` makes the hole **provable** instead: the change read back off a second connection's `311`, a **line count of zero** on an idle second connection while it happens, and the `421` for a client-sent `CHGHOST`. A future phase that closes it has a test to remove rather than a claim to re-derive — and if the `311` assertion ever starts failing, this row is stale. This is also why `chghost` is **not advertised**: the specification's trigger is a change, this node has one path that produces one, and the notification it asks for would be reporting a hole rather than a feature | 
+| **A client changes its own ident after registration, silently** (Phase 10.8) | `handle_user()` writes `conn_t::user` unconditionally and `USER` is `pre_reg`, so the dispatch table routes it for a REGISTERED connection: a client could re-send `USER` and move its own ident with **no line to anyone** — not to itself and not to the members of its channels. Every roster this node draws (`311`, `352`, `353`, the message prefix, `302`) then reported an ident the target's peers were never told about, a `userhost-in-names` client was shown a hostmask that changed without a word, `resume.c` silently invalidated the client's own session record, and a banned user could change its ident and re-`JOIN` | **CLOSED IN PHASE 10.10, and the threat model is what decides the fix.** Nothing on this node is GRANTED to an ident — no privilege and no account reads `c->user` alone, it is client-asserted and unverified at registration, and two users may already hold the same one — so this is **not impersonation**. It IS an access-control bypass: `chan_banned()` runs on every `JOIN` and matches a stored mask against the composite `nick!user@host`, and the suite exercises that form (`MODE #mo +b *!*@127.0.0.1` → `474`), so a mask of the shape `mallory!*@*` could only be defeated by moving the ident and re-joining. `handle_user()` now refuses a second `USER` with **`462 ERR_ALREADYREGISTRED` and returns before the write**, and the gate is `commands_registered()` rather than "has seen a `USER` before", so a client that sends `USER` twice *while registering* still works last-one-wins and nobody is stranded. The previous row's stated reason for not acting — that refusing "is a behaviour change to an RFC 1459 MUST command with nothing in the RFC requiring it" — **was wrong**: RFC 2812 3.1.3 lists `ERR_ALREADYREGISTRED` among `USER`'s numeric replies and RFC 2812 9 names the case, "user details from second USER message". `462` is not migrated, because 4.4.3's rule migrates only numerics that answer more than one question on this node. `test_chghost.c` case 3 is the **inversion** of Phase 10.8's hole-proving case, not a deletion of it | 
 | **An unsolicited notification reaching a client that did not ask** (Phase 10.8a) | the notification is an ASSERTION about a user — their realname changed, their ident and host changed, they are away or no longer away — so sending it to a client that did not negotiate is as wrong as not sending it to one that did. `away-notify` is the sharp case: the line's whole grammar is `:nick!user@host AWAY [:message]`, so a "notification" with no message asserts the user is no longer away | **There is ONE per-destination gate, inside the one walk that decides who gets what (§3.1.1), and it is the absence of a line rather than a third shape.** A gate that returned a third *shape* would still have sent a line, and an empty one reads as "no longer away". The three-handler alternative was rejected for the same reason `fanout.c` exists: `chan_verbs.c`'s own broadcast helper lost a forward arm that way in Phase 4. `test_fanout_gate.c` asserts **zero queued bytes** for the refused member rather than the absence of a needle, because absence-from-a-buffer is satisfied by a line that arrived elsewhere in the stream |
 | **`FAIL` reaching a client that did not negotiate `standard-replies`** (Phase 10.9) | `FAIL` is a command word no such client has ever been told to expect and RFC 1459 2.3 parses it as an unknown command — so the migration would break exactly the clients it was supposed to leave alone, and the breakage is a client that stops rendering errors rather than one that fails loudly | **The branch is `reply.c`'s, and there is exactly one of them.** `reply_refused()` asks `cap_standard_replies_enabled(src)` before it does anything else; a client that did not negotiate reaches `reply()` with the legacy numeric, the same middle parameters and the same text, and the two renderings are the same string because the format is rendered ONCE and handed to whichever branch was chosen. `test_standard_replies.c` runs every case on two connections differing in exactly that one negotiation and asserts **both** answers byte-for-byte, plus the absence of `FAIL`, `WARN` and `NOTE` and a line COUNT for the window — a list of absent numerics would pass a fault that answered with a number nobody thought of |
 | **A legacy numeric migrated for a client that did not ask** (Phase 10.9) | the client loses the numeric it was matching on, and the four that stop arriving are four that clients most often match | **The migration is per destination and the legacy rendering is byte-identical**, and no client that connected to an earlier build can be affected because the capability did not exist to negotiate. The list is four numerics and not thirty, and the rule that chose them is a property of THIS NODE (one number, several questions) rather than a preference: `test_standard_replies.c` asserts `401` and `451` still arrive at a negotiating client unchanged, so the list cannot grow by accident |
