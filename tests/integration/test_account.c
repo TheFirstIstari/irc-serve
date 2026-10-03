@@ -774,7 +774,8 @@ static void test_logged_in(const char *sasl, const char *registry)
     TF_CHECK_MSG(strstr(tc_buffer(&alice.c),
                         " CAP * LS :multi-prefix message-tags draft/message-ids "
                         "sasl account-tag account-notify "
-                        "extended-join userhost-in-names setname echo-message\r\n") != NULL,
+                        "extended-join userhost-in-names setname echo-message "
+                        "standard-replies\r\n") != NULL,
                  "the advertised list on a node with BOTH stores is not the whole set "
                  "of capabilities this node implements: %s", tc_buffer(&alice.c));
 
@@ -877,7 +878,8 @@ static void test_no_registry(const char *sasl, const char *label)
     TF_CHECK_MSG(strstr(tc_buffer(&alice.c),
                         " CAP " "alice" " LS :multi-prefix message-tags "
                         "draft/message-ids sasl account-notify "
-                        "extended-join userhost-in-names setname echo-message\r\n") != NULL,
+                        "extended-join userhost-in-names setname echo-message "
+                        "standard-replies\r\n") != NULL,
                  "%s: the advertised list on a node with a credential store and "
                  "NO registry is not exactly the whole set it really "
                  "has; a client would read an account-tag here as an identity it "
@@ -986,7 +988,8 @@ static void test_default_node(void)
      * the CR -- so the expected literal has no terminator either. */
     TF_CHECK_MSG(strcmp(caps, " CAP * LS :multi-prefix message-tags "
                               "draft/message-ids account-notify "
-                              "extended-join userhost-in-names setname echo-message") == 0,
+                              "extended-join userhost-in-names setname "
+                              "echo-message standard-replies") == 0,
                  "the advertised capability list on a node with no stores is "
                  "\"%s\"; it must be exactly the ones that need no "
                  "configuration", caps);

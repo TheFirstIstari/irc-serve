@@ -746,13 +746,20 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
     int n;
 
     if (m->nparams < 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "JOIN", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     n = chan_split_list(store, sizeof store, m->params[0], names,
                         CHAN_MAX_LIST_ARGS);
     if (n <= 0) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        /* ALSO "TOO FEW", and deliberately NOT a different code: a bare `:` names
+         * no channel, so from the client's side it sent nothing usable and
+         * NEED_MORE_PARAMS is the true statement. Splitting it would invent a
+         * distinction between "no parameters" and "an empty one" that this node
+         * has no reason to make. */
+        (void)reply_refused(s, c, "JOIN", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
 
@@ -1000,13 +1007,15 @@ void handle_part(server_t *s, conn_t *c, const message_t *m)
     int n;
 
     if (m->nparams < 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "PART", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     n = chan_split_list(store, sizeof store, m->params[0], names,
                         CHAN_MAX_LIST_ARGS);
     if (n <= 0) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "PART", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
 
@@ -1069,11 +1078,13 @@ void handle_topic(server_t *s, conn_t *c, const message_t *m)
     int setting;
 
     if (m->nparams < 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "TOPIC", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     if (m->nparams > 2) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "TOPIC", "TOO_MANY_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     setting = (m->nparams > 1);
@@ -1301,17 +1312,61 @@ void handle_kick(server_t *s, conn_t *c, const message_t *m)
     const char *params[4];
 
     if (m->nparams < 2) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "KICK", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     if (m->nparams > 3) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "KICK", "TOO_MANY_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     /* RFC 1459 2.3.1: the reason is optional, and a KICK without one names the
      * kicker, which is the most useful default available -- it is in the message
      * already and it is what the target will see. */
     reason = (m->nparams > 2) ? m->params[2] : c->nick;
+
+    /* ------------------------------------------------------------------------
+     * THE REASON BOUND, AND WHY IT IS CHECKED HERE AND NOT AT THE END
+     * ------------------------------------------------------------------------
+     * Immediately after the arity test, which is where a parameter's validity
+     * belongs: a KICK carrying a parameter this node will not accept is refused
+     * as malformed whatever the sender's standing on the channel, and a node that
+     * answered 482 for a client who simply sent too many bytes would be reporting
+     * a privilege problem for a syntax problem. Nothing below has run, so nothing
+     * below has to be undone.
+     *
+     * IT WAS MISSING, AND THE CONSEQUENCE WAS WORSE THAN A MISSING 005 TOKEN. With
+     * no test here the reason went straight into `deliver_state_change()` ->
+     * `fanout_deliver()` -> `send_line()` -> `message_format()`, which refuses a
+     * line it cannot represent rather than reshaping it -- and the only outcome at
+     * that depth is a refusal counted on `n_reply_refused`, the counter `reply.c`
+     * holds at zero because a non-zero value is a bug report. So one client
+     * command was a reachable way to put a non-zero on it. Phase 10.4 recorded that
+     * as a finding in two places (this bound, and `KICKLEN`'s absence from 005) and
+     * named this as the fix for both; this is it.
+     *
+     * 417 is the numeric this node already uses for "that parameter is longer than
+     * I will store" -- msg_verbs.c's AWAY and PRIVMSG and commands.c's SETNAME --
+     * and reusing it is the point: a client that has learned one over-long
+     * parameter refusal has learned all of them. For a client that negotiated
+     * `standard-replies` this is `FAIL KICK ERR_INPUTTOOLONG` instead; the legacy
+     * numeric and its text are byte-identical to what they would otherwise be,
+     * which is the whole of reply.c's `reply_refused()` contract.
+     *
+     * THE DEFAULT REASON CANNOT FAIL, and that is worth saying rather than leaving
+     * to be checked: it is `c->nick`, and a nickname is bounded by IRC_MAX_NICK
+     * (63), so the substituted value is always inside this bound. A future change
+     * that defaulted the reason to something client-supplied would have to move
+     * this test. */
+    if (strlen(reason) > (size_t)CHAN_MAX_KICK_REASON) {
+        (void)reply_refused(s, c, "KICK", NULL, "417", NULL, 0,
+                            "Kick reason is too long");
+        printf("[observable] chan_kick_refused: channel=%s nick=%s reason=too_long "
+               "len=%zu max=%d\n",
+               m->params[0], c->nick, strlen(reason), CHAN_MAX_KICK_REASON);
+        return;
+    }
 
     ch = resolve_joined(s, c, m->params[0]);
     if (ch == NULL) {
@@ -1331,8 +1386,9 @@ void handle_kick(server_t *s, conn_t *c, const message_t *m)
         /* 482, not 481. 481 is "you need to be a channel operator to do this"
          * for a mode the client may not set at all; 482 is "you are not
          * privileged enough for this action", which is the situation. */
-        (void)reply(s, c, "482", (const char *const[]){ ch->name }, 1,
-                    "You're not a channel operator");
+        (void)reply_refused(s, c, "KICK", NULL, "482",
+                            (const char *const[]){ ch->name }, 1,
+                            "You're not a channel operator");
         printf("[observable] chan_kick_refused: channel=%s nick=%s reason=not_op\n",
                ch->name, c->nick);
         return;
@@ -1426,7 +1482,8 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
     const char *params[3];
 
     if (m->nparams < 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "MODE", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     ch = resolve_joined(s, c, m->params[0]);
@@ -1454,7 +1511,8 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
         return;
     }
     if (m->nparams > 3) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "MODE", "TOO_MANY_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
 
@@ -1472,16 +1530,22 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
         return;
     }
     if (m->params[1][1] == '\0') {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        /* A MODE STRING WITH NO LETTERS: the client sent the mode argument and
+         * none of the argument that goes with it, so this is a too-FEW case rather
+         * than a malformed one, and NEED_MORE_PARAMS says exactly that. */
+        (void)reply_refused(s, c, "MODE", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     if (!chan_has_flag(ch, c, CHAN_MEMBER_OP)) {
-        (void)reply(s, c, "482", (const char *const[]){ ch->name }, 1,
-                    "You're not a channel operator");
+        (void)reply_refused(s, c, "MODE", NULL, "482",
+                            (const char *const[]){ ch->name }, 1,
+                            "You're not a channel operator");
         printf("[observable] chan_mode_refused: channel=%s nick=%s reason=not_op\n",
                ch->name, c->nick);
         return;
     }
+
     if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
         return;
     }
@@ -1532,7 +1596,8 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
             struct member *target;
 
             if (m->nparams < 3) {
-                (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+                (void)reply_refused(s, c, "MODE", NULL, "461", NULL, 0,
+                                    "Not enough parameters");
                 return;
             }
             target = chan_find_nick(ch, m->params[2]);
@@ -1578,7 +1643,8 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
 
         if (mode == 'b') {
             if (m->nparams < 3) {
-                (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+                (void)reply_refused(s, c, "MODE", NULL, "461", NULL, 0,
+                                    "Not enough parameters");
                 return;
             }
             if (plus) {
@@ -1696,7 +1762,8 @@ void handle_invite(server_t *s, conn_t *c, const message_t *m)
     const char *params[1];
 
     if (m->nparams != 2) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "INVITE", "INVALID_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     if (chan_name_valid(m->params[0])) {
@@ -1741,8 +1808,9 @@ void handle_invite(server_t *s, conn_t *c, const message_t *m)
          * users to a channel" (3.3.6). The same numeric KICK and MODE use for
          * the same situation, and 4.4 has nothing better to say about "you
          * lack privilege for this action". */
-        (void)reply(s, c, "482", (const char *const[]){ ch->name }, 1,
-                    "You're not a channel operator");
+        (void)reply_refused(s, c, "INVITE", NULL, "482",
+                            (const char *const[]){ ch->name }, 1,
+                            "You're not a channel operator");
         printf("[observable] chan_invite_refused: channel=%s nick=%s reason=not_op\n",
                ch->name, c->nick);
         return;
@@ -1832,7 +1900,8 @@ void handle_knock(server_t *s, conn_t *c, const message_t *m)
     chan_t *ch;
 
     if (m->nparams != 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "KNOCK", "INVALID_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     /* A channel-name check and an existence check, both 403, and both BEFORE the
@@ -1850,8 +1919,15 @@ void handle_knock(server_t *s, conn_t *c, const message_t *m)
         return;
     }
 
-    (void)reply(s, c, "482", (const char *const[]){ ch->name }, 1,
-                "You're not an IRC operator");
+    /* 482, WHICH ELSEWHERE ON THIS NODE MEANS "NOT A CHANNEL OPERATOR" and here
+     * means "not an IRC operator". That is not a near miss: it is the clearest
+     * single piece of evidence for the migration, which is why this site overrides
+     * the code. For a negotiating client this is `FAIL KNOCK ERR_NOPRIVILEGES` --
+     * which is also the right rendering for the CHOPER refusal in commands.c,
+     * because it is the same fact. */
+    (void)reply_refused(s, c, "KNOCK", "ERR_NOPRIVILEGES", "482",
+                        (const char *const[]){ ch->name }, 1,
+                        "You're not an IRC operator");
     printf("[observable] knock_refused: channel=%s nick=%s reason=NO_OPER_FLAGS "
            "k_mode=%d local=%zu\n",
            ch->name, c->nick, chan_mode_has(ch, 'k'), ch->nmembers);

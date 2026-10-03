@@ -56,7 +56,8 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
      * `MAXTARGETS=` from the same number (msg_verbs.h) and two spellings of it
      * is one too many. */
     if (m->nparams != MSG_MAX_TARGETS + 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, verb, "INVALID_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     text = m->params[1];
@@ -80,7 +81,7 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
      * report and not a metric, and a client that sent a long message is not a
      * bug. It is a limit, and a limit answers with a numeric. */
     if (fanout_line_fits(prefix, verb, m->params[0], text) == 0) {
-        (void)reply(s, c, "417", NULL, 0, "Message too long to send");
+        (void)reply_refused(s, c, verb, NULL, "417", NULL, 0, "Message too long to send");
         printf("[observable] msg_refused: verb=%s nick=%s reason=too_long "
                "len=%zu\n",
                verb, c->nick, strlen(text));
@@ -365,7 +366,8 @@ void handle_who(server_t *s, conn_t *c, const message_t *m)
     const int multiprefix = cap_multiprefix_enabled(c);
 
     if (m->nparams > 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "WHO", "TOO_MANY_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     if (m->nparams == 1) {
@@ -448,7 +450,8 @@ void handle_whois(server_t *s, conn_t *c, const message_t *m)
     time_t now;
 
     if (m->nparams != 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "WHOIS", "INVALID_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     who = fanout_find_nick(s, m->params[0]);
@@ -589,7 +592,8 @@ void handle_ison(server_t *s, conn_t *c, const message_t *m)
     size_t nout = 0;
 
     if (m->nparams < 1 || m->nparams > (int)(sizeof found / sizeof found[0])) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "ISON", "INVALID_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
 
@@ -646,7 +650,8 @@ void handle_away(server_t *s, conn_t *c, const message_t *m)
     size_t len;
 
     if (m->nparams > 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "AWAY", "TOO_MANY_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
 
@@ -664,7 +669,7 @@ void handle_away(server_t *s, conn_t *c, const message_t *m)
     message = m->params[0];
     len = strlen(message);
     if (len > (size_t)CONN_MAX_AWAY) {
-        (void)reply(s, c, "417", NULL, 0, "Away message is too long");
+        (void)reply_refused(s, c, "AWAY", NULL, "417", NULL, 0, "Away message is too long");
         printf("[observable] away: nick=%s state=refused reason=too_long "
                "len=%zu max=%d\n",
                c->nick, len, CONN_MAX_AWAY);
@@ -754,7 +759,8 @@ void handle_userhost(server_t *s, conn_t *c, const message_t *m)
     size_t online = 0;
 
     if (m->nparams < 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "USERHOST", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
 

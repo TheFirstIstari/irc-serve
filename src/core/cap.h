@@ -136,6 +136,7 @@
 #define CAP_USERHOST_IN_NAMES "userhost-in-names"
 #define CAP_SETNAME "setname"
 #define CAP_ECHO_MESSAGE "echo-message"
+#define CAP_STANDARD_REPLIES "standard-replies"
 
 /* 410 ERR_INVALIDCAPSUBCOMMAND. Not in design 4.4's numeric list, which is a gap
  * in the list rather than in the protocol, for the same reason 301, 303, 417,
@@ -390,6 +391,58 @@ int cap_setname_enabled(const conn_t *c);
  * ONE GATE AND NO AVAILABILITY CHECK: unlike `account-tag` there is nothing here
  * that depends on an operator file. */
 int cap_echo_message_enabled(const conn_t *c);
+
+/* standard-replies: whether this node renders its refusals as IRCv3's `FAIL`
+ * line rather than as the legacy numeric, FOR THIS CLIENT.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS ONE IS DIFFERENT FROM EVERY OTHER GATE IN THIS FILE
+ * ---------------------------------------------------------------------------
+ * Every other capability here decides what the node DRAWS. This one decides
+ * whether a refusal arrives as `417` or as
+ *
+ *     FAIL <command> <code> :<description>
+ *
+ * which is a different message with a different command word -- so a client that
+ * did not negotiate it would read the second as an unknown verb. **The migration
+ * is therefore strictly per destination and is decided in `reply.c`**, which is
+ * the one place that says what an outbound message to a client may be. A
+ * capability honoured per handler would be honoured on one path and forgotten on
+ * the next, and the client would see both shapes from one server.
+ *
+ * ---------------------------------------------------------------------------
+ * WHICH REFUSALS MIGRATE, AND WHY THE LIST IS SHORT
+ * ---------------------------------------------------------------------------
+ * `reply.c`'s table carries four numerics and no others. The rule is one
+ * sentence: **a legacy numeric migrates where that numeric answers more than one
+ * question on this node**, because then the number alone cannot tell a client
+ * which refusal happened. `417` answers four (PRIVMSG text, AWAY, SETNAME realname,
+ * KICK reason); `461` answers two and its text says "Not enough parameters" even
+ * when the client sent too many; `482` answers three; `464` answers two. Every
+ * other numeric on this node answers exactly one question and stays, because
+ * replacing it would take away the only thing the client gets from it -- a name it
+ * already handles -- in exchange for a line it must now learn.
+ *
+ * THE COST, and it is paid by the client that asked: after this, `417`, `461`,
+ * `482` and `464` stop reaching a client that negotiated `standard-replies`, and a
+ * client that pattern-matches `417` for "line too long" must read
+ * `FAIL <cmd> ERR_INPUTTOOLONG` instead. Nothing that connected to an EARLIER
+ * build is affected, because the capability did not exist to negotiate.
+ *
+ * AND THE TENSION WITH THE SPECIFICATION'S OWN SENTENCE, recorded rather than
+ * glossed: the specification says servers "SHOULD NOT replace standardised error
+ * numerics with standard replies, unless the replacement is explicitly described
+ * by some other specification", and all four of these are standardised. What
+ * makes the partial migration defensible here is that the exception's purpose is
+ * served -- the complaint the specification's own introduction makes is that
+ * "numerics themselves and the mapping of numerics to names can be unclear or
+ * conflicting", and these four are unclear on THIS node -- and that the
+ * replacement is per destination, so the ambiguity is fixed without taking the
+ * number away from anybody who did not ask. `setname` is the one case the
+ * exception clause covers outright, because its own specification names the
+ * replacement. */
+int cap_standard_replies_enabled(const conn_t *c);
+
 
 /* Handle one `CAP` line. Returns 1 if it was handled, 0 if it was not a CAP at
  * all (which cannot happen: the caller has already dispatched on the verb). */

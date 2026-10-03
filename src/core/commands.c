@@ -108,9 +108,14 @@ int commands_registered(const conn_t *c)
  *   DERIVED, where a bound exists. Every `*LEN` and the one arity number below
  *   come from the constant that ENFORCES the thing, never from a literal. The
  *   test is not "the number looks right" but "is there a check in this tree that
- *   would refuse more than this", and a token whose answer is no is omitted --
- *   see KICKLEN below, which is the worked example of a bound that does not exist
- *   and therefore a token that is not advertised.
+ *   would refuse more than this", and a token whose answer is no is omitted.
+ *   `KICKLEN` was the worked example of the second kind for two phases: Phase
+ *   10.4 found that `handle_kick()` took `<reason>` verbatim with no test, so no
+ *   number described the largest reason accepted AND an over-long one reached
+ *   `message_format()`, which refuses rather than reshapes -- a reachable
+ *   `n_reply_refused`, the counter `reply.c` holds at zero because a non-zero
+ *   value is a bug report. Phase 10.9 added `CHAN_MAX_KICK_REASON`, the 417 and
+ *   the token, so the worked example is now `USERLEN` below.
  *
  *   HONOURED, where a feature exists. A token a client acts on and this node does
  *   not implement is worse than the token's absence: absence is a client that
@@ -168,14 +173,6 @@ int commands_registered(const conn_t *c)
  *                  client was connected. Advertising the capability would put a
  *                  client into a state it cannot leave.
  *
- *   KICKLEN        NO BOUND EXISTS, and this is the honest reason rather than an
- *                  omission of memory: handle_kick() takes <reason> verbatim with
- *                  no length test, so nothing on this node can name the largest
- *                  reason it accepts. Inventing 255 -- the number both neighbours
- *                  happen to use -- would advertise a limit this node does not
- *                  enforce, and the consequence is not cosmetic (see the note
- *                  below and the finding reported for Phase 10.4).
- *
  *   MODES          this token is a COUNT of mode changes permitted in one MODE
  *                  command, not a mode string (004 carries those). This node puts
  *                  no count on a MODE command, so there is no count to write.
@@ -221,6 +218,18 @@ static const char *const k_005[] = {
      * ---------------------------------------------------------------------- */
     "AWAYLEN=" IRC_STR(CONN_MAX_AWAY),         /* 417, msg_verbs.c */
     "CHANNELLEN=" IRC_STR(CHAN_MAX_NAME),      /* chan_name_valid() */
+    /* ADDED IN PHASE 10.9, AND IT IS THE CLOSE OF A FINDING RATHER THAN A NEW
+     * TOKEN. Phase 10.4 recorded that `handle_kick()` took `<reason>` verbatim with
+     * no length test, so (a) no number in the tree described the largest reason
+     * this node accepts and (b) an over-long one reached `message_format()`, which
+     * refuses rather than reshapes, tripping `n_reply_refused` -- the counter
+     * `reply.c` holds at zero because a non-zero value is a bug report. That is a
+     * reachable way to make a client command file a bug report.
+     *
+     * `CHAN_MAX_KICK_REASON` now enforces it and `handle_kick()` answers 417, so
+     * the bound below is a fact rather than a figure of speech: it is the same
+     * shape as TOPICLEN beside it, derived from the constant that refuses. */
+    "KICKLEN=" IRC_STR(CHAN_MAX_KICK_REASON),  /* 417, chan_verbs.c */
     "LINELEN=" IRC_STR(IRC_MAX_LINE),          /* conn_fill() + message_parse_n() */
     "MAXTARGETS=1",                            /* MSG_MAX_TARGETS, msg_verbs.h */
     "NAMELEN=" IRC_STR(CONN_MAX_REALNAME),     /* conn_t::realname; SETNAME 417s */
@@ -463,7 +472,8 @@ static void copy_field(char *dst, size_t cap, const char *src, int *trunc)
 static void handle_pass(server_t *s, conn_t *c, const message_t *m)
 {
     if (m->nparams < 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "PASS", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     s->n_pass_seen++;
@@ -508,9 +518,13 @@ static void handle_nick(server_t *s, conn_t *c, const message_t *m)
     if (m->nparams > 1) {
         /* Also how a nickname containing a space is refused: the wire cannot
          * express a space inside one parameter, so a client that sends
-         * "NICK a b" has sent two parameters, and this is the answer it gets. */
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
-        return;
+         * "NICK a b" has sent two parameters, and this is the answer it gets --
+         * which is a TOO MANY case that the legacy text calls "not enough". The
+         * text is left exactly as it is, because changing it would change the wire
+         * for every client that negotiated nothing; for one that negotiated
+         * `standard-replies` the code above says which of the two it was. */
+        (void)reply_refused(s, c, "NICK", "TOO_MANY_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");        return;
     }
     want = m->params[0];
     if (!valid_nick(want)) {
@@ -637,7 +651,8 @@ static void handle_user(server_t *s, conn_t *c, const message_t *m)
     conn_realname_verdict_t v;
 
     if (m->nparams < 4) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "USER", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     copy_field(c->user, sizeof c->user, m->params[0], &trunc_user);
@@ -714,17 +729,29 @@ static void handle_user(server_t *s, conn_t *c, const message_t *m)
  *      nothing changes -- and it is observable, because a protocol test can assert
  *      that nothing arrived.
  *
- *      A NUMERIC HERE WOULD BE WRONG, not merely different. The specification asks
- *      for `FAIL SETNAME CANNOT_CHANGE_REALNAME`, and `standard-replies` is a
- *      separate phase this node does not have; inventing a `FAIL` to stand in for
- *      it would put a command word on the wire that no client on this node has ever
- *      been told to expect. Silence is a shape every client already handles.
+ *      THE SILENCE IS NOT BECAUSE `standard-replies` WAS ABSENT. It used to be
+ *      justified that way and that justification was WRONG the moment the
+ *      capability landed in Phase 10.9: `FAIL SETNAME CANNOT_CHANGE_REALNAME` is
+ *      now expressible, and sending it would still be wrong, because the
+ *      specification asks for SILENCE here and a `FAIL` is a response. The reason
+ *      for silence is the specification's instruction and nothing else. (The other
+ *      half of that sentence is now handled: the refusal below for an
+ *      unacceptable VALUE is a `FAIL` for a client that negotiated
+ *      `standard-replies`, which is a different refusal from not being permitted to
+ *      try.)
  *
  *   3. VALIDATION, through conn_realname_check() -- the SAME predicate handle_user()
  *      runs, which is what makes this not a looser path than registration. A
  *      refusal is 417 and the previous realname is left exactly as it was. It is
  *      NOT truncated: 3.2's rule, and the reason is that this value is then shown
  *      to every member of every channel the user is on as though it were theirs.
+ *
+ *      417 IS STILL THE NUMERIC, and for a client that negotiated
+ *      `standard-replies` it is `FAIL SETNAME ERR_INPUTTOOLONG` or
+ *      `ERR_INVALID_PARAM` depending on which of the two refusals this was -- a
+ *      distinction the number never carried and the verdict `v` already knows.
+ *      reply.c's `reply_refused()` is what makes the swap per destination, so a
+ *      client that negotiated nothing still receives the 417 and the same text.
  *
  * THE CONFIRMATION. On success this node sends the server-to-client form back to
  * the originating client:
@@ -758,7 +785,8 @@ static void handle_setname(server_t *s, conn_t *c, const message_t *m)
      * does NOT apply to -- silence is for a well-formed SETNAME, not for a missing
      * parameter. */
     if (m->nparams != 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "SETNAME", "INVALID_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         printf("[observable] setname_refused: fd=%d nick=%s reason=ARITY nparams=%d\n",
                c->fd, c->nick, m->nparams);
         return;
@@ -776,7 +804,16 @@ static void handle_setname(server_t *s, conn_t *c, const message_t *m)
     }
     v = conn_realname_check(m->params[0]);
     if (v != CONN_REALNAME_OK) {
-        (void)reply(s, c, "417", NULL, 0, "Realname is not acceptable");
+        /* THE DISTINCTION THE NUMBER NEVER CARRIED, and it is the clearest small
+         * argument for the migration: `v` already knows whether the realname was
+         * too long or held a byte this node will not store, and both were 417
+         * carrying the same text. For a client that negotiated `standard-replies`
+         * they are now two codes, and only the length one is the numeric's own
+         * complaint. */
+        (void)reply_refused(s, c, "SETNAME",
+                            (v == CONN_REALNAME_TOO_LONG) ? "ERR_INPUTTOOLONG"
+                            : "ERR_INVALID_PARAM",
+                            "417", NULL, 0, "Realname is not acceptable");
         printf("[observable] setname_refused: fd=%d nick=%s reason=%s len=%zu "
                "max=%d\n",
                c->fd, c->nick,
@@ -1073,7 +1110,8 @@ static void handle_lusers(server_t *s, conn_t *c, const message_t *m)
 static void handle_admin(server_t *s, conn_t *c, const message_t *m)
 {
     if (m->nparams > 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "ADMIN", "TOO_MANY_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     if (m->nparams == 1 && server_mask_is_self(s, m->params[0]) == 0) {
@@ -1202,7 +1240,8 @@ static void handle_choper(server_t *s, conn_t *c, const message_t *m)
     conn_t *who;
 
     if (m->nparams != 2) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "CHOPER", "INVALID_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     /* fanout_find_nick() rather than server_nick_lookup(): both are the same
@@ -1224,10 +1263,15 @@ static void handle_choper(server_t *s, conn_t *c, const message_t *m)
         return;
     }
 
-    (void)reply(s, c, "464", NULL, 0,
-                "%s cannot become an operator: this server holds no operator "
-                "flags and no operator credentials",
-                who->nick);
+    /* 464, WHICH THE SAME NUMBER ALSO ANSWERS FOR A FAILED SASL EXCHANGE. For a
+     * client that negotiated `standard-replies` this is
+     * `FAIL CHOPER ERR_NOPRIVILEGES`, which says "you are not an operator" rather
+     * than leaving the client to work out that an operator request and a
+     * credential failure share a number. */
+    (void)reply_refused(s, c, "CHOPER", NULL, "464", NULL, 0,
+                        "%s cannot become an operator: this server holds no "
+                        "operator flags and no operator credentials",
+                        who->nick);
     printf("[observable] choper_refused: by=%s target=%s reason=NO_OPER_FLAGS "
            "oper=0 pass_seen=%llu\n",
            c->nick, who->nick, (unsigned long long)s->n_pass_seen);
@@ -1258,13 +1302,21 @@ static void handle_cap_wrapper(server_t *s, conn_t *c, const message_t *m)
  *    environment". Shipping a stable command named `REGISTER` that a draft will
  *    later redefine is how a server ends up un-upgradable without anyone noticing.
  *
- * 2. ITS WIRE FORM DOES NOT EXIST YET. The draft answers with the standard
- *    replies framework -- `FAIL ACCOUNT_REGISTER <reason>` -- and this node has
- *    no FAIL, no ERROR and no WARN: they are Phase 10 item 8, and until they
- *    land there is no numeric a real client parses as a registration answer. The
- *    honest response to a command whose answer is specified and unavailable is
- *    to refuse it, not to invent a different answer in a different numeric and
- *    hope a client reads the text.
+ * 2. ITS WIRE FORM WAS NOT AVAILABLE WHEN THIS WAS WRITTEN, and half of that
+ *    reason has since expired. The draft answers with the standard replies
+ *    framework -- `FAIL ACCOUNT_REGISTER <reason>` -- and this node had no FAIL at
+ *    the time, so there was no numeric a real client parses as a registration
+ *    answer. Phase 10.9 landed `standard-replies`, so the form EXISTS now and the
+ *    refusal below renders as `FAIL REGISTER ERR_ACCOUNTREGISTRATIONDISABLED` for
+ *    a client that negotiated it.
+ *
+ *    WHAT THE ARRIVAL DID NOT CHANGE IS THE DECISION, and that is worth being
+ *    blunt about rather than leaving a reader to wonder whether reason 2 quietly
+ *    expired and took the refusal with it: **being able to say the right thing is
+ *    not a reason to say it.** Reasons 3 and 4 are the ones that hold, and neither
+ *    mentions the wire form. A node that could answer the command truthfully
+ *    should still refuse it, and the refusal is now the more precise of the two
+ *    renderings rather than a compromise.
  *
  * 3. OPEN REGISTRATION IS NOT A FEATURE HERE, IT IS A NAME-CLAIMING PRIMITIVE.
  *    REGISTER takes a password and an optional email and, without a verification
@@ -1317,7 +1369,13 @@ static void handle_cap_wrapper(server_t *s, conn_t *c, const message_t *m)
 static void account_refuse(server_t *s, conn_t *c, const char *verb,
                            const char *text)
 {
-    (void)reply(s, c, "482", NULL, 0, "%s", text);
+    /* 482, WHICH ON THIS NODE ALSO MEANS "NOT A CHANNEL OPERATOR" (KICK, MODE,
+     * INVITE) and "NOT AN IRC OPERATOR" (KNOCK). A REGISTER refused because the
+     * deployment has no open registration is a third fact wearing the same number,
+     * and `verb` is already the command word the `FAIL` needs -- which is why this
+     * site's code is an override rather than the table's. */
+    (void)reply_refused(s, c, verb, "ERR_ACCOUNTREGISTRATIONDISABLED", "482", NULL, 0,
+                        "%s", text);
     printf("[observable] account_cmd_refused: fd=%d nick=%s verb=%s "
            "reason=OPERATOR_SIDE_REGISTRY registry=%s\n",
            c->fd, (c->nick[0] != '\0') ? c->nick : "*", verb,
@@ -1378,7 +1436,8 @@ static void handle_register(server_t *s, conn_t *c, const message_t *m)
 static void handle_account(server_t *s, conn_t *c, const message_t *m)
 {
     if (m->nparams != 0) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "ACCOUNT", "INVALID_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         printf("[observable] account_cmd_refused: fd=%d nick=%s verb=ACCOUNT "
                "reason=arity nparams=%d\n", c->fd, c->nick, m->nparams);
         return;
@@ -1569,9 +1628,15 @@ static void handle_authenticate(server_t *s, conn_t *c, const message_t *m)
          * with a byte comparison, so it is written as the RFC writes it. */
         params[0] = "*";
         (void)send_line(s, c, NULL, "AUTHENTICATE", params, 1);
-        (void)reply(s, c, "464", NULL, 0,
-                    "SASL PLAIN payload was not base64 or not three "
-                    "NUL-separated fields");
+        /* `INVALID_AUTHENTICATE` is the code the SASL specification defines for
+         * exactly this -- an AUTHENTICATE whose payload this node cannot read --
+         * and standard-replies says an existing code MUST be used where one is
+         * defined. The other two 464 sites are NOT this, which is why they carry
+         * different codes. */
+        (void)reply_refused(s, c, "AUTHENTICATE", "INVALID_AUTHENTICATE", "464",
+                            NULL, 0,
+                            "SASL PLAIN payload was not base64 or not three "
+                            "NUL-separated fields");
         conn_mark_closing(c);
         printf("[observable] sasl: fd=%d outcome=REJECTED reason=BAD_PAYLOAD\n",
                c->fd);
@@ -1593,9 +1658,15 @@ static void handle_authenticate(server_t *s, conn_t *c, const message_t *m)
          * whether to fix the store or to look for an attack, and the client
          * needs to know not to retry the same password. It never says anything
          * about the credential itself. */
-        (void)reply(s, c, "464", NULL, 0, "SASL authentication failed: %s",
-                    no_store ? "this node holds no client credential store"
-                             : "the credentials did not verify");
+        /* NOT `SAASL_FAIL`, which the registry defines as an account that is
+         * TEMPORARILY locked: neither of this node's two failures is that, and a
+         * client reading `SAASL_FAIL` would offer the user to wait and retry a
+         * password that will never verify. The registry has no code for "the
+         * credentials did not verify", so this one is `ERR_`-prefixed as ours. */
+        (void)reply_refused(s, c, "AUTHENTICATE", "ERR_AUTHENTICATIONFAILED", "464",
+                            NULL, 0, "SASL authentication failed: %s",
+                            no_store ? "this node holds no client credential store"
+                            : "the credentials did not verify");
         printf("[observable] sasl: fd=%d authcid=%s outcome=REJECTED reason=%s\n",
                c->fd, authcid, no_store ? "NO_STORE" : "BAD_CREDENTIAL");
         return;

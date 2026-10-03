@@ -487,3 +487,11 @@ irc_add_integration_test(test_account test_account.c)
 # test_nick_index.c makes for the nick enumeration. Phase 10.8b then adds the
 # wire-level case on top of it.
 irc_add_integration_test(test_fanout_gate test_fanout_gate.c)
+
+# 7/Phase 10.9: `standard-replies`, and the KICK reason bound `KICKLEN` was
+# waiting for. One file because the two halves of the commit are the same claim
+# about the same thing -- a refusal this node cannot represent must be REFUSED at
+# the boundary with a numeric a client already understands, and only four of this
+# node's numerics are ambiguous enough to be worth rendering as a `FAIL` for a
+# client that negotiated the capability.
+irc_add_integration_test(test_standard_replies test_standard_replies.c)
