@@ -172,6 +172,38 @@
  * rather than silently truncated (3.2's rule, applied to internal state). */
 #define CHAN_MAX_MODES 31
 
+/* A KICK `<reason>`, which RFC 1459 2.3.1 gives no length limit for.
+ *
+ * ADDED IN PHASE 10.9, and the reason it is here at all is that its ABSENCE was
+ * a reachable way to make a client command trip a counter reserved for bugs.
+ * `handle_kick()` used to take `<reason>` verbatim with no test, so an over-long
+ * one reached `fanout_deliver()` and then `message_format()`, which **refuses**
+ * a line it cannot represent rather than truncating it -- and the only available
+ * outcome there is a refusal counted on `n_reply_refused`, which `reply.c`
+ * documents as a bug report and not a metric. So a client could send
+ * `KICK #c nick :<9000 bytes>` and put a non-zero on a counter this project holds
+ * at zero. 005 could not advertise `KICKLEN` either, for the same reason: no
+ * number in the tree described the largest reason the node accepted. Phase 10.4
+ * named both as findings; this is the fix for both.
+ *
+ * WHY IT IS 255, and why it is a written literal. It equals CHAN_MAX_TOPIC,
+ * CONN_MAX_AWAY and CONN_MAX_REALNAME, so there is ONE bound for "a sentence a
+ * user typed" rather than four that differ for no stated reason -- the same
+ * convergence those three record for themselves. And it is written down rather
+ * than derived from a `sizeof(...)`, because 005 renders it with `IRC_STR()` and
+ * `#x` stringifies an argument's token SEQUENCE rather than evaluating it: a
+ * derived constant in that position renders as literal text containing spaces, a
+ * middle parameter holding a space is `unrepresentable`, and the consequence is
+ * that the ENTIRE `005` is refused and every connecting client gets no ISUPPORT
+ * at all. `CONN_MAX_REALNAME` carries a long note about that; the rule is the
+ * same one.
+ *
+ * IT IS A CAP, NOT A TRUNCATION POINT, for the reason the other three are. A
+ * KICK reason is shown to every member of the channel as though the kicker had
+ * written it, and a shortened one is a sentence nobody wrote. `handle_kick()`
+ * refuses with `417` and leaves the roster untouched. */
+#define CHAN_MAX_KICK_REASON 255
+
 /* 2.3: server_link_t::name is char[64], so a server name is at most this. */
 #define CHAN_MAX_SERVER 63
 

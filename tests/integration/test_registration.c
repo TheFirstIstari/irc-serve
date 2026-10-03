@@ -189,8 +189,8 @@ int main(void)
                  ":%s 004 alice %s %s i b,k,l,imnpst "
                  ":are supported by this server\r\n"
                  ":%s 005 alice NETWORK=irc-serve CHANTYPES=#& PREFIX=(ov)@+ "
-                 "CASEMAPPING=ascii AWAYLEN=255 CHANNELLEN=63 LINELEN=8192 "
-                 "MAXTARGETS=1 NAMELEN=255 NICKLEN=63 TOPICLEN=255 "
+                 "CASEMAPPING=ascii AWAYLEN=255 CHANNELLEN=63 KICKLEN=255 "
+                 "LINELEN=8192 MAXTARGETS=1 NAMELEN=255 NICKLEN=63 TOPICLEN=255 "
                  ":are supported by this server\r\n"
                  ":%s 372 alice :- irc-serve: a federation-native IRC node.\r\n"
                    ":%s 372 alice :- registration, channels, messaging and peer "
@@ -235,6 +235,7 @@ int main(void)
         static const char *const want_tokens[] = {
             " AWAYLEN=255 ",
             " CHANNELLEN=63 ",
+            " KICKLEN=255 ",
             " LINELEN=8192 ",
             " MAXTARGETS=1 ",
             " NAMELEN=255 ",
@@ -262,11 +263,22 @@ int main(void)
      * k_005[] in commands.c; what is asserted here is only that the names are not
      * on the wire.
      *
-     * KICKLEN IS IN THIS LIST AND NOT BY OMISSION, which is why it is worth a
-     * name of its own: handle_kick() takes <reason> verbatim with no length test,
-     * so no number in this tree describes the largest reason this node accepts.
-     * Advertising 255 because CHAN_MAX_TOPIC and CONN_MAX_AWAY happen to be 255
-     * would be a number about a limit nobody enforces.
+     * KICKLEN WAS IN THIS LIST AND IS NOT ANY MORE, which is the point of keeping
+     * the list beside the tokens. Phase 10.4 put it here because handle_kick() took
+     * <reason> verbatim with no length test, so no number in this tree described the
+     * largest reason this node accepts -- and because an over-long one then reached
+     * message_format(), which refuses rather than reshapes, so a client COMMAND
+     * could put a non-zero on n_reply_refused, the counter reply.c holds at zero
+     * because a non-zero value is a bug report. Phase 10.9 added
+     * CHAN_MAX_KICK_REASON, the 417 in handle_kick() and the token, and the token
+     * is now asserted ABOVE against the literal 255 -- which is the whole shape of
+     * the fix: a bound that exists and is enforced can be advertised, and one that
+     * exists and is NOT (USERLEN, below) still cannot.
+     *
+     * So the absence of " KICKLEN=" is no longer asserted, and adding it back would
+     * be a test that forbids the fix. What is asserted instead is the token's
+     * presence with its literal, so a node that dropped the bound again fails the
+     * positive assertion rather than quietly satisfying a negative one.
      *
      * BOT / EXTBAN / SAFELIST / MONITOR / WATCHNICK are the features; ACCEPT and
      * silence are the operator-model features, and this node has no operator
@@ -279,7 +291,7 @@ int main(void)
     {
         static const char *const absent[] = {
             " BOT=", " EXTBAN=", " SAFELIST", " MONITOR", " WATCHNICK",
-            " MSGREFTYPES=", " ACCEPT", " silence", " CHATHISTORY", " KICKLEN=",
+            " MSGREFTYPES=", " ACCEPT", " silence", " CHATHISTORY",
             " MODES=", " USERLEN="
         };
 

@@ -22,6 +22,7 @@
 #include <string.h>
 
 #include "core/message.h"
+#include "core/cap.h"
 
 /* ---------------------------------------------------------------------------
  * Refusals
@@ -240,6 +241,265 @@ int send_line_tagged(server_t *s, conn_t *dst, const char *prefix,
     /* The SAME door as send_line(), so the peer-target and CLOSING refusals and
      * the one queueing site are shared rather than restated. See the file header. */
     return emit_built_ex(s, dst, command, prefix, params, nparams, 0, tags);
+}
+
+/* ---------------------------------------------------------------------------
+ * standard-replies
+ * ---------------------------------------------------------------------------
+ * IRCv3 defines THREE commands -- `FAIL`, `WARN` and `NOTE` -- all with the same
+ * shape:
+ *
+ *     <type> <command> <code> [<context>...] :<description>
+ *
+ * and `ERROR` is NOT among them. It is a separate, older server command with no
+ * relation to this specification, and its absence here is a fact rather than a
+ * gap: the specification's introduction, its format section and its capabilities
+ * section name `FAIL`, `WARN` and `NOTE` and nothing else, and the draft's own
+ * history carried a fourth verb (`OK`) which was dropped before publication.
+ * Emitting `ERROR` under this capability would be putting a command word on the
+ * wire that no client negotiated this capability FOR.
+ *
+ * WHY ALL THREE ARE IMPLEMENTED WHEN ONLY `FAIL` HAS A PRODUCER. The three share
+ * one format and one code registry, so implementing one and writing two more
+ * later is exactly the kind of partial state that becomes an inconsistency, and
+ * the cost of the other two is this function with a different `type`. What is NOT
+ * done is inventing a producer: `WARN` is a non-fatal warning about a command and
+ * `NOTE` an informational message about one, and this node has no command that
+ * warns and none that notes. `cap.h` holds the same rule the capability table
+ * does -- the NAME is advertised because the capability is real, and the two
+ * commands without a producer are a named limit rather than a claim.
+ */
+
+/* The `<command>` field, which the specification makes REQUIRED: the command the
+ * reply relates to, or `*` when it was not spawned by one. `*` rather than an
+ * empty string and rather than this node's own name, because "not in the context
+ * of a client command" is a different statement from "in the context of no command
+ * in particular" and a client branching on the field can tell them apart. */
+#define STD_COMMAND_NONE "*"
+
+/* One emitter for all three types, and the ONLY place a standard-replies line is
+ * built. The refusals are reply()'s, in the same order and for the same reasons:
+ * a NULL destination, a peer link (3's federation invariant), a CLOSING target, a
+ * code that does not fit, and a description that does not fit REPLY_TEXT_MAX.
+ *
+ * `nctx` IS COUNTED AGAINST THE SAME 15-PARAMETER CAP AS reply()'s `nmid`, with
+ * the same arithmetic, because `<target> <command> <code>` has taken three slots
+ * before either the context parameters or the description do. The specification's
+ * `<context>` is optional and "not intended for end users, but for developers
+ * gathering more information", so the honest bound is the wire's and not a smaller
+ * invention. */
+int reply_std(server_t *s, conn_t *src, const char *type, const char *command,
+              const char *code, const char *const *ctx, size_t nctx, const char *fmt, ...)
+{
+    const char *params[IRC_MAX_PARAMS];
+    char text[REPLY_TEXT_MAX];
+    size_t n = 0;
+    size_t want;
+    va_list ap;
+    int written;
+
+    if (s == NULL || type == NULL || code == NULL || code[0] == '\0' ||
+        fmt == NULL) {
+        return refuse(s, src, type, "bad_args");
+    }
+    if (command == NULL || command[0] == '\0') {
+        command = STD_COMMAND_NONE;
+    }
+    /* target + <command> + <code> + contexts + description. */
+    want = nctx + 3u;
+    if (want > (size_t)REPLY_MAX_MID) {
+        return refuse(s, src, type, "too_many_params");
+    }
+
+    va_start(ap, fmt);
+    written = vsnprintf(text, sizeof text, fmt, ap);
+    va_end(ap);
+    if (written < 0 || (size_t)written >= sizeof text) {
+        return refuse(s, src, type, "text_too_long");
+    }
+
+    params[n++] = reply_target(src);
+    params[n++] = command;
+    params[n++] = code;
+    for (size_t i = 0; i < nctx; i++) {
+        if (ctx[i] == NULL) {
+            return refuse(s, src, type, "bad_param");
+        }
+        params[n++] = ctx[i];
+    }
+    params[n++] = text;
+
+    /* `emit_built()` rather than `emit_built_ex(..., 1, ...)`: the description is
+     * colonned whenever the formatter needs to, which is the RFC 1459 2.3.1 rule
+     * every other line here obeys. A `FAIL` whose description held a separator
+     * gets its colon from the same code that colons a `461`'s, so the two shapes
+     * agree about when a trailing parameter is marked rather than each having an
+     * opinion. */
+    return emit_built(s, src, type, NULL, params, (int)n);
+}
+
+/* The four numerics this node uses for MORE THAN ONE distinct refusal, and the
+ * `FAIL` code each becomes. This is the whole of the migration table and it is
+ * here rather than at the call sites for the reason this file is the one place a
+ * numeric is emitted: a mapping transcribed per handler is a mapping with forty
+ * copies to keep in step.
+ *
+ * THE RULE, in one sentence: a legacy numeric migrates where that numeric answers
+ * more than one question ON THIS NODE, so the number alone cannot tell a client
+ * which refusal happened.
+ *
+ *   417  PRIVMSG text too long | AWAY too long | SETNAME realname unacceptable |
+ *        KICK reason too long.  Four refusals, one number.
+ *   461  too few parameters AND too many -- and its text reads "Not enough
+ *        parameters" in the too-many case too, so the number is ambiguous AND the
+ *        text is wrong.  Two refusals, one number, one lie.
+ *   482  not a channel operator (KICK, MODE, INVITE) | not an IRC operator
+ *        (KNOCK) | the verb is disabled here (REGISTER, UNREGISTER).  Three
+ *        refusals, one number -- and the KNOCK one is the sharpest, because
+ *        "not a channel operator" and "not an IRC operator" differ by three
+ *        letters and mean entirely different things.
+ *   464  not an IRC operator | SASL authentication failed.  Two refusals, one
+ *        number.
+ *
+ * EVERY OTHER NUMERIC STAYS, and the reason is the same rule pointed the other
+ * way: `401`, `403`, `404`, `421`, `431`, `432`, `433`, `437`, `441`, `442`, `451`,
+ * `472` and the rest each answer exactly ONE question on this node, so the number
+ * is unambiguous, and replacing it would take away the name the client already
+ * handles in exchange for a line it must now learn. The specification's own
+ * introduction states the complaint this table answers -- "numerics themselves and
+ * the mapping of numerics to names can be unclear or conflicting" -- and these
+ * are the four where this node's own use makes them unclear.
+ *
+ * ON THE CODES. The specification says "implementers MUST use an existing code if
+ * one is already defined", and the IRCv3 reply-code registry holds
+ * `NEED_MORE_PARAMS` and `INVALID_PARAMS`. The rest of this table uses an `ERR_`
+ * prefix, which is this node's marker for "a code that is ours and is not in the
+ * registry" -- so a client switching on an unregistered code and an unregistered
+ * code this node made up are never confused for one another.
+ * `ERR_CHANOPRIVSNEEDED` and `ERR_NOPRIVILEGES` are RFC 1459/2812's own names for
+ * 482 and 464, carried over because the numbers they replace were named after
+ * them. */
+typedef struct {
+    const char *numeric;   /* the legacy code, as a caller writes it */
+    const char *fail_code; /* what it becomes for a negotiating client */
+} std_fail_map_t;
+
+static const std_fail_map_t k_std_fail_map[] = {
+    { "417", "ERR_INPUTTOOLONG" },
+    { "461", "NEED_MORE_PARAMS" },
+    { "482", "ERR_CHANOPRIVSNEEDED" },
+    { "464", "ERR_NOPRIVILEGES" }
+};
+
+/* The `FAIL` code for `numeric`, or NULL when this node does not migrate it.
+ *
+ * An `override` wins over the table, and that is the whole reason it exists: each
+ * numeric that answers several questions needs a DIFFERENT code per answer, and
+ * the table can hold only one. A caller that means "too many parameters" passes
+ * `TOO_MANY_PARAMS`; a caller that means "your realname held a byte this node will
+ * not store" passes `ERR_INVALID_PARAM`. A caller that means nothing in
+ * particular -- the overwhelming majority -- passes NULL and gets the table's
+ * answer. */
+static const char *std_fail_code(const char *numeric, const char *override)
+{
+    if (override != NULL && override[0] != '\0') {
+        return override;
+    }
+    if (numeric == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < sizeof k_std_fail_map / sizeof k_std_fail_map[0]; i++) {
+        if (strcmp(k_std_fail_map[i].numeric, numeric) == 0) {
+            return k_std_fail_map[i].fail_code;
+        }
+    }
+    return NULL;
+}
+
+int reply_refused(server_t *s, conn_t *src, const char *command, const char *fail_code,
+                  const char *legacy, const char *const *mid, size_t nmid,
+                  const char *fmt, ...)
+{
+    va_list ap;
+    char text[REPLY_TEXT_MAX];
+    const char *code;
+    int written;
+    int rc;
+
+    /* THE WHOLE OF THIS FUNCTION IS ONE QUESTION, and it is asked before anything
+     * else so that a caller cannot get it wrong by ordering: has this client
+     * negotiated `standard-replies`?
+     *
+     * NO -- `reply()` with the legacy numeric, `mid`, `nmid` and the caller's own
+     * format string. Byte-identical to what the caller would have got by calling
+     * `reply()`. That is the guarantee, and it is STRUCTURAL rather than a matter
+     * of each call site being careful: there is exactly one branch and it is the
+     * old call, so there is nothing to be careful about.
+     *
+     * YES -- `reply_std()` with `FAIL`, the caller's command word, the mapped code,
+     * the SAME `mid` list as the `<context>` parameters and the same text as the
+     * `<description>`. The middle parameters carry over unchanged because they name
+     * the thing the refusal is about (a channel, a nickname) and that is exactly
+     * what `<context>` is for.
+     *
+     * A NULL `fail_code` AND an unmapped `legacy` falls through to `reply()` too,
+     * so this function is SAFE at any call site including one whose numeric this
+     * node does not migrate. That is deliberate: a handler should be able to reach
+     * for the one refusal entry point without first consulting a list that lives
+     * in another file, and a caller that means to migrate and mistypes the numeric
+     * gets the legacy answer rather than a `FAIL` carrying a code nobody can act
+     * on.
+     *
+     * `code` HOLDS THE MAPPED ANSWER AND IS WHAT IS PASSED ON, which sounds like
+     * stating the obvious and was the second version of this function's bug: it
+     * called std_fail_code() to DECIDE whether to migrate and then passed
+     * `fail_code` -- the caller's OVERRIDE, which is NULL at every site that wanted
+     * the table's answer -- straight to reply_std(). reply_std() then refused the
+     * line with `bad_args`, which is its refusal for an empty code, and the client
+     * got NOTHING: no 417, no `FAIL`, and a `reply_refused:` line on the node's own
+     * output for a refusal that had an answer. `test_standard_replies.c` caught it
+     * as a timeout waiting for `FAIL AWAY ERR_INPUTTOOLONG` on a connection that
+     * had negotiated the capability and was owed one. Resolving the code once, into
+     * a name, is what makes the mapping and the emission impossible to disagree.
+     *
+     * THE TEXT IS RENDERED ONCE, AT THE TOP, AND BOTH BRANCHES ARE HANDED IT WITH
+     * `"%s"`. That is not an optimisation and it is not tidiness -- it is the only
+     * way a variadic wrapper can work, and the wrong version of it is a defect this
+     * project has now had once: an earlier version of this function passed the
+     * caller's `fmt` straight through as the ARGUMENT of a literal `"%s"`, which
+     * drops the caller's own arguments and puts the format string itself on the
+     * wire. `test_choper` caught it as `:irc.test 464 * :SASL authentication
+     * failed: %s` -- a refusal that had lost the one word which said whether the
+     * store was missing or the password was wrong. `va_list` cannot be forwarded
+     * to another variadic function in this dialect, so rendering once and handing
+     * the result over is the fix rather than a workaround, and it also guarantees
+     * the two renderings are the same STRING, which is the property
+     * "byte-identical for a client that negotiated nothing" is about.
+     */
+    if (s == NULL || legacy == NULL || legacy[0] == '\0' || fmt == NULL) {
+        return refuse(s, src, legacy, "bad_args");
+    }
+
+    va_start(ap, fmt);
+    written = vsnprintf(text, sizeof text, fmt, ap);
+    va_end(ap);
+    if (written < 0 || (size_t)written >= sizeof text) {
+        /* The same refusal reply() raises for the same text, and for the same
+         * reason: 3.2 forbids delivering a silently shortened parameter. */
+        return refuse(s, src, legacy, "text_too_long");
+    }
+
+    code = std_fail_code(legacy, fail_code);
+    if (cap_standard_replies_enabled(src) == 0 || code == NULL) {
+        return reply(s, src, legacy, mid, nmid, "%s", text);
+    }
+
+    rc = reply_std(s, src, "FAIL", command, code, mid, nmid, "%s", text);
+    /* reply_std()'s outcome is the CALLER's. A `FAIL` that would not render is a
+     * refusal counted on n_reply_refused exactly as a numeric's would be, and
+     * returning REPLY_OK after one would make this wrapper the one place on the
+     * reply path that can fail without saying so. */
+    return rc;
 }
 
 /* ---------------------------------------------------------------------------

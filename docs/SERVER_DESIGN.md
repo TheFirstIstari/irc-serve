@@ -1529,6 +1529,7 @@ a feature on and then behaves as though the node agreed. That is the same rule
 | `CASEMAPPING` | `ascii` | `message.c`'s `up()` and `fanout.c`'s `ascii_lower()` are ASCII-only. True, and the rfc1459 alternative is priced below |
 | `AWAYLEN` | `255` | `CONN_MAX_AWAY`; an over-long AWAY is **refused** with `417`, not truncated |
 | `CHANNELLEN` | `63` | `CHAN_MAX_NAME`; `chan_name_valid()` refuses anything longer |
+| `KICKLEN` | `255` | `CHAN_MAX_KICK_REASON`; an over-long KICK `<reason>` is **refused** with `417`. Added in Phase 10.9 — see §4.4.4 |
 | `LINELEN` | `8192` | `IRC_MAX_LINE`; `conn_fill()`'s read cap and `message_parse_n()`'s on-wire cap |
 | `MAXTARGETS` | `1` | `MSG_MAX_TARGETS` in `msg_verbs.h`, which is the arity check `send_message()` applies — RFC 2812 3.3.1 gives PRIVMSG exactly one `<msgtarget>` and no message verb here parses a list |
 | `NAMELEN` | `255` | `CONN_MAX_REALNAME`; the value bound of `conn_t::realname`. **Mandatory** for a node advertising IRCv3's `setname`, so it is stated whether or not that command is present |
@@ -1584,17 +1585,22 @@ named at `k_005[]` with its reason. In summary:
 
 **Two findings, reported rather than answered.**
 
-1. **`KICKLEN` is omitted because no bound exists.** `handle_kick()` takes
-   `<reason>` verbatim with no length test, so no number in this tree describes the
-   largest reason the node accepts. Writing `255` because `CHAN_MAX_TOPIC` and
-   `CONN_MAX_AWAY` happen to be 255 would advertise a limit nothing enforces. The
-   consequence is worse than an absent token and is worth naming: an over-long KICK
-   reason reaches `fanout_deliver()` and then `message_format()`, which **refuses
-   it as `unrepresentable`** — a refusal on `n_reply_refused`, the counter
-   `reply.c` holds at zero because a non-zero value of it is a bug report. So the
-   missing bound is a reachable way to make a client command trip that counter.
-   Fixing it means adding a KICK reason bound and a `417`, which is a change to
-   `handle_kick()` and outside Phase 10.4.
+1. ~~**`KICKLEN` is omitted because no bound exists.**~~ **CLOSED IN PHASE 10.9.**
+   The original finding, kept because the shape of it is the argument for the whole
+   list: `handle_kick()` took `<reason>` verbatim with no length test, so no number in
+   this tree described the largest reason the node accepts, and writing `255`
+   because `CHAN_MAX_TOPIC` and `CONN_MAX_AWAY` happen to be 255 would have
+   advertised a limit nothing enforces. The consequence was worse than an absent
+   token: an over-long KICK reason reached `fanout_deliver()` and then
+   `message_format()`, which **refused it as `unrepresentable`** — a refusal on
+   `n_reply_refused`, the counter `reply.c` holds at zero because a non-zero value of
+   it is a bug report. So the missing bound was a reachable way to make a **client
+   command** trip a counter reserved for bugs.
+
+   `CHAN_MAX_KICK_REASON` (255) now bounds it, `handle_kick()` answers `417`, and
+   `KICKLEN` is advertised. §4.4.4 has the bound and the boundary. The finding is
+   struck rather than deleted because a list of absences is only trustworthy if the
+   ones that used to be on it are visibly gone.
 2. **`USERLEN` is omitted although a bound exists**, because that bound is not
    *enforced*: `USER`'s ident is truncated into `conn_t::user` rather than
    refused, so `USERLEN=` would promise a limit the node does not apply to the one
@@ -1608,7 +1614,104 @@ the token would mean making the mode letters constants and threading them throug
 the mode evaluator — a change to what a mode *is* in this tree, made for the sake
 of one string. It is named here as a finding rather than done quietly.
 
-#### 4.4.3 `userhost-in-names`, and the disclosure it makes
+#### 4.4.3 `standard-replies`, and the four numerics this node got wrong
+
+Phase 10.9 adds IRCv3's `standard-replies`: `FAIL <command> <code> [<context>...]
+:description`, plus `WARN` and `NOTE`, rendered **only for a client that negotiated
+the capability**. A client that negotiated nothing receives the legacy numeric,
+byte-for-byte, and that is the guarantee this section is mostly about.
+
+**`ERROR` IS NOT ONE OF THE THREE, and that is a fact rather than a gap.** The
+specification's introduction, its format section and its capabilities section name
+`FAIL`, `WARN` and `NOTE` and nothing else; the draft's own history carried a fourth
+verb (`OK`) which was dropped before publication. `ERROR` is a separate, older server
+command with no relation to this specification, so emitting it under this capability
+would be putting a command word on the wire that no client negotiated the capability
+**for**. `WARN` and `NOTE` have **no producer on this node** — it has no command that
+warns and none that notes — and their absence is a named limit, not a claim.
+
+**THE LINE, IN ONE SENTENCE: a legacy numeric migrates where that numeric answers
+more than one question ON THIS NODE**, so the number alone cannot tell a client which
+refusal happened.
+
+| Numeric | The questions it answers here | Becomes |
+|---|---|---|
+| `417` `ERR_INPUTTOOLONG` | `PRIVMSG` text, `AWAY` message, `SETNAME` realname (length **and** bad byte), `KICK` reason — **four** | `ERR_INPUTTOOLONG` / `ERR_INVALID_PARAM` |
+| `461` `ERR_NEEDMOREPARAMS` | too few **and** too many — and its text reads "Not enough parameters" in the too-many case too | `NEED_MORE_PARAMS` / `TOO_MANY_PARAMS` / `INVALID_PARAMS` |
+| `482` `ERR_CHANOPRIVSNEEDED` | not a channel operator (`KICK`, `MODE`, `INVITE`), not an IRC operator (`KNOCK`), the verb is disabled (`REGISTER`) — **three** | `ERR_CHANOPRIVSNEEDED` / `ERR_NOPRIVILEGES` / `ERR_ACCOUNTREGISTRATIONDISABLED` |
+| `464` `ERR_NOPRIVILEGES` | not an IRC operator (`CHOPER`), SASL authentication failed (`AUTHENTICATE`) | `ERR_NOPRIVILEGES` / `INVALID_AUTHENTICATE` / `ERR_AUTHENTICATIONFAILED` |
+
+**EVERY OTHER NUMERIC STAYS**, and the reason is the same rule pointed the other way:
+`401`, `403`, `404`, `421`, `431`, `432`, `433`, `437`, `441`, `442`, `451`, `472`
+and the rest each answer exactly **one** question on this node, so the number is
+unambiguous and replacing it would take away the name the client already handles in
+exchange for a line it must now learn. The specification's own introduction states
+the complaint this table answers — *"numerics themselves and the mapping of numerics
+to names can be unclear or conflicting"* — and these four are where this node's own
+use makes them unclear. `test_standard_replies.c` asserts both halves: the four, and
+`401` and `451` reaching a negotiating client **unchanged**, because a migration of
+every numeric would pass every other case in that file.
+
+**THE COST, and who pays it.** After this, `417`, `461`, `482` and `464` stop
+reaching a client that negotiated `standard-replies`. A client that pattern-matches
+`417` for "line too long" must read `FAIL <cmd> ERR_INPUTTOOLONG` instead. That is a
+real cost and it is the price of the ambiguity being fixed. **No client that
+connected to an earlier build is affected**, because the capability did not exist to
+negotiate — the change is unreachable from any pre-existing client, which is also
+why the legacy rendering is left byte-identical rather than tidied.
+
+**AND THE TENSION WITH THE SPECIFICATION'S OWN SENTENCE, recorded rather than
+glossed:** it says servers "SHOULD NOT replace standardised error numerics with
+standard replies, unless the replacement is explicitly described by some other
+specification", and all four of these are standardised by RFC 1459/2812. Three
+things make the partial migration defensible here, and none of them is that the
+sentence is wrong:
+
+- the exception's **purpose** is served. The introduction's complaint is precisely
+  that these mappings are unclear, and on this node they are. A node with one 482
+  meaning three unrelated things has the defect the sentence is aimed at.
+- the replacement is **per destination**, so nothing is taken away from anybody who
+  did not ask for it — which the sentence's own framing ("to a client which supports
+  this capability") presupposes.
+- `setname` is the one case the exception covers **outright**, because its own
+  specification names the replacement. §4.2.1's silence for a client that did not
+  negotiate is *unchanged* and no longer justified by the capability's absence: the
+  specification asks for silence there, and a `FAIL` is a response.
+
+**WHERE IT LIVES, and why that is the only defensible place.** `reply.c` is already
+"the ONE place a numeric is emitted", and the migration is one table plus one branch
+there. `reply_refused()` renders the text **once** and hands it to whichever shape was
+chosen, so the legacy and `FAIL` renderings are guaranteed to be the same string; and
+a `legacy` this node does not migrate takes the legacy branch, which makes the
+function safe at any call site rather than only at the 39 that are on the list.
+
+#### 4.4.4 `KICKLEN`, and the bound it names
+
+`CHAN_MAX_KICK_REASON` is 255, beside `CHAN_MAX_TOPIC`, `CONN_MAX_AWAY` and
+`CONN_MAX_REALNAME` — **one bound for "a sentence a user typed"** rather than four
+that differ for no stated reason. It is a **written literal** rather than a
+`sizeof(...)` because 005 renders it through `IRC_STR()` and `#x` stringifies an
+argument's token sequence rather than evaluating it: a derived constant in that
+position renders as text containing spaces, a middle parameter holding a space is
+`unrepresentable`, and the consequence is that the **entire `005` is refused** and
+every connecting client gets no ISUPPORT at all. `CONN_MAX_REALNAME` carries the
+long note; the rule is the same one.
+
+It is a **cap, not a truncation point**, for the reason the other three are: a KICK
+reason is shown to every member of the channel as though the kicker had written it.
+`handle_kick()` refuses with `417` and leaves the roster untouched, and the bound is
+checked **immediately after the arity test** rather than near the send, because a
+command carrying a parameter the node will not accept is malformed whatever the
+sender's standing on the channel.
+
+The interesting assertion is not the 417 but the absence of a `reply_refused:` line on
+the node's own output — because with no bound the reason reaches `message_format()`,
+which refuses rather than reshapes, and the only outcome at that depth is a refusal
+counted on a counter `reply.c` holds at zero. `test_standard_replies.c` asserts the
+absence, so a node that dropped the bound again fails on the **defect** rather than on
+a symptom.
+
+#### 4.4.5 `userhost-in-names`, and the disclosure it makes
 
 Phase 10.5 lets a `353` roster carry `nick!user@host` instead of a bare nickname.
 
@@ -2219,20 +2322,47 @@ Single node:
       reason. `test_registration.c` now holds the whole `005` byte-for-byte against
       **literals** — not against the constants, which would follow them and never
       notice that `005` was left behind — plus each token individually and the
-      list of tokens that must be absent. `KICKLEN` is absent because no bound
-      exists; §4.4.2 names the cost of that gap, which is a reachable
-      `n_reply_refused`.
+      list of tokens that must be absent. **`KICKLEN` was on that absent list and is
+      not any more**: Phase 10.9 added the bound it was waiting for (§4.4.4), and with
+      it the token. `USERLEN` is the remaining omission that has a bound behind it and
+      no way to advertise one, which is what keeps the list from being empty.
 - [ ] `005` advertises `PREFIX=(ov)@+`, `CHANTYPES=#&` — **and every roster a
       client is shown is the roster THAT client asked for.** Phase 10.5 added
       `userhost-in-names`, and its obligation is not "draw a hostmask" but "draw
       one for the client that negotiated it and a bare nickname for the client that
-      did not, on the same channel, at the same time" (§4.4.3). That is a
+      did not, on the same channel, at the same time" (§4.4.5). That is a
       **disclosure** capability — it hands every member's ident and host to every
       other member — so the per-destination decision is the security-relevant part,
       not a rendering detail.
       `tests/integration/test_userhost_in_names.c` runs three connections against
       one channel and one member: two that negotiated and one that did not, and the
       bare-nick answer is asserted on a connection that has seen nothing else.
+- [x] *Phase 10.9:* **the four ambiguous refusals are `FAIL`s for a client that
+      asked, and byte-identical numerics for one that did not.** §4.4.3. The line is
+      one sentence — a legacy numeric migrates where it answers more than one
+      question on this node — and it names exactly four: `417` (four refusals),
+      `461` (too few **and** too many, with a text that calls both "not enough"),
+      `482` (three refusals, two of which differ by three letters and mean unrelated
+      things) and `464` (an operator refusal and a credential failure). Every other
+      numeric answers exactly one question and is untouched, which
+      `test_standard_replies.c` asserts on `401` and `451` as well as on the four: a
+      migration of everything would pass every other case in that file.
+      The guarantee is **structural** — `reply_refused()` has one branch and it is
+      the old `reply()` call — and the text is rendered once and handed to whichever
+      shape was chosen, so the two renderings are the same string by construction.
+      The cost is stated where it is paid: those four numbers stop reaching a
+      negotiating client, and nothing that connected to an earlier build is affected
+      because the capability did not exist to negotiate.
+- [x] *Phase 10.9:* **`KICKLEN` is advertised because a bound now exists.**
+      `CHAN_MAX_KICK_REASON` (255) and a `417` in `handle_kick()`, checked immediately
+      after the arity test. The defect this closes was not a wrong token: an over-long
+      reason reached `message_format()`, which **refuses** rather than reshapes, so a
+      client **command** was a reachable way to put a non-zero on `n_reply_refused` —
+      the counter `reply.c` holds at zero because a non-zero value is a bug report.
+      `test_standard_replies.c` asserts the 417, the boundary from both sides, the
+      ` KICKLEN=255 ` token, that the member was **not** removed, and **that no
+      `reply_refused:` line was printed** — so a node that dropped the bound again
+      fails on the defect rather than on a symptom.
 - [x] *Phase 10.8a:* **the routing module can express all THREE per-destination
       outcomes**, and does so in one place. §3.1.1: a plain shape, an alternate
       shape, and **nothing at all** for a destination the caller declines to
@@ -2440,4 +2570,6 @@ Quality:
 | **`SETNAME` silently ignoring a client that did not negotiate** (Phase 10.6) | read as "the command does not exist" by a client that tried it anyway, which `setname` explicitly permits | **It is the specification's instruction**, and it is implemented rather than worked around: no reply, no change. A `FAIL SETNAME CANNOT_CHANGE_REALNAME` needs `standard-replies`, which this node does not have, and inventing a `FAIL` would put a command word on the wire no client here has been told to expect. The test asserts **exhaustively** — the drain `PONG` must be the only line in the window — because a list of absent numerics is not a test of silence (a `482` fault passed the first version of it) |
 | **A message delivered twice to a client that negotiated `echo-message`** (Phase 10.7) | every message the user sends appears twice, from two different-looking prefixes — the defect the capability exists to remove, arrived at from the other side | **There is no second emission.** The capability decides one thing: whether the sender stays in the audience of the delivery that is happening anyway (`msg_verbs.c`'s `exclude`). The sender of a channel `PRIVMSG` was *already* in the audience, so the copy is that one; only `NOTICE`, which RFC 1459 2.4.2 removes, is affected. `test_echo_message.c` **counts** copies rather than searching for them — the two copies are identical apart from the prefix, so a substring assertion passes — and one of its faults adds exactly the extra emission |
 | **An unsolicited notification reaching a client that did not ask** (Phase 10.8a) | the notification is an ASSERTION about a user — their realname changed, their ident and host changed, they are away or no longer away — so sending it to a client that did not negotiate is as wrong as not sending it to one that did. `away-notify` is the sharp case: the line's whole grammar is `:nick!user@host AWAY [:message]`, so a "notification" with no message asserts the user is no longer away | **There is ONE per-destination gate, inside the one walk that decides who gets what (§3.1.1), and it is the absence of a line rather than a third shape.** A gate that returned a third *shape* would still have sent a line, and an empty one reads as "no longer away". The three-handler alternative was rejected for the same reason `fanout.c` exists: `chan_verbs.c`'s own broadcast helper lost a forward arm that way in Phase 4. `test_fanout_gate.c` asserts **zero queued bytes** for the refused member rather than the absence of a needle, because absence-from-a-buffer is satisfied by a line that arrived elsewhere in the stream |
-| **`KICKLEN` has no bound to advertise** (Phase 10.4) | an over-long KICK reason is not refused with a numeric; it reaches `message_format()`, which refuses it as `unrepresentable` — a non-zero `n_reply_refused`, the counter `reply.c` holds at zero because a non-zero value of it is a bug report | **Reported, not fixed, and the reason is scope.** The fix is a reason bound plus a `417` in `handle_kick()`, which is a change to a command this pass did not touch. §4.4.2 states it; the honest mitigation today is that the node logs `reply_refused ... reason=unrepresentable` naming the command, so the condition is visible rather than silent |
+| **`FAIL` reaching a client that did not negotiate `standard-replies`** (Phase 10.9) | `FAIL` is a command word no such client has ever been told to expect and RFC 1459 2.3 parses it as an unknown command — so the migration would break exactly the clients it was supposed to leave alone, and the breakage is a client that stops rendering errors rather than one that fails loudly | **The branch is `reply.c`'s, and there is exactly one of them.** `reply_refused()` asks `cap_standard_replies_enabled(src)` before it does anything else; a client that did not negotiate reaches `reply()` with the legacy numeric, the same middle parameters and the same text, and the two renderings are the same string because the format is rendered ONCE and handed to whichever branch was chosen. `test_standard_replies.c` runs every case on two connections differing in exactly that one negotiation and asserts **both** answers byte-for-byte, plus the absence of `FAIL`, `WARN` and `NOTE` and a line COUNT for the window — a list of absent numerics would pass a fault that answered with a number nobody thought of |
+| **A legacy numeric migrated for a client that did not ask** (Phase 10.9) | the client loses the numeric it was matching on, and the four that stop arriving are four that clients most often match | **The migration is per destination and the legacy rendering is byte-identical**, and no client that connected to an earlier build can be affected because the capability did not exist to negotiate. The list is four numerics and not thirty, and the rule that chose them is a property of THIS NODE (one number, several questions) rather than a preference: `test_standard_replies.c` asserts `401` and `451` still arrive at a negotiating client unchanged, so the list cannot grow by accident |
+| ~~**`KICKLEN` has no bound to advertise**~~ (Phase 10.4) | an over-long KICK reason is not refused with a numeric; it reaches `message_format()`, which refuses it as `unrepresentable` — a non-zero `n_reply_refused`, the counter `reply.c` holds at zero because a non-zero value of it is a bug report | **RESOLVED in Phase 10.9, and by adding the bound rather than by muting the symptom.** `CHAN_MAX_KICK_REASON` (255) refuses it with `417` before anything is applied, and `KICKLEN` is advertised from the same constant (§4.4.4). The refusal leaves the roster untouched, so a node that answered 417 *after* removing the member — which both 417 assertions would have passed — is caught by a PRIVMSG from the kicked connection arriving as a delivery rather than a 404 |

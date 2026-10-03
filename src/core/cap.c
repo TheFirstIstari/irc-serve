@@ -38,7 +38,8 @@ enum {
     CAPBIT_EXTENDED_JOIN = 1u << 6,
     CAPBIT_USERHOST_IN_NAMES = 1u << 7,
     CAPBIT_SETNAME = 1u << 8,
-    CAPBIT_ECHO_MESSAGE = 1u << 9
+    CAPBIT_ECHO_MESSAGE = 1u << 9,
+    CAPBIT_STANDARD_REPLIES = 1u << 10
 };
 
 /* THE BIT ORDER IS FIXED AND THE TABLE BELOW IS THE CLAIM.
@@ -70,7 +71,8 @@ static const cap_def_t k_caps[] = {
     { CAP_EXTENDED_JOIN, CAPBIT_EXTENDED_JOIN },
     { CAP_USERHOST_IN_NAMES, CAPBIT_USERHOST_IN_NAMES },
     { CAP_SETNAME, CAPBIT_SETNAME },
-    { CAP_ECHO_MESSAGE, CAPBIT_ECHO_MESSAGE }
+    { CAP_ECHO_MESSAGE, CAPBIT_ECHO_MESSAGE },
+    { CAP_STANDARD_REPLIES, CAPBIT_STANDARD_REPLIES }
 };
 
 static const size_t k_ncaps = sizeof k_caps / sizeof k_caps[0];
@@ -334,6 +336,27 @@ int cap_setname_enabled(const conn_t *c)
 int cap_echo_message_enabled(const conn_t *c)
 {
     return cap_enabled(c, CAP_ECHO_MESSAGE);
+}
+
+/* standard-replies: ONE GATE, AND IT IS THE ONLY ONE THAT CHANGES A SHAPE A
+ * CLIENT CAN ALREADY PARSE.
+ *
+ * Every other capability in this file decides what this node DRAWS -- an extra
+ * parameter on a JOIN, a tag block, a sigil run, a roster entry. This one decides
+ * whether a refusal arrives as `417` or as `FAIL KICK ERR_INPUTTOOLONG`, which is
+ * a different message with a different command word. That is why the gate is
+ * asked in `reply.c` rather than at a handler: the reply path is the one place
+ * that says what an outbound message to a client MAY BE, and a capability that
+ * could be honoured or ignored per handler would be honoured on one path and
+ * forgotten on the next.
+ *
+ * ONE GATE AND NO AVAILABILITY CHECK, for the reason `extended-join` gives: what
+ * there is to say is not a property of an operator file. Every refusal on this
+ * node has something truthful to render, and `FAIL` is a rendering of the same
+ * refusal rather than a new one. */
+int cap_standard_replies_enabled(const conn_t *c)
+{
+    return cap_enabled(c, CAP_STANDARD_REPLIES);
 }
 
 /* --------------------------------------------------------------------------
