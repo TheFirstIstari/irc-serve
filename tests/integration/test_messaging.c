@@ -51,9 +51,9 @@
  * precisely the reason a window is better than a wait.
  *
  * The scoping is not decoration. tc_expect() searches the whole accumulated
- * buffer, so a second ` 461 alice :Not enough parameters` would match the FIRST
- * one and return instantly, and the wait covering the command under test would
- * never happen. That is a test that passes against a node which stopped
+ * buffer, so a second ` 461 alice PRIVMSG :Not enough parameters` would match the
+ * FIRST one and return instantly, and the wait covering the command under test
+ * would never happen. That is a test that passes against a node which stopped
  * answering after the first case. Here the search is always over the span the
  * command could have answered in, and the drain token is unique per call.
  *

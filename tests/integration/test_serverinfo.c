@@ -542,13 +542,23 @@ int main(void)
     /* 6a: "channel modes evaluated here: +b ... every other letter is refused
      * with 472 rather than silently ignored". MODE +k is a letter this node does
      * not evaluate, so it must be 472 -- and 472 is not in 4.4's list either,
-     * which is the same class of gap as 402 and 371. */
+     * which is the same class of gap as 402 and 371.
+     *
+     * `k` IS THE MIDDLE FIELD AND `#INFO` IS IN THE TEXT, which is RFC 2812 5.2's
+     * field list for 472: "<client> <char> :is unknown mode char to me for
+     * <channel>". It used to be the other way round -- the middle parameter was the
+     * channel and no character was named -- so a client parsing 472 by position
+     * read `#INFO` as the rejected mode character. test_channels.c carries the
+     * positional version of this same assertion, which is what says the character
+     * is a FIELD rather than a coincidence of this line; this case is here because
+     * 4.4's INFO promises 472 and the promise has to be checked where it is made. */
     client_join(&alice, "#INFO");
     from = mark(&alice);
     TF_CHECK_MSG(tc_send(&alice.c, "MODE #INFO +k somekey") == 0, "tc_send failed");
     end = mark(&alice);
     expect_in_window(&alice, from, end, "the 472 INFO promises",
-                     ":" BIN_NAME " 472 alice #INFO :Unknown mode character\r\n");
+                     ":" BIN_NAME " 472 alice k :is unknown mode char to me for "
+                     "channel #INFO\r\n");
     /* 6b: "Unknown verbs are 421." A verb this build has never heard of must be
      * 421, and 421's middle parameter names the verb, so a client can see which
      * word it did not recognise. */
