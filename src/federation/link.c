@@ -2514,13 +2514,55 @@ void fed_tick(server_t *s, uint64_t now_ms)
 
         case (int)HANDSHAKE_SENT:
             /* --- T2: the handshake never answered ----------------------- */
+            /* AND THE OTHER WAY IT IS NEVER ANSWERED, which is the same defect
+             * T4a above finds on an established link and which cost this test
+             * eleven seconds.
+             *
+             * T2's own question is "has the peer had g_hs_ms to answer?". The
+             * answer is also NO -- for ever -- when the socket this attempt was
+             * made on is gone: fed_link_promote() queued the FEDERATE and the peer
+             * will never see it, because there is no socket left to carry it. And
+             * the socket can be gone: a nonblocking connect() that completes into
+             * a peer that has already gone reports writable with SO_ERROR still
+             * reading zero (server_dial() says so where it declines to probe
+             * SO_ERROR at connect time), the descriptor is registered as a live
+             * connection, and the write of the claim that follows either fails
+             * into a socket the kernel has already reset or succeeds into a buffer
+             * nobody will ever read. Either way the exchange cannot complete, and
+             * T2 waits out the whole IRC_FED_HS_TIMEOUT_MS before admitting it.
+             *
+             * SO THE SOCKET IS CHECKED, and it is checked with the same identity
+             * test T4a uses rather than by descriptor number, because a reaped
+             * descriptor is a number the very next accept() can hand to something
+             * else entirely. On the wire this is a twelve-second partition on a
+             * link that was already dead, followed by a retry budget spent
+             * rediscovering a message that had arrived and been discarded.
+             *
+             * AND IT IS ONLY ASKED OF A LINK THAT WAS DIALLING. link->fd is
+             * stamped by fed_link_established() and by fed_link_promote() and by
+             * nothing else, so a link that is HANDSHAKE_SENT because an INBOUND
+             * FEDERATE arrived -- fed_claim_accepted() runs handshake_send() and
+             * fed_link_set_state() on the way to fed_link_established() -- has
+             * fd == -1 for the whole of the exchange while holding a perfectly
+             * live conn_t. Reading fd == -1 there as "the socket is gone" would
+             * tear down every inbound handshake in flight on its first tick,
+             * which is why this is gated on fd >= 0 rather than written as
+             * c == NULL. The accepting side's own liveness is T2's clock, which
+             * is already the next line. */
             if (link->created_ms != 0u &&
-                (uint64_t)(now_ms - link->created_ms) >= g_hs_ms) {
+                ((uint64_t)(now_ms - link->created_ms) >= g_hs_ms ||
+                 (link->fd >= 0 &&
+                  (c == NULL || fed_link_of_conn(s, c) != link)))) {
                 (void)handshake_timeout(&link->hs);
                 fed_link_set_state(link);
                 s->n_fed_hs_timeout++;
-                printf("[observable] link_timeout: peer=%s state=TIMED_OUT\n",
-                       link->name);
+                printf("[observable] link_timeout: peer=%s state=TIMED_OUT "
+                       "cause=%s\n",
+                       link->name,
+                       (link->fd >= 0 &&
+                        (c == NULL || fed_link_of_conn(s, c) != link))
+                           ? "SOCKET_GONE"
+                           : "NO_ANSWER");
                 /* T2 ARMS THE SCHEDULE AND TAKES THE LINK BACK TO INIT, and
                  * both halves were corrections rather than new behaviour. Phase 6
                  * left TIMED_OUT terminal on the reasoning that a handshake which
@@ -2555,6 +2597,69 @@ void fed_tick(server_t *s, uint64_t now_ms)
             break;
 
         case (int)ESTABLISHED:
+            /* --- T4a: a route with no socket -------------------------- */
+            /* THE ARM T4 DOES NOT COVER, and it is the one that decides whether a
+             * partitioned mesh can heal itself.
+             *
+             * T4 below asks whether the PEER has stopped talking.  It cannot see
+             * the other way round, and that is the direction that matters here: a
+             * link is ESTABLISHED, its name is claimed, and the descriptor it is
+             * ESTABLISHED ON IS GONE.
+             *
+             * HOW A LINK GETS INTO THAT STATE. server_reap() is the one place a
+             * descriptor is closed, and it closes it when the conn_t is reaped --
+             * on an EOF, on a read error, on a reset.  Nothing on that path tells
+             * the federation module, so link->fd keeps naming a descriptor the
+             * node no longer owns and link->state stays ESTABLISHED.  Until T4
+             * eventually fires, this node is running on the belief that it has a
+             * live route to a peer whose socket it closed itself.
+             *
+             * WHY THAT IS NOT COSMETIC. fed_check_federate() refuses a second
+             * claim on a name with FED_DUPLICATE_LINK when some link is
+             * ESTABLISHED, and that refusal is correct for a link that HAS a
+             * socket.  It is wrong for one that does not: the peer on the far
+             * side has, quite correctly, already declared its own side dead and is
+             * dialling again -- that is what T4 is FOR -- and it is told the name
+             * is in use by a route that is not there.  The re-dial then sits in
+             * HANDSHAKE_SENT until IRC_FED_HS_TIMEOUT_MS expires, T2 arms the
+             * ladder, and the peer spends a second attempt rediscovering a message
+             * that had already arrived.  Under the shipped 5 s handshake timeout
+             * that is a five-second partition on a link whose socket died; with
+             * this test's 12 s one it is twelve.
+             *
+             * SO THE LINK IS TAKEN DOWN HERE, by the same path T4 uses, at the
+             * moment the socket is found to be gone rather than up to one dead
+             * interval later.  fed_dead() is the right function for it and not a
+             * near miss: this link WAS a route (it is in this arm), so the
+             * announcement fed_link_down() makes is the same true statement, and
+             * the arm it stamps is the same one a peer that went quiet would
+             * stamp.
+             *
+             * THE IDENTITY CHECK IS THE PART THAT IS NOT DEFENSIVE PADDING, and
+             * fd reuse is why.  server_reap() closes the descriptor, and the very
+             * next accept() can hand the same NUMBER to an unrelated connection --
+             * a client, or the peer's own re-dial.  s->by_fd[link->fd] is then a
+             * live conn_t that has nothing to do with this link, and a bare
+             * "is there a conn on link->fd" test would report a healthy link as
+             * socket-less and take down a route that is up.  fed_link_of_conn()
+             * answers the question that is actually being asked -- IS THIS
+             * CONNECTION THIS LINK -- and it is the same function the dialling
+             * side already finds its link with. */
+            {
+                conn_t *own = (c != NULL && fed_link_of_conn(s, c) == link)
+                                  ? c
+                                  : NULL;
+
+                if (own == NULL) {
+                    fed_dead(s, link, NULL, now_ms);
+                    break;
+                }
+                /* The descriptor this link is ESTABLISHED on is a different
+                 * connection's, so the link is down even though by_fd has
+                 * something on the number. */
+                c = own;
+            }
+
             /* --- T3: keepalive, then T4: dead ------------------------- */
             /* Both tests are on this link's own stamps, and both are
              * subtractions: 3.4's clock is monotonic, and a subtraction is the
