@@ -41,6 +41,7 @@ build:
 test: build
 	cd $(BUILD_DIR) && $(CTEST) --output-on-failure --timeout $(CTEST_TIMEOUT) | tee ctest-make.log
 	./scripts/check-skips.sh -b $(BUILD_DIR) $(BUILD_DIR)/ctest-make.log
+	./scripts/check-attribution.sh
 
 # `benchmark` mirrors CI job `ci_benchmark`.
 benchmark:

@@ -504,6 +504,60 @@ static void cap_reply(server_t *s, conn_t *c, const char *sub, const char *args)
  * capabilities must be refused, not allocated for. */
 
 
+/* Append one capability name to an accumulator, and return how much was WRITTEN.
+ *
+ * WHY THIS EXISTS. All three CAP ACK/NAK arms used to read
+ *
+ *     rn += (size_t)snprintf(buf + rn, sizeof buf - rn, "%s%s", sep, name);
+ *
+ * and `snprintf` returns the length it WOULD have written, not the length it did.
+ * So on truncation `rn` jumps past the end of `buf`, the next iteration computes
+ * `sizeof buf - rn` on an already-underflowed size_t, and the arm writes outside
+ * the buffer. That is the shape of the Phase-8 stack overflow -- a remotely
+ * reachable CAP REQ overflowing a stack array -- which was fixed by DERIVING
+ * CAP_LS_MAX so the arithmetic could not exceed the buffer.
+ *
+ * The derivation makes it safe TODAY and that is the whole problem: it is safe by
+ * 17 bytes of headroom (1039 bytes of names against CAP_LS_MAX = 1056), and
+ * nothing at the call site says so. A later CAP_NAME_MAX, a later CAP_MAX_REQ, or
+ * a separator added to the format string reopens it silently, and CodeQL flags
+ * exactly these three lines for that reason.
+ *
+ * So the accumulator advances by what was WRITTEN, which is `cap` - 1 - remaining,
+ * and a truncation is reported rather than absorbed. The bound is unchanged and no
+ * name is dropped: CAP_LS_MAX is derived to hold CAP_MAX_REQ names of CAP_NAME_MAX
+ * plus their separators, so this function's truncation arm is unreachable for a
+ * conforming cap_split() and exists so that a future change to the derivation
+ * fails loudly here instead of quietly in a client's face.
+ *
+ * The separator is written only when the buffer is non-empty, and the empty case
+ * is a genuine 0 return rather than an assumed one -- so `rn` and `nwritten`
+ * cannot disagree about where the buffer ends. */
+static size_t cap_append_name(char *buf, size_t cap, size_t off, const char *name)
+{
+    const char *sep = (off != 0u) ? " " : "";
+    int n;
+
+    if (buf == NULL || name == NULL || off >= cap) {
+        return 0u;
+    }
+    n = snprintf(buf + off, cap - off, "%s%s", sep, name);
+    if (n < 0) {
+        /* Encoding error, which cannot happen for these two arguments but is
+         * reported rather than assumed: the alternative is a caller advancing by
+         * a negative-turned-huge size_t. */
+        buf[off] = '\0';
+        return 0u;
+    }
+    if ((size_t)n >= cap - off) {
+        /* Truncated. The text that WAS written is capped and NUL-terminated by
+         * snprintf, and the caller is told the true written length so the next
+         * append cannot start inside the NUL. */
+        return cap - off - 1u;
+    }
+    return (size_t)n;
+}
+
 static int cap_split(char *arg, char out[][CAP_NAME_MAX + 1], int max)
 {
     int n = 0;
@@ -650,8 +704,7 @@ static void cap_do_req(server_t *s, conn_t *c, const message_t *m)
         const int have = cap_available(s, names[i]);
 
         if (known == 0 || have == 0) {
-            rn += (size_t)snprintf(refused + rn, sizeof refused - rn, "%s%s",
-                                   (rn != 0u) ? " " : "", names[i]);
+            rn += cap_append_name(refused, sizeof refused, rn, names[i]);
             continue;
         }
         /* ENABLE IT. A capability is granted by writing the bit here and nowhere
@@ -662,8 +715,7 @@ static void cap_do_req(server_t *s, conn_t *c, const message_t *m)
                 break;
             }
         }
-        gn += (size_t)snprintf(granted + gn, sizeof granted - gn, "%s%s",
-                               (gn != 0u) ? " " : "", names[i]);
+        gn += cap_append_name(granted, sizeof granted, gn, names[i]);
     }
 
     /* ACK first, then NAK, and only for the non-empty halves. A client waits
@@ -709,8 +761,7 @@ static void cap_do_del(server_t *s, conn_t *c, const message_t *m)
             /* Nothing here is ever disabled, so EVERY requested name is refused
              * -- including one this node never had. Claiming to know a
              * capability is a smaller lie than claiming to have disabled one. */
-            rn += (size_t)snprintf(refused + rn, sizeof refused - rn, "%s%s",
-                                   (rn != 0u) ? " " : "", names[i]);
+            rn += cap_append_name(refused, sizeof refused, rn, names[i]);
         }
     }
     cap_reply(s, c, "NAK", refused);

@@ -53,3 +53,4 @@ ctest --test-dir build --output-on-failure --timeout "${CTEST_TIMEOUT}" -j "${CT
 # before Phase 9, and docs/SERVER_DESIGN.md 6.4 gives the argument. See
 # docs/DEVELOPMENT.md, "The skip gate is a ratchet".
 ./scripts/check-skips.sh -b build "${CTEST_LOG}"
+./scripts/check-attribution.sh

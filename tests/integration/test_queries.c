@@ -759,13 +759,42 @@ int main(void)
         size_t n;
         size_t chunks;
 
-        n = (size_t)snprintf(many, sizeof many, "ISON");
-        for (i = 0; i < 7u; i++) {
-            n += (size_t)snprintf(many + n, sizeof many - n, " carol");
-        }
-        for (i = 0; i < 7u; i++) {
-            n += (size_t)snprintf(many + n, sizeof many - n, " bob");
-        }
+        /* 74 bytes of text into a 512-byte buffer, so this cannot overflow
+          * as written -- and that is the problem with leaving it: the count 7
+          * is two lines above the buffer size 512, nothing ties them together,
+          * and `n += snprintf(...)` advances by the length snprintf WOULD have
+          * written, so raising either number reopens it with nothing failing
+          * to compile.
+          *
+          * The check before the loop is the bound that makes the relationship
+          * machine-checked rather than arithmetic someone has to redo. The
+          * per-append checks keep `many + n` a valid address for the next
+          * append: snprintf documents n < size on success. */
+            const size_t n_names = 7u;
+            size_t k;
+            size_t need = strlen("ISON");
+
+            for (k = 0; k < n_names; k++) {
+                need += strlen(" carol");
+            }
+            for (k = 0; k < n_names; k++) {
+                need += strlen(" bob");
+            }
+            TF_CHECK_MSG(need + 1u <= sizeof many,
+                         "the ISON line needs %zu bytes and the buffer holds %zu,"
+                         " so this case would assert on a truncated request",
+                         need + 1u, sizeof many);
+
+            n = (size_t)snprintf(many, sizeof many, "ISON");
+            TF_CHECK_MSG(n < sizeof many, "the ISON prefix did not fit");
+            for (k = 0; k < n_names; k++) {
+                n += (size_t)snprintf(many + n, sizeof many - n, " carol");
+                TF_CHECK_MSG(n < sizeof many, "carol %zu overflowed the buffer", k);
+            }
+            for (k = 0; k < n_names; k++) {
+                n += (size_t)snprintf(many + n, sizeof many - n, " bob");
+                TF_CHECK_MSG(n < sizeof many, "bob %zu overflowed the buffer", k);
+            }
         from = open_window(&alice);
         TF_CHECK_MSG(tc_send(&alice.c, many) == 0, "tc_send failed");
         end = drain(&alice);
