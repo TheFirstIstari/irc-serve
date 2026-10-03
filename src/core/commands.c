@@ -643,12 +643,107 @@ static void handle_nick(server_t *s, conn_t *c, const message_t *m)
  *
  * The assertion is not thrown away silently -- it goes to the observable
  * output, so a mismatch between what a client claims and where it connected from
- * is visible when diagnosing something -- but it is not identity. */
+ * is visible when diagnosing something -- but it is not identity.
+ *
+ * ---------------------------------------------------------------------------
+ * A SECOND `USER` IS REFUSED: 462, AND THE IDENT IS NOT WRITTEN
+ * ---------------------------------------------------------------------------
+ * `USER` is `pre_reg` in k_commands[] because CAP, SASL, NICK, USER, PING, PONG
+ * and QUIT are the seven verbs a client may send BEFORE it has registered. That
+ * is a statement about what may arrive FIRST, and it is not a statement about
+ * what may arrive again: the dispatch table's registration gate is
+ *
+ *     if (!commands_registered(c) && (cmd == NULL || cmd->pre_reg == 0))
+ *
+ * which a REGISTERED connection passes for every row including `pre_reg`, so
+ * this handler used to run for a second `USER` on a live connection and wrote
+ * `conn_t::user` unconditionally. A client could therefore move its own ident
+ * with no line to itself and no line to anybody sharing a channel.
+ *
+ * THE THREAT MODEL, and the part of it that is not the obvious one. Three
+ * candidate harms, and only two are real:
+ *
+ *   NOT IMIMPERSONATION, and the reason is worth stating because it is the
+ *   answer that makes "just refuse it" feel arbitrary otherwise. Nothing on
+ *   this node is GRANTED to an ident. No privilege, no account and no access
+ *   decision reads `c->user` alone -- `account-logged-in` and every operator
+ *   check are keyed on other things, and the ident is client-asserted and
+ *   UNVERIFIED at registration, so two users may already hold the same one and
+ *   a client could equally have REGISTERED with the ident it now moves to. There
+ *   is no identity here to impersonate.
+ *
+ *   YES, A CHANNEL BAN MASK. This is the part that makes the write a defect
+ *   rather than a shrug. `chan_banned()` is called on every JOIN and matches a
+ *   stored mask against the NICK, against the HOST, and against the COMPOSITE
+ *   `nick!user@host` -- and the suite exercises exactly that composite form
+ *   (`MODE #mo +b *!*@127.0.0.1`, refused with 474). A mask of the shape
+ *   `mallory!*@*` or `mallory!badident@*` can only match through the composite,
+ *   so on this node a client that changes its ident, PARTs and re-JOINs is
+ *   ADMITTED to a channel it is banned from. That is an access-control bypass
+ *   reachable from a single client command, and it is why the answer is not (b)
+ *   "accept but notify": a notification does not stop the rejoin.
+ *
+ *   YES, THE SILENCE ITSELF, to two audiences. Every roster this node draws --
+ *   311, 352, 353, the message prefix, 302 -- then reports an ident nobody was
+ *   told about, so a `userhost-in-names` client (Phase 10.5) is shown a hostmask
+ *   that changed without a word. And `resume.c` REQUIRES (nick, ident, host) to
+ *   all match to resume, so the write silently invalidates the client's own
+ *   session record. On a mesh the peer's roster keeps the old ident until the
+ *   next SBURST, because nothing tells it.
+ *
+ * WHY 462, AND IT IS NOT A CHOICE. RFC 2812 3.1.3 lists the numeric replies to
+ * `USER` as exactly two -- `ERR_NEEDMOREPARAMS` and `ERR_ALREADYREGISTRED` -- and
+ * the numeric's own entry in RFC 2812 9 names the case: "user details from second
+ * USER message". So a second `USER` is 462 because the RFC says so, not because
+ * 462 is the nearest available complaint. (Design 9's risk row previously recorded
+ * the opposite -- that refusing "is a behaviour change to an RFC 1459 MUST command
+ * with nothing in the RFC requiring it" -- and that was wrong: it had read RFC
+ * 1459, whose `USER` section says nothing about a second one, and not RFC 2812
+ * 3.1.3. The finding the row was built on is correct; the reason it did not act
+ * on it was not.)
+ *
+ * WHY 462 IS NOT MIGRATED, which looks inconsistent beside the four numerics
+ * 4.4.3 does migrate: those four answer MORE THAN ONE QUESTION on this node, so
+ * the number alone cannot say which refusal happened. `462` answers exactly one
+ * -- "you are already registered" -- so by the rule it stays legacy, and
+ * reply_refused()'s NULL code is what selects that branch. A client that
+ * negotiated `standard-replies` gets the 462; it is unambiguous.
+ *
+ * THE GATE IS `commands_registered()`, NOT "HAS SEEN A `USER` BEFORE", and the
+ * difference is the whole of the compatibility cost. A client that sends `USER`
+ * twice BEFORE completing registration still works, last-one-wins, because it is
+ * pre-registration in the sense every other gate in this file means. What is
+ * refused is the write to a connection that has already been told `001`, which
+ * is where the hole was.
+ *
+ * THE GATE IS BEFORE THE ARITY TEST, and this is the one place it differs from
+ * handle_setname()'s order, deliberately: the arity complaint is a fact about the
+ * MESSAGE and the registration state is a fact about the CONNECTION, and for a
+ * registered connection the message cannot be processed at all. Answering `461
+ * Not enough parameters` to a client that sent the very same four parameters a
+ * moment ago and was answered `001` would be a numeric describing a problem the
+ * client does not have.
+ *
+ * WHAT IT COSTS, honestly. A client that re-sends `USER` after registration gets
+ * one numeric it did not ask for and keeps its connection, its nickname, its
+ * channels and its realname -- the refusal does not close anything. The only
+ * thing taken away is the ability to move its own ident, which is the defect. The
+ * ident a client wants is the one it should have sent at registration, where it
+ * can still be refused (417/empty) rather than silently truncated. */
 static void handle_user(server_t *s, conn_t *c, const message_t *m)
 {
     int trunc_user = 0;
     int trunc_real = 0;
     conn_realname_verdict_t v;
+
+    if (commands_registered(c)) {
+        (void)reply_refused(s, c, "USER", NULL, "462", NULL, 0,
+                            "Unauthorized command (already registered)");
+        printf("[observable] user_refused: fd=%d nick=%s reason=ALREADY_REGISTERED "
+               "nparams=%d\n",
+               c->fd, c->nick, m->nparams);
+        return;
+    }
 
     if (m->nparams < 4) {
         (void)reply_refused(s, c, "USER", NULL, "461", NULL, 0,

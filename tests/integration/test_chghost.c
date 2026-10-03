@@ -16,19 +16,47 @@
  *   2. THE EVENT. Can a username or host change at all after registration? For the
  *      HOST: no -- `describe_peer()` at accept is its only writer, and
  *      `resume.c` *requires* (nick, ident, host) to match to resume, so a resume
- *      refuses rather than applying a new identity. For the IDENT: **yes**, and
- *      this is the finding. `handle_user()` writes `conn_t::user` unconditionally,
- *      and `USER` is a pre-registration verb that the dispatch table still routes
- *      for a REGISTERED connection, so a client may re-send `USER` and change its
- *      own ident at will.
- *   3. THE NOTIFICATION. Nothing tells anybody. The re-sent `USER` produces no
- *      server-to-client line, and no other client's view of the roster changes --
- *      which is exactly the gap `chghost` exists to close.
+ *      refuses rather than applying a new identity. For the IDENT: **no either**,
+ *      and getting there is what Phase 10.10 did. `handle_user()` used to write
+ *      `conn_t::user` unconditionally, and `USER` is a pre-registration verb that
+ *      the dispatch table still routed for a REGISTERED connection, so a client
+ *      could re-send `USER` and change its own ident at will with no line to
+ *      anyone. That hole is CLOSED: a second `USER` is `462` and the write does
+ *      not happen.
+ *   3. THE NOTIFICATION. Nothing tells anybody, because nothing happens. The
+ *      re-sent `USER` produces no state change, so there is nothing for a
+ *      `CHGHOST` to report.
  *
- * So the capability is NOT advertised, and the reason is not the tidy one. It is
- * not "nothing on this node can change" -- an ident CAN change. It is that the one
- * thing which changes is not supposed to be able to, which is a defect recorded
- * below rather than a feature to notify about.
+ * So the capability is NOT advertised, and after Phase 10.10 the reason is the
+ * tidy one Phase 10.8 could not reach: **nothing this node shows a third party
+ * about a user can change.** A host is fixed at accept(); an ident is fixed at
+ * registration and a second `USER` is `462`; a realname moves only through
+ * `SETNAME`, which is Phase 10.6's own notification.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT CHANGED IN PHASE 10.10, AND WHY INVERTING THE CASE WAS RIGHT
+ * ---------------------------------------------------------------------------
+ * Case 3 below USED TO assert the hole: that the ident changed, and that a
+ * **zero line count** on a second connection's socket while it did. That was a
+ * change-detection test for an open defect, written so a future phase would have
+ * something to remove rather than a claim to re-derive -- and Phase 10.10 is
+ * that future phase. It was **inverted, not deleted**: the case still runs the
+ * same sequence, still asserts the same zero-line count for the same reason, and
+ * now requires the ident to be UNCHANGED, the sender to be refused `462`, and the
+ * node's own output to record a refusal rather than a write.
+ *
+ * Two of those three new assertions are the load-bearing ones, and neither
+ * existed before:
+ *
+ *   - the 462 has to be the RFC's OWN numeric. RFC 2812 3.1.3 lists
+ *     `ERR_ALREADYREGISTRED` among `USER`'s replies and RFC 2812 9 names the
+ *     case ("user details from second USER message"), so a node answering
+ *     something else would be answering a question the RFC already answered.
+ *   - the refusal must be **per destination**: a client that negotiated
+ *     `standard-replies` must still receive the byte-identical `462`, because
+ *     4.4.3's rule migrates a numeric only where it answers more than one
+ *     question on this node and 462 answers exactly one. A node that migrated it
+ *     would have taken away the number a client already handles for no gain.
  *
  * ---------------------------------------------------------------------------
  * WHAT IS DELIBERATELY NOT HERE
@@ -39,11 +67,12 @@
  * have something to report would be inventing a spoofing surface to satisfy a
  * specification, which is worse than the absence.
  *
- * **The `USER`-after-registration hole is REPORTED, not closed.** Refusing a second
- * `USER` is a behaviour change to an RFC 1459 MUST command with nothing in the RFC
- * requiring it, so it is not this file's decision to take. What this file does is
- * make the hole **provable**, so a future phase that closes it has a test to remove
- * rather than a claim to re-derive.
+ * **The pre-registration double `USER` still works**, and that is not an
+ * oversight: the gate is `commands_registered()`, so a client that sends `USER`
+ * twice before it has been answered `001` is registering, and last-one-wins is
+ * what every client library expects. Case 4 asserts it, because "the second USER
+ * is refused" and "the second USER is honoured" are both true on this node and
+ * only the boundary between them is the fix.
  *
  * NO FIXED sleep() ANYWHERE (6.3): every wait is tc_expect()'s deadline loop and
  * every window is closed by a PING whose PONG is the drain token, numbered per
@@ -244,10 +273,13 @@ static void case_no_verb(void)
 }
 
 /* ---------------------------------------------------------------------------
- * 3. THE EVENT: THE HOST CANNOT MOVE, AND THE IDENT CAN
+ * 3. THE EVENT: NEITHER THE HOST NOR THE IDENT CAN MOVE
  * ---------------------------------------------------------------------------
  * Both halves, on the wire, and both from a SECOND client's view -- which is the
- * view `chghost` exists to inform. */
+ * view `chghost` exists to inform. This case is the INVERTION of Phase 10.8's:
+ * it runs the identical sequence and asserts that the ident did NOT move, that
+ * the sender was told, and that nothing at all was said to anybody else.
+ */
 static void case_the_event(void)
 {
     nf_node_t node;
@@ -272,71 +304,219 @@ static void case_the_event(void)
     TF_CHECK_MSG(tc_expect(&bob, ":" SRV " 311 bob alice alice " OBSERVED_HOST
                            " * :Real alice\r\n",
                            T_IO_MS) == 0,
-                 "the 311 does not carry the OBSERVED host. USER sent "
-                 "*spoofed.example as its third parameter and it must not appear "
-                 "here: a host a client asserts is a host it chose.\n  bob saw: %s",
-                 tc_buffer(&bob));
+                  "the 311 does not carry the OBSERVED host. USER sent "
+                  "*spoofed.example as its third parameter and it must not appear "
+                  "here: a host a client asserts is a host it chose.\n  bob saw: %s",
+                  tc_buffer(&bob));
     drain(&bob);
 
     /* ---- THE IDENT. `USER` is a pre-registration verb, and the dispatch table
-     * still routes it for a REGISTERED connection, so this is accepted -- and
-     * `handle_user()` writes `conn_t::user` unconditionally. ----
+     * routes it for a REGISTERED connection too -- which is the whole of how the
+     * hole was reachable. It is now refused, and refused with the RFC's own
+     * numeric. ----
      *
-     * THE ASSERTION IS TWO-SIDED AND BOTH SIDES MATTER. That the ident changed is
-     * the finding; that NOTHING was said about it is the reason the capability
-     * cannot be advertised. A test that asserted only the change would pass on a
-     * node that notified everybody, which is a different deliverable entirely. */
+     * THE ASSERTION IS TWO-SIDED AND BOTH SIDES MATTER. That the ident is
+     * UNCHANGED is the fix; that the client is TOLD is what makes it a refusal
+     * rather than a drop. A test that asserted only the silence would pass on a
+     * node that simply ignored the command, and a node that ignored it is a
+     * different defect: RFC 2812 3.1.3 names 462 as one of `USER`'s two numeric
+     * replies, so silence would be a node declining to answer a question the RFC
+     * answers. */
     (void)snprintf(line, sizeof line, "USER mallory 0 *spoofed.example :Real alice");
     mark_a = tc_received(&alice);
     mark_b = tc_received(&bob);
     TF_CHECK_MSG(tc_send(&alice, line) == 0, "the re-sent USER failed to send");
 
     /* BOB'S WINDOW IS CHECKED FIRST AND HE HAS SENT NOTHING, and that ordering IS
-     * the assertion. Bob is idle on the socket while alice changes her ident, so
-     * every byte he receives in this window arrived because of the change -- which
+     * the assertion. Bob is idle on the socket while alice sends a second USER, so
+     * every byte he receives in this window arrived because of the command -- which
      * makes "zero lines" a statement about the NOTIFICATION rather than about the
      * read schedule. Bob negotiated `standard-replies`, so even the notification
      * family this node does implement would have reached him, and nothing did. */
-    expect_only_replies(&bob, mark_b, "bob while alice's ident changed", 0u);
+    expect_only_replies(&bob, mark_b, "bob while alice's second USER was refused", 0u);
     TF_CHECK_MSG(strstr(tc_buffer(&bob) + mark_b, "CHGHOST") == NULL,
                  "a CHGHOST line reached bob. This node emits none -- there is no "
                  "emitter for it anywhere in src/ -- so if this fires the node has "
                  "grown a verb whose trigger it does not otherwise have.\n"
                  "  bob saw: %s", tc_buffer(&bob) + mark_b);
 
-    /* And the re-sent USER answers NOTHING at all -- not a numeric, not a
-     * server-to-client line. `USER`'s confirmation is its absence, where
-     * `setname`'s is a line, so a client gets silence either way. */
-    expect_only_replies(&alice, mark_a, "re-sent USER", 0u);
+    /* AND THE SENDER IS TOLD, exactly once, with 462 and not with a `FAIL` --
+     * because alice negotiated nothing, so 4.4.3's one question puts her on the
+     * legacy branch. The COUNT is what makes this a refusal and not a flood. */
+    TF_CHECK_MSG(tc_expect(&alice, ":" SRV " 462 alice :Unauthorized command "
+                           "(already registered)\r\n", T_IO_MS) == 0,
+                 "the second USER was not refused with 462. RFC 2812 3.1.3 lists "
+                 "ERR_ALREADYREGISTRED among USER's numeric replies and RFC 2812 9 "
+                 "names the case -- \"user details from second USER message\" -- so "
+                 "this node's answer should be the RFC's own numeric and not silence "
+                 "and not a number of its own.\n  alice saw: %s", tc_buffer(&alice));
+    expect_only_replies(&alice, mark_a, "second USER", 1u);
+    TF_CHECK_MSG(strstr(tc_buffer(&alice) + mark_a, "FAIL") == NULL,
+                 "a FAIL reached a client that negotiated nothing. 462 answers "
+                 "exactly one question on this node -- \"you are already "
+                 "registered\" -- so 4.4.3's migration rule keeps it legacy, and "
+                 "FAIL is a command word no such client was ever told to expect.\n"
+                 "  alice saw: %s", tc_buffer(&alice) + mark_a);
 
-    /* NOW the change is visible -- but only to somebody who goes and looks. Bob
-     * asks, and the 311 carries the new ident. */
+    /* NOW ask again -- and the ident is STILL the one the client sent at
+     * registration. This is the assertion that is the inverse of the old one: it
+     * used to read `mallory` here and carried a comment saying that if it ever
+     * started failing, the hole had been closed. It has been closed, so the
+     * expectation is `alice` and the comment above is what a reader needs. */
     mark_b = tc_received(&bob);
     TF_CHECK_MSG(tc_send(&bob, "WHOIS alice") == 0, "bob WHOIS send failed");
-    TF_CHECK_MSG(tc_expect(&bob, ":" SRV " 311 bob alice mallory " OBSERVED_HOST
+    TF_CHECK_MSG(tc_expect(&bob, ":" SRV " 311 bob alice alice " OBSERVED_HOST
                            " * :Real alice\r\n", T_IO_MS) == 0,
-                 "the ident did NOT change after a re-sent USER. That would be the "
-                 "other honest answer -- `USER` refused once registered -- and it is "
-                 "NOT what this node does: `handle_user()` writes `conn_t::user` "
-                 "unconditionally and `USER` is `pre_reg`, so the dispatch table "
-                 "routes it for a registered connection. If this assertion starts "
-                 "failing, the hole was closed and §9's risk row is stale.\n"
-                 "  bob saw: %s", tc_buffer(&bob));
+                  "the ident CHANGED after a second USER. `handle_user()` refuses a "
+                  "second USER once `commands_registered(c)` and returns before the "
+                  "write to `conn_t::user`, so the ident a client shows every roster "
+                  "on this node is the one it sent at registration and cannot be "
+                  "moved afterwards.\n  bob saw: %s", tc_buffer(&bob));
     /* 312, 317 and 318 follow it: a `WHOIS` is four lines and this node says so. */
     expect_only_replies(&bob, mark_b, "bob's WHOIS of alice", 4u);
 
-    /* AND THE NODE SAID NOTHING ABOUT IT EITHER, which is the half an operator
-     * would want. `handle_user()` prints its `user:` line, so the change IS
-     * visible on the node's own output -- the point is that it is a LOG LINE and
-     * not a notification to a client. */
-    TF_CHECK_MSG(strstr(node.out, "user=mallory") != NULL,
-                 "the node's own output does not record the ident change either, so "
-                 "the hole would be invisible from both sides. `handle_user()` prints "
-                 "a `user:` line for every USER it accepts.\n  node output:\n%s",
-                 node.out);
+    /* AND THE NODE'S OWN OUTPUT RECORDS A REFUSAL, NOT A WRITE. The old case
+     * asserted `user=mallory` was present -- that was the hole being provable from
+     * the operator's side. The inversion is that the refusal is there and the
+     * write is NOT, because a node that logged `user=mallory` while refusing would
+     * be telling an operator something that did not happen. */
+    TF_CHECK_MSG(strstr(node.out, "reason=ALREADY_REGISTERED") != NULL,
+                 "the node's own output does not record the refusal. "
+                 "`handle_user()` prints a `user_refused:` line with "
+                 "reason=ALREADY_REGISTERED, so a log reader can see that a client "
+                 "tried and was stopped.\n  node output:\n%s", node.out);
+    TF_CHECK_MSG(strstr(node.out, "user=mallory") == NULL,
+                 "the node logged `user=mallory`, so the ident was WRITTEN as well as "
+                 "refused. The gate returns before `copy_field()`, so a node that "
+                 "both refuses and writes is a node whose log lies to the operator "
+                 "reading it.\n  node output:\n%s", node.out);
 
     tc_close(&alice);
     tc_close(&bob);
+    TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
+    nf_free(&node);
+}
+
+/* ---------------------------------------------------------------------------
+ * 4. THE SAME REFUSAL FOR A CLIENT THAT NEGOTIATED `standard-replies`
+ * ---------------------------------------------------------------------------
+ * This case exists because the refusal is per DESTINATION, and the per-destination
+ * half is where a migration decision shows up on the wire.
+ *
+ * 4.4.3's rule: a legacy numeric migrates where it answers MORE THAN ONE question
+ * on this node, so the number alone cannot tell a client which refusal happened.
+ * `462` answers exactly one -- "you are already registered" -- so it does NOT
+ * migrate, and a client that negotiated the capability gets the byte-identical
+ * legacy numeric rather than a `FAIL USER ...`. That is a deliberate choice and
+ * the cost is named: a client matching on 462 keeps working, and a client that
+ * would have preferred a code has not been given one it needed.
+ *
+ * The negative half matters as much as the positive: a `FAIL` reaching carol would
+ * be a command word she was never told to expect, and RFC 1459 2.3 parses it as an
+ * unknown command -- which is exactly the breakage 4.4.3's per-destination branch
+ * exists to avoid. */
+static void case_462_is_per_destination(void)
+{
+    nf_node_t node;
+    test_client_t carol;
+    size_t mark;
+
+    TF_CHECK_MSG(nf_spawn_binary(&node) == 0, "could not spawn the node");
+
+    tc_init(&carol);
+    register_caps(&carol, node.port, "carol", CAP_STANDARD_REPLIES);
+
+    mark = tc_received(&carol);
+    TF_CHECK_MSG(tc_send(&carol, "USER mallory 0 *spoofed.example :Real carol") == 0,
+                 "carol's second USER failed to send");
+    TF_CHECK_MSG(tc_expect(&carol, ":" SRV " 462 carol :Unauthorized command "
+                           "(already registered)\r\n", T_IO_MS) == 0,
+                 "carol -- who DID negotiate standard-replies -- did not get the "
+                 "legacy 462. 462 answers exactly one question on this node, so "
+                 "4.4.3's rule leaves it unmigrated and she must receive it "
+                 "byte-identically.\n  carol saw: %s", tc_buffer(&carol));
+    expect_only_replies(&carol, mark, "second USER by a standard-replies client", 1u);
+    TF_CHECK_MSG(strstr(tc_buffer(&carol) + mark, "FAIL") == NULL,
+                 "a FAIL USER reached a client that negotiated standard-replies, so "
+                 "462 has been migrated. That is a change to the numeric a client "
+                 "already handles, taken for no gain: the number was unambiguous.\n"
+                 "  carol saw: %s", tc_buffer(&carol) + mark);
+
+    tc_close(&carol);
+    TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
+    nf_free(&node);
+}
+
+/* ---------------------------------------------------------------------------
+ * 5. THE BOUNDARY: A SECOND `USER` BEFORE REGISTRATION IS STILL HONOURED
+ * ---------------------------------------------------------------------------
+ * The fix is the gate `commands_registered(c)`, not "has this connection ever seen
+ * a `USER`". This case pins the other side of that gate, and it is the compatibility
+ * half of the change: a client that sends `USER` twice while still registering
+ * (holding a CAP negotiation open, or simply correcting a typo in its own ident)
+ * must still work, last-one-wins.
+ *
+ * IT IS ALSO THE CASE THAT MAKES THE GATE'S SHAPE DEFENSIBLE rather than merely
+ * strict. A node that refused every second `USER` would strand the half-registered
+ * client §4.2.1's realname argument is about -- the one that cannot recover except
+ * by reconnecting -- over a value it could have simply corrected. Refusing only
+ * after `001` costs nothing and strands nobody.
+ *
+ * `CAP REQ` with no capability is a NAK, which keeps the negotiation OPEN (this
+ * node's CAP END gate holds registration until END), so the two USERs really do
+ * arrive while `commands_registered(c)` is false. The `001` is then read for its
+ * hostmask, which is the only place the surviving ident is visible on the wire. */
+static void case_second_user_before_registration(void)
+{
+    nf_node_t node;
+    test_client_t c;
+
+    TF_CHECK_MSG(nf_spawn_binary(&node) == 0, "could not spawn the node");
+
+    tc_init(&c);
+    TF_CHECK_MSG(tc_connect(&c, node.port) == 0, "tc_connect failed");
+    /* A NAK keeps CAP negotiation open, so registration is still HELD here --
+     * commands.c's reg_held path -- which is the state this case needs.
+     *
+     * `account-tag` is the capability asked for because it is the one this node
+     * NAKs on a DEFAULT configuration: cap.c's account_possible() withholds it
+     * when no account registry was loaded, and nf_spawn_binary() loads none. An
+     * ACK would also have held registration open (the gate is `cap_negotiating`,
+     * not the verdict), so this is about the refusal being the one a default node
+     * gives rather than about the mechanism. */
+    TF_CHECK_MSG(tc_send(&c, "CAP REQ :" CAP_ACCOUNT_TAG) == 0,
+                 "CAP REQ send failed");
+    TF_CHECK_MSG(tc_expect(&c, " CAP * NAK :" CAP_ACCOUNT_TAG "\r\n", T_IO_MS) == 0,
+                 "CAP REQ was not NAKed, so this case would be asserting about a "
+                 "node whose negotiation state it did not arrange.\n  saw: %s",
+                 tc_buffer(&c));
+    TF_CHECK_MSG(tc_send(&c, "USER first 0 *spoofed.example :First") == 0,
+                 "first USER failed to send");
+    TF_CHECK_MSG(tc_send(&c, "USER second 0 *spoofed.example :Second") == 0,
+                 "second USER failed to send");
+    TF_CHECK_MSG(tc_send(&c, "NICK preuser") == 0, "NICK send failed");
+    /* Registration is still held, so there is no 001 yet and NO 462 -- which is
+     * itself the assertion: the refusal must not fire for a connection this node
+     * has not registered. */
+    TF_CHECK_MSG(tc_send(&c, "CAP END") == 0, "CAP END send failed");
+    TF_CHECK_MSG(tc_expect(&c, "001 preuser :Welcome to the irc-serve network "
+                           "preuser!second@" OBSERVED_HOST "\r\n", T_IO_MS) == 0,
+                 "a client that sent USER twice while still negotiating CAP did not "
+                 "register with the SECOND ident. The gate is "
+                 "`commands_registered(c)`, which is false while CAP END is "
+                 "outstanding, so both USERs are registration and last-one-wins is "
+                 "what a client library expects.\n  saw: %s", tc_buffer(&c));
+    drain(&c);
+    /* And no 462 anywhere in what it received: a refusal here would be the strict
+     * version of the gate, and the strict version strands a half-registered
+     * client over a value it should be able to correct. */
+    TF_CHECK_MSG(strstr(tc_buffer(&c), " 462 ") == NULL,
+                 "a 462 reached a client whose second USER arrived BEFORE "
+                 "registration completed. The gate is on the connection's "
+                 "registration state and not on whether a USER was seen before.\n"
+                 "  saw: %s", tc_buffer(&c));
+
+    tc_close(&c);
     TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
     nf_free(&node);
 }
@@ -361,18 +541,36 @@ static void case_the_event(void)
  *       does not exist, and it is the assertion a future phase would have to
  *       remove.
  *
- *   THE IDENT CHANGE SILENTLY NOTIFIED -- chan_verbs.c or commands.c: a `send_line`
- *       added to the `handle_user()` path so the change is reported. Fails
- *       `expect_only_the_pong()` on BOTH connections -- and that is the assertion
- *       that makes this file's finding precise rather than a complaint. A node that
- *       notified would be a node where `chghost` is implementable; this one is not,
- *       and the difference is visible here.
+ *   THE GATE REMOVED -- commands.c: the `commands_registered(c)` branch at the top
+ *       of `handle_user()` replaced by `if (0) { }`. **This is the Phase 10.8
+ *       fault run BACKWARDS**, and running it backwards is the point: the fault
+ *       that used to expose the hole now restores it, and the case fails.
+ *       Build checked first: 0 errors, 0 warnings, and the run went red at
+ *       `test_chghost.c:346` -- the `462` assertion in case 3, the FIRST of the
+ *       four. `TF_CHECK_MSG` exits on the first failure, so the other three (the
+ *       `311` reading `mallory`, alice's line count of 0, and the operator's
+ *       `user=mallory` log line) are NOT reached in that run. They are recorded
+ *       as a property of the assertions rather than as observed failures, and
+ *       that is the honest way to say it.
+ *
+ *   THE GATE MOVED BELOW THE ARITY TEST -- commands.c: the registration branch
+ *       moved under `if (m->nparams < 4)`. Fails NOTHING today and that is stated
+ *       rather than hidden: every case in this file sends a well-formed four-
+ *       parameter USER. It is recorded because the order is a decision this file
+ *       documents, and a fault that changes nothing today is exactly the kind that
+ *       is unnoticed when it starts mattering. (A conforming fault would be a
+ *       third-parameter-less USER from a REGISTERED client, which is case 3's
+ *       `line` with three parameters -- the honest version of this fault is
+ *       asserted positively instead, by the case-3 count requiring 1 line and
+ *       not 0.)
  */
 int main(void)
 {
     case_not_advertised();
     case_no_verb();
     case_the_event();
+    case_462_is_per_destination();
+    case_second_user_before_registration();
 
     tf_done("chghost");
     return 0;
