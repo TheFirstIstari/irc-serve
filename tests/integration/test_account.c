@@ -1500,6 +1500,9 @@ static void test_account_tag_does_not_cross_to_peers(const char *sasl,
     size_t ae;
     size_t bb;
     size_t be;
+    /* The relay report this node has already printed, so the wait below is for the
+     * NEXT one and not for one that is already in the accumulated buffer. */
+    size_t fed_before;
 
     /* A first, and with no --peer: a node configured with BOTH ends of a pair
      * dials from both and the pair never comes up, so each pair is configured in
@@ -1540,18 +1543,50 @@ static void test_account_tag_does_not_cross_to_peers(const char *sasl,
     join_chan(&alice, CHAN_FED);
     join_chan(&bob, CHAN_FED);
 
-    /* THE BARRIER IS ALICE'S OWN PONG, and it is alice's rather than bob's for
-     * the reason test_account.c's case 7 states at length: two connections have
-     * no order between them, and this message crosses a link before it reaches
-     * bob, so a window closed by bob's PING would be asserting about the order two
-     * sockets arrived in. alice's PONG is answered only after the node has
-     * processed her PRIVMSG, and processing it queues the forward -- so the
-     * forward is already on the wire's queue when bob's window is closed. */
+    /* TWO CONNECTIONS HAVE NO ORDER BETWEEN THEM, and that is still the reason for
+     * everything below -- a node that reads bob's PING before it reads the forward
+     * off the link would close a window containing nothing, and that would look like
+     * the feature being broken. What changed is WHICH PONG closes bob's window, and
+     * the old answer was wrong about which socket the bytes land in.
+     *
+     * alice's PONG is a sound barrier for ALICE'S WINDOW and only for that: alice is
+     * on node A, node A reads her socket in order, so her PONG proves node A
+     * processed the PRIVMSG and queued the forward. It says NOTHING about node B. The
+     * forward's next stop is A's SERVER connection, and then node B's own event loop
+     * has to read that connection and fan it out to bob's CLIENT socket. bob's
+     * PING/PONG does pump node B -- but node B answers a client socket independently
+     * of a peer socket, poll() reports the two descriptors separately, and so node B
+     * can answer bob's PING with the forward still unread. bob's window could
+     * therefore close before the relayed line existed, which is exactly what CI saw:
+     *
+     *   note: the relayed line on the far side of the link: no line in the window
+     *     nick=bob
+     *     window=[PONG irc.b q28 ... :irc.b PONG irc.b q30 ]
+     *
+     * So bob's window is closed by waiting for the EVENT, on the node that has to
+     * perform it. `fed_message:` is federation/verbs.c's own report of a relayed
+     * delivery, printed AFTER fanout_deliver() has returned -- so by the time the
+     * parent has read it, the line is in bob's write queue -- and it is the same line
+     * test_fed_loop.c uses for the same purpose. The drain that follows is then
+     * ordered behind it: node B answers bob's PING on the same connection and the
+     * same queue, so the PONG cannot reach bob before the delivery does.
+     *
+     * COUNTED FROM BEFORE THE SEND, because nf_expect() searches the accumulated
+     * buffer and a needle the node has already printed is satisfied before the event
+     * it is waiting for has happened. This file's header makes that argument for
+     * another reason; here it would be a barrier that proves nothing. */
     ab = drain_on(&alice, "irc.a");
     bb = drain_on(&bob, "irc.b");
+    fed_before = tf_count(b.out, "fed_message: channel=" CHAN_FED);
     TF_CHECK_MSG(tc_send(&alice.c, "PRIVMSG " CHAN_FED " federated") == 0,
                  "alice's PRIVMSG could not be sent");
     ae = drain_on(&alice, "irc.a");
+    TF_CHECK_MSG(nf_expect_nth(&b, "fed_message: channel=" CHAN_FED, fed_before + 1u,
+                               T_IO_MS) == 0,
+                 "node B never reported delivering the relayed PRIVMSG, so bob's "
+                 "window is about a message that had not arrived when the window "
+                 "closed, and \"no account tag\" would be satisfied by an empty "
+                 "window rather than by the tag's absence.\n  node said: %s", b.out);
     be = drain_on(&bob, "irc.b");
 
     /* ---- ON B, THE LINE CROSSED AND THE TAG DID NOT ---- */
@@ -2177,6 +2212,42 @@ static void expect_account_set_refuses(void)
     server_shutdown(&s);
 }
 
+/* ==========================================================================
+ * TEETH, AND WHERE THEY WERE INJECTED
+ * ==========================================================================
+ *   BOB'S WINDOW CLOSED BY ALICE'S PONG -- the barrier in
+ *       test_account_tag_does_not_cross_to_peers(): the `nf_expect_nth()` on node B's
+ *       own `fed_message:` line deleted, so bob's window is closed by bob's PING with
+ *       nothing establishing that node B has read the forward off the link.
+ *
+ *       **Build 0/0, and this fault does NOT reproduce on Darwin**: 11,000 loaded
+ *       runs of the faulted binary (concurrent copies plus background load) produced
+ *       zero occurrences of this failure here, and the same sweep turned up only
+ *       federation-HANDSHAKE timeouts, which is the excluded family and which this
+ *       machine's own load manufactures. So the case for the change is the socket
+ *       argument in the comment at the barrier and not a red run, and it is recorded
+ *       as such rather than as a pass. What the argument needs is one fact that is
+ *       true on this platform and is NOT a property of the test: node B's link
+ *       descriptor is numbered BELOW bob's client descriptor, because the link is
+ *       dialled and established before bob connects, and poll_loop_step() walks
+ *       `s->by_fd` in ascending order and flushes POLLOUT before reading POLLIN on
+ *       each one. That ordering is why the old barrier usually worked and why it is
+ *       still wrong: it is a fact about descriptor allocation, not about the arrival
+ *       the assertion is about.
+ *
+ *       THE ALTERNATIVE BARRIER IS NOT WEAKER, IT IS JUST UNSOUND-BY-ACCIDENT: the
+ *       new wait blocks on the event itself, so it holds whatever the descriptor
+ *       numbering turns out to be.
+ *
+ *   SWEPT FOR THE SAME CLASS, and found once. Every function in tests/ declaring two
+ *       or more `nf_node_t` was read for a client window closed by a PONG from a
+ *       client on a DIFFERENT node. The one other candidate is
+ *       test_ircv3_msgid.c's case_survives_a_relay_hop(), which is two nodes with a
+ *       cross-node delivery -- and is already correct: it waits for the delivered
+ *       TEXT on bob's socket before draining, because that file lost this exact race
+ *       once and says so at the wait. test_fed_resync.c and test_sync_state.c drain
+ *       on the same node the window is asserted on.
+ */
 int main(void)
 {
     char sasl_good[] = "/tmp/irc_serve_acct_sasl.XXXXXX";
