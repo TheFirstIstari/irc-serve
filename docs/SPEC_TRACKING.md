@@ -1037,6 +1037,46 @@ is therefore **not** a generalisation of the away path — the away path is stil
 entry points for two message shapes is the honest answer and it is recorded here so a
 future phase does not read the union one as "the way fan-out should now work".
 
+### 10.14 Phase 10.12 — `batch`, and two findings from the specifications themselves
+
+| Claim | Where | Evidence |
+|---|---|---|
+| `batch` is advertised because it is implemented | `cap.c`'s `k_caps[]` | `test_batch.c` case 1, beside an assertion that `away-notify` **is** advertised — so the presence is not satisfied by a `CAP LS` that stopped early |
+| `BATCH` exists and a malformed reference is **not** `421` | `commands.c`'s verb table, `pre_reg = 1` | `test_batch.c` case 1: `462` for a reference with no sign. `421` would tell a client this server has never heard of the verb |
+| Inside an open batch, **every** line carries `batch=<ref>` | `reply.c`'s `emit_built_ex()`, `batch_line_tag()`'s open-batch arm | `test_batch.c` case 2: a four-line `WHOIS`, 4 of 4 numerics tagged, counted over the **numerics** and not over the window — because the drain `PONG` is inside the batch too and must be |
+| After `BATCH -ref`, **no** line is tagged | the same function, one-shot arm | the same case: 0 tagged lines in the following window |
+| A **mis-cased** `BATCH -ref` refuses AND leaves the batch open | `batch.c`'s `strcmp()` | `test_batch.c` case 3: the `462`, then 4 of 4 lines still carrying `@batch=Who1` — the case-sensitivity claim and the state claim in one case |
+| `+<ref>` tags **exactly one** line and is consumed | `batch_begin_command()` / `batch_line_tag()`'s one-shot arm | `test_batch.c` case 4: 1 of 4, then 0 of 4 on the next command |
+| An **invalid** reference is ignored and the response still arrives, and nothing is stored | `note_reference()`'s early `return` | the same case: 0 tagged lines, 4 delivered — and then **0 on the following command**, which is the half that proves it was not stored |
+| `INVALID_REFTAG` is a `FAIL` **per destination** | `reply_refused(..., "BATCH", "INVALID_REFTAG", "417", ...)` | `test_batch.c` case 5, on two connections differing in exactly that negotiation: `FAIL BATCH INVALID_REFTAG` on one, byte-identical `417` on the other |
+| 64 accepted, 65 refused, and neither truncated | `batch_ref_valid()`'s `n > CONN_MAX_BATCH_REF` | the same case, at both edges. **The 64 half exists because the first `reply.c` sized its tag buffer at `CONN_MAX_BATCH_REF + 1` and dropped the tag at exactly this boundary** |
+| A `BATCH` carrying a `batch=` tag is refused and opens **nothing** | `batch_line_tagged_inbound()`, checked first in `handle_batch()` | `test_batch.c` case 7, half one — sent with **no batch open**, so the one-batch rule cannot fire and only the nesting check can. Half two: the OUTER batch still tags afterwards and `@batch=inner` appears nowhere |
+| The state is per connection and outlives the message | `conn_t`'s three fixed-size fields | `test_batch.c` case 6: `b` sees no tag while `a` has one open, and `a`'s is still tagging several commands later |
+| Teeth, build checked before the run was believed | four faults | **4 red, 0/0 each.** **ONE WAS GREEN ON ITS FIRST RUN** — the obvious shape of the nesting case cannot see the fault, because a nested `+` is refused by the one-batch rule anyway and the numeric and the line count come out identical. The case was rewritten to discriminate and re-run. That is recorded at the test's TEETH block rather than quietly replaced |
+
+**THE TWO FINDINGS, both of them about the specifications rather than about this node.**
+
+1. **`@<ref>` is unimplementable, and that is a property of the tag grammar.** The
+   retired `reference-tags` specification paired `@<ref>` ("send the response nowhere")
+   with `+<ref>`. `@` is the tag-block **marker**, and a conformant parser consumes
+   exactly one of them, so `@ref` parses as a valueless tag named `ref` and `@@ref` is
+   **refused by `message_parse_n()`**. Both were run, not reasoned about. `+` is the
+   sigil the modern grammar keeps inside the key, so `+<ref>` is implemented and the drop
+   form is recorded as not implemented. `conn_t` has no field for it and says why.
+2. **`client-batch` has no code for the refusals it implies.** It defines three `FAIL`
+   codes — `INVALID_REFTAG`, `TIMEOUT`, `UNKNOWN_TYPE` — and none of them covers a
+   second open batch, a mismatched close, or a nested `BATCH`, all of which its own prose
+   forbids. Those use a borrowed `462` with the reason in the text; §6 forbids a new
+   numeric and §4.4 forbids silence.
+
+**WHAT IS NOT IMPLEMENTED, by name.** `netsplit` and `netjoin` batch types (a suppression
+feature this node has no event to batch, and the capability does not claim them — the
+specification says batch types are not advertised and a client may ignore an unknown
+one); `UNKNOWN_TYPE` (see §4.4.7 for the argument); `TIMEOUT` (a code with no specified
+duration); `draft/multiline` (needs the framing, which this is, plus the interpretation
+of `;draft/multiline-concat` values and the splitting of one command into several); and
+`batch/react`, which is a **client-only** batch type and is N/A for a server.
+
 ### 10.11 The honest limits of the account phase
 
 - **The identity is visible on ordinary traffic for LOCAL senders only.**

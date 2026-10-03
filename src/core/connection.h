@@ -118,6 +118,41 @@ struct chan; /* opaque until Phase 4 (2.2) */
 #define CONN_REG_READY 3
 #define CONN_CLOSING 4
 
+/* ---------------------------------------------------------------------------
+ * THE `batch` REFERENCE TAG BOUND, and why there is one
+ * ---------------------------------------------------------------------------
+ * IRCv3's `batch` specification constrains a reference tag to "ASCII letters,
+ * numbers, and/or hyphen", case-sensitive, and says nothing about its LENGTH. So
+ * the character class is a validation and this constant is a bound this node
+ * imposes, and the distinction is worth making rather than blurring: a
+ * specification with no length bound does not license unbounded state.
+ *
+ * 64 is IRC's own nickname bound (`IRC_MAX_NICK`, 63) plus one, and it is the
+ * bound IRCv3's own reference-tag vocabulary converges on in practice. What
+ * matters for the argument is not the number but that it is a COMPILE-TIME
+ * CONSTANT in a fixed-size array on `conn_t`: a client cannot grow it, so
+ * `batch_open` is a field with a compile-time bound rather than an allocation,
+ * which is what makes "there is nothing to free" a structural fact and not a
+ * promise.
+ *
+ * THE COST: a reference tag of 65 bytes is REFUSED (`417`), not truncated. 3.2
+ * forbids delivering a shortened value, and a truncated reference tag would be a
+ * tag that names a batch nobody opened.
+ */
+#define CONN_MAX_BATCH_REF 64
+
+/* The batch TYPE, which the specification calls "an opaque identifier" and does
+ * not bound. Bounded for the same reason and with the same cost. `batch/react`
+ * and `draft/multiline-concat` are the longest names in the vocabulary this node
+ * has any reason to meet, and both are well inside 96.
+ *
+ * IT IS STORED AND THEN NOT USED, and that is worth saying rather than leaving
+ * a reader to wonder: a batch type describes how a CLIENT should present the
+ * events inside a batch, and this node emits no batch types of its own. The
+ * field exists so that the log can say which type a client declared and so that
+ * a future type has somewhere to be read from; nothing branches on it. */
+#define CONN_MAX_BATCH_TYPE 96
+
 /* Bounded write queue, 3.4: "~256 KB per connection". The cap is on the
  * UNSENT tail (wlen - woff), not on the allocation, so a long-lived
  * connection that keeps draining does not eventually fail on its own history.
@@ -373,6 +408,44 @@ typedef struct conn {
     struct chan **chans;           /* channels joined; Phase 4 */
     size_t      nchans;
     size_t      cap;
+    /* Phase 10.12: IRCv3 `batch`, the client-facing half. FOUR fields, and each
+     * answers one question; the batch capability's whole protocol surface is the
+     * difference between them.
+     *
+     *   batch_ref      the reference tag of the batch this client has OPEN, or ""
+     *                  empty for none. Non-empty means "every line this node emits
+     *                  to this connection is inside that batch", which is what a
+     *                  client asked for by sending `BATCH +ref <type>`.
+     *   batch_type     the type that batch was opened with. Logged, never branched
+     *                  on -- see CONN_MAX_BATCH_TYPE.
+     *   batch_once     a ONE-SHOT reference from a `+<ref>` tag on a single
+     *                  command: the NEXT line emitted to this connection carries
+     *                  `batch=<ref>` and the reference is consumed. This is the form
+     *                  the modern message-tag grammar preserves (batch.c's header has
+     *                  the parser probe that established it) and it is what lets a
+     *                  client group the response to ONE command without holding a
+     *                  batch open.
+     *
+     * THERE IS NO `@<ref>` FIELD, and its absence is a FINDING rather than an
+     * oversight. The retired `reference-tags` specification defined `@<ref>` as "send
+     * the response nowhere", but on the wire `@` is the TAG-BLOCK MARKER: this node's
+     * parser consumes exactly one leading `@` and keeps the rest as keys, so
+     * `@ref WHOIS bob` parses to the valueless tag `ref` and `@@ref WHOIS bob` is
+     * **refused outright** by `message_parse_n()`. Both were checked, not reasoned
+     * about -- see batch.c. Making the form work would mean changing what the framing
+     * layer keeps, which 3.2 owns and which every peer line depends on, so the drop
+     * form is not implemented and the reason is written where a future editor reads.
+     *
+     * ALL THREE ARE FIXED-SIZE FIELDS IN A CALLOC'D STRUCT. That is deliberate and it
+     * is why there is no teardown arm for any of them: `conn_new()` zeroes the
+     * struct and `conn_free()` frees it whole, so "a batch reference cannot
+     * outlive its connection" is a property of the allocation rather than of a
+     * cache somebody has to remember to empty. The same paragraph applies to the
+     * `label` field Phase 10.13 adds beside them. */
+    char        batch_ref[CONN_MAX_BATCH_REF + 1];
+    char        batch_type[CONN_MAX_BATCH_TYPE + 1];
+    char        batch_once[CONN_MAX_BATCH_REF + 1];
+    int         batch_suppress;
     char       *rbuf;              /* read buffer */
     size_t      rlen;
     size_t      rcap;

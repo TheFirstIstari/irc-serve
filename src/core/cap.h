@@ -161,6 +161,7 @@
 #define CAP_ECHO_MESSAGE "echo-message"
 #define CAP_STANDARD_REPLIES "standard-replies"
 #define CAP_AWAY_NOTIFY "away-notify"
+#define CAP_BATCH "batch"
 
 /* 410 ERR_INVALIDCAPSUBCOMMAND. Not in design 4.4's numeric list, which is a gap
  * in the list rather than in the protocol, for the same reason 301, 303, 417,

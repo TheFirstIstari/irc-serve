@@ -71,6 +71,7 @@
 #include "core/channel.h"
 #include "core/connection.h"
 #include "core/message.h"
+#include "core/account.h"
 #include "core/server.h"
 
 /* 3.1's VERB CLASS. This is the column of the table that the previous version
@@ -290,6 +291,34 @@ int fanout_deliver_local(server_t *s, const fanout_target_t *t, const char *pref
 int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
                    const char *verb, const char *const *params, int nparams,
                    conn_t *exclude, const irc_serve_tags_t *carry);
+
+/* ---------------------------------------------------------------------------
+ * THE WORST-CASE CLIENT-VISIBLE TAG BLOCK, DERIVED from the tags this node writes
+ * ---------------------------------------------------------------------------
+ *   IRC_MAX_MSGTAG   the `msgid` block, derived in message.h
+ *        1           the ';' between two pairs
+ * ACCOUNT_TAG_MAX   the `account` block, derived in account.h
+ *        1           the NUL
+ *
+ * IT IS USED FOR THREE THINGS, and the third is why it lives in the HEADER rather
+ * than beside its renderer: it sizes the per-destination buffer in fanout.c's
+ * write_to_members(), it is the charge fanout_line_fits() adds to the client-facing
+ * cap, and -- since Phase 10.12 -- it sizes the MERGED buffer in reply.c's
+ * emit_built_ex(), which prepends a `batch=` tag to a block another module rendered.
+ *
+ * THAT THIRD USE IS WHY IT IS HERE AND NOT WHERE IT WAS. A buffer sized by eye and a
+ * cap that forgot the tag are the same defect in two places -- a line that cannot be
+ * rendered -- and a per-module copy of this constant is a third place waiting for the
+ * first tag that does not fit. A module that WRITES a client-visible tag and a module
+ * that RENDERS a client-visible tag have to agree on how wide one is, and the only
+ * honest way to arrange that is one declaration both can see.
+ *
+ * IT IS NOT THE WIDTH OF A `batch=` OR A `label=` BLOCK, and those are added by the
+ * caller that concatenates: reply.c's `merged` buffer is this plus BATCH_TAG_KEY_MAX
+ * plus the separator, sized from named pieces for the same reason. What matters is
+ * that adding a tag is a change to this file AND to that arithmetic, rather than a
+ * change one module makes and another silently does not notice. */
+#define FANOUT_TAG_BLOCK_MAX (IRC_MAX_MSGTAG + 1u + ACCOUNT_TAG_MAX + 1u)
 
 /* ONE WIRE SHAPE: a parameter list and its length. A struct rather than two more
  * arguments because the thing it carries IS a list, and a shape with a length is
