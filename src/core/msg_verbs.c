@@ -250,6 +250,21 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
      * destination and there is nobody here to send an acknowledgement to. Building
      * one would be inventing a local emission for a target that does not exist on
      * this node. The branch above returns before this one, and it is commented. */
+    /* `labeled-response`'s ONE EXCEPTION, decided HERE and only here: "When a client
+     * sends a message to itself, the server MUST NOT include the label tag." A message
+     * ADDRESSED to itself is a resolved local user target that IS the sender -- and this
+     * is the only place in the tree that knows both the resolved target and the sender,
+     * because `reply.c`'s one queueing site knows the line and the destination and has no
+     * third thing.
+     *
+     * IT IS SET FOR EVERY MESSAGE, not only for the self-addressed one, because it is a
+     * property of the command in flight: clearing it here and setting it here means no
+     * other handler has to know the field exists. The first version of `label.c` decided
+     * this by comparing the emitted line's PREFIX against the destination's hostmask,
+     * which is a source test rather than a target test -- so it withheld the label from
+     * the echo-message copy of a CHANNEL message too, and a labelled `PRIVMSG #chan` came
+     * back unlabelled followed by an `ACK`. */
+    c->label_self = ((t.kind == FANOUT_LOCAL_USER) && (t.user == c)) ? 1 : 0;
     exclude = ((is_notice != 0) && (cap_echo_message_enabled(c) == 0)) ? c : NULL;
     {
         const char *sp[1];

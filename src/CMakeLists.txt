@@ -48,6 +48,12 @@ add_library(irc_core STATIC
   # and a decision any two of them have to reach into separately is a decision they
   # will eventually disagree about.
   core/batch.c
+  # Phase 10.13: IRCv3 `labeled-response`. It is a module of its own because the
+  # specification's requirement is not "echo the tag" but "the tag appears in EXACTLY ONE
+  # LOGICAL MESSAGE", and on this node a response is frequently several lines -- so the
+  # state has to answer "what tag does THIS line carry" from inside reply.c's one
+  # queueing site AND "what remains to be said" from inside commands.c's dispatch tail.
+  core/label.c
   # Phase 6. federation/ is a DIRECTORY of its own rather than more core/*.c,
   # because the split that matters in this phase is not "core versus
   # federation" but "encode versus decode": verbs.c is the outbound half of

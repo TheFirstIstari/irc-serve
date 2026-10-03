@@ -24,15 +24,20 @@
 #include "core/message.h"
 #include "core/cap.h"
 #include "core/batch.h"
+#include "core/label.h"
 #include "core/fanout.h"
 
 /* THE MERGED BUFFER'S ARITHMETIC, in three named pieces so that raising any bound
  * moves it rather than silently overflowing:
  *
- *   BATCH_TAG_MAX         one `batch=<ref>` pair INCLUDING its NUL -- the key, the
- *                         '=', and the widest reference CONN_MAX_BATCH_REF admits
- *   1u                    the ';' that joins it to whatever the caller already had
- *   FANOUT_TAG_BLOCK_MAX  that whatever: the `msgid`/`account` block fanout.c renders
+ *   LABEL_TAG_MAX         one `label=<value>` pair INCLUDING its NUL
+ *   BATCH_TAG_MAX         one `batch=<ref>` pair INCLUDING its NUL
+ *   2u                    the two ';'s that join them to each other and to the rest
+ *   FANOUT_TAG_BLOCK_MAX  that rest: the `msgid`/`account` block fanout.c renders
+ *
+ * It is the SUM of every client-visible tag this node can put on one line, which is the
+ * only way the number stays right when a tag is added: each new tag is a new piece of
+ * this expression, and nothing here is a literal that looks generous.
  *
  * The whole of this is one line, and it is here rather than beside the buffer because
  * the first version of this file sized the CALLER's `bref` at CONN_MAX_BATCH_REF + 1
@@ -116,7 +121,7 @@ static int emit_built_ex(server_t *s, conn_t *c, const char *code,
      * larger block, this buffer would be the thing that has to move with it -- which
      * is why the size is written as an arithmetic expression over named pieces
      * rather than as a literal that looks generous. */
-    char merged[FANOUT_TAG_BLOCK_MAX + BATCH_TAG_MAX + 1u];
+    char merged[FANOUT_TAG_BLOCK_MAX + LABEL_TAG_MAX + BATCH_TAG_MAX + 2u];
     size_t len;
 
     /* ------------------------------------------------------------------------
@@ -135,8 +140,32 @@ static int emit_built_ex(server_t *s, conn_t *c, const char *code,
      * this is a readability choice: `batch=` first is the tag a reader is looking for.
      */
     if (c != NULL && c->kind != CONN_SERVER) {
-        char bref[BATCH_TAG_MAX];
+        char bref[LABEL_TAG_MAX];
 
+        /* `label=` IS PREPENDED TO `batch=` FOR THE SAME REASON `batch=` IS PREPENDED TO
+         * A CALLER'S OWN BLOCK, and the two are applied in that order so that a line
+         * inside a `labeled-response` batch reads `@label=..` then `@batch=..` across two
+         * separate calls. Only one of the two is ever non-empty for a given line: the
+         * label on the first line, the reference after it, which is what "exactly one
+         * logical message" requires.
+         *
+         * AND NEITHER IS APPLIED TO A `BATCH` VERB, because that verb is how this node's
+         * OWN grouping lines are emitted -- see label.h's `label_is_grouping_verb()`. */
+        if (label_line_tag(s, c, code, prefix, bref, sizeof bref) == 1) {
+            int pre = snprintf(merged, sizeof merged, "%s", bref);
+
+            if (pre > 0 && (size_t)pre < sizeof merged && tags != NULL &&
+                tags[0] != '\0') {
+                int post = snprintf(merged + pre, sizeof merged - (size_t)pre, ";%s",
+                                   tags);
+
+                if (post > 0 && (size_t)(pre + post) < sizeof merged) {
+                    tags = merged;
+                }
+            } else if (pre > 0 && (size_t)pre < sizeof merged) {
+                tags = merged;
+            }
+        }
         if (batch_line_tag(c, bref, sizeof bref) == 1) {
             /* NO "batch=" PREFIX HERE. `batch_line_tag()` writes the WHOLE pair --
              * key, '=', value -- because batch.h says so and because a caller that

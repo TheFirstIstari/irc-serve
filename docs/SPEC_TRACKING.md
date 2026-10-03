@@ -1077,6 +1077,50 @@ duration); `draft/multiline` (needs the framing, which this is, plus the interpr
 of `;draft/multiline-concat` values and the splitting of one command into several); and
 `batch/react`, which is a **client-only** batch type and is N/A for a server.
 
+### 10.15 Phase 10.13 — `labeled-response`, and what "exactly one logical message" costs
+
+| Claim | Where | Evidence |
+|---|---|---|
+| The label is **copied**, never referenced past the request | `conn_t::label`, a fixed-size field; `label.c`'s `ircv3_unescape_value()` into it | `test_labeled_response.c` case 6: a 64-byte value comes back **byte for byte**. The FAULT (a stored `char *`) is **red** but **ASan is SILENT** — see the note below |
+| The label appears in **exactly one** logical message | `label_line_tag()`: `label=` on the batch start, `batch=<ref>` after | case 3: 4 of 4 numerics carry `@batch=…` and exactly **1** line carries `@label=…` |
+| A multi-line response is grouped, `BATCH +` **tagged with the label**, `BATCH -` untagged | `label_line_tag()`'s first-line arm, `label_finish_command()` | case 3, on the specification's own example shape, with the reference **read back out of the opening line** so the rest of the assertions are about what the node minted |
+| A single-line response is **wrapped too** | the same arm — the batch is opened on the first line, before the node knows how many there will be | case 1: 3 lines (batch, answer, close) and exactly one `@label=`. **This is the cost and it is named at §4.4.8** |
+| A labelled `PRIVMSG` to a channel the sender is not on produces a labelled **`404`** | the whole path | case 5, with a second client on the channel so the answer is `404` and not `403` — and with the assertion that **the channel heard nothing** |
+| `ACK` for a command that produced nothing, and **not** for one that did | `label_finish_command()`'s two arms | case 4: a labelled `PONG` → `ACK`; a labelled `PING` → a PONG and **zero** `ACK` |
+| A message **to itself** carries no tag, and the label lands on the `ACK` instead | `conn_t::label_self`, set by `msg_verbs.c` | case 7: the echoed `PRIVMSG`'s line begins with a bare `:` (walked back to the line start), `@label=self` appears once, and it is on the `ACK` |
+| A message to a **channel** IS labelled on the echo, and the label never travels | the same field, `0` for a channel target | the same case, second half: `@label=other` once on the sender, and **no** `label` anywhere on the recipient's socket |
+| 64 accepted, 65 **ignored and not truncated**, a valueless `@label` ignored | `CONN_MAX_LABEL`, checked before the copy | case 6, all three: 64 comes back byte-for-byte; 65 produces **no** `label=` at all and the response still arrives |
+| Per destination: the label, no `BATCH`, no `ACK` for a client that negotiated nothing | `cap_labeled_response_enabled()` gating the batch and the `ACK`, never the label | case 2, on a connection that negotiated `away-notify` and nothing else |
+| Teeth, build checked before the run was believed | five faults | **5 red, 0/0 each** — with **two recorded as faults of the FAULT rather than of the test**: the grouping fault needed a `(void)s` to compile (`unused-parameter`), and the pointer fault is **red without ASan reporting anything**. Both are in the test's TEETH block |
+
+**THE ASAN FINDING, and it is the interesting one.** The fault the pass plan asked for —
+"a label pointer retained past the request (use-after-free under ASan)" — **does not produce
+an ASan report in this design**, and the reason is a fact about the ordering rather than
+about the fault. The label is consumed inside `commands_dispatch()`: the `BATCH +<ref>` line
+is emitted from `emit_built_ex()` while the handler is still running, and the `BATCH -<ref>`
+from `label_finish_command()` before dispatch returns. **`poll_loop.c` frees the parser's
+buffer after dispatch returns.** So a stored pointer is dangling but still *readable* at
+every point it is used.
+
+What the fault produces instead is a **corrupted label on the wire** — the fault's run
+shows `@label=<two bytes of whatever the allocator had>` — and the test is red on that. So
+the fixed-size field is defended by a **wire-level assertion rather than by the
+sanitizer**, which is a weaker guarantee than this project usually claims, and it is stated
+here and at the test's TEETH block rather than dressed up. If a future phase moves any
+labelled emission outside dispatch, the fault becomes a real ASan report and the claim
+becomes stale in the useful direction.
+
+**TWO MORE DEFECTS THIS TEST FOUND BY RUNNING**, both invisible to review and both of the
+same class — *a rule that was true of the code and not of the protocol*:
+
+1. `label_finish_command()` cleared its state **after** emitting, so the `ACK` triggered the
+   batching the function exists to prevent and came out as
+   `@batch=<its own ref>;label=<value>` on one line. Fixed by disarming first.
+2. The "sent to itself" test was keyed on the line's **prefix** rather than on the message's
+   **target**, so it withheld the label from every `echo-message` copy on the node: a
+   labelled `PRIVMSG #chan` returned an unlabelled echo followed by an `ACK`. Fixed by
+   `conn_t::label_self`, set where the target is in scope.
+
 ### 10.11 The honest limits of the account phase
 
 - **The identity is visible on ordinary traffic for LOCAL senders only.**

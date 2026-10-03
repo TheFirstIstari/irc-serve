@@ -4,6 +4,7 @@
  */
 #include "core/commands.h"
 #include "core/batch.h"
+#include "core/label.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -2116,5 +2117,23 @@ void commands_dispatch(server_t *s, conn_t *c, const message_t *m)
      * starts: it only sees outbound lines, and "which of them is the FIRST line of
      * this command's response" is not a property of any one of them. */
     batch_begin_command(c, m);
+    label_begin_command(c, m);
     cmd->fn(s, c, m);
+    /* THE TAIL. Two things have to happen after the handler and not inside it, and both
+     * are "what remains to be said" questions that a handler cannot answer because it
+     * does not know what the handler emitted:
+     *
+     *   label_finish_command()  closes the `labeled-response` batch if one was opened,
+     *                           or answers `ACK` if the command produced nothing. A
+     *                           handler returning early on a refusal has still produced
+     *                           a response -- the refusal -- so the label goes on THAT,
+     *                           which is why the tail asks what was emitted rather than
+     *                           asking whether the handler returned.
+     *   batch has no tail       a client batch is closed by the client.
+     *
+     * IT IS NOT OPTIONAL ON ANY PATH, and every path here ends in this call: a
+     * `label_live` that outlived its command would label the NEXT command's first line
+     * with a value the client was already told was finished.
+     */
+    label_finish_command(s, c);
 }
