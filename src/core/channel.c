@@ -893,6 +893,32 @@ int chan_ban_add(chan_t *ch, const char *mask)
         strlen(mask) > (size_t)CHAN_MAX_BAN) {
         return -1;
     }
+    /* THE CAP, AND IT WAS NOT HERE. Phase 11's RFC 2812 sweep found this while
+     * checking whether the ban-list-full refusal was reachable at all, and it was
+     * not: `bcap` was doubled on demand with nothing comparing `nbans` against
+     * CHAN_MAX_BANS, so the list grew without bound and the caller's `-1` branch
+     * -- which is where 478 ERR_BANLISTFULL lives -- could never be taken.
+     *
+     * That made two documented claims false. channel.h says of this function that
+     * it returns "-1 on ... a full list (CHAN_MAX_BANS)", and channel.h says of
+     * the constant that "Bans ARE client-driven (MODE #c +b mask), so this bound
+     * is reached by ordinary input and CHAN_MAX_BANS is a real limit rather than a
+     * formality". Neither was true. The same mistake is documented one page above
+     * for SERVER_TOPIC_MAX, and there the bound IS enforced and a loss is counted
+     * -- which is what made the contrast checkable rather than a matter of taste.
+     *
+     * CHECKED HERE AND NOT BY THE CALLER, for the reason the growth is here and not
+     * in the caller: this is the only writer of `ch->bans`, so a bound checked at
+     * the call site would be one call site out of however many exist later, and the
+     * next one would not have it. It also has to be checked before the growth, not
+     * after, or the refusal has already allocated.
+     *
+     * THE COST IS ONE COMPARISON on a path a client reaches by asking for a ban,
+     * and the cost of NOT having it is a per-channel array that a single `MODE #c
+     * +b` loop grows without limit on an operator-controlled channel. */
+    if (ch->nbans >= (size_t)CHAN_MAX_BANS) {
+        return -1;
+    }
     if (ch->nbans == ch->bcap) {
         size_t want = (ch->bcap == 0) ? 4u : ch->bcap * 2u;
         struct chan_ban *grown =

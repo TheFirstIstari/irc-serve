@@ -538,3 +538,26 @@ irc_add_integration_test(test_labeled_response test_labeled_response.c)
 # INVITE reaches the INVITEE, so a substring search for "INVITE" on any socket here is
 # satisfied by the delivery and every claim has to be a count.
 irc_add_integration_test(test_invite_notify test_invite_notify.c)
+
+# RFC 2812 conformance (Phase 11), split into one file per numeric group rather than
+# one file for the whole phase, because each group is a different subsystem and each
+# wants to be able to fail on its own. See docs/RFC2812_CONFORMANCE.md.
+
+# 319 RPL_WHOISCHANNELS in WHOIS. Its own file because it is the one numeric whose
+# ABSENCE was a defect: until Phase 11 a WHOIS named a person and never named a
+# channel, which is the whole content of a WHOIS to a client looking for somebody.
+irc_add_integration_test(test_whois_channels test_whois_channels.c)
+
+
+# The ban-list query surface: `MODE #chan +b` answered with 367/368, and a full
+# list answered with 478. Its own file because the observable is a LIST -- the
+# assertions are counts of 367 lines and a check that 368 comes last -- and a
+# substring search reports success for both a correct count and an empty list.
+irc_add_integration_test(test_banlist test_banlist.c)
+
+# The rest of the server-query surface Phase 11 checked: 254 RPL_LUSERCHANNELS,
+# 433 recovery, and PING/PONG token echoing. Its own file because 254 is the only
+# one that needed code -- the other two are here as the WIRE EVIDENCE that the
+# sweep found them conformant, which is worth having in the suite rather than only
+# in the phase report.
+irc_add_integration_test(test_query_surface test_query_surface.c)

@@ -60,10 +60,16 @@ socket** — not inferred from the source:
   naming the verb it was given
 - `JOIN` `PART` `TOPIC` `NAMES` `LIST` `KICK` `MODE`, `+o`/`+v` rendering as `@`/`+`,
   origin ownership, single-writer refusal `437`
-- `WHO` with `352` and `315` end-of; `WHOIS` with `311` `312` `317` `318`
+- `WHO` with `352` and `315` end-of; `WHOIS` with `311` `312` `319` `317` `318`,
+  plus `301` away, `330` account and `319`'s `@`/`+` channel sigils
 - `401` unknown target, `442` not on that channel, `461` missing parameter, `482`
   lacking authority
+- `MODE #chan +b` as a **query**: one `367` per mask then `368`, and `478` when
+  the list is at `CHAN_MAX_BANS`
+- `254` from `LUSERS` once any channel exists, absent while the count is zero
 - CTCP (`\x01ACTION\x01`) relayed intact
+- Every RFC 2812 numeric, what this node does with each one and why — see
+  [docs/RFC2812_CONFORMANCE.md](docs/RFC2812_CONFORMANCE.md)
 - **Federation** — peer links, the `FEDERATE` handshake, the S-verb set, `SBURST`
   resync driven on link-up, `(origin, epoch, id)` dedup, hop ceiling 10, and
   backoff with a retry budget on a dropped link

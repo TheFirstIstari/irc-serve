@@ -1552,6 +1552,45 @@ different name on a false premise, and the real cause is never surfaced.
 `005` with `PREFIX=(ov)@+`, `CHANTYPES=#&`, `NETWORK=` is effectively
 mandatory — many clients misbehave without it.
 
+#### 4.4.0 Phase 11 — the RFC 2812 sweep, and what the list above was worth
+
+Phase 11 walked every numeric RFC 2812 defines against what this tree emits and
+wrote the result up in **[docs/RFC2812_CONFORMANCE.md](RFC2812_CONFORMANCE.md)**.
+Four of the additions fill gaps in the list this section carries:
+
+- `319` `RPL_WHOISCHANNELS` — `<nick> :*( ( "@" / "+" ) <channel> " " )`. The
+  list above says "query `311`–`319`", so `319` was always in scope and had
+  never been emitted: a `WHOIS` named a person and never named a channel. It is
+  the one thing a client asks a `WHOIS` for after learning somebody is away, and
+  `away-notify`'s own documented promise ("they can rely on `305`/`306`") is about
+  the *setter*, so it never covered this.
+- `367` `RPL_BANLIST` / `368` `RPL_ENDOFBANLIST` — `MODE #chan ±b` with no mask,
+  which RFC 2812 3.3.2 defines as a query. It was answered `461`, a refusal for
+  the form that asks the question, so every client that populates a ban list on
+  window open got an error and an empty list.
+- `478` `ERR_BANLISTFULL` — replaces `696`, which is `RPL_ENDOFMODES` from the
+  historical `MODE` draft and not this condition at all. `478`'s field list also
+  names the mode letter, which `696`'s use did not.
+- `254` `RPL_LUSERCHANNELS` — RFC 2812 3.4.2 requires it whenever the channel
+  count is non-zero, and the list above already said "server info `251`–`266`".
+  It was never emitted, so `/LUSERS` omitted a figure every client displays.
+
+The sweep also found **`CHAN_MAX_BANS` was never enforced**: `chan_ban_add()`
+doubled its array on demand with nothing comparing `nbans` to the constant, so
+`channel.h`'s claim that it is "a real limit rather than a formality" was false
+and the refusal above was unreachable. Enforcing it is what makes `478` a fact.
+
+And it found **two arity deviations this phase did not change**, both because the
+existing tests pin the non-conformant bytes: `461` omits the RFC's `<command>`
+field, and `472` sends `<channel>` where the RFC sends `<char>`. Both are written
+up with their client-visible symptoms and the exact assertion sites in
+`docs/RFC2812_CONFORMANCE.md` §6.
+
+**The document, not the diff, is the deliverable.** The next sweep should start
+from that table rather than from six source files — which matters more than usual
+right now, because the TLS work that follows touches the event loop and every
+read/write path.
+
 #### 4.4.1 The full `005`, and the rule it is built on
 
 Phase 10.4 replaced the five-token list with eleven. The rule is one sentence:

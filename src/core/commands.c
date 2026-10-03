@@ -1218,12 +1218,13 @@ static int refuse_foreign_server(server_t *s, conn_t *c, const char *verb,
     return 1;
 }
 
-/* 251, 255, 265, 266. Order is the RFC's and it matters only to a human
- * reading a log; a client reads all four. */
+/* 251, 254, 255, 265, 266. Order is the RFC's and it matters only to a human
+ * reading a log; a client reads all five. */
 static void send_lusers(server_t *s, conn_t *c)
 {
     size_t clients = server_nick_count(s);
     size_t servers = established_peers(s);
+    size_t channels = server_chan_count(s);
     /* The two numbers 265 and 266 need are carried as STRINGS because they are
      * MIDDLE parameters, and 3.2's formatter will not format a number into a
      * non-final parameter position -- it reports the message as unrepresentable
@@ -1237,6 +1238,53 @@ static void send_lusers(server_t *s, conn_t *c)
 
     (void)reply(s, c, "251", NULL, 0, "%s %d %zu %zu %d", s->name, 0, clients,
                 servers, NODE_MAX_CLIENTS);
+    /* ------------------------------------------------------------------------
+     * 254 RPL_LUSERCHANNELS, AND IT IS THE ONE OF THE THREE OPTIONAL REFINEMENT
+     * NUMERICS THAT IS NOT OPTIONAL HERE.
+     * ------------------------------------------------------------------------
+     * RFC 2812 5.1 defines it as "<integer> :channels formed", and 3.4.2 draws
+     * the line that matters: "When replying, a server MUST send back
+     * RPL_LUSERCLIENT and RPL_LUSERME. The other replies are only sent back if a
+     * non-zero count is found for them." So the test is not "is this server's
+     * feature set rich" -- it is "is the count zero".
+     *
+     *   252 RPL_LUSEROP     operators online.   This node has none: 258 says so
+     *                      on the wire and CHOPER is unconditionally refused,
+     *                      so the count is zero and its absence is CONFORMANT.
+     *   253 RPL_LUSERUNKNOWN unknown connections. This node has none: every
+     *                      accepted connection becomes either a registered
+     *                      client or a peer link, and an unregistered socket is
+     *                      not a category the node keeps a count of. Zero, and
+     *                      so correctly absent.
+     *   254 RPL_LUSERCHANNELS channels formed. NOT zero. This node creates
+     *                      channels on the first JOIN and keeps them in the
+     *                      registry 2.2 requires, so once anybody has joined
+     *                      anything the count is positive and RFC 2812 3.4.2
+     *                      requires the numeric.
+     *
+     * THE NUMBER IS `server_chan_count()`, WHICH IS THE SAME COUNT `LIST` WALKS,
+     * and that is worth stating rather than leaving implied: a client can ask
+     * LUSERS for the figure and LIST for the items and compare them, and on this
+     * node the two agree because they are one counter read twice.
+     *
+     * SENT ONLY WHEN NON-ZERO, which is the condition RFC 2812 states rather
+     * than a preference. A node with no channels emits no 254, and a client
+     * reading /LUSERS output sees the same three lines it saw before this phase.
+     *
+     * THE COST, stated: one more line in every LUSERS answer once a channel
+     * exists, which is a line-count change for any test that counts them -- and
+     * test_away_notify.c's and test_batch.c's WHOIS counts are the precedent for
+     * how this tree handles that. The benefit is that /LUSERS on a node with
+     * channels stops omitting a figure a client displays, which is the same
+     * "an away state no client can see is not an away state" argument Phase 5
+     * made about 301.
+     */
+    if (channels > 0u) {
+        char formed[24];
+
+        (void)snprintf(formed, sizeof formed, "%zu", channels);
+        (void)reply(s, c, "254", (const char *const[]){ formed }, 1, "channels formed");
+    }
     (void)reply(s, c, "255", NULL, 0, "I have %zu clients and %zu servers", clients,
                 servers);
     (void)reply(s, c, "265", (const char *const[]){ now_clients, now_max }, 2,
@@ -1247,8 +1295,9 @@ static void send_lusers(server_t *s, conn_t *c)
      * node. A node that reported a larger global figure would be inventing one. */
     (void)reply(s, c, "266", (const char *const[]){ now_clients, now_max }, 2,
                 "Current global users %s, max %s", now_clients, now_max);
-    printf("[observable] lusers: nick=%s clients=%zu servers=%zu max=%d hops=0\n",
-           c->nick, clients, servers, NODE_MAX_CLIENTS);
+    printf("[observable] lusers: nick=%s clients=%zu servers=%zu channels=%zu "
+           "max=%d hops=0\n",
+           c->nick, clients, servers, channels, NODE_MAX_CLIENTS);
 }
 
 static void handle_lusers(server_t *s, conn_t *c, const message_t *m)
