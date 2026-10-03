@@ -554,3 +554,10 @@ irc_add_integration_test(test_whois_channels test_whois_channels.c)
 # assertions are counts of 367 lines and a check that 368 comes last -- and a
 # substring search reports success for both a correct count and an empty list.
 irc_add_integration_test(test_banlist test_banlist.c)
+
+# The rest of the server-query surface Phase 11 checked: 254 RPL_LUSERCHANNELS,
+# 433 recovery, and PING/PONG token echoing. Its own file because 254 is the only
+# one that needed code -- the other two are here as the WIRE EVIDENCE that the
+# sweep found them conformant, which is worth having in the suite rather than only
+# in the phase report.
+irc_add_integration_test(test_query_surface test_query_surface.c)
