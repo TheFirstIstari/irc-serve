@@ -215,19 +215,75 @@ static void test_negotiation(void)
                 TF_CHECK_MSG(strstr(line, "message-tags") != NULL,
                              "CAP LS does not advertise message-tags, which this "
                              "node implements");
-                /* NOT ADVERTISED, and each of these is a capability a client
-                 * would act on: cap-notify expects unsolicited CAP NEW lines,
-                 * away-notify expects an AWAY you did not ask for,
-                 * echo-message expects your own PRIVMSG back. */
+                /* ...and `account-tag` is NOT here on this node, which has neither
+                 * a registry nor an identity to stamp. The store check is
+                 * account_possible() and this node has no store; Phase 10.2a's
+                 * two-node and two-store cases are what cover the other side. */
+                TF_CHECK_MSG(strstr(line, "account-tag") == NULL,
+                             "CAP LS advertises account-tag on a node with no "
+                             "account registry, which can never write the tag");
+                /* ...and `extended-join` IS advertised here even though this node
+                 * has no account system, because its answer is a `*` account field
+                 * rather than a name: `JOIN #chan * :Real Name` is complete and
+                 * true. Two account capabilities, two answers to the same shape of
+                 * question, and cap.h is where the difference is argued. */
+                TF_CHECK_MSG(strstr(line, "extended-join") != NULL,
+                             "CAP LS does not advertise extended-join, which this "
+                             "node implements on every node");
+                /* ...and `userhost-in-names` IS here (Phase 10.5), which is a
+                 * DISCLOSURE capability rather than a rendering one: it puts every
+                 * member's ident and host in front of the client that asked. That
+                 * is exactly why the roster shape is decided per destination and
+                 * not per channel, and why this test's sibling
+                 * (test_userhost_in_names.c) is the one that checks the two
+                 * renderings rather than this file checking the advertisement. */
+                TF_CHECK_MSG(strstr(line, "userhost-in-names") != NULL,
+                             "CAP LS does not advertise userhost-in-names, which "
+                             "this node implements for every 353 it draws");
+                /* NOT ADVERTISED, and this one is a capability a client would
+                 * act on: cap-notify expects unsolicited CAP NEW lines.
+                 *
+                 * `echo-message` WAS on this list, under a comment reading "expects
+                 * your own PRIVMSG back" -- which is a DESCRIPTION of the feature
+                 * presented as a reason for withholding it, and it was the wrong
+                 * reason: this node has echoed a channel PRIVMSG to its sender since
+                 * Phase 5, because fanout writes to every local member. What the
+                 * capability adds is NOTICE, which is what Phase 10.7 implemented --
+                 * so the line has moved from "must be absent" to "must be present",
+                 * and the behaviour it names is asserted in test_echo_message.c,
+                 * which is where a count can be taken rather than a substring. */
                 TF_CHECK_MSG(strstr(line, "cap-notify") == NULL,
                              "CAP LS advertises cap-notify, which nothing here "
                              "sends CAP NEW for");
-                TF_CHECK_MSG(strstr(line, "away-notify") == NULL,
-                             "CAP LS advertises away-notify");
-                TF_CHECK_MSG(strstr(line, "echo-message") == NULL,
-                             "CAP LS advertises echo-message");
-                TF_CHECK_MSG(strstr(line, "account-notify") == NULL,
-                             "CAP LS advertises account-notify");
+                /* `away-notify` WAS here and Phase 10.8 is why it is not any
+                 * more, on the same shape as `echo-message` above: the refusal was
+                 * a DESCRIPTION of the feature presented as a reason for withholding
+                 * it ("expects an AWAY you did not ask for"), and the correct
+                 * question is whether this node can produce one at all. It can --
+                 * `conn_t::away` exists on every connection, `AWAYLEN` is advertised
+                 * from `CONN_MAX_AWAY`, and `handle_away()` now notifies the users
+                 * sharing a channel with the setter, per destination and excluding
+                 * the setter. The behaviour is asserted in test_away_notify.c,
+                 * which is where the SET and the CLEARED cases can each be a count
+                 * rather than a substring. */
+                TF_CHECK_MSG(strstr(line, "away-notify") != NULL,
+                             "CAP LS does not advertise away-notify, which this node "
+                             "implements: a user who sets or clears an away state "
+                             "notifies the users sharing a channel with them");
+                TF_CHECK_MSG(strstr(line, "echo-message") != NULL,
+                             "CAP LS does not advertise echo-message, which this node "
+                             "implements -- a sender that negotiated it gets its own "
+                             "NOTICE back");
+                /* `account-notify` WAS here, and Phase 10.2b is why it is not any
+                 * more. The node emitted no ACCOUNT line, and a listed capability
+                 * is a client switching the feature on and then drawing the wrong
+                 * conclusion from every line -- which for this one means a client
+                 * whose channel-mates all appear anonymous for ever. It is now a
+                 * capability this build really does, so it belongs in the
+                 * "advertised means implemented" arm above. */
+                TF_CHECK_MSG(strstr(line, "account-notify") != NULL,
+                             "CAP LS does not advertise account-notify, which this "
+                             "node implements and answers");
                 TF_CHECK_MSG(strstr(line, "server-time") == NULL,
                              "CAP LS advertises server-time, which this node "
                              "does not stamp");

@@ -4,6 +4,12 @@
 build-testing/
 build-benchmark/
 cmake-build-*/
+
+# This phase's build matrix directories (b-prefixed: gcc-16 / upstream clang /
+# Apple clang x Release/Debug, plus the ASan/UBSan one). Same reasoning as the
+# lines above -- they are build artifacts, not sources -- named explicitly so a
+# future matrix does not have to remember.
+b*/
 *.o
 *.a
 *.so
@@ -67,6 +73,12 @@ Thumbs.db
 
 # In-tree CMake build directories (any name, not just /build)
 build-*/
+
+# This phase's build matrix directories (b-prefixed: gcc-16 / upstream clang /
+# Apple clang x Release/Debug, plus the ASan/UBSan one). Same reasoning as the
+# lines above -- they are build artifacts, not sources -- named explicitly so a
+# future matrix does not have to remember.
+b*/
 # Stray compiled executables accidentally left in source dirs
 tests/benchmark/throughput
 tests/benchmark/footprint

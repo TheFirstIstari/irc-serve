@@ -71,6 +71,7 @@
 #include "core/channel.h"
 #include "core/connection.h"
 #include "core/message.h"
+#include "core/account.h"
 #include "core/server.h"
 
 /* 3.1's VERB CLASS. This is the column of the table that the previous version
@@ -290,6 +291,201 @@ int fanout_deliver_local(server_t *s, const fanout_target_t *t, const char *pref
 int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
                    const char *verb, const char *const *params, int nparams,
                    conn_t *exclude, const irc_serve_tags_t *carry);
+
+/* ---------------------------------------------------------------------------
+ * THE WORST-CASE CLIENT-VISIBLE TAG BLOCK, DERIVED from the tags this node writes
+ * ---------------------------------------------------------------------------
+ *   IRC_MAX_MSGTAG   the `msgid` block, derived in message.h
+ *        1           the ';' between two pairs
+ * ACCOUNT_TAG_MAX   the `account` block, derived in account.h
+ *        1           the NUL
+ *
+ * IT IS USED FOR THREE THINGS, and the third is why it lives in the HEADER rather
+ * than beside its renderer: it sizes the per-destination buffer in fanout.c's
+ * write_to_members(), it is the charge fanout_line_fits() adds to the client-facing
+ * cap, and -- since Phase 10.12 -- it sizes the MERGED buffer in reply.c's
+ * emit_built_ex(), which prepends a `batch=` tag to a block another module rendered.
+ *
+ * THAT THIRD USE IS WHY IT IS HERE AND NOT WHERE IT WAS. A buffer sized by eye and a
+ * cap that forgot the tag are the same defect in two places -- a line that cannot be
+ * rendered -- and a per-module copy of this constant is a third place waiting for the
+ * first tag that does not fit. A module that WRITES a client-visible tag and a module
+ * that RENDERS a client-visible tag have to agree on how wide one is, and the only
+ * honest way to arrange that is one declaration both can see.
+ *
+ * IT IS NOT THE WIDTH OF A `batch=` OR A `label=` BLOCK, and those are added by the
+ * caller that concatenates: reply.c's `merged` buffer is this plus BATCH_TAG_KEY_MAX
+ * plus the separator, sized from named pieces for the same reason. What matters is
+ * that adding a tag is a change to this file AND to that arithmetic, rather than a
+ * change one module makes and another silently does not notice. */
+#define FANOUT_TAG_BLOCK_MAX (IRC_MAX_MSGTAG + 1u + ACCOUNT_TAG_MAX + 1u)
+
+/* ONE WIRE SHAPE: a parameter list and its length. A struct rather than two more
+ * arguments because the thing it carries IS a list, and a shape with a length is
+ * the shape every parameter in this file already has. */
+typedef struct {
+    const char *const *params;
+    int         nparams;
+} fanout_form_t;
+
+/* As fanout_deliver(), for an emission whose PARAMETERS -- not merely its tags --
+ * differ per destination. `plain` is the shape everybody gets; `extended` is the
+ * shape a destination that negotiated `extended-join` gets instead. A NULL
+ * `extended` means one shape for all, and is exactly fanout_deliver().
+ *
+ * WHY IT IS A SEPARATE ENTRY POINT AND NOT A FLAG. `extended-join` changes the
+ * JOIN from `:nick!user@host JOIN #chan` to `:nick!user@host JOIN #chan <account>
+ * :<realname>`, and those are two different messages rather than two decorations
+ * of one. Every tag in this file is a per-destination decision because a tag is
+ * not part of what the line MEANS; a parameter is. A client that did not ask for
+ * the extension and received the two extra ones would read the account name as a
+ * topic and the realname as a reason, and it would do that silently.
+ *
+ * WHAT THE FORWARD DOES WITH IT, because this is where the two shapes have to be
+ * reconciled: **the forward always uses `plain`.** The peer-facing form of a JOIN
+ * is 4.3's SJOIN, and its shape is decided by federation/verbs.c's
+ * fed_sverb_params() from the channel's own membership -- which is where the
+ * account and the flags both come from. Handing `extended` to the forward would
+ * give a peer two different JOIN shapes depending on which of its clients had
+ * negotiated a capability, which is precisely the divergence 4.3's single frozen
+ * shape exists to prevent.
+ *
+ * The identity is minted once for both shapes, exactly as it is for the tags, so
+ * a client that receives the plain form and a peer that receives the SJOIN are
+ * looking at one emission. */
+int fanout_deliver_forms(server_t *s, const fanout_target_t *t, const char *prefix,
+                         const char *verb, const fanout_form_t *plain,
+                         const fanout_form_t *extended, conn_t *exclude,
+                         const irc_serve_tags_t *carry);
+
+/* As fanout_deliver_local(), for an emission whose parameters differ per
+ * destination, and with the SAME reason for existing: the extended JOIN is a
+ * local emission with no forward leg, and a future caller that resolved a channel
+ * and wanted the extension would otherwise have to reimplement the member walk.
+ *
+ * `carry` is still not a parameter, for fanout_deliver_local()'s reason: a
+ * local-only emission originates here. */
+int fanout_deliver_local_forms(server_t *s, const fanout_target_t *t,
+                               const char *prefix, const char *verb,
+                               const fanout_form_t *plain,
+                               const fanout_form_t *extended, conn_t *exclude);
+
+/* ---------------------------------------------------------------------------
+ * THE THIRD OUTCOME: "SEND THIS MEMBER NOTHING"
+ * ---------------------------------------------------------------------------
+ * The two wire SHAPES above answer "which of these two lines does this
+ * destination get", which is a choice between two answers and therefore cannot
+ * express a third one: a member who is not supposed to hear about an emission
+ * at all. Three specifications need that third answer, and each needs it for the
+ * same reason -- the notification is UNSOLICITED and goes only to clients that
+ * asked for it:
+ *
+ *   setname        "to all clients in common channels, as well as to the client
+ *                   from which it originated"
+ *   chghost        "to other clients who share channels with the target client
+ *                   and who have enabled the `chghost` capability"
+ *   away-notify    "clients will be sent an AWAY message when a user sharing a
+ *                   channel with them sets, changes or removes their away state"
+ *
+ * THREE HANDLERS WALKING THE ROSTER THEMSELVES IS THE ALTERNATIVE, and it is the
+ * one this module exists to prevent: chan_verbs.c grew a broadcast helper in
+ * Phase 4 for the same reason this file exists (see the header), and it had no
+ * forward arm, and the missing forward was lost. A second walk in a handler is a
+ * walk that can drift from the first, and a walk that skips `chan_member_live()`
+ * is a refusal counted on n_reply_refused -- the counter reply.c keeps at zero
+ * because a non-zero value is a bug report. So the audience question is asked
+ * HERE, once per destination, in the one place that already asks the shape
+ * question once per destination.
+ *
+ * WHY IT IS A PREDICATE AND NOT A THIRD FORM. A third `fanout_form_t` holding an
+ * empty parameter list would still be a LINE: `nick!user@host AWAY #chan` with no
+ * trailing text says "this user is not away" whether it was sent because they
+ * stopped being away or because the client was never told. Absence is the
+ * assertion here, exactly as it is for `account-tag`'s tag, so the outcome has to
+ * be the absence of a line and not a line that means nothing. (The away case is
+ * the sharp one: `AWAY` with no parameter means "no longer away", so a node that
+ * sent it to a client which did not ask would be asserting a state change that
+ * did not happen.)
+ *
+ * THE SIGNATURE, and why `dst` is the only destination-side datum: a gate is
+ * asked once per destination from inside the walk, so a predicate taking only the
+ * destination can be an ordinary function -- `cap_away_notify_enabled` has exactly
+ * this shape and is handed over with no glue at all. Everything about the
+ * EMISSION that the audience depends on arrives through `ctx`, because the
+ * alternative would be a per-emission closure and C has no room for one here.
+ *
+ * A NULL `gate` means "every destination the emission reaches", and is exactly
+ * fanout_deliver_local_forms(). The same sentence, for the same reason: a NULL is
+ * the case that already works rather than a second implementation of it.
+ *
+ * WHAT THE GATE DOES NOT DO. It does not affect the forward arm, and there is
+ * nothing for it to affect: a gate is asked about a LOCAL DESTINATION, and the
+ * forward arm has none -- a peer is not a client that negotiated anything. That
+ * is also why there is no gated variant of fanout_deliver_forms(): the question
+ * is unaskable there rather than answerable-but-ignored, and a parameter a caller
+ * can set on a path where it cannot mean anything is a parameter that will be set
+ * and believed.
+ *
+ * The order inside the walk is liveness, then `exclude`, then the gate, and it is
+ * cheapest-first: a member whose descriptor the loop has already dropped, and a
+ * member the caller excluded, are not asked a question about an emission they
+ * were never going to receive.
+ */
+typedef int (*fanout_gate_fn)(const conn_t *dst, void *ctx);
+
+/* As fanout_deliver_local_forms(), and a destination for which `gate` returns 0
+ * receives NOTHING: no line, no tag block, no entry in the returned count.
+ *
+ * Returns the number of CLIENTS the line was queued for, which -- as everywhere
+ * else in this file -- is a count of deliveries and not a count of destinations
+ * reached. A gated-off member is not a destination that was reached and declined,
+ * so a caller cannot tell the two apart from the number; nothing needs to, and a
+ * caller that did would be asking the count a question it cannot answer. */
+int fanout_deliver_local_gated(server_t *s, const fanout_target_t *t,
+                               const char *prefix, const char *verb,
+                               const fanout_form_t *plain,
+                               const fanout_form_t *extended, fanout_gate_fn gate,
+                               void *gate_ctx, conn_t *exclude);
+
+/* ---------------------------------------------------------------------------
+ * THE FOURTH OUTCOME: "TO THE PEOPLE WE SHARE A CHANNEL WITH, EXACTLY ONCE"
+ * ---------------------------------------------------------------------------
+ * The gated entry point above addresses ONE channel, and a caller with more than
+ * one would loop it -- which is right for every emission whose line NAMES the
+ * channel, and wrong for the one that does not.
+ *
+ * `setname`'s server-to-client line is `:nick!user@host SETNAME :<realname>`: the
+ * specification's shape carries NO channel parameter, because it is a statement
+ * about a *person* and not about a channel. So a per-channel emission puts a
+ * `#channel` where a client expects the realname, and hands a member of three
+ * shared channels three byte-identical copies of one fact. Neither is what the
+ * specification says, and the second is `echo-message`'s defect reached from the
+ * other side: one announcement, delivered more than once.
+ *
+ * So this addresses the UNION of `chans[]` -- which is the caller's own
+ * `conn_t::chans`, 2.2's second index, kept in step with the channel's list by
+ * chan_attach_conn() -- and writes each destination ONCE.
+ *
+ * DE-DUPLICATION IS A SEARCH AND NOT A SET, which is why there is no bounded
+ * cache here and so no teardown arm to forget: "already reached?" is "is this
+ * member of a channel at a LOWER index", answered against structures the channel
+ * layer already owns and frees. The bound is `nchans * nmembers`, both of which
+ * are compile-time constants in headers this node already treats as limits.
+ *
+ * NO FORWARD, and for the same reason fanout_deliver_local() has none: this is an
+ * ORIGINATING emission, one that happens in response to a command this node just
+ * read. There is no `carry` parameter for the same reason there is none there.
+ *
+ * THERE IS NO GATED VARIANT OF THE FORWARDING PATH, still, and this function does
+ * not change that: it is a LOCAL emission by construction.
+ */
+int fanout_deliver_union_local_gated(server_t *s, struct chan *const *chans,
+                                     size_t nchans, const char *prefix,
+                                     const char *verb, const fanout_form_t *plain,
+                                     const fanout_form_t *extended,
+                                     fanout_gate_fn gate, void *gate_ctx,
+                                     conn_t *exclude);
+
 
 
 /* ---------------------------------------------------------------------------

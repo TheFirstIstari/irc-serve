@@ -212,6 +212,96 @@ int send_line_tagged(server_t *s, conn_t *dst, const char *prefix,
  * <target> and the trailing text have taken two slots. */
 #define REPLY_MAX_MID (IRC_MAX_PARAMS - 2)
 
+/* ---------------------------------------------------------------------------
+ * standard-replies: `FAIL`, `WARN` and `NOTE`
+ * ---------------------------------------------------------------------------
+ * IRCv3's `standard-replies` defines three commands with ONE shape:
+ *
+ *     <type> <command> <code> [<context>...] :<description>
+ *
+ *   type      "FAIL" (the command could not be processed), "WARN" (a non-fatal
+ *             warning about it) or "NOTE" (an informational message about it).
+ *   command   the command the reply relates to, REQUIRED, or "*" when it was not
+ *             spawned by one. A NULL or empty `command` here renders "*".
+ *   code      a machine-readable reply code. The IRCv3 reply-code registry holds
+ *             some of these; the rest of this node's are `ERR_`-prefixed, which is
+ *             the marker for "ours and not registered" so a client switching on an
+ *             unregistered code and one this node invented are never confused.
+ *   ctx       optional extra context, "not intended for end users but for
+ *             developers". Counted against the same 15-parameter cap as `nmid`.
+ *   fmt       the description, which is colonned exactly when the formatter needs
+ *             to -- the RFC 1459 2.3.1 rule every other line here obeys.
+ *
+ * EVERY REFUSAL IS reply()'s, in the same order and for the same reasons: a NULL
+ * destination, a peer link (3's federation invariant), a CLOSING target, and a
+ * description too long for REPLY_TEXT_MAX. It goes through the same
+ * emit_built(), so it is one queueing site and not two.
+ *
+ * `ERROR` IS NOT ONE OF THESE THREE, and that is a fact rather than a gap -- see
+ * reply.c, which carries the argument and the source.
+ *
+ * **`WARN` AND `NOTE` HAVE NO PRODUCER ON THIS NODE.** They are implemented because
+ * the three share a format and writing two of them later is how a partial
+ * implementation becomes an inconsistency; they are not implemented because this
+ * node has no command that warns and none that notes, and inventing a producer for
+ * either would be inventing a feature.
+ */
+int reply_std(server_t *s, conn_t *src, const char *type, const char *command,
+              const char *code, const char *const *ctx, size_t nctx, const char *fmt, ...)
+#if defined(__GNUC__)
+    __attribute__((format(printf, 8, 9)))
+#endif
+    ;
+
+/* ---------------------------------------------------------------------------
+ * reply_refused() -- THE ONE ENTRY POINT FOR A REFUSAL THIS NODE MIGRATES
+ * ---------------------------------------------------------------------------
+ *   command    the command word for the `FAIL`, or NULL for "*".
+ *   fail_code  the `FAIL` code, or NULL for "whatever this numeric maps to".
+ *   legacy     the RFC numeric as reply() would have been given it.
+ *   mid/nmid   the numeric's middle parameters, which become `FAIL`'s <context>.
+ *   fmt        the description, identical to what the numeric would have carried.
+ *
+ * ONE QUESTION decides the outcome, and it is asked before anything else:
+ *
+ *   THIS CLIENT NEGOTIATED `standard-replies`?
+ *
+ *   NO   -> `reply()` with `legacy`, verbatim. **Byte-identical** to what the
+ *           caller would have got without this function. That is the guarantee,
+ *           and it is structural: there is one branch and it is the old call, so
+ *           there is nothing for a call site to be careful about.
+ *   YES  -> `FAIL <command> <code> <mid...> :<description>`.
+ *
+ * A `legacy` this node does not migrate, or a NULL `fail_code` with an unmapped
+ * `legacy`, ALSO takes the legacy branch -- so this function is safe at any call
+ * site, including one whose numeric happens not to be on the migration list.
+ *
+ * WHICH NUMERICS MIGRATE, and why the list is short: a legacy numeric migrates
+ * where it answers more than one question ON THIS NODE, so the number alone
+ * cannot tell a client which refusal happened. Four qualify -- `417` (four
+ * refusals), `461` (too few and too many, with a text that calls both "not
+ * enough"), `482` (three refusals, two of which are "not a channel operator" and
+ * "not an IRC operator") and `464` (an operator refusal and a credential
+ * failure) -- and every other numeric on this node answers exactly one question
+ * and stays. reply.c carries the table, the per-refusal argument and the code
+ * strings; cap.h carries the cost, which is that those four numbers stop reaching
+ * a client that negotiated the capability.
+ *
+ * THE COST IN CALL SITES, and it is why this function takes the command word as a
+ * parameter rather than deriving it: `reply()` cannot know which command produced
+ * a refusal, and `<command>` is a REQUIRED field of a `FAIL`. So each migrated call
+ * site grows the one word it always knew and nothing else -- the numeric, the
+ * middle parameters and the description stay exactly as they were, which is what
+ * makes the legacy branch identical.
+ */
+int reply_refused(server_t *s, conn_t *src, const char *command, const char *fail_code,
+                  const char *legacy, const char *const *mid, size_t nmid,
+                  const char *fmt, ...)
+#if defined(__GNUC__)
+    __attribute__((format(printf, 8, 9)))
+#endif
+    ;
+
 /* Answer a PING with a PONG. PONG is not a numeric -- it is a command, and it
  * is the one command this node originates -- but it travels the same path and
  * obeys the same peer-link refusal, because the reason a numeric must not

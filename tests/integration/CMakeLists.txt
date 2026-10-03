@@ -138,6 +138,28 @@ irc_add_integration_test(test_ircv3_msgid test_ircv3_msgid.c)
 # the ratchet asks.
 irc_add_integration_test(test_multi_prefix test_multi_prefix.c)
 
+# userhost-in-names (Phase 10.5), here beside test_multi_prefix for one reason:
+# both are about what a `353` roster LOOKS LIKE per destination, and both are the
+# kind of test that passes with one client and fails with two. A separate file, not
+# a second case in test_multi_prefix.c, because this one is a privacy assertion --
+# it checks that a hostmask is disclosed to the client that asked and ONLY to that
+# client -- and burying it beside a sigil-ordering case would make the disclosure
+# easy to skim past.
+irc_add_integration_test(test_userhost_in_names test_userhost_in_names.c)
+
+# setname (Phase 10.6), its own file for one reason: almost everything the
+# specification says about it is a REFUSAL -- before registration, without the
+# capability, over-long, hostile -- and a file whose cases are mostly "nothing
+# arrived, and the field did not change" reads very differently beside one whose
+# cases are all "this line is on the wire".
+irc_add_integration_test(test_setname test_setname.c)
+
+# echo-message (Phase 10.7). Its own file because its assertions are COUNTS and no
+# other capability here has that shape: the defect it invites is two identical
+# deliveries, and a substring search for either one reports success. Every case
+# below is tf_count over a marked region.
+irc_add_integration_test(test_echo_message test_echo_message.c)
+
 # 2.1 / 5: valid_nick() enforced at runtime. Phase 1 shipped the predicate with
 # no caller in src/, so this is the test that makes it load-bearing. Asserts the
 # RESPONSE, never that the function was called.
@@ -437,3 +459,75 @@ irc_add_integration_test(test_peer_discovery test_peer_discovery.c)
 # over real sockets. The CTest NAME is unchanged (AutoScale) -- see irc_ctest_name()
 # above for why, and tests/loadbal/CMakeLists.txt for what is left of the five.
 irc_add_integration_test(test_autoscale test_autoscale.c)
+
+# 7/Phase 10.1: the ACCOUNT subsystem -- an identity that outlives a socket,
+# which is the thing seven IRCv3 specs were blocked on because src/ had no
+# account concept at all. In tests/integration/ and not tests/protocol/ for the
+# same reason test_cap_negotiation.c is: the properties are all about what a
+# CLIENT sees and what a node says at start-up and teardown, so they need a real
+# socket, a real forked node, and the node's own stdout.
+#
+# Its own file because the claims are asymmetric and cannot be split by a file
+# boundary without the file's testing itself: a registry that LOADS and a registry
+# that does not must produce the SAME observable behaviour for a client that is
+# not identified (that is the "account == \"\" is indistinguishable from no
+# account system" invariant), and the only way to assert that is to run one set of
+# assertions over both configurations.
+irc_add_integration_test(test_account test_account.c)
+
+# 7/Phase 10.8a: the fanout contract's THIRD outcome. `fanout_form_t` chose
+# between two wire SHAPES per destination, which cannot express "send this member
+# nothing" -- and `setname`, `chghost` and `away-notify` all need to publish to a
+# SUBSET of a channel's members. So the routing module grew a per-destination
+# GATE rather than three handlers growing three member walks.
+#
+# Its own file because nothing on the wire produces a gated emission until
+# away-notify lands, and the contract is load-bearing for three specifications
+# that do: the assertion has to be against the API, which is the same argument
+# test_nick_index.c makes for the nick enumeration. Phase 10.8b then adds the
+# wire-level case on top of it.
+irc_add_integration_test(test_fanout_gate test_fanout_gate.c)
+
+# 7/Phase 10.9: `standard-replies`, and the KICK reason bound `KICKLEN` was
+# waiting for. One file because the two halves of the commit are the same claim
+# about the same thing -- a refusal this node cannot represent must be REFUSED at
+# the boundary with a numeric a client already understands, and only four of this
+# node's numerics are ambiguous enough to be worth rendering as a `FAIL` for a
+# client that negotiated the capability.
+irc_add_integration_test(test_standard_replies test_standard_replies.c)
+
+# 7/Phase 10.8: `chghost`, and the finding that is its deliverable. There is no
+# CHGHOST verb on this node and no CHGHOST emitter, so the capability is ABSENT
+# and the file's job is to make the absence provable and the reason precise: a
+# HOST cannot move after accept(), but an IDENT CAN -- `USER` is a pre-registration
+# verb the dispatch table still routes for a registered connection -- and nothing
+# tells anybody when it does.
+irc_add_integration_test(test_chghost test_chghost.c)
+
+# 7/Phase 10.8b: `away-notify`, the `AWAY` notification on BOTH edges of the
+# change. Its own file because the cleared edge is the half that is usually
+# missing and it needs the same case as the set edge to be visible at all: a
+# node that notified only on the way out leaves every member believing their
+# friend is still at lunch for ever.
+irc_add_integration_test(test_away_notify test_away_notify.c)
+
+# IRCv3 `batch`, the client-facing half (Phase 10.12). Its own file because the whole
+# capability's visible behaviour is a TAG on somebody else's line, so every assertion
+# in it is either a count of tagged lines or a count of their absence -- and a
+# substring search reports success for both. It is also the only place the `@`/`+`
+# reference tags are tested at all.
+irc_add_integration_test(test_batch test_batch.c)
+
+# IRCv3 `labeled-response` (Phase 10.13). Its own file because the specification's
+# central requirement -- "the tag in EXACTLY ONE LOGICAL MESSAGE" -- is a claim about a
+# MULTI-LINE response, so every assertion in it is a count over a window rather than a
+# substring, and because it is the only place the `labeled-response` grouping batch and
+# the `ACK` are tested at all.
+irc_add_integration_test(test_labeled_response test_labeled_response.c)
+
+# IRCv3 `invite-notify` (Phase 10.14). Its own file because the specification's AUDIENCE
+# is the thing being asserted -- the members of one channel, not the invitee's other
+# connections and not the node -- and because `test_invite.c` already asserts that an
+# INVITE reaches the INVITEE, so a substring search for "INVITE" on any socket here is
+# satisfied by the delivery and every claim has to be a count.
+irc_add_integration_test(test_invite_notify test_invite_notify.c)

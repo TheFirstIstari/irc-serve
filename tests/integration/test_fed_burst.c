@@ -472,7 +472,7 @@ static void send_truncated_burst(server_t *s, server_link_t *link)
     const char *n0[2];
     const char *n1[6];
     const char *c1[6];
-    const char *m1[4];
+    const char *m1[5];
     const char *e1[4];
     char epoch[24];
     int ok = 0;
@@ -510,6 +510,7 @@ static void send_truncated_burst(server_t *s, server_link_t *link)
     m1[1] = NAME_A;
     m1[2] = NICK_A;
     m1[3] = "-";
+    m1[4] = "*"; /* the account, since Phase 10.3: `*` for "not logged in" */
     e1[0] = epoch;
     e1[1] = "1"; /* nicks: correct */
     e1[2] = "1"; /* chans: correct */
@@ -524,7 +525,7 @@ static void send_truncated_burst(server_t *s, server_link_t *link)
                        NULL) == 0 &&
         fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURSTC", c1, 6,
                        NULL) == 0 &&
-        fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURSTM", m1, 4,
+        fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURSTM", m1, 5,
                        NULL) == 0 &&
         fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURSTE", e1, 4,
                        NULL) == 0) {

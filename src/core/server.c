@@ -16,6 +16,15 @@
 
 #include "core/channel.h"
 #include "core/message.h"
+/* Phase 10.1's account registry. Included for the same reason sasl_framework.h
+ * below is: it is a teardown arm on a table this struct holds, so the pointer
+ * belongs to the node and the layout belongs to the module that owns it. */
+#include "account_store.h"
+/* Phase 10.1's account_clear(), called from server_close_conn() beside the
+ * nickname release for the reason account.h gives: the identity must not outlive
+ * the connection that owns it, and server_close_conn() is the one function every
+ * retirement goes through. */
+#include "core/account.h"
 /* The one include that points the other way. 4.3's inbound resync shadow is a
  * module global rather than a field on server_t, so the shutdown has to reach
  * into its owner to release it -- the same reason the dedup table below is freed
@@ -761,6 +770,38 @@ void server_shutdown(server_t *s)
      * pointer into it. */
     sasl_store_free(s->sasl_store);
     s->sasl_store = NULL;
+    /* Phase 10.1's account registry: the same SHAPE of obligation as the
+     * credential store above and the same reason it is a call rather than a
+     * free. The layout and the three-field file format are account_store.c's,
+     * and the owner also OVERWRITES THE PASSWORDS before releasing them -- so a
+     * free() here would be a different, weaker operation than the one the module
+     * provides, which is the reason this is not `free(s->account_store)`.
+     *
+     * IT IS SAFE HERE, and the argument is the same one the burst shadow's and
+     * the resume table's arms give: every connection was closed by the walk
+     * above and every one of those closures called account_clear(), so no
+     * conn_t::account -- and no connection that borrowed this registry -- can
+     * still be pointing at anything inside it. And it is safe on a node that
+     * never loaded one, which is every node started without --account-store:
+     * the field is NULL until account_store_load() succeeds.
+     *
+     * THE ARM PRINTS whether a registry was OPEN, following
+     * `fed_burst_close: shadow=OPEN|NONE` rather than inventing a second
+     * convention, and for the reason that convention exists:
+     * **LeakSanitizer does not run on Darwin**, so a missing free here is
+     * invisible to every local run and is caught only by the Linux CI job. The
+     * line makes the arm ASSERTED on every platform -- a test can require it --
+     * and VERIFIED on the one that has a leak checker, from the same run.
+     *
+     * `store=OPEN` means a registry was loaded and has now been released with
+     * its passwords overwritten; `store=NONE` means the node had no account
+     * system, which is the state most deployments of this design are in and is
+     * not an error. */
+    printf("[observable] account_store_close: store=%s records=%zu\n",
+           (s->account_store != NULL) ? "OPEN" : "NONE",
+           account_store_count(s->account_store));
+    account_store_free(s->account_store);
+    s->account_store = NULL;
     /* Phase 9's remote-nick registry: 2.1's "which server holds the user called
      * X", the table that makes 3.1's last row resolvable. A CALL rather than a
      * free for the same reason as the two arms above -- the layout and the
@@ -1096,6 +1137,25 @@ void server_close_conn(server_t *s, int fd)
      * whether the connection is in the index is the mistake this paragraph is
      * about. */
     server_nick_unclaim(s, c);
+
+    /* And the ACCOUNT, in the same place and for the same reason. Two
+     * identities, two retirements, one function.
+     *
+     * The account is NOT in an index -- it is a field on the conn and nothing
+     * else looks it up -- so this arm is belt to conn_free()'s braces rather
+     * than the only thing holding them up, and it is here anyway for three
+     * reasons that are all about a reader rather than about correctness:
+     * server_nick_unclaim() is directly above, and a reader who is told "every
+     * retirement releases the names" should be able to see the account go in the
+     * same breath; account.h documents this call as the teardown's job, and a
+     * teardown that did not do it would leave that claim false; and
+     * account_clear() erases BOTH fields in one function, which is only
+     * reachable if something calls it.
+     *
+     * A connection's account outlives the connection in the sense that matters
+     * -- it outlives the SOCKET, so the same person gets it back on the next
+     * connection -- and it must not outlive the conn_t. */
+    account_clear(c);
 
     /* The counterpart of the loop's conn_close lines, and deliberately a
      * different word: those say a connection is ON ITS WAY OUT and why, this one

@@ -10,6 +10,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "core/account.h"
 #include "core/cap.h"
 #include "core/channel.h"
 #include "core/fanout.h"
@@ -43,14 +44,20 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
     int is_channel;
     int member;
     int delivered;
+    conn_t *exclude;
 
-    /* Arity. RFC 2812 3.3.1 gives PRIVMSG <msgtarget> <text> and 3.3.2 gives
+/* Arity. RFC 2812 3.3.1 gives PRIVMSG <msgtarget> <text> and 3.3.2 gives
      * NOTICE the same two. A third parameter is not text the client meant to
-     * send -- the grammar has already absorbed everything after a ':' -- so it
-     * is refused rather than guessed at, which is the same call Phase 3 made
-     * for "NICK a b". */
-    if (m->nparams != 2) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+     * send -- the grammar has already absorbed everything after a ':' -- so it is
+     * refused rather than guessed at, which is the same call Phase 3 made for
+     * "NICK a b".
+     *
+     * `MSG_MAX_TARGETS + 1` rather than a written 2, because 005 advertises
+     * `MAXTARGETS=` from the same number (msg_verbs.h) and two spellings of it
+     * is one too many. */
+    if (m->nparams != MSG_MAX_TARGETS + 1) {
+        (void)reply_refused(s, c, verb, "INVALID_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     text = m->params[1];
@@ -74,7 +81,7 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
      * report and not a metric, and a client that sent a long message is not a
      * bug. It is a limit, and a limit answers with a numeric. */
     if (fanout_line_fits(prefix, verb, m->params[0], text) == 0) {
-        (void)reply(s, c, "417", NULL, 0, "Message too long to send");
+        (void)reply_refused(s, c, verb, NULL, "417", NULL, 0, "Message too long to send");
         printf("[observable] msg_refused: verb=%s nick=%s reason=too_long "
                "len=%zu\n",
                verb, c->nick, strlen(text));
@@ -112,6 +119,13 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
         const char *textp[1];
 
         textp[0] = text;
+        /* NO echo-message GATE HERE, and the omission is deliberate rather than a
+         * gap: 3.1's last row is "forward to that server", so the target has no
+         * local destination at all and there is nobody on this node to send an
+         * acknowledgement to. A negotiating client whose PRIVMSG went to
+         * `bob@irc.b` gets no copy back, and the honest reason is that the
+         * acknowledgement would have to be a local-only emission invented here for a
+         * user who is not here. SPEC_TRACKING 10.7 records it. */
         fanout_deliver(s, &t, prefix, verb, textp, 1, NULL, NULL);
         return;
     }
@@ -193,20 +207,78 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
      * after the target in both verbs (RFC 2812 3.3.1: <msgtarget> <text>) and
      * the arity check at the top of this function has already refused anything
      * else, so the array cannot overflow. */
+    /* ------------------------------------------------------------------------
+     * `exclude`, AND IT IS DECIDED HERE AND NOWHERE ELSE
+     * ------------------------------------------------------------------------
+     * `exclude` is the sender for a verb whose RFC rule says it must not see its
+     * own message, and NULL when it must. RFC 2812 3.3.2 defines NOTICE that way
+     * and nothing else does, so before IRCv3's `echo-message` the whole expression
+     * was `(is_notice != 0) ? c : NULL`.
+     *
+     * WHAT `echo-message` CHANGES, AND WHY IT IS NOT A SECOND DELIVERY. The
+     * specification says a server MUST send PRIVMSG and NOTICE back to the client
+     * that sent them, and its own example --
+     *
+     *     --> PRIVMSG Attila :hi
+     *     :example!ex@example.com PRIVMSG Attila :hi
+     *
+     * -- is BYTE-IDENTICAL to what this node's normal path has produced for a
+     * channel PRIVMSG since Phase 5, because `fanout.c`'s write_to_members() writes
+     * to every live local member INCLUDING the author, and `exclude` has been NULL
+     * for PRIVMSG for exactly that reason. The copy the specification asks for is
+     * already on the wire. What is NOT already on the wire is a sender's own NOTICE,
+     * which 2.4.2 takes away and which `echo-message` -- for a client that negotiated
+     * it -- puts back.
+     *
+     * SO THE IMPLEMENTATION IS THIS ONE ARGUMENT. There is no second call to
+     * fanout_deliver(), no second emission, and therefore no way for one message to
+     * arrive twice: a node that "implemented" this by sending an acknowledgement
+     * after the normal delivery would deliver EVERY message from every negotiating
+     * client twice, which is the bug the capability exists to remove reached from the
+     * other side. One delivery, one 2.4 stamp minted above fanout's switch, one
+     * `msgid` shared by the sender and every other recipient.
+     *
+     * IT IS PER DESTINATION IN THE SENSE THAT MATTERS, which is that the decision
+     * is about THIS connection's own capability rather than about the target or
+     * about the node. Two members of one channel, one with the capability and one
+     * without, get different audiences out of the same emission -- which is why the
+     * `echo=` field on the observable line below reports the decision that was
+     * actually taken rather than re-deriving it from the verb.
+     *
+     * `nick@server` IS NOT COVERED, and that is a named limit rather than an
+     * oversight: 3.1's last row is forward-only, so the target has no local
+     * destination and there is nobody here to send an acknowledgement to. Building
+     * one would be inventing a local emission for a target that does not exist on
+     * this node. The branch above returns before this one, and it is commented. */
+    /* `labeled-response`'s ONE EXCEPTION, decided HERE and only here: "When a client
+     * sends a message to itself, the server MUST NOT include the label tag." A message
+     * ADDRESSED to itself is a resolved local user target that IS the sender -- and this
+     * is the only place in the tree that knows both the resolved target and the sender,
+     * because `reply.c`'s one queueing site knows the line and the destination and has no
+     * third thing.
+     *
+     * IT IS SET FOR EVERY MESSAGE, not only for the self-addressed one, because it is a
+     * property of the command in flight: clearing it here and setting it here means no
+     * other handler has to know the field exists. The first version of `label.c` decided
+     * this by comparing the emitted line's PREFIX against the destination's hostmask,
+     * which is a source test rather than a target test -- so it withheld the label from
+     * the echo-message copy of a CHANNEL message too, and a labelled `PRIVMSG #chan` came
+     * back unlabelled followed by an `ACK`. */
+    c->label_self = ((t.kind == FANOUT_LOCAL_USER) && (t.user == c)) ? 1 : 0;
+    exclude = ((is_notice != 0) && (cap_echo_message_enabled(c) == 0)) ? c : NULL;
     {
         const char *sp[1];
 
         sp[0] = m->params[1];
         /* `carry` is NULL: a client sent this line, so this node is ORIGINATING
          * it and fanout_forward_sverb() mints the 2.4 identity at the forward. */
-        delivered = fanout_deliver(s, &t, prefix, verb, sp, 1,
-                                   (is_notice != 0) ? c : NULL, NULL);
+        delivered = fanout_deliver(s, &t, prefix, verb, sp, 1, exclude, NULL);
     }
     printf("[observable] msg: verb=%s from=%s target=%s kind=%d members=%zu "
            "delivered=%d echo=%s member=%d\n",
            verb, c->nick, t.name, (int)t.kind,
            (t.chan != NULL) ? t.chan->nmembers : 0u, delivered,
-           (is_notice != 0) ? "no" : "yes", member);
+           (exclude != NULL) ? "no" : "yes", member);
 }
 
 void handle_privmsg(server_t *s, conn_t *c, const message_t *m)
@@ -309,7 +381,8 @@ void handle_who(server_t *s, conn_t *c, const message_t *m)
     const int multiprefix = cap_multiprefix_enabled(c);
 
     if (m->nparams > 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "WHO", "TOO_MANY_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     if (m->nparams == 1) {
@@ -392,7 +465,8 @@ void handle_whois(server_t *s, conn_t *c, const message_t *m)
     time_t now;
 
     if (m->nparams != 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "WHOIS", "INVALID_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     who = fanout_find_nick(s, m->params[0]);
@@ -444,10 +518,58 @@ void handle_whois(server_t *s, conn_t *c, const message_t *m)
     (void)reply(s, c, "317", (const char *const[]){ who->nick, idle, signon }, 3,
                 "seconds idle");
 
+    /* ------------------------------------------------------------------------
+     * 330 RPL_WHOISACCOUNT, and it is the ONE wire surface the account subsystem
+     * has in Phase 10.1. Read this before concluding that is the wrong scope.
+     *
+     * A FIFTH HOLE IN 4.4's LIST, in exactly the way 301, 303, 417 and 302 are:
+     * RFC 1459 3.3.4 defines 330 as the reply carrying "<nick> <account> :is
+     * logged in as", and this tree had nothing to put in <account> -- because it
+     * had no account. The list has a gap and the protocol does not.
+     *
+     * WHY IT IS IN THIS PHASE RATHER THAN P10.2. The forbidden list for 10.1 is
+     * `account-tag` EMISSION, `account-notify`, `extended-join`, `oper-tag`,
+     * `chghost`, `account-extban` and `away-notify` -- all of which push an
+     * identity onto a line UNSOLICITED, and all of which are what "account-tag"
+     * means. 330 is not that: it answers a question the client ASKED, on a
+     * connection that already registered, about a person it named. Nothing is
+     * stamped on anybody's traffic.
+     *
+     * AND WITHOUT IT THE PASS'S CENTRAL INVARIANT HAS NO WIRE PROOF AT ALL.
+     * The claim is that `account == ""` is indistinguishable from "this node has
+     * no account system", and the way to show that on the wire is that a client
+     * that is not logged in and a node that has no accounts produce BYTE-IDENTICAL
+     * WHOIS output. That is only checkable if a logged-in client produces
+     * something different, and 330 is that something. Leaving it out would mean
+     * the account name exists, is set from a verified credential, is free at
+     * teardown -- and is invisible to every client and every operator except as
+     * one log line, which is an identity only this node can see.
+     *
+     * SENT ONLY WHEN THERE IS AN ACCOUNT, and the absence is the RFC-conventional
+     * "not identified". That is NOT the same hazard as `account-tag`'s absent
+     * tag, which the specification makes meaningful: 330's absence means "no
+     * account", and on this node that is exactly and only true -- account_name()
+     * returns "" precisely when the predicate is false. The two were argued
+     * separately; see cap.h on why `account-tag` is withheld and this is not.
+     *
+     * THE COST, stated: one more line in a WHOIS for every identified user, so
+     * a client that parses WHOIS positionally must find 330 by number rather
+     * than by offset -- which is what the numerics are for. And it is the only
+     * place a person's account name is revealed to another user, so an operator
+     * who does not want that has no way to turn it off short of not loading a
+     * registry. That trade is worth one sentence here rather than being left to
+     * be discovered.
+     */
+    if (account_logged_in(who) != 0) {
+        (void)reply(s, c, "330", (const char *const[]){ who->nick, account_name(who) },
+                    2, "is logged in as");
+    }
+
     (void)reply(s, c, "318", (const char *const[]){ who->nick }, 1,
                 "End of /WHOIS list");
-    printf("[observable] whois: by=%s nick=%s host=%s away=%d\n", c->nick,
-           who->nick, who->host, (who->away[0] != '\0') ? 1 : 0);
+    printf("[observable] whois: by=%s nick=%s host=%s away=%d account=%d\n",
+           c->nick, who->nick, who->host, (who->away[0] != '\0') ? 1 : 0,
+           account_logged_in(who));
 }
 
 /* ---------------------------------------------------------------------------
@@ -485,7 +607,8 @@ void handle_ison(server_t *s, conn_t *c, const message_t *m)
     size_t nout = 0;
 
     if (m->nparams < 1 || m->nparams > (int)(sizeof found / sizeof found[0])) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "ISON", "INVALID_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
 
@@ -529,20 +652,119 @@ void handle_ison(server_t *s, conn_t *c, const message_t *m)
  * 303: the list has a gap rather than the protocol doing so. RFC 2812 3.3.1
  * defines 417 ERR_INPUTTOOLONG and every client understands it, while 4.4's own
  * candidates are all false here -- 461 says "you did not send enough", and the
- * client sent exactly what it meant to.
+ * client sent exactly what it meant to. Since Phase 10.9 it is a `FAIL AWAY
+ * ERR_INPUTTOOLONG` for a client that negotiated `standard-replies` and the same
+ * 417 for one that did not; design 4.4.3 has the migration rule.
  *
  * 305 and 306 are not in 4.4 either, and this one is not a close call. A
  * state-changing command that answers nothing leaves a client unable to tell
  * success from a dropped line, which is precisely the silence 4.4's numerics
  * exist to prevent; Phase 4's 472, 474, 696 and 368 took the same decision for
- * the same reason. */
+ * the same reason.
+ *
+ * ---------------------------------------------------------------------------
+ * away-notify: THE NOTIFICATION, AND WHY IT IS A SEPARATE FUNCTION
+ * ---------------------------------------------------------------------------
+ * `notify_away()` is called on BOTH edges of the change and is the whole of
+ * `away-notify`. It walks the user's own channel list and asks `fanout.c` to tell
+ * each channel's members -- and the two things it does NOT do are the interesting
+ * half:
+ *
+ *   THE SETTER IS EXCLUDED. The specification says so directly ("Clients SHOULD
+ *   NOT be sent AWAY messages to notify them of their own away status (as they
+ *   can rely on RPL_NOWAWAY and RPL_UNAWAY)"), and `305`/`306` above are those
+ *   two numerics. So `exclude` is the setter: a member who negotiated the
+ *   capability is still not told their own state. That is `exclude` and not the
+ *   gate, and the two are different questions -- the gate asks "did this
+ *   destination ask?", `exclude` asks "is this the author?" -- which is why both
+ *   exist and why neither is expressed with the other.
+ *
+ *   THE NOTIFICATION IS NOT FORWARDED. It goes out through
+ *   `fanout_deliver_local_gated()`, the LOCAL-ONLY entry point, so there is no
+ *   forward arm and no question about whether a peer should be told: a peer is not
+ *   a client that negotiated anything, and design 3.1.1's argument for there being
+ *   no gated variant of the forwarding path is exactly this case. Away STATE
+ *   federates -- 4.3's SBURST carries it and a resync rebuilds it -- and a
+ *   notification is not state.
+ *
+ * THE CLEARED CASE IS NOT AN OMISSION, and it is the half implementations get
+ * wrong: `AWAY` with no message must still notify, because the notification is the
+ * only thing that tells a client the user is BACK. A node that emitted the
+ * notification only on the way out would leave every member believing their friend
+ * was still at lunch for ever. So the notification is one call on both edges and
+ * the wire shape is decided by whether the parameter list has anything in it.
+ *
+ * NO CHANNEL MEANS NO NOTIFICATION, and that is `c->nchans` rather than a check
+ * anywhere else: the audience is "users sharing a channel", so with no channels
+ * there is no audience, and the 305/306 above are the whole answer. There is no
+ * loop over the connection registry here and there never will be one -- that walk
+ * is `fanout.c`'s. */
+static void notify_away(server_t *s, conn_t *c, const char *message)
+{
+    const char *params[1];
+    fanout_form_t plain;
+    char prefix[CONN_HOSTMASK_MAX];
+    int delivered = 0;
+
+    if (c->nchans == 0u) {
+        printf("[observable] away_notify: nick=%s recipients=0 reason=NO_SHARED_CHANNEL\n",
+               c->nick);
+        return;
+    }
+    /* THE PREFIX IS THE SETTER'S OWN HOSTMASK, for the reason every server-to-client
+     * line this node emits uses one: the notification NAMES who changed, and
+     * `conn_hostmask()` renders it from the fields §2.1 owns -- including the
+     * OBSERVED host, which USER does not touch. */
+    if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
+        printf("[observable] away_notify: nick=%s reason=UNRENDERABLE\n", c->nick);
+        return;
+    }
+    /* THE TWO SHAPES, AND NOTHING ELSE. With a message the line carries it as the
+     * trailing parameter (`:nick!user@host AWAY #chan :message`); without one the
+     * parameter list is EMPTY and the line is `:nick!user@host AWAY #chan`, which
+     * is what "the user is removing their away state" looks like on the wire. A
+     * third shape -- an empty string in the parameter list -- would render as
+     * `AWAY #chan :`, and 3.2 says an empty value is not representable in a
+     * non-final position, so the formatter would refuse the whole line rather than
+     * sending it. Emptiness is expressed by ABSENCE and that is not an accident of
+     * the shape. */
+    plain.params = (message != NULL) ? params : NULL;
+    plain.nparams = (message != NULL) ? 1 : 0;
+    if (message != NULL) {
+        params[0] = message;
+    }
+
+    /* ONE FANOUT CALL PER CHANNEL, and the walk is over `c->chans` -- the
+     * connection's own membership, which 2.2 keeps as a second list beside the
+     * channel's for exactly this kind of teardown-and-notification use. Each
+     * channel is resolved through `fanout_resolve()` rather than looked up in the
+     * registry, because resolution is the only place that answers "is this a
+     * channel" and a caller that went around it would have to answer the question
+     * a second way. The class is `message`: this is not a state change, it is an
+     * observation, and the class decides the forward arm -- which the local-only
+     * entry point does not have. */
+    for (size_t i = 0; i < c->nchans; i++) {
+        fanout_target_t t;
+
+        if (c->chans[i] == NULL ||
+            fanout_resolve(s, c, c->chans[i]->name, FANOUT_MESSAGE, &t) == 0) {
+            continue; /* a chan_t this node no longer holds: nothing to address */
+        }
+        delivered += fanout_deliver_local_gated(s, &t, prefix, "AWAY", &plain, NULL,
+                                                cap_gate_away_notify, NULL, c);
+    }
+    printf("[observable] away_notify: nick=%s channels=%zu recipients=%d state=%s\n",
+           c->nick, c->nchans, delivered, (message != NULL) ? "set" : "cleared");
+}
+
 void handle_away(server_t *s, conn_t *c, const message_t *m)
 {
     const char *message;
     size_t len;
 
     if (m->nparams > 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "AWAY", "TOO_MANY_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
 
@@ -550,9 +772,17 @@ void handle_away(server_t *s, conn_t *c, const message_t *m)
         /* Bare AWAY, and `AWAY :` which parses to one empty parameter. Both
          * mean "not away": RFC 1459 2.4.2 has no separate syntax for clearing,
          * so a client that sends an empty trailing parameter means exactly what
-         * a client that sends none does. */
+         * a client that sends none does.
+         *
+         * AND THE NOTIFICATION FIRES ON THIS EDGE TOO, which is the half that is
+         * usually missed: without it a member's client believes the user is still
+         * away for ever, because the ONLY thing that tells it otherwise is the
+         * parameterless `AWAY` and nothing else carries the fact. The `305` below
+         * is for the user and the notification is for everybody else; neither
+         * substitutes for the other. */
         c->away[0] = '\0';
         (void)reply(s, c, "305", NULL, 0, "You are no longer marked as being away");
+        notify_away(s, c, NULL);
         printf("[observable] away: nick=%s state=clear\n", c->nick);
         return;
     }
@@ -560,7 +790,8 @@ void handle_away(server_t *s, conn_t *c, const message_t *m)
     message = m->params[0];
     len = strlen(message);
     if (len > (size_t)CONN_MAX_AWAY) {
-        (void)reply(s, c, "417", NULL, 0, "Away message is too long");
+        (void)reply_refused(s, c, "AWAY", NULL, "417", NULL, 0,
+                            "Away message is too long");
         printf("[observable] away: nick=%s state=refused reason=too_long "
                "len=%zu max=%d\n",
                c->nick, len, CONN_MAX_AWAY);
@@ -569,6 +800,7 @@ void handle_away(server_t *s, conn_t *c, const message_t *m)
 
     memcpy(c->away, message, len + 1u);
     (void)reply(s, c, "306", NULL, 0, "You have been marked as being away");
+    notify_away(s, c, c->away);
     printf("[observable] away: nick=%s state=set len=%zu\n", c->nick, len);
 }
 
@@ -650,7 +882,8 @@ void handle_userhost(server_t *s, conn_t *c, const message_t *m)
     size_t online = 0;
 
     if (m->nparams < 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "USERHOST", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
 

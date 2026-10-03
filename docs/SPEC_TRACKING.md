@@ -34,6 +34,15 @@ changed: **§2** (the skip list, and the claim that CI does not count skips),
 **§5.1** (which phase owns the skip gate), and the `TopicPersistence` row of
 §2's table. Everything else here is as of 2026-09-28.
 
+**A Phase 10.1 addendum, in the same spirit.** Nothing in the audit below is
+rewritten, because none of it is about accounts; what Phase 10.1 adds is a new
+**§10** at the end, which is the only place in this document that records what
+the account subsystem did and did not unblock. The one claim below that the phase
+**does** falsify is corrected in place and marked as such: **§8's** IRCv3 bullet,
+which said CAP negotiation, SASL and `msgid` were unimplemented — already false at
+Phase 8, but Phase 10.1 is the phase that made `account-tag` a decision rather
+than an absence, so it is the right place to say so.
+
 ### Commit under verification
 
 `HEAD` = `e958ea9` ("Phase 2: server core - poll loop, conn_t framing,
@@ -578,6 +587,11 @@ Source: `gh issue list --milestone "Federated IRC Server v1.0" --state all`
 | 8 | #82 | Phase 8: IRCv3 - real tag escaping, CAP negotiation, SASL PLAIN | OPEN | Not started. Turns `CapNegotiation` green and replaces `ircv3_tags.c` and `sasl_framework.c`. |
 | 9 | #83 | Phase 9: Federation hardening, peer discovery, auto-scaling | DONE | Turns `SyncState`, `FailoverReconnect`, `PeerDiscovery`, `Reconnect`, `AutoScale` green. All five retired; `tests/known_skips.txt` is EMPTY and the gate is "no test may skip". Auto-scale is scoped to propagation + graceful leave, NOT node lifecycle (§2.3). |
 
+**The table above is the 2026-09-28 `gh issue list` snapshot and is left as
+written.** Phase 10.1 (issue **#117**) is not in it because that list predates it;
+**§10** is where the account subsystem is measured, including which of the seven
+IRCv3 specifications it unblocked and which it did not.
+
 Phases 1 and 2 are done and committed. **Phase 3 is not done in any sense a
 reader can rely on** — the work exists and passes, but it lives in uncommitted
 changes on `phase/3-registration` and issue #77 is still open. Design Phase 5 is
@@ -720,8 +734,14 @@ present:
   `CASEMAPPING`) are specified here.
 - **IRCv3** — https://ircv3.net/
   Message tags and the tag-escaping rules (implemented in `core/message.c`),
-  and the three features this node has **not** implemented: CAP negotiation,
-  SASL, and `msgid`.
+  **CAP negotiation, SASL PLAIN and `draft/message-ids`** (implemented in Phase 8 —
+  this bullet said the three were *not* implemented and had been false since then;
+  corrected here because Phase 10.1 made `account-tag` a decision rather than an
+  absence, and this is the reference that bullet governs), and the account family
+  (§10). **There is no official IRCv3 conformance suite** —
+  `ircv3/ircv3-test-suite` and `ircv3/chathistory-test-suite` do not exist, so
+  every compliance claim in §10 is hand-written tests against spec text, which is
+  a weaker guarantee than a green third-party runner.
 
 Additional reference named by RFC 2812, which the design and code rely on for
 nickname syntax and `432`/`433`, and which is not CI-checked:
@@ -742,3 +762,626 @@ https://datatracker.ietf.org/doc/html/rfc2812
   on it, that is called out.
 - **It does not restate the design.** `docs/SERVER_DESIGN.md` is the plan;
   this file is the measurement of the code against it. Where they conflict, §5.
+
+---
+
+## 10. Phase 10.1 — the account subsystem
+
+Issue #117. `docs/SERVER_DESIGN.md` §2.1.1, §2.5, §2.5.1–§2.5.4 and §7's Phase 10
+block carry the reasoning; this section is the measurement, and it has one job:
+**which of the seven gated specifications are now unblocked and which are not.**
+
+### 10.1 The gate, as it was
+
+`src/` had **zero** hits for `account_tag`, `logged_in`, `serviced_login` or
+`account_name`. That single absence blocked seven specifications at once, because
+`account-tag` needs to know who is logged in on *every* message and `extended-join`
+needs the account on *every* `JOIN`. None of them is a capability that can be
+bolted on, which is why P10.1 is a subsystem and the rest follows from it.
+
+### 10.2 The seven, one by one
+
+**"Unblocked" here means: the missing account concept exists, so the
+specification no longer needs a new subsystem. It does NOT mean the specification
+is implemented** — every one of these still has its own implementation phase, and
+saying otherwise is exactly the failure this document is written to prevent.
+
+| Spec | Unblocked by P10.1? | What is still missing, and where it lands |
+|---|---|---|
+| `account-registration` | **Yes, and REFUSED rather than implemented.** The identity it would describe exists and `330` reports it. | `REGISTER`/`UNREGISTER` answer `482`; the draft's own header says not to implement it in production and says to use `draft/account-registration`, and its wire form is `FAIL ACCOUNT_REGISTER`, which needs **standard-replies** (Phase 10 item 8). Design §2.5.2 gives four independent reasons. |
+| `account-tag` | **Yes — the identity it carries now exists.** | **Nothing.** **IMPLEMENTED in Phase 10.2a.** The tag is stamped once per emission in `fanout.c`, per destination on the recipient's own `account-tag` (plus `message-tags`), withheld from an unidentified sender, withheld from a node with no registry, and **not** forwarded across a link. Design §2.5.3. |
+| `account-notify` | **Yes.** | **PARTLY IMPLEMENTED in Phase 10.2b, and the part left is named.** The `ACCOUNT <account> PASS` / `ACCOUNT *` line, gated on the recipient's own negotiation, with the capability available **unconditionally** because "you have no account" is an answer this node can give truthfully. **Not implemented:** the *channel-scoped* half of the specification and `ACCOUNT <account> FAIL`. On this node the association is established by SASL before registration, so when it becomes true the connection has no nickname, no hostmask and no channel — there is never a shared member to notify, and there is no logout to notify about. Design §2.5.6. |
+| `extended-join` | **Yes.** | **IMPLEMENTED in Phase 10.3, with one named limit.** The `JOIN` echo carries the account **and** the realname, per destination on the recipient's own negotiation, with `*` for a member who is not logged in — and the capability is advertised even with no registry, because `*` is a complete answer there. `SJOIN` and `SBURSTM` carry the account (design §4.3.1). **Not implemented:** this node emits no extended JOIN for a member it learned from a PEER, because 4.3's SJOIN carries only a server prefix and a JOIN with a server prefix is a line no client can parse — so a remote member's account is stored on the roster and not yet shown. Design §2.5.7. |
+| `away-notify` | **Yes — and it needed nothing from this phase at all.** | The unsolicited `AWAY` on state change. It was never account-gated; it was simply not started. Listed here because issue #117 groups it with the account family, and the honest answer is that this phase unblocked **nothing** for it. Phase 10.3. |
+| `chghost` | **Partly, and the part is worth naming.** It needs the **account on the `CHGHOST` echo**, which now exists. | The verb itself, and the `userhost-in-names` interaction. Phase 10.3. |
+| `oper-tag` | **Yes.** | The `+` tag on `PRIVMSG`/`NOTICE` — which needs **operator flags**, and **this node has no operator concept at all** (`CHOPER` answers `464` for every request). So `oper-tag` is now unblocked *as far as the account is concerned* and blocked *on a subsystem that does not exist*. Phase 10.8. |
+| `account-extban` | **Yes.** | `~&account:name` match types, which need the account **and** a ban-expression evaluator — and this node evaluates **no** channel modes beyond the ones §4.4 advertises. Phase 10.8. |
+
+**Summary as of Phase 10.1: all seven are unblocked as far as the ACCOUNT is
+concerned; zero are implemented.** One (`away-notify`) was never account-gated at
+all. One (`oper-tag`) is blocked on operator flags rather than on accounts. One
+(`account-registration`) is delivered as a **refusal**, which is a decision rather
+than an implementation and is recorded as such.
+
+**Updated as of Phase 10.3: `account-tag` and `extended-join` are IMPLEMENTED and
+`account-notify` is IMPLEMENTED IN PART**, which makes the count **two of seven
+implemented, one partly implemented and four not.** The table above is the per-spec record and each
+row says which. "Partly implemented" is not a rounding of "implemented": for
+`account-notify` the two missing halves (the channel-scoped fan-out and the `FAIL`
+form) are unreachable on this node rather than merely unstarted, and design §2.5.6
+says why. Nothing else moved: `away-notify` and `chghost` were never account-gated, and
+`oper-tag` and `account-extban` are blocked on subsystems this node does not have
+(`CHOPER` answers 464 for everything, and this node evaluates no channel modes
+beyond the ones §4.4 advertises).
+
+### 10.3 What P10.1 actually delivered, with evidence
+
+| Claim | Where | Evidence |
+|---|---|---|
+| An account name on `conn_t`, set only from a verified credential | `src/core/connection.h` (`CONN_MAX_ACCOUNT`), `src/core/account.c` (`account_set()`) | `test_account.c`'s in-process case, on return values |
+| **An account grants nothing** | `connection.h`'s "what none of them grant" block, design §2.1.1 | — (a negative claim, stated where a future editor reads it) |
+| A registry, as a **separate operator file** with the credential store's discipline | `src/account_store.{h,c}`, `--account-store` in `node_main.c` | `test_account.c`: five refusal cases, each landing in the no-registry state |
+| Passwords overwritten before release | `account_store_free()` — `volatile` write pass | **LeakSanitizer is Linux-only**; reasoned at design §2.5.4, verified on the CI job |
+| `account == ""` indistinguishable from no account system | `account_logged_in()`, one writer, two stores | `test_account.c` runs **one** assertion set over a node with a registry and a node without |
+| Two operator files disagreeing ⇒ not identified | `account_set()`'s registry check | `test_account.c`: `reason=NOT_IN_REGISTRY`, then the not-identified path byte-for-byte |
+| `REGISTER`/`UNREGISTER` refused with `482`, never `421` | `core/commands.c` | `test_account.c`, with the 421 absence asserted |
+| **`account-tag` advertised only where it is emitted** | `src/core/cap.h` (the argument is in the header), `cap.c`'s `account_possible()` | `test_account.c`: in `CAP LS` and ACKed with a registry; absent and NAKed without one; the whole list compared byte-for-byte on a default node |
+| The one wire surface: `330 RPL_WHOISACCOUNT` | `src/core/msg_verbs.c` | `test_account.c`, from the client **and from a second client** |
+| The teardown arm | `server_shutdown()`, `[observable] account_store_close: store=OPEN|NONE` | asserted on both states; the `free` itself asserted by source inspection (`tf_calls`), because a line with no free behind it satisfies the line |
+
+### 10.5 The four non-account specifications of issue #117
+
+Issue #117 groups eight specifications, and §10.2's seven are the account family.
+These four are **independent of the account subsystem** — none of them reads
+`conn_t::account`, and none was blocked by Phase 10.1 — so they were implemented
+as their own passes rather than as a consequence of anything above. Each is
+recorded here with what it cost, and the table is the measurement rather than the
+design (design §4.4.1 carries the reasoning for the first).
+
+| Spec | Status | What it cost, and what is named as missing |
+|---|---|---|
+| `extended-ispupport` | **IMPLEMENTED (Phase 10.4).** The `005` went from five hand-written tokens to eleven, every `*LEN` rendered from the constant that **enforces** it, and eight tokens that would have been claims about unimplemented features deliberately left out. **Twelve tokens now — Phase 10.9 closed the `KICKLEN` gap.** | **One finding closed, one still open.** `KICKLEN` was absent because `handle_kick()` took `<reason>` verbatim with no length test, so no number in the tree described the largest reason accepted and an over-long one reached `message_format()` and tripped `n_reply_refused` — the counter `reply.c` holds at zero. **Phase 10.9 added `CHAN_MAX_KICK_REASON` (255), the `417` and the token**, so the absence is struck rather than deleted (design §4.4.4). `USERLEN` is still absent even though `CONN_USER_MAX` exists, because `USER`'s ident is *truncated* rather than refused, so the token would promise a limit the node does not apply — that is now the worked example of an omission that must stay. `PREFIX=(ov)@+` remains a written-out token: no constant names the mode letters, and making one would mean changing the mode evaluator. The cost of the work itself is one new constant (`MSG_MAX_TARGETS`), two sigil macros, `CHAN_MAX_KICK_REASON`, and a test that holds the whole `005` against **literals** rather than the constants. |
+| `userhost-in-names` | **IMPLEMENTED (Phase 10.5).** `353` renders `nick!user@host` per destination, on the recipient's own negotiation, for local *and* remote members. | **The privacy decision, stated plainly: this discloses every member's ident and observed host to every other member of the channel.** It is why the capability is opt-in and why the roster shape is decided per destination. The cost is `chan_remote_t::user` — the ident was on the wire in `SBURSTN` and in the burst shadow all along and was being **discarded**, so a federated roster could not have rendered a hostmask without it; +64 bytes per remote-member element, 4 KiB per channel's addressed array. See design §4.4.5. |
+| `setname` | **IMPLEMENTED in part (Phase 10.6).** The command, the capability, `NAMELEN`, and the confirmation to the originating client. | The validation is a predicate **shared with `USER`** (`conn_realname_check()`), which is what makes "not a looser path than registration" a property of the code; `SETNAME` refuses over-long and control-bearing values while `USER` truncates length and empties a hostile one, because refusing `USER` would strand a half-registered client — §4.2.1 argues it. **The common-channel fan-out is NOT implemented, and that is the specification's MUST.** `core/fanout.c`'s per-destination decision is a choice between two wire **shapes** (the `fanout_form_t` the extended JOIN introduced); "send this member nothing" is a **third** outcome, and expressing it means a contract change to the routing module — which is the reason the alternative, a second member walk inside a handler, is worse. Named rather than faked. The refusals are also not `FAIL SETNAME INVALID_REALNAME` as the spec asks, because `standard-replies` is a separate pass and inventing a `FAIL` numeric was out of bounds; the node answers `417`, which is the numeric this tree already uses for an over-long parameter. |
+| `echo-message` | **IMPLEMENTED (Phase 10.7).** A sender who negotiated it gets its own `NOTICE` back, with its own hostmask as the source. | **Almost nothing, and the reason is the interesting part: `PRIVMSG` was already echoed.** This node delivers a channel `PRIVMSG` to every local member *including* the sender, so the copy `echo-message` requires already exists on the wire — the spec's example is byte-identical to what the normal path produces. The only gap was `NOTICE`, which RFC 1459 2.4.2 says is never returned to its sender. So the implementation is **one argument**: `exclude` stays `c` unless the sender negotiated the capability. There is no second emission, and that is the whole defence against the double-delivery bug the capability invites. `batch` echoes are out of scope, as is the acknowledgement for a `nick@server` target (no local destination exists to send one to). |
+
+### 10.6 What the four cost, with evidence
+
+| Claim | Where | Evidence |
+|---|---|---|
+| Every advertised `005` value is derived from the constant that enforces it | `commands.c` `k_005[]`, rendered by `IRC_STR()` | `test_registration.c`: the whole `005` byte-for-byte against **literals**, each token individually, and the twelve names that must be absent. A literal is the point — a test built from `CHAN_MAX_TOPIC` would follow the constant and never notice `005` was left behind |
+| `CHANTYPES=#&` and the validator cannot disagree | `channel.h`'s `CHAN_TYPES` / `CHAN_TYPE1` / `CHAN_TYPE2`, used by `chan_name_valid()` | `test_registration.c` asserts `CHANTYPES=#&`; `test_channels.c` and `test_dup_nick.c` already refuse a name the advertised token would not admit |
+| `NAMELEN` is the realname bound, not a figure of speech | `CONN_MAX_REALNAME` in `connection.h`; `conn_realname_check()` | `test_setname.c`: 255 accepted, 256 refused with `417` and the field **unchanged** |
+| A `353` roster's shape differs per destination for the same sender | `chan_verbs.c`'s `send_names_list()` / `names_emit()` | `test_userhost_in_names.c`: one channel, one member, three connections — negotiated, not negotiated, and a second negotiated one — with the long form required on two and the bare nick required on one |
+| The federation roster can render a hostmask at all | `chan_remote_t::user`, fed from `SBURSTN` | `test_fed_roster.c` — the ident was previously discarded by `burst.c`'s shadow→roster join and is now stored, which is the only reason a remote entry is not stuck at `nick` |
+| A sender who negotiated `echo-message` gets exactly **one** copy | `msg_verbs.c`'s `send_message()`, the `exclude` argument | `test_echo_message.c`: `PRIVMSG` to a channel counts 1 for a negotiating sender, 0 for a non-negotiating one; `NOTICE` counts 1 and 0 the same way |
+| The echoed copy is not *also* delivered by the normal path | there is one delivery call; `echo-message` chooses `exclude`, it does not add a second | `test_echo_message.c`: the double-delivery fault (an extra `fanout_deliver_local()` aimed at the sender) is injected and watched failing with **2 copies where 1 is expected** |
+| A client that did **not** negotiate is served exactly as before | `exclude` stays `c` unless the sender negotiated | the same test, cases 2 and 4: a non-negotiating sender's `PRIVMSG` gets **one** copy and its `NOTICE` gets **zero** |
+| `setname` is refused pre-registration / without the capability / over-long / hostile | `handle_setname()`'s three gates and `conn_realname_check()` | `test_setname.c`: `451`; **silence** (asserted exhaustively — the drain `PONG` must be the only line); `417` at 256 with the previous value read back off the wire through a `JOIN`; `417` for ESC+BEL; 255 accepted; empty accepted |
+| `userhost-in-names` is a per-destination decision, not a per-node one | `chan_verbs.c`'s `names_entry()` | `test_userhost_in_names.c`: three connections, one channel, one member; the long form required on two and the bare nick required on one |
+| The federation roster can render a hostmask at all | `chan_remote_t::user`, fed from `SBURSTN` via `shadow_ident()` | `test_fed_roster.c` still passes with the field added; the ident was previously **discarded** by burst.c's shadow→roster join |
+| Teeth, each watched red with the **build checked first** | the TEETH blocks at the foot of each test | **18 faults red across the four passes** (2 for `extended-ispupport`, 4 for `userhost-in-names`, 7 for `setname`, 5 for `echo-message`), plus **2 that did not compile** and so never reached a run. Four of them found a missing assertion or a no-op check; all four are recorded in place rather than quietly fixed — see 10.6a |
+
+### 10.6a The teeth that found something
+
+Eighteen faults were watched go red. **Four of them found a defect in the tests
+rather than in the node**, and they share one class: *a check that is only
+sometimes checked.* They are recorded here and in the test files rather than fixed
+quietly, because a negative that passes once is the kind of thing that survives
+indefinitely.
+
+- **`setname` answered with `482` instead of staying silent.** The case asserted the
+  absence of `417`, `421`, `451` and the `SETNAME` line — a list of the numerics
+  somebody thought of, which is not a test of silence. Fixed by requiring the drain
+  `PONG` to be the **only** line in the window (`lines_since()`), so any reply of any
+  kind fails.
+- **The `echo-message` source-prefix fault was a no-op**, because it only rewrote the
+  prefix when `exclude != NULL` and that never holds in the passing cases. The test
+  went green on a fault that changed nothing — the same trap reached from the other
+  side, and caught the same way: the test being green is not evidence that the fault
+  was harmless.
+- **Two faults did not compile** and so never reached a run: an `if (0)` branch trips
+  `-Wunreachable-code`, and the first `userhost-in-names` gate fault left `dst`
+  unused in `chan_verbs.c` under `-Weverything` (moved to `cap.c`, where it
+  compiles). A fault that does not build leaves the previous binary in place and
+  reports a pass — which is why the build is checked before every run and the
+  per-fault build result is recorded rather than assumed.
+- **`userhost-in-names`'s per-destination gate fault did not compile** in
+  `chan_verbs.c` (`dst` becomes an unused parameter under `-Weverything`), so it was
+  moved to `cap.c`. Recorded because a fault that does not build leaves the previous
+  binary in place and reports a pass, and the build check is what caught it.
+
+### 10.7 The honest limits of these four
+
+- ~~**`setname` does not fan out to common channels.**~~ **CLOSED IN PHASE 10.11.**
+  It does now, per destination, on the RECIPIENT's own `setname` negotiation. The gate
+  side was the open question, not the mechanism; §10.10 records the decision and §4.2.1
+  carries the shape argument for why it needed a union walk rather than one
+  `fanout_deliver_local_gated()` call per channel.
+- **`echo-message` is not implemented for a `nick@server` target.** 3.1's last row
+  is forward-only, so there is no local destination to acknowledge to. The
+  acknowledgement would have to be a local-only emission invented here.
+- **`userhost-in-names` does not change `352` or `311`.** Those numerics already
+  carry `<user>` and `<host>` in the RFC's shape, so they were never the gap; the
+  gap was `353` alone.
+- ~~**`extended-ispupport` did not close the `KICKLEN` gap**~~ **CLOSED IN PHASE 10.9.**
+  The cost §10.5 named was one bound, one `417` and one token, and that is what it took:
+  `CHAN_MAX_KICK_REASON`, refused in `handle_kick()` immediately after the arity test. The
+  interesting half was not the token but the reachable `n_reply_refused` — a client command
+  could make the node file a bug report about itself, and `test_standard_replies.c` asserts the
+  ABSENCE of that line so a regression fails on the defect rather than on a symptom.
+
+### 10.9 `standard-replies`, the fanout contract, and the two that follow
+
+Issue #117's remaining four are `standard-replies`, `chghost`, `away-notify` and
+the routing **contract** the other three needed. None of them reads
+`conn_t::account`, so §10.2's table was never the thing standing in front of them;
+what stood in front of `chghost` and `away-notify` was a **contract**, and that is
+what landed first.
+
+**THE ORDER WAS CHOSEN, and the reason is retrofitting.** The contract came first
+because three specifications would otherwise each have grown its own member walk.
+`standard-replies` came before the other two because `chghost` and `away-notify`
+want `FAIL` and `ERROR`-class numerics rather than legacy ones, and changing a
+numeric afterwards means touching the same handlers twice.
+
+| Spec | Status | What it cost, and what is named as missing |
+|---|---|---|
+| `standard-replies` | **IMPLEMENTED (Phase 10.9), as a PARTIAL migration and the partial is the point.** `FAIL <command> <code> [<context>...] :description` for a client that negotiated the capability; the **byte-identical legacy numeric** for one that did not. `WARN` and `NOTE` are implemented and have no producer. | **The line drawn: a legacy numeric migrates where it answers more than one question ON THIS NODE**, so the number alone cannot tell a client which refusal happened. Four qualify — `417` (four refusals), `461` (too few AND too many, its text saying "not enough" for both), `482` (three, two of which differ by three letters and mean unrelated things), `464` (two) — and every other numeric answers exactly one question and stays, which `test_standard_replies.c` asserts on `401` and `451` as well. **Cost:** those four numbers stop reaching a negotiating client, so a client pattern-matching `417` for "line too long" must read `FAIL <cmd> ERR_INPUTTOOLONG`; nothing that connected to an earlier build is affected, because the capability did not exist to negotiate. **The tension with the specification is recorded, not glossed** (design §4.4.3): it says servers SHOULD NOT replace standardised numerics, and all four are standardised — what makes it defensible is that these four are the ones this node's own use made unclear, which is the complaint the specification's introduction makes. `ERROR` is **not** implemented because the specification does not define it. | 
+| `chghost` | **NOTHING TO NOTIFY — and after Phase 10.10 the reason is the tidy one, because the one thing that COULD change cannot.** The capability is **absent** from `CAP LS` and NAKed on request; a client-sent `CHGHOST` is `421`. **Phase 10.10 closed the ident hole this row was built on.** `handle_user()` wrote `conn_t::user` unconditionally and `USER` is `pre_reg`, so a registered client could re-send `USER` and move its own ident with nothing told to anyone; it now returns **`462 ERR_ALREADYREGISTRED` before the write**. The threat model is what picked that fix: nothing is **granted** to an ident here (no privilege, no account, and the ident is client-asserted and unverified at registration, so two users may already share one), so this is **not impersonation** — but `chan_banned()` runs on every `JOIN` and matches a mask against the composite `nick!user@host`, so a mask of the shape `mallory!*@*` was defeatable by moving the ident and re-joining. That is an access-control bypass reachable from one client command, and it is why "accept and notify" would have been wrong: a `CHGHOST` does not stop the rejoin. **The cost:** a client that re-sends `USER` after `001` gets one numeric it did not ask for and **loses nothing** — the connection, nickname, channels and realname all survive; only the ident move is gone, which was the defect. The gate is `commands_registered()` and not "has seen a `USER` before", so a client that sends `USER` twice *while registering* still works last-one-wins. `462` is **not migrated**: 4.4.3's rule moves only a numeric that answers more than one question on this node. **`test_chghost.c` case 3 is INVERTED, not deleted** — the same sequence now requires the ident unchanged, the `462`, a zero line count on the peer, and `reason=ALREADY_REGISTERED` in the log with `user=mallory` absent; cases 4 and 5 pin the two edges. Design §4.4.6. |
+| `away-notify` | **IMPLEMENTED (Phase 10.8b), on BOTH edges of the change.** `:nick!user@host AWAY [:message]` — present means going away, absent means removing — to the users sharing a channel with the setter, per destination, through the Phase 10.8a gate. | **The cleared edge is the half implementations miss** and it is in the same test case as the set edge for that reason: without it every member believes the user is still away for ever, because the parameterless `AWAY` is the only thing that carries the fact. **Two exclusions, and they are different questions**: the gate asks "did this destination ask?", and the **setter is excluded** because the specification says a user "SHOULD NOT be sent AWAY messages to notify them of their own away status" — `305`/`306` are those numerics, and the setter negotiated the capability, so only `exclude` keeps it out. **Not forwarded**: the notification goes through `fanout_deliver_local_gated()`, the local-only entry point, because away *state* federates through 4.3's SBURST and a notification is not state. `test_away_notify.c` settles every connection before opening a window and then asserts the exact line on both edges, `301` present then absent, zero lines for a member who did not negotiate and for a member of another channel, exactly one line for a member of one of two channels, and nothing for a refused over-long `AWAY`. **Not implemented, and named:** the specification also says a user joining with an away message set is announced, and that half is not landed — `chan_admit()` has no notification, and it needs one emitted *after* the extended-JOIN echo (which is a fixed shape with no room for it). |
+| the fanout contract (Phase 10.8a) | **IMPLEMENTED, as a contract rather than a feature.** §3.1.1: a per-destination **gate** beside the existing per-destination shape choice, so one emission has **three** outcomes per destination — the plain shape, the alternate shape, and **nothing**. | `fanout_form_t` chose between two wire **shapes**, and a choice between two answers cannot express "send this member nothing". All three of the remaining specifications publish to a SUBSET of a channel's members, so each would have grown its own member walk — the exact duplication `fanout.c` exists to prevent, and the reason `chan_verbs.c`'s Phase 4 broadcast helper lost its forward arm. The gate is asked **inside the walk that already asks the shape question**, in the order liveness → `exclude` → gate, and it is asked about local destinations only, so there is deliberately **no gated variant of the forwarding entry point**: a peer is not a client that negotiated anything, so the question is unaskable there rather than answerable-but-ignored. Nothing on the wire produces a gated emission until `away-notify` lands, so `test_fanout_gate.c` asserts the three outcomes **against the API** — the same argument `test_nick_index.c` makes — while still comparing the exact CRLF-terminated bytes queued for each descriptor, and asserting **zero bytes** for the refused member rather than the absence of a needle. |
+
+### 10.10a Phase 10.10 — the second `USER`, and what the RFC actually says
+
+The one deliverable here is a **closing**, and it is worth a section of its own because
+the reason the previous pass declined to close it was **factually wrong**.
+
+`docs/SERVER_DESIGN.md` §9 carried the row "REPORTED, NOT FIXED, and the reason is that
+the fix is a decision about an RFC 1459 MUST command — refusing a second `USER` is a
+behaviour change with nothing in the RFC requiring it". RFC 2812 **3.1.3** lists `USER`'s
+numeric replies as exactly two, `ERR_NEEDMOREPARAMS` and `ERR_ALREADYREGISTRED`, and RFC
+2812 **§9**'s entry for `462` names the case outright: *"user details from second USER
+message"*. RFC 1459's `USER` section says nothing about a second one, which is evidently
+what was read. So `462` is not a judgement call here; it is the RFC's own answer.
+
+| Claim | Where | Evidence |
+|---|---|---|
+| A second `USER` is refused and the ident is not written | `commands.c`'s `handle_user()`, the `commands_registered(c)` branch | `test_chghost.c` case 3: the `311` read back off a **second** connection carries the registration ident, not the one the second `USER` asserted |
+| The refusal is the RFC's numeric and it is said exactly once | `reply_refused(..., "USER", NULL, "462", NULL, 0, ...)` | `test_chghost.c` case 3: the literal `462` line, then `expect_only_replies(..., 1u)` — a COUNT, so a flood fails too |
+| It is **not** migrated for a `standard-replies` client | the NULL `fail_code`, which selects `reply_refused()`'s legacy branch | `test_chghost.c` case 4, on a connection that DID negotiate: the byte-identical `462`, plus the absence of any `FAIL` |
+| Nothing was told to the channel | the gate returns before the write, and there is no emitter | `test_chghost.c` case 3: `expect_only_replies(..., 0u)` on bob's idle socket — the same zero-line assertion the hole-proving version made, now for a different and better reason |
+| The operator's log is not lying | the `[observable] user_refused:` line, and the return before `copy_field()` | `test_chghost.c` case 3: `reason=ALREADY_REGISTERED` present **and** `user=mallory` absent |
+| The compatibility half still works | the gate is `commands_registered()`, not "has seen a USER before" | `test_chghost.c` case 5: `CAP REQ` NAKed so registration is held, two `USER`s, then `CAP END` → `001 preuser!second@…`, and **no** `462` anywhere in what that client received |
+| Teeth, build checked before the run was believed | `commands.c`, the branch replaced by `if (0) { }` | **1 fault, red.** Build check **0 errors / 0 warnings** first, then `test_chghost` failed at `test_chghost.c:346`. `TF_CHECK_MSG` exits on the first failure, so the case's other three assertions were **not reached** — recorded as a property of the assertions, not as observed failures |
+
+### 10.10 The honest limits of the fanout contract
+
+- ~~**`setname`'s common-channel broadcast is still not implemented.**~~
+  **CLOSED IN PHASE 10.11**, and this row's own prediction turned out to be incomplete
+  in a way worth recording. It said "a caller needs a gate predicate and a walk of
+  `c->chans[]`", which is right about the gate and wrong about the walk: `setname`'s
+  server-to-client line has **no channel parameter**
+  (`:nick!user@host SETNAME :<realname>`), and 3.1's row prepends the resolved target —
+  so one call per channel would put `#chan` where a client expects the realname **and**
+  would hand a member of three shared channels three copies of one fact. **The gate was
+  necessary and not sufficient**, which is the lesson: "express the audience question
+  once, inside the routing module" says nothing about whether the LINE is per channel.
+  The gate side is now decided too — **the RECIPIENT's negotiation**, because the
+  specification says the message MUST NOT be sent to clients which did not negotiate it
+  and because `cap.h` already gates the confirmation that way, so a sender-gated
+  fan-out would make the two halves of one specification contradict each other.
+  `fanout_deliver_union_local_gated()` is the mechanism: the union of `c->chans`, each
+  destination written once, de-duplication by search so there is no cache and therefore
+  no teardown arm.
+- **The gate answers about a destination, not about a peer's clients.** A relayed
+  emission is never gated, so in a mesh a notification reaches peers' clients
+  according to what THEY negotiated, with no way for the originating node to know.
+  That is the same position `account-tag` takes (§2.5.3) and for the same reason:
+  the originating node has no registry it could ask.
+
+
+### 10.12 The honest limits of `away-notify`
+
+- ~~**A user who JOINS with an away message set is not announced.**~~ **CLOSED IN
+  PHASE 10.11**, in the shape this section predicted. It is one
+  `fanout_deliver_local_gated()` call in `chan_admit()` — after the JOIN echo, before
+  the joiner's own numerics — gated on the RECIPIENT's `away-notify`, excluded to the
+  joiner, and conditioned on `c->away[0] != '\0'`.
+  **IT IS A SEPARATE EMISSION RATHER THAN A FOURTH `JOIN` PARAMETER, and the
+  specification requires that rather than this file preferring it:** the two messages
+  have different grammars and different audiences. The extended `JOIN` is a statement
+  about the roster; `away-notify`'s is `:nick!user@host AWAY #chan [:message]`, a
+  statement about ONE user's away STATE. Folding the away message into the `JOIN` would
+  make a line a client parses as a roster carry a fourth field, and would hand every
+  member the away message whether or not it negotiated — the exact
+  unsolicited-notification defect §3.1.1's gate exists to prevent.
+  **AND THE TWO SPECIFICATIONS NEED DIFFERENT WALKS, WHICH IS WHY THE UNION ENTRY
+  POINT EXISTS RATHER THAN A REWRITE OF THE AWAY PATH:** `away-notify`'s line NAMES its
+  channel, so one call per channel is right and a member of three shared channels gets
+  three true statements about three channels; `setname`'s does not, so it needs the
+  union walk. That asymmetry is a property of the two message shapes and is the whole
+  reason there are two entry points.
+- **The notification is not forwarded, and that is not a limitation of the
+  mechanism.** Away *state* federates (4.3's `SBURST` carries it and a resync
+  rebuilds it), so a mesh member's clients learn an away message the next time they
+  see the roster or ask a `WHOIS`; what does not cross a link is the *notification*,
+  because the entry point used is the local-only one and a peer is not a client that
+  negotiated anything (design §3.1.1).
+- **A member who is in the channel and negotiated the capability still gets nothing
+  about their own state**, which is the specification's instruction rather than a
+  gap, and is why the setter is excluded by `exclude` rather than by the gate.
+
+### 10.13 Phase 10.11 — the two the fanout gate unblocked, and the disclosure decision
+
+Phase 10.8a built the gate and could not use it twice. Phase 10.11 uses it twice, and
+the interesting half of each is a decision the gate does not make for you.
+
+| Claim | Where | Evidence |
+|---|---|---|
+| The `setname` fan-out is gated on the **RECIPIENT**, not the sender | `cap.c`'s `cap_gate_setname()`, handed to `fanout_deliver_union_local_gated()` by `commands.c`'s `setname_notify_channels()` | `test_setname.c` `case_fanout`: a member who negotiated is told, a member who did **not** is not, by a line count |
+| The line is the specification's shape, with **no channel parameter** | the union entry point builds no `all[]` and prepends no target | the same case, on the literal `:nick!user@host SETNAME :<realname>` |
+| A member of **two** shared channels gets exactly **one** copy | `fanout_deliver_union_local_gated()`'s "already reached?" search | the same case: `tf_count(...) == 1u`, a COUNT because two identical copies are indistinguishable from one to a substring search |
+| The origin gets **one** line, not two | `exclude = c`, because the confirmation already answered it | the same case: the setter's window holds exactly 2 lines (the `SETNAME` and the drain `PONG`) |
+| The join-time `AWAY` announcement is a **separate emission** | `chan_verbs.c`'s `announce_join_away()`, after the `JOIN` echo, before the joiner's numerics | `test_away_notify.c` `case_join_while_away`: the exact line, and the `JOIN` echo at a **LOWER BUFFER OFFSET** than the announcement |
+| A joiner who is **not** away produces **no** line | `if (c->away[0] == '\0') return;` | the same case: a second joiner with no away message, `watcher`'s window holds exactly 3 lines and no ` AWAY ` for them |
+| The joiner is excluded about its **own** state | `exclude = c`, mirroring `notify_away()` | the same case, on a connection that DID negotiate — so the gate would have let it through and only `exclude` keeps it out |
+| Teeth, build checked before the run was believed | four faults | **4 red.** `setname`: gate on the sender, `exclude` → `NULL`, the union's de-dup made unreachable — **0/0 each**. `away-notify`: the join-time `exclude` removed — **0/0**. **Two faults that did not compile or did nothing are recorded rather than dropped** — see `test_setname.c`'s TEETH block for the `for (j = 0; j < 0u; ...)` and `s->name != NULL` attempts, both of which left a GREEN test against a stale binary |
+
+**WHAT THE SHAPE ARGUMENT COST, and it is the finding.** §3.1.1's gate answers *who
+hears about an emission*. It does not answer *whether the emission is per channel*, and
+for `setname` that second question is the one that bites: 3.1's row prepends the
+resolved target, and `setname`'s specified line carries no target. The union entry point
+is therefore **not** a generalisation of the away path — the away path is still one
+`fanout_deliver_local_gated()` per channel, because its line names its channel. Two
+entry points for two message shapes is the honest answer and it is recorded here so a
+future phase does not read the union one as "the way fan-out should now work".
+
+### 10.14 Phase 10.12 — `batch`, and two findings from the specifications themselves
+
+| Claim | Where | Evidence |
+|---|---|---|
+| `batch` is advertised because it is implemented | `cap.c`'s `k_caps[]` | `test_batch.c` case 1, beside an assertion that `away-notify` **is** advertised — so the presence is not satisfied by a `CAP LS` that stopped early |
+| `BATCH` exists and a malformed reference is **not** `421` | `commands.c`'s verb table, `pre_reg = 1` | `test_batch.c` case 1: `462` for a reference with no sign. `421` would tell a client this server has never heard of the verb |
+| Inside an open batch, **every** line carries `batch=<ref>` | `reply.c`'s `emit_built_ex()`, `batch_line_tag()`'s open-batch arm | `test_batch.c` case 2: a four-line `WHOIS`, 4 of 4 numerics tagged, counted over the **numerics** and not over the window — because the drain `PONG` is inside the batch too and must be |
+| After `BATCH -ref`, **no** line is tagged | the same function, one-shot arm | the same case: 0 tagged lines in the following window |
+| A **mis-cased** `BATCH -ref` refuses AND leaves the batch open | `batch.c`'s `strcmp()` | `test_batch.c` case 3: the `462`, then 4 of 4 lines still carrying `@batch=Who1` — the case-sensitivity claim and the state claim in one case |
+| `+<ref>` tags **exactly one** line and is consumed | `batch_begin_command()` / `batch_line_tag()`'s one-shot arm | `test_batch.c` case 4: 1 of 4, then 0 of 4 on the next command |
+| An **invalid** reference is ignored and the response still arrives, and nothing is stored | `note_reference()`'s early `return` | the same case: 0 tagged lines, 4 delivered — and then **0 on the following command**, which is the half that proves it was not stored |
+| `INVALID_REFTAG` is a `FAIL` **per destination** | `reply_refused(..., "BATCH", "INVALID_REFTAG", "417", ...)` | `test_batch.c` case 5, on two connections differing in exactly that negotiation: `FAIL BATCH INVALID_REFTAG` on one, byte-identical `417` on the other |
+| 64 accepted, 65 refused, and neither truncated | `batch_ref_valid()`'s `n > CONN_MAX_BATCH_REF` | the same case, at both edges. **The 64 half exists because the first `reply.c` sized its tag buffer at `CONN_MAX_BATCH_REF + 1` and dropped the tag at exactly this boundary** |
+| A `BATCH` carrying a `batch=` tag is refused and opens **nothing** | `batch_line_tagged_inbound()`, checked first in `handle_batch()` | `test_batch.c` case 7, half one — sent with **no batch open**, so the one-batch rule cannot fire and only the nesting check can. Half two: the OUTER batch still tags afterwards and `@batch=inner` appears nowhere |
+| The state is per connection and outlives the message | `conn_t`'s three fixed-size fields | `test_batch.c` case 6: `b` sees no tag while `a` has one open, and `a`'s is still tagging several commands later |
+| Teeth, build checked before the run was believed | four faults | **4 red, 0/0 each.** **ONE WAS GREEN ON ITS FIRST RUN** — the obvious shape of the nesting case cannot see the fault, because a nested `+` is refused by the one-batch rule anyway and the numeric and the line count come out identical. The case was rewritten to discriminate and re-run. That is recorded at the test's TEETH block rather than quietly replaced |
+
+**THE TWO FINDINGS, both of them about the specifications rather than about this node.**
+
+1. **`@<ref>` is unimplementable, and that is a property of the tag grammar.** The
+   retired `reference-tags` specification paired `@<ref>` ("send the response nowhere")
+   with `+<ref>`. `@` is the tag-block **marker**, and a conformant parser consumes
+   exactly one of them, so `@ref` parses as a valueless tag named `ref` and `@@ref` is
+   **refused by `message_parse_n()`**. Both were run, not reasoned about. `+` is the
+   sigil the modern grammar keeps inside the key, so `+<ref>` is implemented and the drop
+   form is recorded as not implemented. `conn_t` has no field for it and says why.
+2. **`client-batch` has no code for the refusals it implies.** It defines three `FAIL`
+   codes — `INVALID_REFTAG`, `TIMEOUT`, `UNKNOWN_TYPE` — and none of them covers a
+   second open batch, a mismatched close, or a nested `BATCH`, all of which its own prose
+   forbids. Those use a borrowed `462` with the reason in the text; §6 forbids a new
+   numeric and §4.4 forbids silence.
+
+**WHAT IS NOT IMPLEMENTED, by name.** `netsplit` and `netjoin` batch types (a suppression
+feature this node has no event to batch, and the capability does not claim them — the
+specification says batch types are not advertised and a client may ignore an unknown
+one); `UNKNOWN_TYPE` (see §4.4.7 for the argument); `TIMEOUT` (a code with no specified
+duration); `draft/multiline` (needs the framing, which this is, plus the interpretation
+of `;draft/multiline-concat` values and the splitting of one command into several); and
+`batch/react`, which is a **client-only** batch type and is N/A for a server.
+
+### 10.15 Phase 10.13 — `labeled-response`, and what "exactly one logical message" costs
+
+| Claim | Where | Evidence |
+|---|---|---|
+| The label is **copied**, never referenced past the request | `conn_t::label`, a fixed-size field; `label.c`'s `ircv3_unescape_value()` into it | `test_labeled_response.c` case 6: a 64-byte value comes back **byte for byte**. The FAULT (a stored `char *`) is **red** but **ASan is SILENT** — see the note below |
+| The label appears in **exactly one** logical message | `label_line_tag()`: `label=` on the batch start, `batch=<ref>` after | case 3: 4 of 4 numerics carry `@batch=…` and exactly **1** line carries `@label=…` |
+| A multi-line response is grouped, `BATCH +` **tagged with the label**, `BATCH -` untagged | `label_line_tag()`'s first-line arm, `label_finish_command()` | case 3, on the specification's own example shape, with the reference **read back out of the opening line** so the rest of the assertions are about what the node minted |
+| A single-line response is **wrapped too** | the same arm — the batch is opened on the first line, before the node knows how many there will be | case 1: 3 lines (batch, answer, close) and exactly one `@label=`. **This is the cost and it is named at §4.4.8** |
+| A labelled `PRIVMSG` to a channel the sender is not on produces a labelled **`404`** | the whole path | case 5, with a second client on the channel so the answer is `404` and not `403` — and with the assertion that **the channel heard nothing** |
+| `ACK` for a command that produced nothing, and **not** for one that did | `label_finish_command()`'s two arms | case 4: a labelled `PONG` → `ACK`; a labelled `PING` → a PONG and **zero** `ACK` |
+| A message **to itself** carries no tag, and the label lands on the `ACK` instead | `conn_t::label_self`, set by `msg_verbs.c` | case 7: the echoed `PRIVMSG`'s line begins with a bare `:` (walked back to the line start), `@label=self` appears once, and it is on the `ACK` |
+| A message to a **channel** IS labelled on the echo, and the label never travels | the same field, `0` for a channel target | the same case, second half: `@label=other` once on the sender, and **no** `label` anywhere on the recipient's socket |
+| 64 accepted, 65 **ignored and not truncated**, a valueless `@label` ignored | `CONN_MAX_LABEL`, checked before the copy | case 6, all three: 64 comes back byte-for-byte; 65 produces **no** `label=` at all and the response still arrives |
+| Per destination: the label, no `BATCH`, no `ACK` for a client that negotiated nothing | `cap_labeled_response_enabled()` gating the batch and the `ACK`, never the label | case 2, on a connection that negotiated `away-notify` and nothing else |
+| Teeth, build checked before the run was believed | five faults | **5 red, 0/0 each** — with **two recorded as faults of the FAULT rather than of the test**: the grouping fault needed a `(void)s` to compile (`unused-parameter`), and the pointer fault is **red without ASan reporting anything**. Both are in the test's TEETH block |
+
+**THE ASAN FINDING, and it is the interesting one.** The fault the pass plan asked for —
+"a label pointer retained past the request (use-after-free under ASan)" — **does not produce
+an ASan report in this design**, and the reason is a fact about the ordering rather than
+about the fault. The label is consumed inside `commands_dispatch()`: the `BATCH +<ref>` line
+is emitted from `emit_built_ex()` while the handler is still running, and the `BATCH -<ref>`
+from `label_finish_command()` before dispatch returns. **`poll_loop.c` frees the parser's
+buffer after dispatch returns.** So a stored pointer is dangling but still *readable* at
+every point it is used.
+
+What the fault produces instead is a **corrupted label on the wire** — the fault's run
+shows `@label=<two bytes of whatever the allocator had>` — and the test is red on that. So
+the fixed-size field is defended by a **wire-level assertion rather than by the
+sanitizer**, which is a weaker guarantee than this project usually claims, and it is stated
+here and at the test's TEETH block rather than dressed up. If a future phase moves any
+labelled emission outside dispatch, the fault becomes a real ASan report and the claim
+becomes stale in the useful direction.
+
+**TWO MORE DEFECTS THIS TEST FOUND BY RUNNING**, both invisible to review and both of the
+same class — *a rule that was true of the code and not of the protocol*:
+
+1. `label_finish_command()` cleared its state **after** emitting, so the `ACK` triggered the
+   batching the function exists to prevent and came out as
+   `@batch=<its own ref>;label=<value>` on one line. Fixed by disarming first.
+2. The "sent to itself" test was keyed on the line's **prefix** rather than on the message's
+   **target**, so it withheld the label from every `echo-message` copy on the node: a
+   labelled `PRIVMSG #chan` returned an unlabelled echo followed by an `ACK`. Fixed by
+   `conn_t::label_self`, set where the target is in scope.
+
+### 10.16 Phase 10.14 — `invite-notify`, and a misreading corrected rather than implemented
+
+| Claim | Where | Evidence |
+|---|---|---|
+| The **audience is the channel**, and the line is the specification's | `notify_invite()` in `chan_verbs.c`, through the union entry point with a one-element list | `test_invite_notify.c` case 1, byte for byte: `:in_op!in_op@127.0.0.1 INVITE in_g #I`. **The first version rendered `INVITE #I in_g #I`** — 3.1's row prepends the resolved target and the specification's grammar is the other way round |
+| A member who negotiated is told **exactly once** | `cap_gate_invite_notify()` | case 1: `tf_count(" INVITE ") == 1` |
+| A member who did **not** negotiate is told **nothing** | the same gate | case 1's `blunt`, by line count of 0 |
+| The **inviter** gets its `341` and nothing else, and that is `exclude` not the gate | `notify_invite()`'s last argument | case 1's `op`: the inviter DID negotiate, so the gate would have let it through — which is what makes this the case that proves the two are different questions |
+| The notification is addressed to **one** channel | the one-element channel list | case 2: two channels, three connections; the member of the other channel gets nothing about this one, and the other invitation reaches the other channel |
+| A **refused** INVITE notifies nobody | the call site, after every refusal in `handle_invite()` has returned | case 3: a non-op's `482`, and the channel's member window is empty |
+| **One connection per nickname**, which is why the other reading is vacuous | the nick registry | case 4: a second connection claiming a held nick is `433` |
+| Teeth, build checked before the run was believed | four faults | **4 red, 0/0 each** — the gate ignored, the inviter not excluded, the notification moved above the authority check, and the parameters swapped |
+
+**THE CORRECTION, because it is the substance of the pass.** The plan for this phase
+described `invite-notify` as "`INVITE` reaching a client's other connections", and
+predicted a vacuous result on the grounds that this node has one connection per user.
+**The premise is wrong and the prediction follows from it.** The specification is about
+**channel members**: "allows a client to specify that it would like to be notified when
+users are invited to channels", with the message `:<inviter> INVITE <target> <channel>`.
+The source is the inviter and the subject is a third party doing something to a channel the
+recipient is on; RFC 2812 3.3.6's "Other channel members SHOULD NOT be notified" is the
+rule this capability exists to let a client opt out of. Nothing in it concerns the
+invitee's connections.
+
+The vacuity is still worth recording, and it is recorded as a **fact about the node** rather
+than as the outcome: one connection may hold a nickname (the registry answers `433`), so
+the "other connections" set is empty and case 4 asserts that. Had the feature been built
+to the brief's reading it would have been a no-op with a passing test.
+
+### 10.17 Phase 10.15 — the seven specifications that are NOT implemented, and why
+
+**NO CODE IN THIS PASS.** Every row below is a decision, a block, or a correction of a
+misreading, and each carries its reasoning rather than a shrug. Where a specification is
+blocked, the missing thing is named; where it is out of scope, the scope boundary is named;
+where the brief was wrong about it, that is said first.
+
+| Specification | Status | The reasoning |
+|---|---|---|
+| **`chathistory`** | **NOT IMPLEMENTED — a DESIGN CONFLICT, and the instruction is to document it and leave it** | See below. This is the only item in the phase that is not a "not started" |
+| **`websocket`** | **OUT OF SCOPE — a transport, not a protocol feature** | See below |
+| **`sts`** | **OUT OF SCOPE — a crypto surface** | See below |
+| **`sasl-3.2`** | **OUT OF SCOPE for the MECHANISMS; the framework is present** | See below |
+| **`client-tags/channel-context`, `react`, `reply`, `typing`, `batch/react`** | **N/A FOR A SERVER** | See below |
+| **`oper-tag`** | **BLOCKED — on a subsystem that does not exist** | See below |
+| **`account-extban`** | **BLOCKED — on the one gap already named twice** | See below |
+
+---
+
+#### `chathistory` — a design conflict, documented and NOT implemented
+
+**THE INSTRUCTION WAS EXPLICIT: document the conflict, do not implement.** This section is
+that document, and it is the longest thing in this phase that is not code.
+
+**WHAT IT WOULD REQUIRE.** `draft/chathistory` answers "what was said in `#t` while I was
+away". On this node the answer is: nothing, because nothing is kept. `resume.c`'s restore
+hands a client back the channels it was in at disconnect, and that is a **session** — it
+keeps nothing that was not said while the client was connected, so it cannot answer a
+question about last week. §4.4.2 already refuses to advertise `draft/CHATHISTORY` for
+exactly this reason: "Advertising it would put a client into a state it cannot leave."
+
+**THE CONFLICT IS WITH §2.2's DISPOSAL RULE, and it is not a matter of effort.** §2.2
+frees a channel with no local members and no member-server, and the paragraph above it
+gives the reason in one sentence: "holding one per channel *name* a client ever typed
+would be an **unbounded store reachable from the wire**." A message history is exactly
+that, and worse — it is unbounded in **time** as well as in name, because a channel's
+history grows for as long as anybody is talking.
+
+The design already solved this once, and the solution is the template for what a history
+would need. A channel's **topic** is the one field whose loss a client can see, so
+`topic`/`topic_who`/`topic_when` are copied into a **bounded cache on `server_t`** at
+disposal and copied back at creation. Four limits are stated there rather than left to a
+reader: it does not survive a restart, only the topic is carried, the bound is small, and
+the cache's lifetime is exactly the channel's.
+
+**WHAT WOULD HAVE TO CHANGE IN THE DESIGN, stated as the four things and not as a shrug:**
+
+1. **A bounded, time-boxed history per channel**, on `server_t`, with a bound on **both**
+   axes — messages per channel and age. §2.2's rule is about the first; a history needs the
+   second, and an age bound is a new kind of thing on this node because nothing in the
+   design currently ages anything out on a timer. §3.4 forbids a write inside the event
+   loop, so the eviction would have to run from the poll tick.
+2. **A stated answer to "what is the bound, and who decided".** §2.2's topic cache has a
+   bound this project chose and documented. A history's bound is a *policy* an operator
+   will have opinions about, which makes it a configuration surface — and §4.5's
+   `--sasl-store` / `--account-store` argument is about secrets, not about retention, so
+   there is no existing precedent for it.
+3. **A decision about federation, which is the one that would actually be expensive.** 4.3's
+   frozen verb table has no message verb for history and `SBURST` carries nicks, channels,
+   topics and away — **not messages**. So a mesh member's history would be empty unless a
+   new S-verb were added, and §6 forbids inventing a wire format after Phase 6. The two
+   S-verbs that already exist (`SPRIVMSG`, `SNOTICE`) are live traffic, and a history is
+   not live traffic: replaying old messages through them would put them in every
+   duplicate-suppression store and every `msgid` namespace as though they were new.
+4. **A storage decision, and this is where the fail-closed posture bites.** The posture is
+   fail-closed with no buffered state, and a history is buffered state on purpose. §2.2's
+   channel disposal and §2.3's load reporting both assume that what a node holds can be
+   recomputed from the mesh; a history cannot be, because the mesh does not carry it.
+
+**THE COST OF LEAVING IT OUT, and it is small.** A client that joins a channel after a
+conversation sees nothing of it. Every IRC client already treats that as normal, because
+`chathistory` is a draft and no widely-deployed client requires it. **The cost of
+implementing it without the four decisions above is larger**: unbounded wire-reachable
+memory, which is the exact defect §2.2 names.
+
+---
+
+#### `websocket`, `sts`, `sasl-3.2` — a transport, a crypto surface, and two mechanisms
+
+**`websocket` — a TRANSPORT, not a protocol feature.** The specification changes how bytes
+reach the node: an HTTP upgrade handshake, then a framed stream instead of CRLF lines.
+Everything above that — the parser, `dispatch()`, every capability, every numeric — is
+unchanged, which is a good sign that it is a different layer rather than a missing
+feature. Implementing it means: a listener that speaks HTTP for exactly one request, a
+frame codec, and a decision about what a half-open upgrade costs while a client
+misbehaves. **None of that is protocol work and all of it is this node's job**, which is
+precisely why it is out of scope for a phase about IRCv3 specifications. §4.4.1's rule
+gives the honest alternative: if it is wanted, `WEBSOCKET=302` is an `005` token and
+there is a place to add it.
+
+**`sts` — a CRYPTO SURFACE, and the reason is stronger.** `sts` ("Strict Transport
+Security") tells a client to *only* ever use TLS, and it depends on a `tls` capability
+this node does not have. Advertising `sts` without `tls` would be advertising a promise
+this node cannot keep, which is `cap.h`'s rule in its strongest form. **And it is not
+implementable in isolation**: `sts` is a policy layered on `tls`, and `tls` is Phase 8's
+`STARTTLS` which this node does not implement either. Two specifications, one transport,
+and the bottom one is missing.
+
+**`sasl-3.2` — the FRAMEWORK IS HERE; the two MECHANISMS ARE NOT.** This needs splitting,
+because the brief listed it as one thing and it is two:
+
+- **The SASL framework is implemented.** `sasl_framework.c` implements RFC 4616 `PLAIN`
+  against a credential store, `CAP LS` withholds `sasl` when no store was loaded (a node
+  with no credentials cannot authenticate anybody), and `AUTHENTICATE` is answered inside
+  the registration burst.
+- **`sasl-3.2` names `SCRAM-SHA-1`/`SCRAM-SHA-256` and `EXTERNAL`, and this node
+  implements neither.** `EXTERNAL` authenticates a client by a credential it presented
+  *elsewhere* — a TLS client certificate, or an already-authenticated `sasl` identity from
+  a bouncer — and this node has neither TLS nor bouncer support, so there is nothing for
+  `EXTERNAL` to assert. `SCRAM` is a challenge-response mechanism: the server holds a
+  **salted, iterated hash** rather than a plaintext-equivalent secret, and
+  `account_store.c` holds the latter. Storing SCRAM verifiers correctly is a credential
+  store redesign, and getting it wrong is a silent authentication weakness rather than a
+  loud failure.
+- **`sasl-3.1` IS RETIRED IN FAVOUR OF `3.2`, and that is why `3.1` is not on this list at
+  all.** Implementing the retired version would mean implementing the wrong one.
+
+**WHAT WOULD HAVE TO CHANGE, briefly:** for `websocket`, a transport layer and a new
+listener; for `sts` and `tls`, a TLS listener and `STARTTLS`, and then a policy on top;
+for `sasl-3.2`, a credential store that can hold a SCRAM verifier, which is a change to
+`account_store.c`'s file format and to every test that reads it.
+
+---
+
+#### Client-only specifications — N/A FOR A SERVER, with the reasoning
+
+`client-tags/channel-context`, `client-tags/react`, `client-tags/typing`,
+`client-tags/reply`, and the `batch/react` batch type. **All five are N/A for a server, and
+the reason is one sentence from the specifications themselves: their subject is the
+PRESENTATION OF A MESSAGE TO A HUMAN.**
+
+- **`typing`** is "the user is typing a message". A server can observe the `TAGMSG` but the
+  observation has no meaning without the typing indicator the client draws.
+- **`react`** is a reaction to a message. The IRCv3 registry records it as a **client-only
+  tag**; a server relaying it is a `PRIVMSG`-shaped relay with no semantics, and the
+  specification's own framing is that the client shows the reaction.
+- **`reply`** marks a message as a reply to another `msgid`. The server half of that is
+  **already implemented**: `msgid` is stamped on every line this node relays (Phase 10) and
+  forwarded across a link with 2.4's identity intact. What the `reply` tag adds is the
+  *display* — an indent, a quote — and that is the client's.
+- **`channel-context`** is "display this private message as if it were in `#chan`". A server
+  has no display.
+- **`batch/react`** is a **batch type**, and the `batch` specification says batch types are
+  "not advertised by servers nor explicitly requested by clients" — a server-emitted
+  `react` batch would be a server deciding how a client presents reactions, which is the
+  opposite of what the type is for.
+
+**THE GENERAL RULE, and it is worth having written down**: a **client-only tag** is one the
+IRCv3 specifications define as travelling *directly between clients with no server
+involvement*. A server that recognises one and acts on it is inventing semantics. The one
+partial exception here is `reply`, and the partial exception is `msgid`, which this node
+already emits and which is what the tag's value refers to.
+
+---
+
+#### `oper-tag` — blocked on a subsystem this node does not have
+
+The specification adds a `+` tag to `PRIVMSG`/`NOTICE` **when the sender is an IRC
+operator**. So it needs operator flags.
+
+**This node has no operator concept at all**, and that is not a gap in one handler:
+`conn_t` has no operator field, `004` advertises a user-mode set of `i` that nothing
+evaluates, `CHOPER` answers `464` for every request, and `KNOCK` is refused with `482`
+precisely because "the only thing the RFC names as that authority is an IRC operator". So
+the block is not "the tag is hard" — it is that **the predicate the tag asks about does not
+exist**. A node cannot stamp `+` on messages from operators it does not have.
+
+**WHY IT WAS NOT IMPLEMENTED AS AN ALWAYS-ABSENT TAG.** An absent tag is a smaller lie than
+a wrong one: a client that sees `+` on a message reads "this person is an operator", and a
+client that sees nothing reads nothing. Adding the tag with no operator model behind it
+would produce the first.
+
+**WHAT WOULD HAVE TO CHANGE**, and it is a whole phase rather than a handler: §5's operator
+model — a way to be one, a way to stop being one, a way to be *seen* to be one (the
+capability's own `oper` argument), and a `MODE`-independent privilege set. §9's risk row
+for "fabricating a load metric to decide node lifecycle" is the same shape of problem: a
+node deciding something on the strength of a value it invented.
+
+---
+
+#### `account-extban` — blocked on the ONE gap this document has already named twice
+
+The specification adds `~&account:<name>` mask types to a channel ban list, so that an
+operator can ban an account rather than a hostmask.
+
+**It needs two things and this node has neither:**
+
+1. **The account.** Delivered in Phase 10.1 and available.
+2. **A ban-expression parser.** `+b` stores a mask verbatim and `chan_banned()` tests it by
+   **string equality and a glob**, per §2.2. There is no expression language, so there is
+   no `~&account:` to parse.
+
+**AND THIS IS ONE GAP NAMED TWICE ALREADY**, which is the point of listing it here rather
+than writing a new paragraph: §4.4.2 already records that `EXTBAN=` is **deliberately
+absent from `005`** because "There is no ban-**expression** parser, so there is no
+`~&account:name` and no `EXTBAN` value", and it says in the same breath "This is the same
+missing evaluator that blocks `account-extban`". §10.2's table says it a third time from the
+account side.
+
+**So the honest status is: one missing subsystem, three consequences, and they should be
+counted once.** A `+b` that stores a mask verbatim is not a bug and is not a gap in
+`chan_banned()` — it is a complete implementation of what §2.2 specifies, and the missing
+piece is the *expression grammar* that would sit above it.
+
+**WHAT IT WOULD COST**, and the estimate is deliberately coarse because the design is not
+written: a mask grammar and a parser; an evaluator with a defined precedence and a defined
+answer for a mask it cannot parse (fail closed, or ignore the mask? — the two answers have
+opposite failure modes and §2.2's posture says fail closed); an `EXTBAN=` token rendered
+from the constants the evaluator enforces, in `005`; and a per-channel bound on how much
+work one mask may cost, because a glob over a long mask against a long roster is a place a
+client can spend the node's time. **That last one is the part that has to be designed
+before it is coded**, and it is why this is a decision rather than an omission.
+
+### 10.11 The honest limits of the account phase
+
+- **The identity is visible on ordinary traffic for LOCAL senders only.**
+  `account-tag` (Phase 10.2a) stamps it on every line an identified client emits
+  to a client that negotiated the capability, and `330 RPL_WHOISACCOUNT` still
+  answers a `WHOIS` about a person the client named. Neither reaches a message
+  this node **relayed**, and neither reaches a numeric — the tag on numerics is
+  the specification's SHOULD, not its MUST. Design §2.5.3 names all three.
+- **No client can create or delete an account.** By decision (§2.5.2), and the
+  cost is stated: a deployment wanting open registration must not use this node.
+- **Accounts do not federate, and that is now a WIRE decision rather than only a
+  limitation of the subsystem.** A registry is per node and per operator, exactly
+  as `sasl_store_t` is — a two-node mesh with two registries will disagree about
+  who somebody is. Phase 10.2a therefore **does not** put `+account` on a relayed
+  message (§2.5.3), so per-message identity stops at the node that verified the
+  credential; the account reaches a peer as **membership** state instead, through
+  `extended-join` (Phase 10.3). Closing the per-message gap needs an account
+  authority both nodes trust, and this node has none.
+- **`account-extban` and `oper-tag` are unblocked by accounts and blocked by
+  subsystems that do not exist** (no channel-mode evaluator, no operator flags).
+- **Compliance is hand-written tests against spec text**, not a third-party runner:
+  `ircv3/ircv3-test-suite` and `ircv3/chathistory-test-suite` do not exist.

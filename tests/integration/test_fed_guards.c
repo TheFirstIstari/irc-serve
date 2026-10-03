@@ -682,9 +682,13 @@ static void case_verb_and_field_checks(nf_node_t *node, int *peer_fd)
                  "me' and is evidence of neither: %s",
                  node->out);
 
-    /* An SJOIN with the wrong arity. 4.3's frozen shape is exactly three
-     * parameters, and a two-parameter one is a peer running a different format:
-     * reading params[2] of it would be a read of a field that does not exist. */
+    /* An SJOIN with the wrong arity. 4.3's frozen shape is exactly FOUR
+     * parameters -- `<channel> <member> <flags> <account>` since Phase 10.3 -- and a
+     * two-parameter one is a peer running a different format: reading params[2] of
+     * it would be a read of a field that does not exist. A THREE-parameter line is
+     * now the shape of a build that predates the account field, and it is refused
+     * for the same reason and by the same check; the case below is the short one
+     * because it is the one that was already here. */
     stamp(block, sizeof block, "irc.z", 1700000006UL, 603UL, 1UL);
     (void)snprintf(line, sizeof line, "%s:" PEER " SJOIN " CHAN " mallory\r\n", block);
     TF_CHECK_MSG(send_line(*peer_fd, line) == 0, "the test could not send the line");
@@ -703,7 +707,7 @@ static void case_verb_and_field_checks(nf_node_t *node, int *peer_fd)
      * is the first point in the tree where a nickname arrives from a network. */
     stamp(block, sizeof block, "irc.z", 1700000007UL, 604UL, 1UL);
     (void)snprintf(line, sizeof line,
-                   "%s:" PEER " SJOIN " CHAN " bad@nick -\r\n", block);
+                   "%s:" PEER " SJOIN " CHAN " bad@nick - *\r\n", block);
     TF_CHECK_MSG(send_line(*peer_fd, line) == 0, "the test could not send the line");
     TF_CHECK_MSG(nf_expect(node, "fed_sjoin_reject: ", T_IO_MS) == 0,
                  "an SJOIN whose member is not a legal nickname was recorded in "
@@ -715,7 +719,7 @@ static void case_verb_and_field_checks(nf_node_t *node, int *peer_fd)
      * recorded, so the refusal above is a charset check and not a node that
      * refuses every SJOIN. */
     stamp(block, sizeof block, "irc.z", 1700000008UL, 605UL, 1UL);
-    (void)snprintf(line, sizeof line, "%s:" PEER " SJOIN " CHAN " mallory -\r\n",
+    (void)snprintf(line, sizeof line, "%s:" PEER " SJOIN " CHAN " mallory - *\r\n",
                    block);
     TF_CHECK_MSG(send_line(*peer_fd, line) == 0, "the test could not send the line");
     TF_CHECK_MSG(nf_expect(node, "fed_sjoin: channel=" CHAN " member=mallory", T_IO_MS) ==

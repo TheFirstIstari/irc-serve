@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "account_store.h"
+#include "core/account.h"
 #include "core/channel.h"
 #include "core/fanout.h"
 #include "federation/burst.h"
@@ -303,6 +305,77 @@ static const char *fed_flag_token(unsigned flags, char *out, size_t cap)
  * fanout_forward_link() for one value that one caller (handle_join) knows and
  * every other caller does not -- and a default of 0 on the other five would be a
  * way for an SJOIN to lose +o without anybody noticing. */
+/* An account name, or `*`, into `out`. The ONE place the protocol's
+ * "no account" spelling is produced for the S-verb side, for the same reason
+ * fanout.c's fanout_emitter_account() is the one place it is produced on the
+ * client side: a token written in two places is a token that comes to disagree
+ * with itself about what an absent account looks like. */
+static int fed_account_token(const char *name, char *out, size_t cap)
+{
+    size_t n;
+
+    if (out == NULL || cap < 2u) {
+        return 0;
+    }
+    if (name == NULL || name[0] == '\0') {
+        out[0] = '*';
+        out[1] = '\0';
+        return 1;
+    }
+    n = strlen(name);
+    if (n >= cap) {
+        return 0;
+    }
+    memcpy(out, name, n + 1u);
+    return 1;
+}
+
+/* The member's account as 4.3's SJOIN carries it: the account name, or `*`.
+ *
+ * READ OUT OF THE MEMBERSHIP for the same reason fed_member_flags() reads the
+ * flags out of it, and with the same asymmetry handled the same way: a LOCAL
+ * member is a conn_t and its account is account_name() -- "" for a connection that
+ * is not identified, which renders as `*` -- while a REMOTE member's account is
+ * the field its SJOIN or SBURSTM filled in, and an entry this node has not been
+ * told about renders as `*` too.
+ *
+ * `*` IS NEVER STORED, so a member with an empty `account` field and a member who
+ * has no account at all are the same value here, which is the roster-level version
+ * of 2.1.1's invariant: there is no such thing as an account named "*". The buffer
+ * is ACCOUNT_SJOIN_ACCOUNT_MAX because the value is either a name or that one
+ * byte, and a name is bounded by CONN_MAX_ACCOUNT. */
+#define ACCOUNT_SJOIN_ACCOUNT_MAX (CONN_MAX_ACCOUNT + 2u)
+
+static int fed_member_account(const chan_t *ch, const char *nick, char *out,
+                              size_t cap)
+{
+    const struct member *local;
+
+    /* A NULL CHANNEL IS NOT A REFUSAL, and that is fed_member_flags()'s rule
+     * applied to a second property: a caller shaping a JOIN for a channel this
+     * node does not hold -- which a peer-only fixture and a forward of a channel
+     * whose record has already been dropped both are -- still has to produce a
+     * legal SJOIN, and "no membership here" is truthfully `*`. Refusing would make
+     * the whole forward of that line fail with BAD_SHAPE, which says nothing true
+     * about anything. */
+    if (nick == NULL || out == NULL || cap < 2u) {
+        return 0;
+    }
+    if (ch == NULL) {
+        return fed_account_token("", out, cap);
+    }
+    local = chan_find_nick(ch, nick);
+    if (local != NULL && local->c != NULL) {
+        return fed_account_token(account_name(local->c), out, cap);
+    }
+    for (size_t i = 0; i < ch->nremotes; i++) {
+        if (chan_same_name(ch->remotes[i].nick, nick)) {
+            return fed_account_token(ch->remotes[i].account, out, cap);
+        }
+    }
+    return fed_account_token("", out, cap);
+}
+
 static unsigned fed_member_flags(const chan_t *ch, const char *nick)
 {
     const struct member *local;
@@ -373,16 +446,35 @@ int fed_sverb_params(const char *client_verb, const char *target,
     }
 
     if (strcmp(client_verb, "JOIN") == 0) {
-        /* <channel> <member> <flags>. */
-        if (n != 1 || nparams != 0 || cap < 3) {
+        /* <channel> <member> <flags> <account>.
+         *
+         * THE ACCOUNT IS THE FOURTH PARAMETER AND IT IS DERIVED FROM THE CHANNEL
+         * HERE, for exactly the reason `<flags>` is: both are properties of the
+         * MEMBERSHIP, and the node forwarding the join is the node that just made
+         * it, so its own record is the authority for both. A local member's account
+         * is `account_name()` on its connection and a remote member's is the field
+         * 4.3's SJOIN put on the roster entry; `*` is the protocol's spelling of
+         * "not logged in to an account", and it is what BOTH of those render as
+         * when there is nothing.
+         *
+         * THE PEER ALWAYS GETS THE SAME FOURTH PARAMETER, which is the reason the
+         * client-facing `extended` shape is not handed to the forward
+         * (fanout.h): which of this node's CLIENTS negotiated `extended-join` must
+         * not change what this node says to a peer. */
+        if (n != 1 || nparams != 0 || cap < 4) {
             return -1;
         }
         if (fed_flag_token(fed_member_flags(ch, member), scratch->flags,
                            sizeof scratch->flags) == NULL) {
             return -1;
         }
+        if (fed_member_account(ch, member, scratch->account,
+                               sizeof scratch->account) == 0) {
+            return -1;
+        }
         out[n++] = member;
         out[n++] = scratch->flags;
+        out[n++] = scratch->account;
         return n;
     }
     if (strcmp(client_verb, "PART") == 0) {
@@ -684,14 +776,21 @@ static void fed_in_sjoin(server_t *s, server_link_t *link, chan_t *ch,
 {
     unsigned flags = 0u;
 
-    if (nparams != 3 || fed_parse_flags(params[2], &flags) != 0 ||
-        /* link->name TWICE, and that is the whole of what an SJOIN can say: 4.3's
-         * SJOIN carries no server field, so the member's holder is inferred from
-         * the link the record arrived on -- exact on a two-node mesh and a
-         * relaying peer's best guess on a larger one, which is why the BURST
-         * format grew a <server> field and this one has not. See
+    /* FOUR PARAMETERS NOW, not three: `<channel> <member> <flags> <account>`, and
+     * the arity is the FORMAT's and is enforced here rather than guessed at, which
+     * is the reason the table in this file carries an SJOIN row of 4,4. A peer
+     * running a build without 4.3's extension sends three and is refused, which is
+     * a loud incompatibility rather than a member silently recorded with no
+     * account -- and the same direction 4.3.1 chose for `<server>`, which was added
+     * before a second implementation existed rather than after. */
+    if (nparams != 4 || fed_parse_flags(params[2], &flags) != 0 ||
+        /* link->name TWICE, and that is the whole of what an SJOIN can say about a
+         * member's HOLDER: 4.3's SJOIN carries no server field, so the member's
+         * holder is inferred from the link the record arrived on -- exact on a
+         * two-node mesh and a relaying peer's best guess on a larger one, which is
+         * why the BURST format grew a <server> field and this one has not. See
          * channel.h's chan_remote_t for the two-server split. */
-        chan_remote_add(ch, link->name, link->name, params[1], flags) != 0) {
+        chan_remote_add(ch, link->name, link->name, params[1], params[3], flags) != 0) {
         printf("[observable] fed_sjoin_reject: channel=%s member=%s server=%s\n",
                ch->name, (nparams > 1) ? params[1] : "?", link->name);
         return;
@@ -1687,7 +1786,7 @@ static const struct {
 } INBOUND[] = {
     { "SPRIVMSG", 2, 2, NULL, FANOUT_MESSAGE,  "PRIVMSG" },
     { "SNOTICE",  2, 2, NULL, FANOUT_MESSAGE,  "NOTICE"  },
-    { "SJOIN",    3, 3, NULL, FANOUT_STATE_CHANGE, "JOIN"  },
+    { "SJOIN",    4, 4, NULL, FANOUT_STATE_CHANGE, "JOIN"  },
     { "SPART",    2, 3, NULL, FANOUT_STATE_CHANGE, "PART"  },
     { "STOPIC",   3, 3, NULL, FANOUT_STATE_CHANGE, "TOPIC" },
     { "SMODES",   3, 4, NULL, FANOUT_STATE_CHANGE, "MODE"  },

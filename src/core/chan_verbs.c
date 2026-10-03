@@ -43,6 +43,7 @@
 
 #include "core/cap.h"
 #include "core/channel.h"
+#include "core/account.h"
 #include "core/fanout.h"
 #include "core/reply.h"
 
@@ -329,10 +330,107 @@ static const char *names_signs(unsigned flags, int multiprefix, char *out,
     return out;
 }
 
+/* The ROSTER ENTRY for one member, drawn in the shape this DESTINATION asked
+ * for, into `out`. Returns `out`, or "" when nothing fits.
+ *
+ * ---------------------------------------------------------------------------
+ * THE PRIVACY DECISION IS IN THIS FUNCTION, NOT IN ITS CALLER
+ * ---------------------------------------------------------------------------
+ * IRCv3's `userhost-in-names` says a `353` may carry `nick!user@host` rather than
+ * a bare nickname. What that means is that **every member's ident and observed
+ * host address is disclosed to every other member of the channel**, to clients
+ * that member has never spoken to and to clients who joined after them. There is
+ * no per-member consent anywhere in it: one client asking puts the whole roster's
+ * hostmasks on the wire to that client.
+ *
+ * So the shape is decided per DESTINATION and nowhere else, and it is decided
+ * here rather than in `send_names_list()` so that the LOCAL roster and the REMOTE
+ * roster -- two separate arrays walked by two separate loops -- cannot answer the
+ * question differently. That was already the reason `multiprefix` is a parameter
+ * of `names_signs()`; the difference is the cost of getting it wrong. One sigil
+ * drawn in the wrong shape is cosmetic; one hostmask disclosed to a client that
+ * did not ask is not.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT HAPPENS WHEN THE NODE DOES NOT HAVE A HOSTMASK TO DRAW
+ * ---------------------------------------------------------------------------
+ * It draws the BARE NICK, which is the historical shape and which every client
+ * parses, and the asymmetry is genuine rather than an oversight:
+ *
+ *   - a LOCAL member always has both halves. `c->host` was filled by accept()
+ *     before the connection had a nickname, and `c->user` by USER.
+ *   - a REMOTE member has them only if 4.3's SBURSTN announced them. A live SJOIN
+ *     carries neither (4.3's SJOIN is `<server> <chan> <nick> <flags>`), so the
+ *     empty host is the NORMAL state for a member learned from one -- channel.h
+ *     says so at `chan_remote_t` and that note is still true.
+ *
+ * The alternative would be to put `*` in place of a missing half, and that is
+ * refused on purpose: `*` would be a byte on the wire that reads as part of a
+ * hostmask and means nothing. A client that negotiated this capability and still
+ * sees a bare nickname learns exactly the true thing -- that this node has not been
+ * told -- and RFC 2812 3.3.5 permits a `353` to hold bare nicknames, so the mixed
+ * roster is parseable rather than surprising.
+ *
+ * THE BUFFER IS PER MEMBER AND NOT HOISTED, for the reason `write_to_members()`
+ * gives for its tag buffer: this renders inside the loop because the decision is
+ * per destination, and a buffer shared across iterations is one whose contents
+ * change under a line already queued. CONN_HOSTMASK_MAX is written from the three
+ * struct widths rather than picked, so raising any of `nick`, `user` or `host`
+ * cannot leave this one byte short. */
+static const char *names_entry(const conn_t *dst, const char *nick,
+                               const char *ident, const char *host, char *out,
+                               size_t cap)
+{
+    const int long_form = cap_userhost_in_names_enabled(dst);
+
+    if (out == NULL || cap == 0u || nick == NULL) {
+        return "";
+    }
+    if (long_form == 0 || ident == NULL || ident[0] == '\0' ||
+        host == NULL || host[0] == '\0') {
+        if (strlen(nick) >= cap) {
+            return "";
+        }
+        memcpy(out, nick, strlen(nick) + 1u);
+        return out;
+    }
+    /* `nick!ident@host` is exactly conn_hostmask()'s own shape, so the local arm
+     * could have called it -- and it deliberately does not, because this function
+     * also renders REMOTE members, which have no conn_t and therefore no
+     * conn_hostmask(). One renderer for both lists is why a remote entry and a local
+     * one cannot come out in different shapes, which is the failure this whole
+     * capability would otherwise have. */
+    {
+        const int w = snprintf(out, cap, "%s!%s@%s", nick, ident, host);
+
+        /* snprintf returns what it WOULD have written, so the check is on the
+         * return and a truncation is the negative side of it: a half-written
+         * hostmask is worse than no hostmask, because a client parses what it is
+         * given. Returning "" makes the caller SKIP the member rather than draw it
+         * short, which would be a roster entry naming nobody. Unreachable with the
+         * current bounds -- a 353 line is CHAN_NAMES_LINE (400) and the widest
+         * entry is CONN_HOSTMASK_MAX (259) -- and stated rather than assumed
+         * because the roster is the one place a silent omission is invisible. */
+        if (w < 0 || (size_t)w >= cap) {
+            out[0] = '\0';
+            return "";
+        }
+    }
+    return out;
+}
+
 /* Emit `nick` into the 353 line under construction, flushing first if it will not
  * fit. Returns the new `used`. The flush is RFC 2819 3.3.5's "a 353 MAY be
  * split across lines" and 3.2's "never deliver a shortened value" together: a
  * half-written nickname is worse than one more line.
+ *
+ * `entry` is the ALREADY-RENDERED member name: the sigils are drawn by the
+ * caller's `names_signs()` because they are 005's PREFIX and `multi-prefix`'s, and
+ * the name itself is drawn by `names_entry()` because it is 353's shape and
+ * `userhost-in-names`'s. Two decisions about two different things, kept apart so
+ * that a caller cannot render a name and forget the gate -- which is the defect
+ * `userhost-in-names` invites, and the same one `extended-join` had to be careful
+ * about for the same reason.
  *
  * This is the ONE place a name is rendered into a 353, and it takes the two
  * lists as (nick, flags) rather than reading either of them itself. That is what
@@ -350,14 +448,31 @@ static const char *names_signs(unsigned flags, int multiprefix, char *out,
  * order it is handed them, so dropping the parameter changes nothing about where a
  * name lands -- only about how much is drawn in front of it. */
 static size_t names_emit(server_t *s, conn_t *dst, const char *const *mid,
-                         unsigned flags, const char *nick, char *line,
+                         unsigned flags, const char *entry, char *line,
                          size_t used, int *produced, int multiprefix)
 {
     char signs[4];
     size_t slen = strlen(names_signs(flags, multiprefix, signs, sizeof signs));
-    size_t nicklen = strlen(nick);
-    size_t need = slen + nicklen + 1u; /* +1 for the joining space */
+    size_t elen = strlen(entry);
+    size_t need = slen + elen + 1u; /* +1 for the joining space */
 
+    if (elen == 0u) {
+        /* A member this node cannot draw at all. `names_entry()` returns "" only
+         * when the entry would not fit its buffer, which the current bounds make
+         * unreachable -- a 353 line is CHAN_NAMES_LINE (400) and the widest entry
+         * is CONN_HOSTMASK_MAX (259) -- and it is handled rather than assumed,
+         * because the alternative is a silent omission from a names list, and a
+         * names list is exactly where a silent omission is invisible.
+         *
+         * IT IS REPORTED RATHER THAN DRAWN SHORT. Falling back to the bare nick
+         * here would be a second opinion about the shape, taken in a function that
+         * does not have the capability gate, and it would produce a roster entry
+         * asserting that this node does not know a host it does. The refusal goes
+         * to the node's own output and the member is left out. */
+        printf("[observable] names_entry_refused: channel=%s\n",
+               (mid != NULL && mid[1] != NULL) ? mid[1] : "?");
+        return used;
+    }
     if (used != 0 && used + need > (size_t)CHAN_NAMES_LINE) {
         (void)reply(s, dst, "353", mid, 2, "%s", line);
         *produced = 1;
@@ -372,8 +487,8 @@ static size_t names_emit(server_t *s, conn_t *dst, const char *const *mid,
      * about. */
     memcpy(line + used, signs, slen);
     used += slen;
-    memcpy(line + used, nick, nicklen);
-    used += nicklen;
+    memcpy(line + used, entry, elen);
+    used += elen;
     line[used] = '\0';
     return used;
 }
@@ -411,6 +526,11 @@ static void send_names_list(server_t *s, conn_t *dst, const chan_t *ch)
 
         for (size_t i = 0; i < ch->nmembers; i++) {
             const struct member *m = &ch->members[i];
+            /* PER MEMBER, and the buffer is per member rather than hoisted for the
+             * reason `write_to_members()` gives for its tag buffer: the shape is
+             * decided per destination inside the walk, and a buffer shared across
+             * iterations is one whose contents change under a line already queued. */
+            char entry[CONN_HOSTMASK_MAX];
 
             if (m->c == NULL || m->c->nick[0] == '\0') {
                 continue;
@@ -418,17 +538,29 @@ static void send_names_list(server_t *s, conn_t *dst, const chan_t *ch)
             if (names_group(m) != group) {
                 continue;
             }
-            used = names_emit(s, dst, mid, m->flags, m->c->nick, line, used,
-                              &produced, multiprefix);
+            used = names_emit(s, dst, mid, m->flags,
+                              names_entry(dst, m->c->nick, m->c->user, m->c->host,
+                                          entry, sizeof entry),
+                              line, used, &produced, multiprefix);
         }
         for (size_t i = 0; i < ch->nremotes; i++) {
             const chan_remote_t *r = &ch->remotes[i];
+            /* AND THE SAME RENDERER FOR A REMOTE MEMBER, which is the whole reason
+             * `names_entry()` takes (nick, ident, host) rather than a conn_t: a
+             * remote member has no conn_t, so a renderer that read one could not
+             * have drawn it at all and the roster would carry two shapes by
+             * construction. The empty ident and empty host are the documented normal
+             * state for a member learned from a live SJOIN, and they render as the
+             * bare nick rather than as a half-built hostmask. */
+            char entry[CONN_HOSTMASK_MAX];
 
             if (r->nick[0] == '\0' || names_group_flags(r->flags) != group) {
                 continue;
             }
-            used = names_emit(s, dst, mid, r->flags, r->nick, line, used,
-                              &produced, multiprefix);
+            used = names_emit(s, dst, mid, r->flags,
+                              names_entry(dst, r->nick, r->user, r->host, entry,
+                                          sizeof entry),
+                              line, used, &produced, multiprefix);
         }
         if (used != 0) {
             (void)reply(s, dst, "353", mid, 2, "%s", line);
@@ -554,9 +686,10 @@ static void send_creation_time(server_t *s, conn_t *dst, const chan_t *ch)
  * forwarding IS the action. A caller that treated FORWARD as "do nothing" would
  * answer every client on a non-owned channel with success and change nothing
  * anywhere. */
-static void deliver_state_change(server_t *s, conn_t *c, chan_t *ch,
-                                 const char *verb, const char *prefix,
-                                 const char *const *params, int nparams)
+static void deliver_state_change_forms(server_t *s, conn_t *c, chan_t *ch,
+                                      const char *verb, const char *prefix,
+                                      const fanout_form_t *plain,
+                                      const fanout_form_t *extended)
 {
     fanout_target_t t;
 
@@ -571,7 +704,19 @@ static void deliver_state_change(server_t *s, conn_t *c, chan_t *ch,
      * command and this node is minting its 2.4 identity at the forward. The
      * relay path is federation/verbs.c, and it hands its own tags to
      * fanout_deliver() instead. */
-    (void)fanout_deliver(s, &t, prefix, verb, params, nparams, NULL, NULL);
+    (void)fanout_deliver_forms(s, &t, prefix, verb, plain, extended, NULL, NULL);
+}
+
+/* The one-shape form, and every state change except JOIN uses it: the extension
+ * is a JOIN extension, so there is exactly one caller of the two-shape entry point
+ * and this wrapper is what the other five get. */
+static void deliver_state_change(server_t *s, conn_t *c, chan_t *ch,
+                                 const char *verb, const char *prefix,
+                                 const char *const *params, int nparams)
+{
+    const fanout_form_t plain = { params, nparams };
+
+    deliver_state_change_forms(s, c, ch, verb, prefix, &plain, NULL);
 }
 
 /* ---------------------------------------------------------------------------
@@ -601,13 +746,20 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
     int n;
 
     if (m->nparams < 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "JOIN", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     n = chan_split_list(store, sizeof store, m->params[0], names,
                         CHAN_MAX_LIST_ARGS);
     if (n <= 0) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        /* ALSO "TOO FEW", and deliberately NOT a different code: a bare `:` names
+         * no channel, so from the client's side it sent nothing usable and
+         * NEED_MORE_PARAMS is the true statement. Splitting it would invent a
+         * distinction between "no parameters" and "an empty one" that this node
+         * has no reason to make. */
+        (void)reply_refused(s, c, "JOIN", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
 
@@ -750,7 +902,36 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
  *      the local one already happened, and the non-owned row is "forward ONLY"
  *      precisely so that the ORIGIN is the node that emits to its members.
  *
- *   3. THE JOINER'S OWN FOUR NUMERICS, in the order a client parses them:
+ *   3. THE AWAY-NOTIFY ANNOUNCEMENT, IF THE JOINER IS AWAY. `away-notify` says a
+ *      user joining with an away message set is announced to the users it shares the
+ *      channel with. It goes out AFTER the JOIN echo and BEFORE the joiner's own
+ *      numerics, which is the order a client renders: first that the person arrived,
+ *      then that they are away, then the joiner's own view of the channel.
+ *
+ *      IT IS A SEPARATE EMISSION AND NOT ANOTHER PARAMETER, and the specification
+ *      requires that rather than this file preferring it. The two messages have
+ *      different grammars and different audiences: the extended JOIN is
+ *      `:nick!user@host JOIN #chan <account> :<realname>` and is a statement about
+ *      the roster, while the announcement is `:nick!user@host AWAY #chan [:message]`
+ *      and is a statement about ONE user's away STATE. Folding the away message into
+ *      the JOIN would make a line a client parses as a roster carry a fourth field,
+ *      and would mean every member learned the away message whether or not it
+ *      negotiated `away-notify` -- which is exactly the unsolicited-notification
+ *      defect Phase 10.8a's gate exists to prevent.
+ *
+ *      THE JOINER IS EXCLUDED, for msg_verbs.c's notify_away() reason: a user should
+ *      not be sent an AWAY message about their own away status, and on this node they
+ *      have `301` and `305` for that. It is `exclude` rather than the gate -- a
+ *      different question from "did this destination ask?", which is why both exist.
+ *
+ *      GATED ON `c->away[0] != '\0'` AND NOTHING ELSE. There is no "is anybody
+ *      currently away" question to ask: `conn_t::away` exists on every connection from
+ *      accept(), so the only question is whether THIS joiner has a message, and a
+ *      joiner with none produces no line at all. A third shape -- an `AWAY` with an
+ *      empty trailing parameter -- would render as `AWAY #chan :`, which 3.2 does not
+ *      represent in a non-final position and the formatter would refuse.
+ *
+ *   4. THE JOINER'S OWN FOUR NUMERICS, in the order a client parses them:
  *      topic, names, creation time, end of names. This is what makes a JOIN
  *      self-describing, and it is why a restore can hand a client back its
  *      channels without the client having to ask for anything.
@@ -764,9 +945,42 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
  * second definition of local membership, with its own ban check to forget and
  * its own idea of which mesh to tell. Both callers ask the same question of the
  * same channel, so both ask it here. */
+static void announce_join_away(server_t *s, conn_t *c, chan_t *ch, const char *prefix);
+
 int chan_admit(server_t *s, conn_t *c, chan_t *ch, unsigned flags)
 {
     char prefix[CONN_HOSTMASK_MAX];
+    /* THE TWO JOIN SHAPES, BUILT ONCE PER ADMISSION.
+     *
+     * `plain` is RFC 2812 3.3.1's JOIN echo, with no parameters at all -- the
+     * channel name is the target, which fanout prepends. `extended` adds the two
+     * parameters `extended-join` defines:
+     *
+     *   :nick!user@host JOIN #chan <account> :<realname>
+     *   :nick!user@host JOIN #chan * :<realname>
+     *
+     * THE ACCOUNT IS `<account>` OR `*` AND NEVER EMPTY, and the rule is
+     * account_logged_in() rather than `c->account[0]`, because the `*` form is the
+     * specification's way of saying "this user has not logged in to an account
+     * prior to channel ingress" -- and on a node with NO REGISTRY nobody ever is,
+     * so `*` is not an absence of information here, it is the information. A node
+     * that emitted an empty account field would be sending a parameter that reads
+     * as an empty one, which is the exact confusion 2.1.1's invariant exists to
+     * prevent, moved from a struct field to the wire.
+     *
+     * THE REALNAME IS `c->realname` AND MAY BE EMPTY, which is legal: it is the
+     * trailing parameter, 3.2 colons it, and an empty one renders as a bare `:`
+     * -- the one representation of "no text here". USER fills the field at
+     * registration and a client that sent none has an empty realname, which is a
+     * fact about the client rather than a limit this node imposes.
+     *
+     * BOTH LIVES ARE IN THIS FRAME, which is the same reason the hostmask is: the
+     * emission happens inside fanout, so the values have to outlive the call that
+     * builds them. */
+    const char *extended_params[2];
+    char acct_token[CONN_MAX_ACCOUNT + 2];
+    fanout_form_t plain;
+    fanout_form_t extended;
 
     if (s == NULL || c == NULL || ch == NULL) {
         return -1;
@@ -787,13 +1001,71 @@ int chan_admit(server_t *s, conn_t *c, chan_t *ch, unsigned flags)
                     "Cannot join channel");
         return -1;
     }
-    deliver_state_change(s, c, ch, "JOIN", prefix, NULL, 0);
+    memcpy(acct_token, account_logged_in(c) != 0 ? c->account : "*",
+           strlen(account_logged_in(c) != 0 ? c->account : "*") + 1u);
+    /* NEITHER LIST CARRIES THE CHANNEL NAME, because fanout prepends the resolved
+     * target: 3.1's row is "write the target, then the caller's parameters", and
+     * putting the name in the caller's list as well would render it twice. That is
+     * why the plain list is EMPTY rather than holding one entry. */
+    extended_params[0] = acct_token;
+    extended_params[1] = c->realname;
+    plain.params = NULL;
+    plain.nparams = 0;
+    extended.params = extended_params;
+    extended.nparams = 2;
+    deliver_state_change_forms(s, c, ch, "JOIN", prefix, &plain, &extended);
 
+    announce_join_away(s, c, ch, prefix);
     send_topic(s, c, ch);
     send_names_list(s, c, ch);
     send_creation_time(s, c, ch);
     send_end_of_names(s, c, ch->name);
     return 0;
+}
+
+/* The AWAY-NOTIFY announcement for a user who JOINED while away. Called only from
+ * chan_admit(), immediately after the JOIN echo, and the header above carries the
+ * argument for its position, its separate shape and its two exclusions.
+ *
+ * IT IS NOT msg_verbs.c's notify_away() CALLED DIFFERENTLY, and the reason is the
+ * count again: notify_away() walks `c->chans` and emits once per channel, which is
+ * right for the away STATE CHANGE -- its line names the channel, so a member of three
+ * shared channels gets three lines about three different channels, all of them true.
+ * Here there is exactly one channel and one fact, so the walk would be a loop of one
+ * and the helper would have grown a parameter for a case it does not have. One
+ * `fanout_deliver_local_gated()` call is the whole of it, and the gate and the
+ * liveness question are inside fanout.c where every other emission asks them.
+ *
+ * THE PARAMETER LIST IS BUILT HERE, IN THE CALLER'S FRAME, because the emission
+ * happens inside fanout: `c->away` is read there and `message_format()` renders
+ * there, so a pointer into this frame has to outlive this function, and it does
+ * because the call is synchronous. That is the same reason chan_admit()'s extended
+ * JOIN parameters are locals. */
+static void announce_join_away(server_t *s, conn_t *c, chan_t *ch, const char *prefix)
+{
+    const char *params[1];
+    fanout_form_t plain;
+    fanout_target_t t;
+    int delivered;
+
+    if (c->away[0] == '\0') {
+        return; /* not away: the specification announces an AWAY MESSAGE, not a JOIN */
+    }
+    if (fanout_resolve(s, c, ch->name, FANOUT_MESSAGE, &t) == 0) {
+        return; /* a chan_t this node no longer holds: nothing to address */
+    }
+    params[0] = c->away;
+    plain.params = params;
+    plain.nparams = 1;
+    /* The class is `message` and not `state_change` for the reason notify_away()
+     * gives: this is not a change to the channel's state -- the roster already says
+     * the user is on it -- it is an observation about that user. The class decides
+     * the forward arm, and the local-only entry point has none to decide. */
+    /* FAULT: the joiner is not excluded from the join-time announcement. */
+    delivered = fanout_deliver_local_gated(s, &t, prefix, "AWAY", &plain, NULL,
+                                            cap_gate_away_notify, NULL, c);
+    printf("[observable] away_notify: nick=%s join=1 channel=%s recipients=%d\n",
+           c->nick, ch->name, delivered);
 }
 
 /* ---------------------------------------------------------------------------
@@ -812,13 +1084,15 @@ void handle_part(server_t *s, conn_t *c, const message_t *m)
     int n;
 
     if (m->nparams < 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "PART", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     n = chan_split_list(store, sizeof store, m->params[0], names,
                         CHAN_MAX_LIST_ARGS);
     if (n <= 0) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "PART", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
 
@@ -881,11 +1155,13 @@ void handle_topic(server_t *s, conn_t *c, const message_t *m)
     int setting;
 
     if (m->nparams < 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "TOPIC", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     if (m->nparams > 2) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "TOPIC", "TOO_MANY_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     setting = (m->nparams > 1);
@@ -1113,17 +1389,61 @@ void handle_kick(server_t *s, conn_t *c, const message_t *m)
     const char *params[4];
 
     if (m->nparams < 2) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "KICK", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     if (m->nparams > 3) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "KICK", "TOO_MANY_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     /* RFC 1459 2.3.1: the reason is optional, and a KICK without one names the
      * kicker, which is the most useful default available -- it is in the message
      * already and it is what the target will see. */
     reason = (m->nparams > 2) ? m->params[2] : c->nick;
+
+    /* ------------------------------------------------------------------------
+     * THE REASON BOUND, AND WHY IT IS CHECKED HERE AND NOT AT THE END
+     * ------------------------------------------------------------------------
+     * Immediately after the arity test, which is where a parameter's validity
+     * belongs: a KICK carrying a parameter this node will not accept is refused
+     * as malformed whatever the sender's standing on the channel, and a node that
+     * answered 482 for a client who simply sent too many bytes would be reporting
+     * a privilege problem for a syntax problem. Nothing below has run, so nothing
+     * below has to be undone.
+     *
+     * IT WAS MISSING, AND THE CONSEQUENCE WAS WORSE THAN A MISSING 005 TOKEN. With
+     * no test here the reason went straight into `deliver_state_change()` ->
+     * `fanout_deliver()` -> `send_line()` -> `message_format()`, which refuses a
+     * line it cannot represent rather than reshaping it -- and the only outcome at
+     * that depth is a refusal counted on `n_reply_refused`, the counter `reply.c`
+     * holds at zero because a non-zero value is a bug report. So one client
+     * command was a reachable way to put a non-zero on it. Phase 10.4 recorded that
+     * as a finding in two places (this bound, and `KICKLEN`'s absence from 005) and
+     * named this as the fix for both; this is it.
+     *
+     * 417 is the numeric this node already uses for "that parameter is longer than
+     * I will store" -- msg_verbs.c's AWAY and PRIVMSG and commands.c's SETNAME --
+     * and reusing it is the point: a client that has learned one over-long
+     * parameter refusal has learned all of them. For a client that negotiated
+     * `standard-replies` this is `FAIL KICK ERR_INPUTTOOLONG` instead; the legacy
+     * numeric and its text are byte-identical to what they would otherwise be,
+     * which is the whole of reply.c's `reply_refused()` contract.
+     *
+     * THE DEFAULT REASON CANNOT FAIL, and that is worth saying rather than leaving
+     * to be checked: it is `c->nick`, and a nickname is bounded by IRC_MAX_NICK
+     * (63), so the substituted value is always inside this bound. A future change
+     * that defaulted the reason to something client-supplied would have to move
+     * this test. */
+    if (strlen(reason) > (size_t)CHAN_MAX_KICK_REASON) {
+        (void)reply_refused(s, c, "KICK", NULL, "417", NULL, 0,
+                            "Kick reason is too long");
+        printf("[observable] chan_kick_refused: channel=%s nick=%s reason=too_long "
+               "len=%zu max=%d\n",
+               m->params[0], c->nick, strlen(reason), CHAN_MAX_KICK_REASON);
+        return;
+    }
 
     ch = resolve_joined(s, c, m->params[0]);
     if (ch == NULL) {
@@ -1143,8 +1463,9 @@ void handle_kick(server_t *s, conn_t *c, const message_t *m)
         /* 482, not 481. 481 is "you need to be a channel operator to do this"
          * for a mode the client may not set at all; 482 is "you are not
          * privileged enough for this action", which is the situation. */
-        (void)reply(s, c, "482", (const char *const[]){ ch->name }, 1,
-                    "You're not a channel operator");
+        (void)reply_refused(s, c, "KICK", NULL, "482",
+                            (const char *const[]){ ch->name }, 1,
+                            "You're not a channel operator");
         printf("[observable] chan_kick_refused: channel=%s nick=%s reason=not_op\n",
                ch->name, c->nick);
         return;
@@ -1238,7 +1559,8 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
     const char *params[3];
 
     if (m->nparams < 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "MODE", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     ch = resolve_joined(s, c, m->params[0]);
@@ -1266,7 +1588,8 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
         return;
     }
     if (m->nparams > 3) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "MODE", "TOO_MANY_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
 
@@ -1284,16 +1607,22 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
         return;
     }
     if (m->params[1][1] == '\0') {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        /* A MODE STRING WITH NO LETTERS: the client sent the mode argument and
+         * none of the argument that goes with it, so this is a too-FEW case rather
+         * than a malformed one, and NEED_MORE_PARAMS says exactly that. */
+        (void)reply_refused(s, c, "MODE", NULL, "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     if (!chan_has_flag(ch, c, CHAN_MEMBER_OP)) {
-        (void)reply(s, c, "482", (const char *const[]){ ch->name }, 1,
-                    "You're not a channel operator");
+        (void)reply_refused(s, c, "MODE", NULL, "482",
+                            (const char *const[]){ ch->name }, 1,
+                            "You're not a channel operator");
         printf("[observable] chan_mode_refused: channel=%s nick=%s reason=not_op\n",
                ch->name, c->nick);
         return;
     }
+
     if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
         return;
     }
@@ -1344,7 +1673,8 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
             struct member *target;
 
             if (m->nparams < 3) {
-                (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+                (void)reply_refused(s, c, "MODE", NULL, "461", NULL, 0,
+                                    "Not enough parameters");
                 return;
             }
             target = chan_find_nick(ch, m->params[2]);
@@ -1390,7 +1720,8 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
 
         if (mode == 'b') {
             if (m->nparams < 3) {
-                (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+                (void)reply_refused(s, c, "MODE", NULL, "461", NULL, 0,
+                                    "Not enough parameters");
                 return;
             }
             if (plus) {
@@ -1497,6 +1828,9 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
  * nonsense invite of one channel to another either way. No legal line is
  * misread.
  */
+static void notify_invite(server_t *s, conn_t *c, chan_t *ch, const char *prefix,
+                           const char *target);
+
 void handle_invite(server_t *s, conn_t *c, const message_t *m)
 {
     const char *nick_arg;
@@ -1508,7 +1842,8 @@ void handle_invite(server_t *s, conn_t *c, const message_t *m)
     const char *params[1];
 
     if (m->nparams != 2) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "INVITE", "INVALID_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     if (chan_name_valid(m->params[0])) {
@@ -1553,8 +1888,9 @@ void handle_invite(server_t *s, conn_t *c, const message_t *m)
          * users to a channel" (3.3.6). The same numeric KICK and MODE use for
          * the same situation, and 4.4 has nothing better to say about "you
          * lack privilege for this action". */
-        (void)reply(s, c, "482", (const char *const[]){ ch->name }, 1,
-                    "You're not a channel operator");
+        (void)reply_refused(s, c, "INVITE", NULL, "482",
+                            (const char *const[]){ ch->name }, 1,
+                            "You're not a channel operator");
         printf("[observable] chan_invite_refused: channel=%s nick=%s reason=not_op\n",
                ch->name, c->nick);
         return;
@@ -1591,13 +1927,86 @@ void handle_invite(server_t *s, conn_t *c, const message_t *m)
     params[0] = ch->name;
     (void)fanout_deliver(s, &t, prefix, "INVITE", params, 1, NULL, NULL);
 
-    /* The inviter is told last, and only the inviter. who->nick is the spelling
+    /* The inviter is told, and only the inviter. t.user->nick is the spelling
      * the INVITEE chose (2.1: the registry folds the key and the display case is
      * the user's), so the 341 names them the way every other numeric does. */
     (void)reply(s, c, "341", (const char *const[]){ ch->name, t.user->nick }, 2,
                 "%s has invited you to channel %s", c->nick, ch->name);
+    notify_invite(s, c, ch, prefix, t.user->nick);
     printf("[observable] chan_invite: channel=%s by=%s target=%s\n", ch->name,
            c->nick, t.user->nick);
+}
+
+/* ---------------------------------------------------------------------------
+ * invite-notify: THE CHANNEL IS TOLD
+ * ---------------------------------------------------------------------------
+ * `:nick!user@host INVITE <target> <channel>`, per destination, to the members of the
+ * channel that negotiated the capability. The SOURCE is the inviter -- which is why this
+ * is not a separate `send_line` but a fan-out carrying the inviter's own hostmask, the
+ * same prefix the invitee's own copy carries and the same prefix `away-notify` uses.
+ *
+ * THE AUDIENCE IS THE CHANNEL, and RFC 2812 3.3.6 is the rule this relaxes: "Other
+ * channel members SHOULD NOT be notified." The specification's whole purpose is to be the
+ * opt-in that lets a client say it wants them, which is why the gate is the RECIPIENT's
+ * negotiation and not the inviter's -- a sender-gated notification would put the fact on
+ * the wire to members who never asked, which is the defect Phase 10.8a's gate was built
+ * to prevent and which §9's risk row names.
+ *
+ * THE INVITER IS EXCLUDED, and it is excluded rather than gated because the gate would
+ * have let it through if it negotiated. Two reasons: the `341` above IS the inviter's
+ * answer -- "You have invited <nick> to <channel>" says exactly what this line would say
+ * -- and the specification's own phrase is "a standard way that allows clients to learn
+ * when ANOTHER client does an /INVITE". One line per event, to the audience it is for.
+ *
+ * NOT FORWARDED, for the reason `notify_away()` is not forwarded: this is an originating
+ * emission and the local-only entry point has no forward arm. The cost is stated at
+ * `away-notify`'s §3.1.1 note and applies verbatim -- away STATE federates through 4.3's
+ * SBURST and a notification is not state; the same is true of an invitation, which 4.3's
+ * frozen verb table has no S-verb for at all, so a mesh member's clients learn of an
+ * invitation to a channel they can see by being in it and by nothing else.
+ *
+ * PER CHANNEL, NOT OVER A UNION, and the reason is the shape: the line's own grammar is
+ * `:<inviter> INVITE <target> <channel>` and it NAMES its channel, so a member of three
+ * shared channels gets three true statements about three channels. That is the same
+ * distinction `setname`'s fan-out turned on, in the other direction. */
+static void notify_invite(server_t *s, conn_t *c, chan_t *ch, const char *prefix,
+                          const char *target)
+{
+    const char *params[2];
+    fanout_form_t plain;
+    struct chan *one[1];
+    int delivered;
+
+    /* ONE CHANNEL HANDED TO THE UNION ENTRY POINT, and the reuse is deliberate rather
+     * than convenient. `fanout_deliver_local_gated()` PREPENDS the resolved target, so a
+     * channel-addressed emission renders `:inv!u@h INVITE #chan <target>` -- and this
+     * specification's grammar is `:<inviter> INVITE <target> <channel>`, the other way
+     * round. The first version of this used the channel entry point and the line on the
+     * wire was `INVITE #I in_g` with the parameters the wrong way round.
+     *
+     * `fanout_deliver_union_local_gated()`'s CONTRACT IS ABOUT THE AUDIENCE -- "the local
+     * members of these channels, each written once, with NO target prepended" -- and a
+     * one-element list of one channel is exactly the members of that channel. What it
+     * takes is a list of `chan_t *`, not a connection's own list; the de-duplication it
+     * does inside the walk is a no-op for one channel. So no new entry point and no new
+     * parameter is needed for a line whose shape does not match 3.1's row.
+     *
+     * (This is the second user of that entry point and it is worth noting that the two
+     * have opposite requirements: `setname` needs it because its line names NO channel
+     * and would otherwise carry one, and this needs it because its line names the channel
+     * in a position 3.1's row would have filled with the channel. Both are the same fact
+     * -- the emission's grammar and the routing table's row disagree -- seen from two
+     * sides. `away-notify` is the case where they agree, because `AWAY #chan :message`
+     * happens to put the target first.) */
+    params[0] = target;
+    params[1] = ch->name;
+    plain.params = params;
+    plain.nparams = 2;
+    one[0] = ch;
+    delivered = fanout_deliver_union_local_gated(s, one, 1u, prefix, "INVITE", &plain,
+                                                 NULL, cap_gate_invite_notify, NULL, c);
+    printf("[observable] invite_notify: channel=%s by=%s target=%s recipients=%d\n",
+           ch->name, c->nick, target, delivered);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1644,7 +2053,8 @@ void handle_knock(server_t *s, conn_t *c, const message_t *m)
     chan_t *ch;
 
     if (m->nparams != 1) {
-        (void)reply(s, c, "461", NULL, 0, "Not enough parameters");
+        (void)reply_refused(s, c, "KNOCK", "INVALID_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
         return;
     }
     /* A channel-name check and an existence check, both 403, and both BEFORE the
@@ -1662,8 +2072,15 @@ void handle_knock(server_t *s, conn_t *c, const message_t *m)
         return;
     }
 
-    (void)reply(s, c, "482", (const char *const[]){ ch->name }, 1,
-                "You're not an IRC operator");
+    /* 482, WHICH ELSEWHERE ON THIS NODE MEANS "NOT A CHANNEL OPERATOR" and here
+     * means "not an IRC operator". That is not a near miss: it is the clearest
+     * single piece of evidence for the migration, which is why this site overrides
+     * the code. For a negotiating client this is `FAIL KNOCK ERR_NOPRIVILEGES` --
+     * which is also the right rendering for the CHOPER refusal in commands.c,
+     * because it is the same fact. */
+    (void)reply_refused(s, c, "KNOCK", "ERR_NOPRIVILEGES", "482",
+                        (const char *const[]){ ch->name }, 1,
+                        "You're not an IRC operator");
     printf("[observable] knock_refused: channel=%s nick=%s reason=NO_OPER_FLAGS "
            "k_mode=%d local=%zu\n",
            ch->name, c->nick, chan_mode_has(ch, 'k'), ch->nmembers);

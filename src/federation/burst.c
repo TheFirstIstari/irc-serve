@@ -8,6 +8,8 @@
 #include <time.h>
 
 #include "core/channel.h"
+#include "account_store.h"
+#include "core/account.h"
 #include "core/connection.h"
 #include "federation/link.h"
 /* Phase 9: the COMMIT installs this transaction's nick records into 2.1's
@@ -100,6 +102,11 @@ typedef struct {
 typedef struct {
     char     nick[IRC_MAX_NICK + 1];
     char     server[CHAN_MAX_SERVER + 1];
+    /* The member's account, or "" when the origin did not say. See the header on
+     * WHY THIS IS ON THE MEMBER RECORD AND NOT ON THE NICK RECORD, which is the
+     * argument for 4.3's SJOIN and SBURSTM carrying the same fact in the same
+     * place. */
+    char     account[CONN_MAX_ACCOUNT + 1];
     unsigned flags;
 } burst_member_t;
 
@@ -405,6 +412,26 @@ static const char *burst_mid_or_dash(const char *v)
  * modes fills it in without a format change. */
 #define burst_modes_token(v) burst_mid_or_dash(v)
 
+/* An account name, or `*`, for the wire. `c` is the LOCAL member whose account is
+ * wanted, and NULL means "use the roster entry's instead", which is the remote
+ * half of the same question.
+ *
+ * IT IS A SEPARATE FUNCTION FROM federation/verbs.c's fed_account_token() and
+ * that duplication is deliberate and small: verbs.c builds the account for a LIVE
+ * SJOIN and has the membership in hand, while this builds it for a RESYNC from
+ * either a local conn_t or a roster entry, and threading one of them into the other
+ * would make burst.c depend on the S-verb shaper for a record that is not an
+ * S-verb. The two agree because both call account_name()/account_logged_in() and
+ * both render the empty case as `*` -- and the tests assert that, because two
+ * renderers of one protocol token is precisely the thing to check. */
+static const char *burst_account_token(const conn_t *c, const char *roster)
+{
+    if (c != NULL) {
+        return (account_logged_in(c) != 0) ? c->account : "*";
+    }
+    return ((roster != NULL && roster[0] != '\0') ? roster : "*");
+}
+
 /* The member's flags, bare: '-', "o", "v" or "ov". The plus is the SJOIN token's
  * and not this one's. */
 static int burst_flags_token(unsigned flags, char *out, size_t cap)
@@ -582,6 +609,9 @@ int fed_burst_send(server_t *s, server_link_t *link)
     /* --- every channel, and its members immediately after it -------------- */
     for (size_t i = 0; i < server_chan_count(s); i++) {
         const chan_t *ch = server_chan_at(s, i);
+        /* SIX, not four: SBURSTC needs six and SBURSTM now needs five, and one
+         * array sized for the smaller of two shapes would be the kind of
+         * arithmetic that is right until it is not. */
         const char *params[6];
         char when[24];
 
@@ -618,7 +648,15 @@ int fed_burst_send(server_t *s, server_link_t *link)
             params[1] = s->name;
             params[2] = ch->members[k].c->nick;
             params[3] = flags;
-            if (stage_line(&st, s, s->name, "SBURSTM", params, 4) != 0) {
+            /* AND <account>, WHICH IS 4.3's SJOIN's FOURTH PARAMETER AGAIN. The
+             * two records MUST carry the same fact, or a resync would restore a
+             * roster that disagrees with the live path about who a member is --
+             * and the disagreement would only show up after a link drop, which is
+             * the moment 2.2 says a stale roster is least acceptable. `*` for a
+             * member who is not identified, which is the protocol's spelling of
+             * the absence and the same value a live SJOIN would carry. */
+            params[4] = burst_account_token(ch->members[k].c, NULL);
+            if (stage_line(&st, s, s->name, "SBURSTM", params, 5) != 0) {
                 goto refused;
             }
         }
@@ -636,7 +674,8 @@ int fed_burst_send(server_t *s, server_link_t *link)
             params[1] = burst_member_server(r, s->name);
             params[2] = r->nick;
             params[3] = flags;
-            if (stage_line(&st, s, s->name, "SBURSTM", params, 4) != 0) {
+            params[4] = burst_account_token(NULL, r->account);
+            if (stage_line(&st, s, s->name, "SBURSTM", params, 5) != 0) {
                 goto refused;
             }
         }
@@ -1097,8 +1136,14 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
     burst_chan_t *sc = g_shadow.cur;
     unsigned flags = 0u;
 
-    if (sc == NULL || m->nparams != 4 || !irc_serve_server_name_valid(m->params[1]) ||
-        !valid_nick(m->params[2]) || !chan_name_valid(m->params[0])) {
+    /* FIVE PARAMETERS NOW: <chan> <server> <nick> <flags> <account>. The arity is
+     * the FORMAT's and is enforced here rather than defaulted, for the reason the
+     * 4.3.1 `<server>` paragraph gives: a member record that is missing a field is
+     * a peer running a different format, and the safe direction is to refuse it
+     * rather than install a member whose account this node cannot tell. */
+    if (sc == NULL || m->nparams != 5 || !irc_serve_server_name_valid(m->params[1]) ||
+        !valid_nick(m->params[2]) || !chan_name_valid(m->params[0]) ||
+        (m->params[4][0] != '*' && account_name_wire_safe(m->params[4]) == 0)) {
         s->n_fed_malformed++;
         printf("[observable] fed_malformed: fd=%d command=SBURSTM member=%s\n",
                link->fd, (m->nparams > 2) ? m->params[2] : "?");
@@ -1147,7 +1192,7 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
         }
     }
     if (shadow_charge(s, "TOO_LARGE",
-                      wire_size(link->name, "SBURSTM", m->params, 4)) != 0) {
+                      wire_size(link->name, "SBURSTM", m->params, 5)) != 0) {
         return -1;
     }
     if (sc->nmembers == sc->mcap) {
@@ -1167,6 +1212,11 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
     slot = &sc->members[sc->nmembers++];
     (void)burst_copy(slot->nick, sizeof slot->nick, m->params[2]);
     (void)burst_copy(slot->server, sizeof slot->server, m->params[1]);
+    /* `*` BECOMES "" on the way in, for the reason channel.h's chan_remote_add()
+     * gives: `*` is a rendering of the absence, and storing it would make an
+     * account named "*" representable in a roster. */
+    (void)burst_copy(slot->account, sizeof slot->account,
+                     (m->params[4][0] == '*') ? "" : m->params[4]);
     slot->flags = flags;
     g_shadow.nmembers++;
     return 0;
@@ -1187,6 +1237,33 @@ static const char *shadow_host(const char *nick)
     for (size_t i = 0; i < g_shadow.nnicks; i++) {
         if (chan_same_name(g_shadow.nicks[i].nick, nick)) {
             return g_shadow.nicks[i].host;
+        }
+    }
+    return NULL;
+}
+
+/* The IDENT a burst's nick record announced, or NULL on the same rule
+ * shadow_host() has.
+ *
+ * IT IS A SECOND WALK RATHER THAN A THIRD FIELD RETURNED BY THE FIRST, and the
+ * reason is that the two answers are asked separately and may be asked in either
+ * order relative to each other -- `apply_nick()` fills the shadow before the
+ * member loop runs, but nothing in this file promises that a future caller will
+ * keep that order, and a function that returned both would be wrong the moment one
+ * of them was wanted without the other. The walk is O(n) over the nicks a burst
+ * announced, once per member of the burst, and a burst is a resync rather than a
+ * hot path; the honest cost is O(n*m) on a large burst and it is paid once.
+ *
+ * WHY IT EXISTS AT ALL: 4.3's SBURSTN carries `<user>`, the shadow below has
+ * stored it since Phase 6, and this file copied only the HOST out of it. Half a
+ * hostmask was being discarded, which cost nothing until Phase 10.5's
+ * `userhost-in-names` needed to draw `nick!user@host` for a member this node does
+ * not host -- a remote member has no conn_t to read the pair from. */
+static const char *shadow_ident(const char *nick)
+{
+    for (size_t i = 0; i < g_shadow.nnicks; i++) {
+        if (chan_same_name(g_shadow.nicks[i].nick, nick)) {
+            return g_shadow.nicks[i].user;
         }
     }
     return NULL;
@@ -1481,7 +1558,8 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
                 continue;
             }
             if (chan_remote_add(ch, origin, sc->members[k].server,
-                                sc->members[k].nick, sc->members[k].flags) != 0) {
+                                sc->members[k].nick, sc->members[k].account,
+                                sc->members[k].flags) != 0) {
                 dropped++;
                 continue;
             }
@@ -1498,6 +1576,21 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
             host = shadow_host(sc->members[k].nick);
             if (host != NULL) {
                 (void)chan_remote_set_host(ch, origin, sc->members[k].nick, host);
+            }
+            /* AND THE IDENT, from the same shadow record and by the same lookup,
+             * for the reason shadow_ident() gives. It is set SEPARATELY rather than
+             * as a second half of the host setter because the two have different
+             * failure modes on the wire -- 4.3's SJOIN carries neither, and a burst
+             * may announce a member line for a nick whose nick record arrived in a
+             * different order or not at all -- so one of them being absent must not
+             * cost the other. */
+            {
+                const char *ident = shadow_ident(sc->members[k].nick);
+
+                if (ident != NULL) {
+                    (void)chan_remote_set_user(ch, origin, sc->members[k].nick,
+                                               ident);
+                }
             }
             installed++;
         }

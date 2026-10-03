@@ -147,6 +147,22 @@
  * which is the same relationship IRC_MAX_NICK has to conn_t::nick in 2.1. */
 #define CHAN_MAX_NAME 63
 
+/* CHANTYPES, AND THE TWO SIGILS THE VALIDATOR ACCEPTS, AS ONE DECLARATION.
+ *
+ * 005's CHANTYPES token and chan_name_valid()'s first test are the same fact --
+ * "a channel name begins with one of these two bytes" -- and until Phase 10.4
+ * they were two written-out spellings of it. That is the shape of drift: raise a
+ * sigil in the validator and 005 goes on advertising the old set, so every client
+ * reads a name this node will refuse.
+ *
+ * The validator tests CHAN_TYPE1/CHAN_TYPE2 by name rather than indexing
+ * CHAN_TYPES, so a C string constant is never used as a byte value and the
+ * dependency runs the way it reads: the two sigils are declared, and the token
+ * is built from them. */
+#define CHAN_TYPE1 '#'
+#define CHAN_TYPE2 '&'
+#define CHAN_TYPES  "#&"
+
 /* 2.2: topic[256], topic_who[64]. */
 #define CHAN_MAX_TOPIC    255
 #define CHAN_MAX_TOPIC_WHO 63
@@ -155,6 +171,38 @@
  * more distinct mode letters than this cannot record them, which is reported
  * rather than silently truncated (3.2's rule, applied to internal state). */
 #define CHAN_MAX_MODES 31
+
+/* A KICK `<reason>`, which RFC 1459 2.3.1 gives no length limit for.
+ *
+ * ADDED IN PHASE 10.9, and the reason it is here at all is that its ABSENCE was
+ * a reachable way to make a client command trip a counter reserved for bugs.
+ * `handle_kick()` used to take `<reason>` verbatim with no test, so an over-long
+ * one reached `fanout_deliver()` and then `message_format()`, which **refuses**
+ * a line it cannot represent rather than truncating it -- and the only available
+ * outcome there is a refusal counted on `n_reply_refused`, which `reply.c`
+ * documents as a bug report and not a metric. So a client could send
+ * `KICK #c nick :<9000 bytes>` and put a non-zero on a counter this project holds
+ * at zero. 005 could not advertise `KICKLEN` either, for the same reason: no
+ * number in the tree described the largest reason the node accepted. Phase 10.4
+ * named both as findings; this is the fix for both.
+ *
+ * WHY IT IS 255, and why it is a written literal. It equals CHAN_MAX_TOPIC,
+ * CONN_MAX_AWAY and CONN_MAX_REALNAME, so there is ONE bound for "a sentence a
+ * user typed" rather than four that differ for no stated reason -- the same
+ * convergence those three record for themselves. And it is written down rather
+ * than derived from a `sizeof(...)`, because 005 renders it with `IRC_STR()` and
+ * `#x` stringifies an argument's token SEQUENCE rather than evaluating it: a
+ * derived constant in that position renders as literal text containing spaces, a
+ * middle parameter holding a space is `unrepresentable`, and the consequence is
+ * that the ENTIRE `005` is refused and every connecting client gets no ISUPPORT
+ * at all. `CONN_MAX_REALNAME` carries a long note about that; the rule is the
+ * same one.
+ *
+ * IT IS A CAP, NOT A TRUNCATION POINT, for the reason the other three are. A
+ * KICK reason is shown to every member of the channel as though the kicker had
+ * written it, and a shortened one is a sentence nobody wrote. `handle_kick()`
+ * refuses with `417` and leaves the roster untouched. */
+#define CHAN_MAX_KICK_REASON 255
 
 /* 2.3: server_link_t::name is char[64], so a server name is at most this. */
 #define CHAN_MAX_SERVER 63
@@ -348,6 +396,39 @@ struct chan_ban {
  * tree may report it as one. Anything that renders a remote member has to handle
  * the empty case rather than printing a half-built hostmask.
  */
+/* THE `account` FIELD, ADDED IN PHASE 10.3, AND WHY IT IS ON THE MEMBERSHIP
+ * RECORD RATHER THAN ON THE USER RECORD
+ *
+ * 4.3 has a per-USER record (`SBURSTN`, carrying nick/user/host/modes/signon/away)
+ * and a per-MEMBERSHIP one (`SBURSTM`, carrying chan/server/nick/flags). An
+ * account is naturally the former -- it belongs to a person, not to one of their
+ * memberships -- and this field is on the latter anyway, for a reason that is
+ * about where the receiver has to PUT it rather than about what it means:
+ *
+ *   the thing this node can render to a client is the ROSTER ENTRY, because a
+ *   remote member has no conn_t and 353 and any future extended JOIN read from
+ *   chan_remote_t. A fact delivered on `SBURSTN` would have to be re-joined onto
+ *   the roster by a lookup at install time, and a live `SJOIN` -- the other way a
+ *   member arrives -- would have to put the SAME field in a DIFFERENT place. Two
+ *   records holding one fact is how a wire format comes to disagree with itself,
+ *   and 4.3.1's `<server>` paragraph is the argument against exactly that.
+ *
+ * So the account rides the record the roster is BUILT FROM, which means the two
+ * ways a member arrives -- a live SJOIN and a resync -- carry it in the same
+ * parameter of the same verb family and land it in the same field. Agreement by
+ * construction rather than by a join at install time.
+ *
+ * THE COST: 64 bytes on every remote roster entry, and CONN_MAX_ACCOUNT + 1 on
+ * every shadow member during a burst. It is the same trade 4.3.1 already records
+ * for `<server>` and `host`, and it is stated rather than implied.
+ *
+ * AN EMPTY ACCOUNT IS NORMAL, exactly as an empty `host` and an empty
+ * `member_server` are: it means "this node has not been told", which is the state
+ * of an entry learned from a peer that does not implement 4.3 as extended. `*` is
+ * NOT stored -- it is translated to "" on receipt, because `*` is a rendering of
+ * the absence and storing the absence as a name is how an account named "*" would
+ * become representable. Nothing in this tree may render an empty account; it
+ * renders `*`. */
 typedef struct chan_remote {
     char     nick[IRC_MAX_NICK + 1];
     /* The ATTRIBUTION KEY: the peer whose report put this entry here. See the
@@ -360,6 +441,32 @@ typedef struct chan_remote {
     /* The member's host, or "" when this node learned the member from a live
      * SJOIN rather than from a burst. See the note above. */
     char     host[CHAN_MAX_REMOTE_HOST + 1];
+    /* The member's IDENT, or "" when this node has not been told. Added in Phase
+     * 10.5, and it is a field whose data was ALREADY ON THE WIRE and being
+     * discarded: 4.3's SBURSTN carries `<user>`, `burst.c`'s shadow has stored it
+     * since Phase 6, and the join from the shadow to the roster copied only the
+     * host across. So nothing about this field required a wire format change --
+     * it required somebody to notice that half of a hostmask was being thrown
+     * away.
+     *
+     * IT IS HERE BECAUSE `userhost-in-names` NEEDS IT, and that is worth stating as
+     * a fact rather than as a justification: before Phase 10.5 no code path read a
+     * remote member's ident, so dropping it cost nothing observable. A 353 drawn in
+     * the extended form is `nick!user@host`, and a roster entry with an empty host
+     * already has a documented rendering rule (bare nick); an entry with a host and
+     * no ident has no such rule, and inventing `*` for the ident would put a byte
+     * on the wire that means nothing to a client parsing a hostmask.
+     *
+     * THE COST, since every added field has one: 64 bytes per element, and the
+     * array is CHAN_MAX_REMOTE_MEMOTEES -- CHAN_MAX_REMOTE_MEMBERS (64) elements,
+     * so 4 KiB per channel of ADDRESSED array of which only the used prefix is
+     * touched. The three properties that made the previous two additions safe all
+     * still hold and are the note above's: nothing serialises this struct, the
+     * array grows in whole elements, and everything addresses it by name. */
+    char     user[CONN_USER_MAX + 1];
+    /* The account the member is logged in to, or "" when this node has not been
+     * told. See the note below -- this field's placement is the argument. */
+    char     account[CONN_MAX_ACCOUNT + 1];
     unsigned flags; /* CHAN_MEMBER_OP / CHAN_MEMBER_VOICE, as for a local one */
 } chan_remote_t;
 
@@ -653,7 +760,7 @@ int chan_server_has(const chan_t *ch, const char *name);
  * because an entry's holder is a fact a later record can correct and a stale
  * one is an entry nobody can act on. */
 int chan_remote_add(chan_t *ch, const char *server, const char *member_server,
-                    const char *nick, unsigned flags);
+                    const char *nick, const char *account, unsigned flags);
 
 /* Drop the (server, nick) member. Returns 1 when one was removed, 0 when there
  * was none. Does NOT touch servers[] -- the caller decrements that, because the
@@ -690,6 +797,19 @@ size_t chan_remote_purge(chan_t *ch, const char *server);
  * prevent. */
 int chan_remote_set_host(chan_t *ch, const char *server, const char *nick,
                          const char *host);
+
+/* As chan_remote_set_host(), for the member's IDENT. Added with the field, in
+ * Phase 10.5, and for the same reason: the bounded copy belongs in the module that
+ * owns the struct, and the only caller is `federation/burst.c` translating a
+ * shadow record into a roster entry.
+ *
+ * THE REFUSAL IS THE SAME SHAPE AS THE HOST'S AND FOR THE SAME REASON -- an over
+ * long ident is REFUSED, not truncated, because a truncated ident renders a
+ * hostmask that is not the one the peer reported. The bound is CONN_USER_MAX, which
+ * is `conn_t::user` minus one, so the widest ident a peer can report is the widest
+ * this field can hold and neither side has to guess. */
+int chan_remote_set_user(chan_t *ch, const char *server, const char *nick,
+                         const char *user);
 
 /* Rekey the (server, old) member to (server, new). Returns 1 when a member was
  * renamed, 0 when there was none, -1 when `new` is not a legal nickname, is
