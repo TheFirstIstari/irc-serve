@@ -39,7 +39,8 @@ enum {
     CAPBIT_USERHOST_IN_NAMES = 1u << 7,
     CAPBIT_SETNAME = 1u << 8,
     CAPBIT_ECHO_MESSAGE = 1u << 9,
-    CAPBIT_STANDARD_REPLIES = 1u << 10
+    CAPBIT_STANDARD_REPLIES = 1u << 10,
+    CAPBIT_AWAY_NOTIFY = 1u << 11
 };
 
 /* THE BIT ORDER IS FIXED AND THE TABLE BELOW IS THE CLAIM.
@@ -72,7 +73,8 @@ static const cap_def_t k_caps[] = {
     { CAP_USERHOST_IN_NAMES, CAPBIT_USERHOST_IN_NAMES },
     { CAP_SETNAME, CAPBIT_SETNAME },
     { CAP_ECHO_MESSAGE, CAPBIT_ECHO_MESSAGE },
-    { CAP_STANDARD_REPLIES, CAPBIT_STANDARD_REPLIES }
+    { CAP_STANDARD_REPLIES, CAPBIT_STANDARD_REPLIES },
+    { CAP_AWAY_NOTIFY, CAPBIT_AWAY_NOTIFY }
 };
 
 static const size_t k_ncaps = sizeof k_caps / sizeof k_caps[0];
@@ -357,6 +359,41 @@ int cap_echo_message_enabled(const conn_t *c)
 int cap_standard_replies_enabled(const conn_t *c)
 {
     return cap_enabled(c, CAP_STANDARD_REPLIES);
+}
+
+/* away-notify: whether this node tells THIS client, unprompted, when a user it
+ * shares a channel with sets, changes or removes their away state.
+ *
+ * ONE GATE AND NO AVAILABILITY CHECK, and the question is not "is there an away
+ * message to report" but "is there away STATE to report at all". `conn_t::away`
+ * exists on every connection from accept() and `AWAYLEN` is advertised from
+ * `CONN_MAX_AWAY`, so this node has away state whether or not any client is
+ * currently away -- which is the same shape of answer as `userhost-in-names`
+ * (does the data exist) and the opposite of `account-tag` (is there something to
+ * SAY). A node that withheld the name whenever nobody happened to be away would be
+ * a capability that appears and disappears with the traffic.
+ *
+ * IT IS HANDED TO `fanout.c` DIRECTLY, through `cap_gate_away_notify()` below
+ * rather than through a wrapper in msg_verbs.c, so that the adaptation between
+ * this file's one-argument predicates and fanout.h's two-argument gate lives in
+ * ONE place next to the capability it is about. */
+int cap_away_notify_enabled(const conn_t *c)
+{
+    return cap_enabled(c, CAP_AWAY_NOTIFY);
+}
+
+/* fanout.h's `fanout_gate_fn` is `int (*)(const conn_t *, void *)`; every
+ * predicate in this file is `int (*)(const conn_t *)`. The gate's second argument
+ * is per-EMISSION context and none of this file's predicates wants any, but the
+ * signature is not changed for them: five other callers already hold the one-
+ * argument shape and it is the shape cap.h's own table documents. So the
+ * adaptation is a named function rather than a macro, and it lives here rather
+ * than at the call site so that "every capability predicate here is one-argument,
+ * and the gate that adapts them is this" is a single readable claim. */
+int cap_gate_away_notify(const conn_t *dst, void *ctx)
+{
+    (void)ctx;
+    return cap_away_notify_enabled(dst);
 }
 
 /* --------------------------------------------------------------------------

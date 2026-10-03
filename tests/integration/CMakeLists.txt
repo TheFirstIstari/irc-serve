@@ -503,3 +503,10 @@ irc_add_integration_test(test_standard_replies test_standard_replies.c)
 # verb the dispatch table still routes for a registered connection -- and nothing
 # tells anybody when it does.
 irc_add_integration_test(test_chghost test_chghost.c)
+
+# 7/Phase 10.8b: `away-notify`, the `AWAY` notification on BOTH edges of the
+# change. Its own file because the cleared edge is the half that is usually
+# missing and it needs the same case as the set edge to be visible at all: a
+# node that notified only on the way out leaves every member believing their
+# friend is still at lunch for ever.
+irc_add_integration_test(test_away_notify test_away_notify.c)
