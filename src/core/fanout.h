@@ -418,6 +418,45 @@ int fanout_deliver_local_gated(server_t *s, const fanout_target_t *t,
                                const fanout_form_t *extended, fanout_gate_fn gate,
                                void *gate_ctx, conn_t *exclude);
 
+/* ---------------------------------------------------------------------------
+ * THE FOURTH OUTCOME: "TO THE PEOPLE WE SHARE A CHANNEL WITH, EXACTLY ONCE"
+ * ---------------------------------------------------------------------------
+ * The gated entry point above addresses ONE channel, and a caller with more than
+ * one would loop it -- which is right for every emission whose line NAMES the
+ * channel, and wrong for the one that does not.
+ *
+ * `setname`'s server-to-client line is `:nick!user@host SETNAME :<realname>`: the
+ * specification's shape carries NO channel parameter, because it is a statement
+ * about a *person* and not about a channel. So a per-channel emission puts a
+ * `#channel` where a client expects the realname, and hands a member of three
+ * shared channels three byte-identical copies of one fact. Neither is what the
+ * specification says, and the second is `echo-message`'s defect reached from the
+ * other side: one announcement, delivered more than once.
+ *
+ * So this addresses the UNION of `chans[]` -- which is the caller's own
+ * `conn_t::chans`, 2.2's second index, kept in step with the channel's list by
+ * chan_attach_conn() -- and writes each destination ONCE.
+ *
+ * DE-DUPLICATION IS A SEARCH AND NOT A SET, which is why there is no bounded
+ * cache here and so no teardown arm to forget: "already reached?" is "is this
+ * member of a channel at a LOWER index", answered against structures the channel
+ * layer already owns and frees. The bound is `nchans * nmembers`, both of which
+ * are compile-time constants in headers this node already treats as limits.
+ *
+ * NO FORWARD, and for the same reason fanout_deliver_local() has none: this is an
+ * ORIGINATING emission, one that happens in response to a command this node just
+ * read. There is no `carry` parameter for the same reason there is none there.
+ *
+ * THERE IS NO GATED VARIANT OF THE FORWARDING PATH, still, and this function does
+ * not change that: it is a LOCAL emission by construction.
+ */
+int fanout_deliver_union_local_gated(server_t *s, struct chan *const *chans,
+                                     size_t nchans, const char *prefix,
+                                     const char *verb, const fanout_form_t *plain,
+                                     const fanout_form_t *extended,
+                                     fanout_gate_fn gate, void *gate_ctx,
+                                     conn_t *exclude);
+
 
 
 /* ---------------------------------------------------------------------------

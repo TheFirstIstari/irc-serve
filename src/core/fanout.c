@@ -1045,6 +1045,131 @@ int fanout_deliver_local_gated(server_t *s, const fanout_target_t *t,
     }
 }
 
+int fanout_deliver_union_local_gated(server_t *s, struct chan *const *chans,
+                                     size_t nchans, const char *prefix,
+                                     const char *verb, const fanout_form_t *plain,
+                                     const fanout_form_t *extended,
+                                     fanout_gate_fn gate, void *gate_ctx,
+                                     conn_t *exclude)
+{
+    irc_serve_tags_t ident;
+    int relayed = 0;
+    const char *account;
+    int n = 0;
+
+    if (s == NULL || chans == NULL || verb == NULL || plain == NULL) {
+        return 0;
+    }
+    /* THE ARITY GUARD IS write_to_members()'s, including its `>=` and the reason
+     * the target slot is not counted here: this emission has NO target. Every
+     * parameter the caller hands over is a parameter of the line, so the bound is
+     * simply "as many as the builder takes" -- IRC_MAX_PARAMS, and no +1 for a
+     * name that is not there. A caller that outgrew it gets zero writes rather
+     * than a refusal counted on n_reply_refused, for the same reason. */
+    if ((plain->params == NULL && plain->nparams != 0) || plain->nparams < 0 ||
+        plain->nparams >= IRC_MAX_PARAMS) {
+        return 0;
+    }
+    /* ONE IDENTITY FOR THE WHOLE EMISSION, computed once above the loops for the
+     * reason fanout_deliver_forms() computes it once above its switch: the 2.4
+     * stamp and the account name are facts about the EMISSION, not about a
+     * destination, and every copy of this line -- to a member of the first channel
+     * and to a member of the last -- must be the same emission. Minting per
+     * channel would give one SETNAME two msgids. */
+    fanout_stamp(s, NULL, &ident, &relayed);
+    account = fanout_emitter_account(s, prefix, relayed);
+
+    for (size_t i = 0; i < nchans; i++) {
+        chan_t *ch = chans[i];
+
+        if (ch == NULL) {
+            continue; /* a chan_t this node no longer holds: nothing to address */
+        }
+        for (size_t k = 0; k < ch->nmembers; k++) {
+            conn_t *m = ch->members[k].c;
+            const char *const *use = plain->params;
+            int nuse = plain->nparams;
+            char tags[FANOUT_TAG_BLOCK_MAX + 1u];
+            int already = 0;
+
+            /* THE ORDER IS THE SAME FOUR QUESTIONS write_to_members() asks, in the
+             * same order, and the new one is LAST of the pre-render checks: is this
+             * member addressable, is it the excluded one, has this emission already
+             * reached it under an earlier channel, and does the gate allow it. The
+             * gate stays after `exclude` for the reason fanout.h gives -- asking it
+             * last means a member the emission was never going to reach is not
+             * asked a question about it -- and the de-duplication stays before the
+             * gate for the same shape of reason: a member already written to needs
+             * no capability question asked about a line it is not going to get. */
+            if (!chan_member_live(&ch->members[k])) {
+                continue;
+            }
+            if (exclude != NULL && m == exclude) {
+                continue;
+            }
+            /* ONCE PER DESTINATION, and this is the whole reason this entry point
+             * exists rather than a loop of fanout_deliver_local_gated() in the
+             * handler. A SETNAME line is `:nick!user@host SETNAME :<realname>` --
+             * the specification's shape has NO CHANNEL PARAMETER -- so a per-channel
+             * emission would put a *channel name* where a client expects the
+             * realname, and would hand a member of three shared channels three
+             * byte-identical copies of one fact. Neither is the specification, and
+             * the second is the same defect echo-message's fault was: one
+             * announcement, delivered more than once.
+             *
+             * THE ANSWER IS A SEARCH, NOT A SET. "Has this emission already reached
+             * `m`?" is "is `m` a member of one of the channels at a LOWER index?",
+             * and `chans` is the caller's own `conn_t::chans` -- 2.2's second index,
+             * which exists for exactly this kind of walk and is kept in step with the
+             * channel's list by chan_attach_conn()/chan_detach_conn(). So the test is
+             * a bounded search over at most `nchans * nmembers` records and there is
+             * no allocation, no cache, and therefore no teardown arm: the structure
+             * this reads is owned and freed by the channel layer.
+             *
+             * IT IS EXACT RATHER THAN APPROXIMATE, and that is a property of liveness
+             * rather than luck: `chan_member_live()` only ever goes from 1 to 0, so a
+             * member that was addressable at an earlier channel was written to, and a
+             * member that was not is not addressable now either -- so the raw pointer
+             * comparison below is sufficient and needs no second liveness test. */
+            for (size_t j = 0; j < i && already == 0; j++) {
+                chan_t *earlier = chans[j];
+
+                if (earlier == NULL) {
+                    continue;
+                }
+                for (size_t q = 0; q < earlier->nmembers; q++) {
+                    if (earlier->members[q].c == m) {
+                        already = 1;
+                        break;
+                    }
+                }
+            }
+            if (already != 0) {
+                continue;
+            }
+            if (gate != NULL && gate(m, gate_ctx) == 0) {
+                continue;
+            }
+            /* THE SHAPE AND THE ARITY, per destination, from the same two helpers
+             * every other row uses -- so a per-destination form cannot answer the
+             * shape question differently here than it does in a channel emission. */
+            fanout_form_for(m, extended, &use, &nuse);
+            if (nuse >= IRC_MAX_PARAMS) {
+                printf("[observable] fanout_unhandled_form: verb=%s target=UNION "
+                       "nparams=%d\n", verb, nuse);
+                continue;
+            }
+            /* NO `all[]`, and the absence is the point: there is no target to
+             * prepend, so the caller's list IS the line. */
+            (void)send_line_tagged(s, m, prefix, verb, use, nuse,
+                                   fanout_tag_block(m, &ident, account, tags,
+                                                    sizeof tags));
+            n++;
+        }
+    }
+    return n;
+}
+
 int fanout_deliver(server_t *s, const fanout_target_t *t, const char *prefix,
                    const char *verb, const char *const *params, int nparams,
                    conn_t *exclude, const irc_serve_tags_t *carry)

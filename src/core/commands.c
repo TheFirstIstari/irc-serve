@@ -868,6 +868,82 @@ static void handle_user(server_t *s, conn_t *c, const message_t *m)
  * server-to-client shape and is also what makes the line trustworthy: it names who
  * changed, and `conn_hostmask()` renders it from the fields §2.1 owns (including the
  * OBSERVED host, which USER does not touch). */
+
+/* THE COMMON-CHANNEL FAN-OUT, and the disclosure decision is the whole of it.
+ *
+ * The specification: "they MUST send the server-to-client version of the SETNAME
+ * message **to all clients in common channels**, as well as to the client from which
+ * it originated" and "The SETNAME message **MUST NOT** be sent to clients which do
+ * not have the `setname` capability negotiated."
+ *
+ * THE GATE IS THE RECIPIENT'S, which is the specification's condition read
+ * literally ("clients", plural) and the answer that agrees with `cap.h`'s existing
+ * rule for the CONFIRMATION above. Gating on the SENDER -- which is the other thing
+ * one could implement, and which is one line -- would let a client who negotiated
+ * `setname` put a member's realname on the wire to every other member of a shared
+ * channel by asking for a capability those members never requested, and would
+ * contradict the confirmation's own rule in the same handler. A realname is personal
+ * data; the per-destination answer is the only one that does not require trusting
+ * the person disclosing it to be careful about who finds out.
+ *
+ * THE ORIGIN IS EXCLUDED, and the reason is the ORDER rather than a rule about
+ * authors: the confirmation above has ALREADY delivered this line to the client that
+ * asked, and the specification counts that as the origin's half of the MUST. Leaving
+ * the origin in the audience would give it two byte-identical `SETNAME` lines for one
+ * command, which is the same double-delivery defect `echo-message` has a fault for.
+ * So `exclude` is `c`, exactly as msg_verbs.c's notify_away() excludes the away
+ * setter because 306/305 are that user's own answer.
+ *
+ * IT IS THE UNION, NOT ONE CALL PER CHANNEL, and the SHAPE is why:
+ * `:nick!user@host SETNAME :<realname>` has no channel parameter, so a per-channel
+ * emission would put a `#channel` where a client expects the realname, and would hand
+ * a member of three shared channels three copies of one fact. fanout.h's
+ * `fanout_deliver_union_local_gated()` is the one walk that gets both right, and its
+ * de-duplication is a search over the caller's own `conn_t::chans` rather than a
+ * cache -- which is why there is no bounded store here with a teardown arm to forget.
+ *
+ * NOT FORWARDED, for the same reason away-notify is not: this is an originating
+ * emission and the local-only entry points have no forward arm. Worth being honest
+ * about what that costs: 4.3's frozen `SBURSTN` carries no realname, so a mesh
+ * member's clients learn a peer's realname from its own roster -- `extended-join` --
+ * and never learn that it CHANGED, because there is no S-verb to carry the change and
+ * a wire format cannot be invented after Phase 6. Closing that needs a new 4.3 verb
+ * and a version bump, not a decision. */
+static void setname_notify_channels(server_t *s, conn_t *c)
+{
+    const char *params[1];
+    fanout_form_t plain;
+    char prefix[CONN_HOSTMASK_MAX];
+    int delivered;
+
+    /* NO CHANNELS MEANS NO AUDIENCE, and that is `c->nchans` rather than a check
+     * anywhere else: the audience is "users sharing a channel", so with no channels
+     * there is nobody to tell. The confirmation above has already reached the only
+     * client the specification requires an answer to. */
+    if (c->nchans == 0u) {
+        printf("[observable] setname_notify: nick=%s recipients=0 "
+               "reason=NO_SHARED_CHANNEL\n",
+               c->nick);
+        return;
+    }
+    if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
+        /* Unrenderable is a bug report rather than a refusal, and it cannot have
+         * happened: the caller rendered this same prefix a few lines ago and got here
+         * because it succeeded. Reported rather than assumed, because the alternative
+         * is a silent reason for a notification that never went out. */
+        printf("[observable] setname_notify: nick=%s reason=UNRENDERABLE\n", c->nick);
+        return;
+    }
+    params[0] = c->realname;
+    plain.params = params;
+    plain.nparams = 1;
+    delivered = fanout_deliver_union_local_gated(s, c->chans, c->nchans, prefix,
+                                                 "SETNAME", &plain, NULL,
+                                                 cap_gate_setname, NULL, c);
+    printf("[observable] setname_notify: nick=%s channels=%zu recipients=%d\n",
+           c->nick, c->nchans, delivered);
+}
+
 static void handle_setname(server_t *s, conn_t *c, const message_t *m)
 {
     conn_realname_verdict_t v;
@@ -935,6 +1011,7 @@ static void handle_setname(server_t *s, conn_t *c, const message_t *m)
     }
     params[0] = c->realname;
     (void)send_line(s, c, prefix, "SETNAME", params, 1);
+    setname_notify_channels(s, c);
     printf("[observable] setname: fd=%d nick=%s len=%zu\n", c->fd, c->nick,
            strlen(c->realname));
 }
