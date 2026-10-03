@@ -1550,6 +1550,88 @@ void handle_kick(server_t *s, conn_t *c, const message_t *m)
  * a lie about the verb, and silence is the failure mode 4.4's numerics exist to
  * prevent. 472 says "that mode character means nothing to me", which is true.
  */
+/* ---------------------------------------------------------------------------
+ * 367 RPL_BANLIST and 368 RPL_ENDOFBANLIST: `MODE <channel> +b` with no mask.
+ * ---------------------------------------------------------------------------
+ * RFC 2812 3.3.2 names this as a QUERY and not a change, in the same sentence
+ * that defines the whole verb: "If the <modestring> parameter is given with a
+ * list of mode arguments, then a list of mode arguments is returned for channel
+ * modes b, e and I. ... +b, +e and +I are always passed to the server." So
+ *
+ *     MODE #chan +b          -> one 367 per mask, then 368
+ *     MODE #chan -b          -> the same list, because the RFC does not
+ *                               distinguish the signs for the LIST form
+ *
+ * and the mask is absent in both, which is the whole signal. Before this phase a
+ * `+b` with no mask was answered 461 ERR_NEEDMOREPARAMS, which is the exact
+ * opposite of the RFC: the client did not send too few parameters, it sent the
+ * form that ASKS the question, and the answer it got was "you sent too few
+ * parameters".
+ *
+ * WHY THAT MATTERS TO A REAL CLIENT, and it is why this is not a cosmetic fix.
+ * irssi, weechat and hexchat all send `MODE <channel> b` when a window is
+ * opened, precisely so the client's ban list is populated before the user
+ * touches it. A node that answers 461 to that query leaves the client showing an
+ * error in a status window and an EMPTY ban list, on a channel where the node is
+ * enforcing bans perfectly well -- and a user who then types `/mode +b` on a mask
+ * that is already set is told nothing useful, because there was never a list to
+ * check against. The ban feature worked and was unreadable, which is the same
+ * failure Phase 5 named for 301.
+ *
+ * THE GRAMMAR, from RFC 2812 5.1:
+ *
+ *   367 RPL_BANLIST  "<channel> <banmask>"
+ *   368 RPL_ENDOFBANLIST "<channel> :End of channel ban list"
+ *
+ * so 367 has NO trailing field and 368 has one. 367 is emitted with an empty
+ * trailing parameter -- `reply()` takes a trailing parameter by construction and
+ * `message_format()` renders an empty one as a bare ':' -- which is the same
+ * choice `send_names_list()` already makes for the empty 353, and the same
+ * reason: a value in the final position is always representable and never has to
+ * be invented. A 367 that appended the mask a second time in the text would be
+ * one field the RFC does not have, on a numeric some clients read positionally.
+ *
+ * AND ONE 367 PER MASK, ALWAYS, WITH NO CHUNKING. The mask is a MIDDLE parameter
+ * here, so the only bound is the wire line cap and reply() refuses rather than
+ * reshapes (3.2). A mask is CHAN_MAX_BAN (63) bytes and a channel name is
+ * CHAN_MAX_NAME (63), so one 367 is about 140 bytes -- inside IRC_MAX_LINE with
+ * room for a second one, and well inside REPLY_TEXT_MAX. The list cannot be
+ * chunked the way a 353 or a 319 is, and does not need to be: RFC 2812 3.3.4
+ * permits 367 to repeat, but a loop over a bounded array of bounded strings
+ * cannot produce a value the formatter refuses, so nothing is dropped and
+ * nothing is truncated.
+ *
+ * THE AUTHORITY QUESTION IS NOT ASKED AGAIN. This is a QUERY about a channel the
+ * caller has already been shown to be on (resolve_joined() sent 442 otherwise) and
+ * whose modes 324 already answered from the same array -- and 324 is answered to
+ * any member, not only to an operator. Asking "are you an operator" here would
+ * make the ban list LESS readable than the mode list beside it, and RFC 2812
+ * 3.3.2 attaches no privilege requirement to reading a list that the server is
+ * publishing anyway. The masks in `ch->bans` are this node's own state and 2.2
+ * puts the origin's ban list in the same struct every member's 353 is drawn from.
+ */
+static void send_ban_list(server_t *s, conn_t *dst, const chan_t *ch)
+{
+    for (size_t i = 0; i < ch->nbans; i++) {
+        if (ch->bans[i].mask[0] == '\0') {
+            continue;
+        }
+        (void)reply(s, dst, "367", (const char *const[]){ ch->name, ch->bans[i].mask },
+                    2, "%s", "");
+    }
+    /* 368 ALWAYS, including for an empty list, and that is RFC 2812 3.3.4's rule
+     * for this family rather than an inference from 353's: "a server is required
+     * to send the list back using the RPL_BANLIST and RPL_ENDOFBANLIST messages
+     * ... After the banmasks have been listed ... a RPL_ENDOFBANLIST MUST be
+     * sent." A client that asked for the list and got no terminator is a client
+     * still waiting for it, and the empty-list case is precisely the one where
+     * silence and "no bans" are indistinguishable. */
+    (void)reply(s, dst, "368", (const char *const[]){ ch->name }, 1,
+                "End of channel ban list");
+    printf("[observable] chan_ban_list: channel=%s by=%s masks=%zu\n", ch->name,
+           dst->nick, ch->nbans);
+}
+
 void handle_mode(server_t *s, conn_t *c, const message_t *m)
 {
     chan_t *ch;
@@ -1720,14 +1802,53 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
 
         if (mode == 'b') {
             if (m->nparams < 3) {
-                (void)reply_refused(s, c, "MODE", NULL, "461", NULL, 0,
-                                    "Not enough parameters");
+                /* THE QUERY FORM, not a too-few-params case. RFC 2812 3.3.2:
+                 * "If the <modestring> parameter is given with a list of mode
+                 * arguments, then a list of mode arguments is returned for
+                 * channel modes b, e and I." The client sent the mode argument
+                 * and no argument to go with it, which is the QUESTION, and
+                 * 461 answered it with "you sent too few parameters" -- a
+                 * refusal that told the client its own question was malformed.
+                 * See send_ban_list() for the full argument. */
+                send_ban_list(s, c, ch);
                 return;
             }
             if (plus) {
                 if (chan_ban_add(ch, m->params[2]) != 0) {
-                    (void)reply(s, c, "696", (const char *const[]){ ch->name }, 1,
-                                "Channel ban list is full");
+                    /* 478 ERR_BANLISTFULL, whose RFC 2812 5.1 field list is
+                     * "<channel> <char> :Channel list is full" -- so the channel
+                     * AND the mode letter are middle parameters.
+                     *
+                     * THIS USED TO BE 696. Two things were wrong with that and the
+                     * second is the one a client can see:
+                     *
+                     *   1. 696 IS NOT THIS CONDITION. RFC 2812 5.1 has no 696 at
+                     *      all; 696 is RPL_ENDOFMODES from the historical MODE
+                     *      draft, an end-of-list marker with no meaning about
+                     *      capacity. A client holding 696 in its numeric table
+                     *      renders "End of MODE list" for a refusal to add a ban,
+                     *      and a client that does not hold it -- which is most,
+                     *      because it is not a registered code -- shows nothing
+                     *      at all. So the refusal was invisible or actively
+                     *      misleading in both cases.
+                     *   2. THE ARITY WAS WRONG EVEN FOR ITS OWN NUMERIC. It sent
+                     *      the channel and nothing else, so the <char> the RFC's
+                     *      field list names was absent; a client parsing positionally
+                     *      read the channel name as the mode character that could
+                     *      not be set.
+                     *
+                     * RFC 2812 3.3.4's own name for the condition is 478, and
+                     * every client that knows a ban list at all maps 478 to "ban
+                     * list full". Correcting it makes a cap that CHAN_MAX_BANS
+                     * has always enforced report itself as the RFC's refusal
+                     * instead of as an unexplained absence.
+                     */
+                    (void)reply(s, c, "478",
+                                (const char *const[]){ ch->name, "b" }, 2,
+                                "Channel list is full");
+                    printf("[observable] chan_ban_refused: channel=%s by=%s "
+                           "reason=ban_list_full nbans=%zu max=%d\n",
+                           ch->name, c->nick, ch->nbans, CHAN_MAX_BANS);
                     return;
                 }
                 /* chan_ban_add() deliberately does not touch modes[]: a caller

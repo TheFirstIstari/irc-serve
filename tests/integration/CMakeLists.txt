@@ -548,3 +548,9 @@ irc_add_integration_test(test_invite_notify test_invite_notify.c)
 # channel, which is the whole content of a WHOIS to a client looking for somebody.
 irc_add_integration_test(test_whois_channels test_whois_channels.c)
 
+
+# The ban-list query surface: `MODE #chan +b` answered with 367/368, and a full
+# list answered with 478. Its own file because the observable is a LIST -- the
+# assertions are counts of 367 lines and a check that 368 comes last -- and a
+# substring search reports success for both a correct count and an empty list.
+irc_add_integration_test(test_banlist test_banlist.c)
