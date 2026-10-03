@@ -263,19 +263,23 @@ int main(void)
      * the verb is defined per channel and a client that wanted two must send
      * two lines -- and a bare KNOCK names no channel at all. 461 for both,
      * which is the numeral every handler in the node uses for a wrong-arity
-     * line and the one 4.4 lists. */
+     * line and the one 4.4 lists.
+     *
+     * `KNOCK` is RFC 2812 5.2's `<command>` field, and both needles carry it. A
+     * needle stopping at `461 alice` would pass against a node whose 461 named
+     * no verb, which is the arity this pair exists to pin. */
     from = mark(&alice);
     TF_CHECK_MSG(tc_send(&alice.c, "KNOCK") == 0, "tc_send failed");
     end = mark(&alice);
     expect_in_window(&alice, from, end, "461 for a bare KNOCK",
-                     ":" BIN_NAME " 461 alice :Not enough parameters\r\n");
+                     ":" BIN_NAME " 461 alice KNOCK :Not enough parameters\r\n");
     expect_absent_in_window(&alice, from, end, "the bare knock", " 482 ");
 
     from = mark(&alice);
     TF_CHECK_MSG(tc_send(&alice.c, "KNOCK " CHAN " " CHAN) == 0, "tc_send failed");
     end = mark(&alice);
     expect_in_window(&alice, from, end, "461 for two channels",
-                     ":" BIN_NAME " 461 alice :Not enough parameters\r\n");
+                     ":" BIN_NAME " 461 alice KNOCK :Not enough parameters\r\n");
     expect_absent_in_window(&alice, from, end, "the two-channel knock", " 482 ");
 
     /* =======================================================================

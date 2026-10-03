@@ -561,3 +561,13 @@ irc_add_integration_test(test_banlist test_banlist.c)
 # sweep found them conformant, which is worth having in the suite rather than only
 # in the phase report.
 irc_add_integration_test(test_query_surface test_query_surface.c)
+
+# 461's `<command>` field, asserted by PARSING THE LINE rather than by matching its
+# bytes, plus the two numerics that must not grow one. Its own file because the
+# other seventeen 461 needles in the suite cannot fail on this defect: a needle of
+# `461 alice :Not enough parameters` passes against a node that omits the field,
+# and a needle of `461 alice PRIVMSG :...` passes against one that hardcoded the
+# verb. This file drives twenty-two probes over seventeen verbs and decomposes the
+# answer, so "the field is present" and "the field is the right verb" are separate
+# failures with separate messages.
+irc_add_integration_test(test_numeric_arity test_numeric_arity.c)

@@ -29,9 +29,9 @@ are the ones to read carefully; they are collected in
 
 ## 1. The counts
 
-RFC 2812 section 5 defines **160** distinct numerics: 130 in 5.1 (command
-responses) and 30 more in 5.3 (reserved, obsolete, or specific to one server's
-non-generic features). Of those 160:
+RFC 2812 defines **160** distinct numerics: **84** in 5.1 (command responses), **53**
+in 5.2 (error replies) and **23** in 5.3 (reserved, obsolete, or specific to one
+server's non-generic features). Of those 160:
 
 | | Count |
 |---|---|
@@ -41,7 +41,8 @@ non-generic features). Of those 160:
 | **Defined in RFC 2812 and not accounted for** | **0** |
 
 RFC 2812 5.3 prints `244` twice (RPL_STATSHLINE and RPL_STATSSLINE), which is a
-typo in the RFC rather than two numerics; it is counted once.
+typo in the RFC rather than two numerics; it is counted once, which is why 5.3
+contributes 23 and not 24.
 
 This node also emits **eight** numerics RFC 2812 does not define, all of them
 de-facto or IRCv3. They are in [§4](#4-numerics-this-node-emits-that-rfc-2812-does-not-define).
@@ -50,12 +51,72 @@ Every row below is one of those four. There is no fifth category, and a numeric
 with no row is a gap in this document rather than in the node — which is the one
 failure mode a table like this has, and the reason the last column is mandatory.
 
+### 1.1 How these three numbers were checked, and what that check cannot see
+
+**Phase 11 wrote them by reading six source files. Phase 11b re-derived all three
+mechanically**, because the two arity defects that table recorded as open findings
+were both found by reading and both survived anyway. The method, so the next sweep
+can repeat it:
+
+1. **The 160 and its 84/53/23 split** come from parsing the RFC's own text for
+   lines matching `^ {3,}<3 digits> {2,}<SYMBOLIC NAME>` and attributing each to the
+   nearest preceding `5.x` heading. That gives 84 in 5.1 and 53 in 5.2. **§5.3 is a
+   two-column table and cannot be read by line prefix** — nine of its 23 codes are on
+   the table's *second* column and a prefix match misses every one of them — so it
+   is read instead by pairing `<code> <NAME>` across the whole block: 25 pairs, of
+   which one is `812`, the page number in a running header, leaving 24; and `244` is
+   printed twice (`RPL_STATSHLINE`, `RPL_STATSSLINE`), leaving **23 distinct**. The
+   three sections share no code, so `84 + 53 + 23 = 160` is the union and not merely
+   the sum.
+2. **The 59 emitted** comes from parsing every `reply()` and `reply_refused()` call
+   in `src/` — **176 sites** — and collecting the three-digit literal each one names.
+   That yields 65 distinct numerics; six of them (`265`, `266`, `329`, `330`,
+   `333`, `417`) are §4's, and the remaining **59** are RFC 2812's.
+   **Two more of §4's eight are not in that scan, and the reason is a macro rather
+   than a gap in the sweep**: `410` and `908` are emitted as
+   `RPL_INVALIDCAPSUBCOMMAND` and `RPL_SASLMECHS`, defined in `cap.h`, so the literal
+   never appears at the call site. §4's other six appear inline, which is why the
+   scan finds them and these two it does not. Anyone repeating this sweep should
+   expand those two macros by hand rather than conclude the table is wrong.
+3. **The 0 unaccounted for** is the set difference
+   `RFC2812 − (§2 ∪ §3.1 ∪ §3.2 ∪ §4)`, with `413–415` style ranges expanded and
+   only the FIRST column of each table read, so a cross-reference in a note cannot
+   make a code look accounted for. It is empty.
+4. **The arithmetic closes, and this is the form in which it closes.** §2's first
+   column names **105** codes, of which **104** are RFC 2812's (`333` is not), and it
+   splits them **59 emitted + 43 `A` + 2 `—`**. §3.1 lists 79 codes, **31 of which
+   already have a row in §2**, so it contributes **48** new ones. §3.2 lists 10 codes,
+   **2 of which already have a row in §2** (`384` and `492`), so it contributes **8**.
+   `104 + 48 + 8 = 160`, and the ten N/A figures are §3.2's ten — which is why `477`
+   can be `—` in §2 and still appear in §3.1's feature table: §2's mark is the
+   verdict, §3.1's row is the reason.
+
+**What the mechanical check cannot see, stated plainly.** Parsing call sites
+verifies the *arity* of each numeric — how many middle parameters reach the wire —
+and it cannot verify the *values*, the text, or whether the numeric is the right
+answer to the question being asked. §5 is where the judgement calls live and they
+are not mechanical: `317` carrying two numbers where the RFC names one is an arity
+mismatch a scan finds, but `401` being used for `WHO <a b>` is a mapping question
+no scan can reach. **The field-list re-vet was the arity half, run against all 176
+call sites**, and it is what found the three new findings in §6.11 to §6.13 and the
+two this document had recorded wrongly in §5.1 and §5.4.
+
 ## 2. Emitted, and conformant in field list
 
-Fifty-nine rows here; the eight numerics this node emits that RFC 2812 does not
-define are in §4. A `✓` in the last column means the field list was checked against
-the RFC and matches; where it does not, the row says so and the numeric appears
-again in §5 or §6.
+**Sixty rows here, of which fifty-nine are RFC 2812 numerics and one — `333` — is
+one of §4's**, which is also why `333` appears in both tables. The other seven of
+§4's eight (`265`, `266`, `329`, `330`, `410`, `417`, `908`) have no row here
+because they are not RFC 2812 numerics and §2 is the RFC's table.
+
+A `✓` in the last column means the field list was checked against the RFC and
+matches; where it does not, the row says so and the numeric appears again in §5 or
+§6. **Phase 11b re-checked all one hundred and three rows against the RFC
+mechanically** — §1.1's method, run over all 176 `reply()` and `reply_refused()` call
+sites — and that re-check is what corrected this column: **five rows below were
+marked `✓` and were wrong** (`303`, `324`, `366`, `404`, `482`, each with exactly one
+non-conformant call site), and one row's justification for its own deviation did not
+hold (`324`, §5.4). `461` and `472` were the sixth and seventh, and both are now
+conformant.
 
 ### Registration and server info (001–005)
 
@@ -86,8 +147,8 @@ again in §5 or §6.
 | Code | Name | Field list | Here | Notes |
 |---|---|---|---|---|
 | 301 | RPL_AWAY | `<nick> :<away message>` | E | ✓ |
-| 302 | RPL_USERHOST | `:<reply>` (one per nickname) | E | **deviation** — see §5.1. |
-| 303 | RPL_ISON | `:<nick> *( " " <nick> )` | E | Chunked at `REPLY_MAX_MID`; RFC 1459 2.4.3 anticipates the split. |
+| 302 | RPL_USERHOST | `:<reply>` (one per nickname) | E | **deviation** — one middle parameter where the RFC has a trailing-only list. See §5.1. |
+| 303 | RPL_ISON | `:<nick> *( " " <nick> )` | E | **deviation** — the nick list is chunked into middle parameters where the RFC has a trailing-only list, the same shape as `302` and recorded with it in §5.1. RFC 1459 2.4.3 anticipates splitting a long list across *replies*; it does not put list members in parameters within one reply. **Found by the Phase 11b re-vet, which §5.1 had missed.** |
 | 305 | RPL_UNAWAY | `:You are no longer marked as being away` | E | ✓ |
 | 306 | RPL_NOWAWAY | `:You have been marked as being away` | E | ✓ |
 
@@ -111,7 +172,7 @@ again in §5 or §6.
 | 321 | RPL_LISTSTART | Obsolete. Not used. | E | Emitted as `"Channel" :Users  Name`, which is RFC 1459's form. RFC 2812 marks it obsolete, and RFC 1459 kept it; emitting both an obsolete and a modern form would be worse. **246/247 are the pre-1459 numbers and are absent — see §3.** |
 | 322 | RPL_LIST | `<channel> <# visible> :<topic>` | E | ✓ |
 | 323 | RPL_LISTEND | `:End of LIST` | E | ✓ |
-| 324 | RPL_CHANNELMODEIS | `<channel> <mode> <mode params>` | E | Channel and mode are middle parameters; there are no mode params, and the trailing text is the RFC's free `<text>`. |
+| 324 | RPL_CHANNELMODEIS | `<channel> <mode> <mode params>` | E | **deviation** — two middle parameters and a trailing sentence, where the RFC has three fields and **no trailing parameter at all**. See §5.4. The missing `<mode params>` is honest (this node evaluates `b`, `o`, `v` and no mode takes an argument beyond `+b`'s mask), but Phase 11's justification — that the added text "is the RFC's free `<text>`" — was **wrong**: 324's entry in RFC 2812 5.1 contains no `:` and so names no free text. Corrected by the Phase 11b re-vet. |
 | 325 | RPL_UNIQOPIS | `<channel> <nickname>` | A | No `+q`/`+a` mode exists on this node. |
 | 331 | RPL_NOTOPIC | `<channel> :No topic is set` | E | ✓ |
 | 332 | RPL_TOPIC | `<channel> :<topic>` | E | ✓ |
@@ -124,7 +185,7 @@ again in §5 or §6.
 |---|---|---|---|---|
 | 352 | RPL_WHOREPLY | `<channel> <user> <host> <server> <nick> ( "H" / "G" ) ["*"] [ ( "@" / "+" ) ] :<hopcount> <real name>` | E | ✓ `H`/`G` first letter, then the sigil. Honours `multi-prefix` when negotiated and says so in 005. |
 | 353 | RPL_NAMREPLY | `( "=" / "*" / "@" ) <channel> :[ "@" / "+" ] <nick> *( … )` | E | ✓ Chunked at `CHAN_NAMES_LINE`. |
-| 366 | RPL_ENDOFNAMES | `<channel> :End of /NAMES list` | E | ✓ Always last. |
+| 366 | RPL_ENDOFNAMES | `<channel> :End of /NAMES list` | E | ✓ on every site that has a channel, and always last. **One site is not**: `NAMES` with no argument on a node with **zero** channels sends `366 <client> :End of /NAMES list` with no `<channel>`, because there is none to name. See §6.11. |
 | 367 | RPL_BANLIST | `<channel> <banmask>` | E | **Added in Phase 11.** Two middle parameters and no trailing field. |
 | 368 | RPL_ENDOFBANLIST | `<channel> :End of channel ban list` | E | **deviation** on one path — see §5.3. |
 | 369 | RPL_ENDOFWHOWAS | `<nick> :End of WHOWAS` | A | No WHOWAS command. |
@@ -145,7 +206,7 @@ again in §5 or §6.
 | 401 | ERR_NOSUCHNICK | `<nickname> :No such nick/channel` | E | ✓ |
 | 402 | ERR_NOSUCHSERVER | `<server name> :No such server` | E | ✓ Used for a mask that does not name this node. |
 | 403 | ERR_NOSUCHCHANNEL | `<channel name> :No such channel` | E | **deviation** on the `MODE <nick>` path — see §6.1. |
-| 404 | ERR_CANNOTSENDTOCHAN | `<channel name> :Cannot send to channel` | E | ✓ |
+| 404 | ERR_CANNOTSENDTOCHAN | `<channel name> :Cannot send to channel` | E | ✓ on the site that answers the real condition — a channel the client is not on, with `t.name` as the field. **One site is not**: when the source hostmask itself will not render, the line carries no `<channel name>` and a different sentence. See §6.12. |
 | 405 | ERR_TOOMANYCHANNELS | `<channel name> :You have joined too many channels` | A | **There is no per-client channel limit on this node**, so the condition cannot arise. That is a resource decision, not an oversight: channels are bounded only by the descriptor table. See §8. |
 | 406 | ERR_WASNOSUCHNICK | `<nickname> :There was no such nickname` | A | No WHOWAS. |
 | 407 | ERR_TOOMANYTARGETS | `<target> :<error code> recipients. <abort message>` | A | 005 advertises `MAXTARGETS=1`, so a multi-recipient line is refused as a parameter-count problem (461) rather than as too many recipients. The token is the honest disclosure. |
@@ -170,7 +231,7 @@ again in §5 or §6.
 | 445 | ERR_SUMMONDISABLED | `:SUMMON has been disabled` | A | No SUMMON command; 421. |
 | 446 | ERR_USERSDISABLED | `:USERS has been disabled` | A | No USERS command; 421. |
 | 451 | ERR_NOTREGISTERED | `:You have not registered` | E | ✓ |
-| 461 | ERR_NEEDMOREPARAMS | `<command> :Not enough parameters` | E | **deviation** — the `<command>` field is absent. See §6.3. |
+| 461 | ERR_NEEDMOREPARAMS | `<client> <command> :Not enough parameters` | E | **✓ conformant as of Phase 11b.** All 29 `reply_refused()` sites pass `NULL, 0`, and `reply_refused()` prepends its own `command` argument for this one numeric — see §6.3 for what was wrong, why the fix is in one place rather than 29, and what a `standard-replies` client gets instead. |
 | 462 | ERR_ALREADYREGISTRED | `:Unauthorized command (already registered)` | E | ✓ |
 | 463 | ERR_NOPERMFORHOST | `:Your host isn't among the privileged` | A | No host-based connection restriction. |
 | 464 | ERR_PASSWDMISMATCH | `:Password incorrect` | E | **deviation** — see §6.4. |
@@ -178,7 +239,7 @@ again in §5 or §6.
 | 466 | ERR_YOUWILLBEBANNED | — | A | Reserved by RFC 2812 5.3; same reasoning as 465. |
 | 467 | ERR_KEYSET | `<channel> :Channel key already set` | A | `+k` is advertised in 004 and **not evaluated** — it is refused with 472 by name — so no key can ever be set. |
 | 471 | ERR_CHANNELISFULL | `<channel> :Cannot join channel (+l)` | A | `+l` is advertised and not evaluated, so no channel can be full. |
-| 472 | ERR_UNKNOWNMODE | `<char> :is unknown mode char to me for <channel>` | E | **deviation** — the node sends `<channel>` where the RFC sends `<char>`, and names no mode character at all. See §6.5. |
+| 472 | ERR_UNKNOWNMODE | `<client> <char> :is unknown mode char to me for <channel>` | E | **✓ conformant as of Phase 11b.** Both sites send the mode character as the middle parameter and name the channel in RFC 1459 4.4's sentence: `:irc.test 472 <client> k :is unknown mode char to me for channel #MO`. See §6.5 for the two faults this was. |
 | 473 | ERR_INVITEONLYCHAN | `<channel> :Cannot join channel (+i)` | A | `+i` is advertised and not evaluated. |
 | 474 | ERR_BANNEDFROMCHAN | `<channel> :Cannot join channel (+b)` | E | ✓ `+b` is the one channel mode this node evaluates. |
 | 475 | ERR_BADCHANNELKEY | `<channel> :Cannot join channel (+k)` | A | `+k` is advertised and not evaluated. A `JOIN #chan <key>` argument is accepted and ignored. |
@@ -186,7 +247,7 @@ again in §5 or §6.
 | 477 | ERR_NOCHANMODES | `<channel> :Channel doesn't support modes` | — | The node does support channel modes (`b`, and the prefix modes `o`/`v`). |
 | 478 | ERR_BANLISTFULL | `<channel> <char> :Channel list is full` | E | **Added in Phase 11**, replacing 696. Both middle parameters. |
 | 481 | ERR_NOPRIVILEGES | `:Permission Denied- You're not an IRC operator` | A | **deviation** — see §6.7. |
-| 482 | ERR_CHANOPRIVSNEEDED | `<channel> :You're not channel operator` | E | ✓ |
+| 482 | ERR_CHANOPRIVSNEEDED | `<client> <channel> :You're not channel operator` | E | ✓ on the four channel sites, which name `ch->name`. **One site is not**: `REGISTER`/`UNREGISTER` refused by `account_refuse()` sends `482` with no `<channel>` and this node's own text, because neither verb has a channel and this node has no operator model to name instead. See §6.13. |
 | 483 | ERR_CANTKILLSERVER | `:You can't kill a server!` | A | `KILL` is in the dispatch table with a NULL handler, so it answers 421. No operator model. |
 | 484 | ERR_RESTRICTED | `:Your connection is restricted!` | A | No user mode `+r`. 004 advertises user modes `i` only. |
 | 485 | ERR_UNIQOPPRIVSNEEDED | `:You're not the original channel operator` | A | No `+q`/`+a`. |
@@ -270,20 +331,62 @@ know where it came from.
 | 330 | RPL_WHOISACCOUNT | ircd practice | `<nick> <account> :is logged in as`. Sent only when there is an account; absence is the RFC-conventional "not identified". The one place a person's account name reaches another user, and it is said so at the call site. |
 | 333 | RPL_TOPICWHYTIME | ircd practice | `<channel> <who> <time> :<topic>`. Every client reads a topic's setter and time from here; without it the node has no way to report who set a topic. |
 | 410 | ERR_INVALIDCAPSUBCOMMAND | IRCv3 `capability-negotiation` | `<cap> :Invalid CAP subcommand`. |
-| 417 | ERR_INPUTTOOLONG | ircdocs / ircd practice | Not in RFC 2812 or RFC 1459. Used for every over-long parameter: AWAY, PRIVMSG, SETNAME, KICK reason, TOPIC, channel name. 3.2 forbids delivering a silently shortened parameter, so *something* has to be said, and this is what clients already understand. A client that negotiated `standard-replies` gets `FAIL … ERR_INPUTTOOLONG` instead. |
+| 417 | ERR_INPUTTOOLONG | ircdocs / ircd practice | Not in RFC 2812 or RFC 1459 — **re-verified in Phase 11b** by parsing the RFC's own numeric table, which contains no 417 at all. Used for every over-long parameter: AWAY, PRIVMSG, SETNAME, KICK reason, TOPIC, channel name. 3.2 forbids delivering a silently shortened parameter, so *something* has to be said, and this is what clients already understand. A client that negotiated `standard-replies` gets `FAIL … ERR_INPUTTOOLONG` instead. |
 | 908 | RPL_SASLMECHS | IRCv3 `sasl` | `<mechs> :are available SASL mechanisms`. |
 
 ## 5. Deviations: emitted, and not quite the RFC
 
-Five. Four are defensible and argued at the call site; the fifth is open.
+**Six entries, covering seven numerics, up from five.** Four are Phase 11's and were
+re-verified against the RFC by the scan; **three numerics are new**, and all three
+were found by that scan rather than by reading. Two of the seven are not fixable
+without a decision that is not this document's to make, and the third is a one-line
+change deliberately not made here — §6.11 to §6.13 say so with the reasoning.
 
-### 5.1 `302` uses `nick+user@host`, not the RFC's `nick=+/user@host`
+| | Numeric | What |
+|---|---|---|
+| [§5.1](#51-302-and-303-put-a-list-where-the-rfc-has-a-trailing-parameter) | `302`, `303` | a nick list in middle parameters where the RFC has one trailing parameter |
+| [§5.2](#52-317-carries-two-numbers-where-the-rfcs-field-list-has-one) | `317` | two numbers where the RFC names one |
+| [§5.3](#53-368-is-also-used-as-a-refusal-with-two-middle-parameters) | `368` | a refusal role the RFC does not give it |
+| [§5.4](#54-324-adds-a-trailing-parameter-where-the-rfc-has-none) | `324` | a trailing sentence where the RFC's field list has no trailing parameter at all |
+| [§5.5](#55-432-puts-the-nickname-in-the-trailing-text) | `432` | the nickname in the trailing text |
+| [§5.6](#56-256-puts-the-server-name-in-the-sentence) | `256` | the server name in the sentence |
 
-RFC 2812 5.1 writes the reply string as `nickname [ "*" ] "=" ( "+" / "-" )
-hostname`. **Every deployed server writes `nick+user@host` and `nick*user@host`**, and
-every client parses that. Answering the RFC's literal form would be a different
-shape from what clients expect, for a numeric whose entire purpose is the shape.
-Deviation kept; the RFC's spelling is a known erratum in practice.
+**`302`, `303`, `317`, `324`, `368`, `432` and `256` are deviations. `366`, `404` and
+`482` are in §6 instead**, because each of those three is conformant on most of its
+sites and the non-conformance is one call out of several — a different kind of thing
+from a numeric this node always gets wrong.
+
+### 5.1 `302` and `303` put a list where the RFC has a trailing parameter
+
+**`302` — the spelling.** RFC 2812 5.1 writes the reply string as `nickname [ "*" ]
+"=" ( "+" / "-" ) hostname`. **Every deployed server writes `nick+user@host` and
+`nick*user@host`**, and every client parses that. Answering the RFC's literal form
+would be a different shape from what clients expect, for a numeric whose entire
+purpose is the shape. Deviation kept; the RFC's spelling is a known erratum in
+practice.
+
+**`303` — the arity, which is Phase 11b's finding.** RFC 2812 5.1: `":*1<nick> *( " "
+<nick> )"`, which is a **trailing** parameter and nothing else. Both `302` and
+`303` put the list in **middle parameters** and an empty trailing text, so the wire
+form is `:irc.test 303 alice bob carol :` rather than
+`:irc.test 303 alice :bob carol`.
+
+Phase 11 recorded `302`'s arity in its §5.1 title, which is about the spelling and
+does not mention it, and recorded `303` as conformant with a note about chunking. That
+note is
+about a real thing — `msg_verbs.c` chunks the nick list at `REPLY_MAX_MID` so a
+thousand-nickname `ISON` does not overflow `IRC_MAX_PARAMS` — but RFC 1459 2.4.3
+anticipates splitting a long list across **replies**, not putting list members in
+parameters within one reply. Chunking is the right engineering answer and it is not
+the RFC's shape.
+
+**Why not changed.** Both are the de-facto shape and a client that dispatches on the
+numeric reads the first middle parameter as the first nickname and the rest as
+continuation; a client written to the RFC's literal trailing form would find an empty
+one. The cost of conforming is a rewrite of both renderers plus every client's
+parser, and the benefit is conformance on a numeric whose field list no client
+checks. Recorded rather than churned, and now recorded for **both** numerics instead
+of one.
 
 ### 5.2 `317` carries two numbers where the RFC's field list has one
 
@@ -293,6 +396,7 @@ Short version: 317 is the only place a WHOIS reply carries a timestamp at all, t
 two-number form is what clients parse, and `<signon>` had to be a *parameter*
 rather than part of the sentence because 3.2 will not format a number into a
 non-final position — so the trailing text stays exactly where the RFC puts it.
+Re-verified by the Phase 11b scan: three middle parameters, where the RFC names two.
 
 **The trailing text is left at the RFC's own literal `"seconds idle"`.** RFC 2812
 3.3.4 makes it free text, so `"seconds idle, signon time"` would be equally
@@ -318,27 +422,84 @@ everywhere — "4.4's numerics exist to prevent" the silence failure mode), a nu
 the RFC gives a different meaning, and this. This names the offending mask, so the
 client's remedy is the same in all three cases: re-read the list, which
 `MODE #c +b` now makes possible. A client that treats 368 as "list over" loses
-nothing here, because it was not building a list from this line.
+nothing here, because it was not building a list from this line. Re-verified: one
+site at one middle parameter and one at two.
 
-### 5.4 `432` puts the nickname in the trailing text
+### 5.4 `324` adds a trailing parameter where the RFC has none
+
+**Phase 11b's finding, and the one place this document was wrong about itself in a
+way that mattered** — not just an omission but a stated justification that does not
+hold. RFC 2812 5.1 writes `324 RPL_CHANNELMODEIS "<channel> <mode> <mode params>"` —
+**three fields and no `:`**, so the field list names no trailing parameter and no
+free text. This node sends two middle parameters (`ch->name`, the mode string) and
+`:Channel modes` as the trailing text:
+
+```
+:irc.test 324 moa #MO +b :Channel modes
+```
+
+Phase 11's row for `324` recorded this as conformant and gave a reason: "the
+trailing text is the RFC's free `<text>`". That reason is false — there is no free
+`<text>` in `324`'s entry, and the re-vet found it by counting the middle parameters
+against the RFC and noticing that the RFC has three of them where the node has two.
+
+**The two halves are different in kind, and only one of them is a defect.** The
+missing `<mode params>` is honest: this node evaluates `b`, `o` and `v`, and `+b`'s
+mask is carried in a `MODE` command rather than reported here, so there is no third
+field to send. Adding a trailing sentence *is* the deviation, and it is the same
+kind as §5.6's `256` — a value moved into the text so the line has something to say
+— except that in `256`'s case the RFC names a field and in `324`'s case it does not.
+
+**Why not changed.** Removing the sentence gives `:irc.test 324 moa #MO +b :`, and
+`message_format()` is free to render the empty trailing parameter — so the change is
+mechanical. It is not made here because this is a documentation commit and because
+`324`'s trailing text is the only thing that tells a human reading a log which
+numeric they are looking at. That is a weak argument and it is stated as weak: the
+honest reason is that the sentence is not required and nobody has yet decided whether
+removing it is an improvement. It is a one-line change with no test churn and it
+belongs to whoever reads this next.
+
+### 5.5 `432` puts the nickname in the trailing text
 
 Forced, and argued at the call site. An illegal nickname may be empty, may start
 with `:`, or may hold a space; 3.2's formatter **refuses** a value that cannot be
 represented in a non-final position rather than reshaping it, so a middle parameter
 would turn a nickname refusal into a `reply_refused` counter bump — a bug report
 from ordinary client input. The trailing parameter is always representable.
+Re-verified: zero middle parameters where the RFC names one.
 
-### 5.5 `256` puts the server name in the sentence
+### 5.6 `256` puts the server name in the sentence
 
 RFC 2812 5.1: `<server> :Administrative info`. This node: `:Administrative info`,
 with the server name in the message prefix. Free text, and the value is redundant
-with the prefix.
+with the prefix. Re-verified: zero middle parameters where the RFC names one.
 
-## 6. Open findings: this phase did not change these
+## 6. Open findings
 
-Eight. Each is a real deviation with a named client-visible symptom. **None was
-changed**, and the reasons are stated individually — this is the list the next
-phase should read first.
+Thirteen, and the count is now the number of subsections rather than a number
+typed earlier. Each is a real deviation with a named client-visible symptom.
+
+**Two of them were open findings in Phase 11 and were FIXED in Phase 11b** — §6.3
+and §6.5, kept in place and rewritten as the record of what was wrong and what
+replaced it, because a table that quietly deletes the defect it was written to
+track loses the reason the fix looks the way it does. The other eleven are open,
+and each says why.
+
+| | Numeric | Status |
+|---|---|---|
+| [§6.1](#61-mode-nick-is-answered-403-err_nosuchchannel) | `403` | open — needs a user-mode decision first |
+| [§6.2](#62-privmsg-arity-is-461-not-411-and-412) | `461` for `PRIVMSG` | open — deliberate, and a real gap |
+| [§6.3](#63-461-omitted-the-command-field--fixed-in-phase-11b) | `461` | **fixed** |
+| [§6.4](#64-464-is-not-err_passwdmismatch-for-choper-or-authenticate) | `464` | open — a mapping choice |
+| [§6.5](#65-472-sent-channel-where-the-rfc-sends-char--fixed-in-phase-11b) | `472` | **fixed** |
+| [§6.6](#66-no-ban-mask-validation-so-476-cannot-happen) | `476` | open — needs a validator |
+| [§6.7](#67-481-is-absent-the-not-privileged-family-answers-482-and-464) | `481` | open — needs an operator model |
+| [§6.8](#68-501-and-502-are-unreachable) | `501`, `502` | open — same cause as §6.1 |
+| [§6.9](#69-version-is-not-a-command) | `351` | open — needs a new verb |
+| [§6.10](#610-time-ping-and-version-are-handled-as-commands-ctcp-is-not) | — | N/A, argued |
+| [§6.11](#611-366-has-no-channel-when-names-is-asked-with-no-argument-and-there-are-no-channels) | `366` | open — **new in Phase 11b**, and one line |
+| [§6.12](#612-404-has-no-channel-when-the-source-hostmask-will-not-render) | `404` | open — **new in Phase 11b** |
+| [§6.13](#613-482-has-no-channel-for-register-and-unregister) | `482` | open — **new in Phase 11b** |
 
 ### 6.1 `MODE <nick>` is answered 403 ERR_NOSUCHCHANNEL
 
@@ -382,23 +543,64 @@ is one check and `MAXTARGETS=1` in 005 makes the arity public — and 461 is not
 *false*. But the RFC names the two conditions and the node does not, which is a real
 gap, not a style preference.
 
-### 6.3 `461` omits the `<command>` field
+### 6.3 `461` omitted the `<command>` field — FIXED in Phase 11b
 
-RFC 2812 5.1: `<command> :Not enough parameters`. This node sends
-`:irc.test 461 alice :Not enough parameters` — **no command word**. Every one of its
-~30 call sites passes `NULL, 0` for the middle parameters.
+**What was wrong.** RFC 2812 5.2: `461 ERR_NEEDMOREPARAMS "<client> <command> :Not
+enough parameters"`. All 29 `reply_refused()` sites passed `NULL, 0` for the middle
+parameters, so `<command>` was absent from every one and the wire read:
 
-**Symptom.** A client that echoes "wrong parameters for *WHICH* command" cannot.
-Several clients parse 461's first parameter to attribute the error; they get the
-trailing text where the command should be.
+```
+:alice JOIN
+:irc.test 461 alice :Not enough parameters
+```
 
-**Why not changed.** This is the highest-value fix in the document and it was left
-alone for a specific reason: **the existing tests assert the current bytes.** Nine
-assertion sites across seven files pin `:irc.test 461 <nick> :Not enough parameters`
-(`test_knock.c` ×2, `test_messaging.c` ×2, `test_invite.c` ×2,
-`test_standard_replies.c` ×3, `test_account.c` ×1). Correcting the arity means
-correcting all of them. See the handoff: this is the one decision the architect
-needs to make.
+**Symptom, as recorded in Phase 11.** A client that echoes "wrong parameters for
+*WHICH* command" cannot. Several clients parse 461's first middle parameter to
+attribute the error; they got the trailing text where the command should be.
+
+**Why Phase 11 did not change it, and why that was correct then.** The existing
+tests asserted the current bytes, and correcting a conformance defect by correcting
+the assertions that pin it is a decision with an owner, not a judgement call. Phase
+11's own count of the damage was also **wrong**, which is worth recording because the
+next reader would otherwise trust it: it said *"nine assertion sites across seven
+files"*. The real figure is **eighteen sites across ten files** —
+`test_account.c` ×1, `test_choper.c` ×4, `test_invite.c` ×2, `test_knock.c` ×2,
+`test_messaging.c` ×2, `test_nick_rule.c` ×1, `test_serverinfo.c` ×1,
+`test_standard_replies.c` ×3, `test_userhost.c` ×2. Phase 11 found the two examples it
+named and generalised from them.
+
+**What Phase 11b did, and the shape it chose.** The fix is in `reply_refused()`, not
+at the 29 call sites: `command` is already an argument to that function and is already
+used on the `FAIL` branch, so the value was present at exactly the point where the
+legacy line was rendered and simply was not used. Three things bound it:
+
+- **The legacy branch only.** A `FAIL` already carries `command` as its own required
+  `<command>`, so prepending there would render
+  `FAIL PRIVMSG PRIVMSG NEED_MORE_PARAMS …`.
+- **461 only.** `451` has no `<command>` field and does not even route through
+  `reply_refused()`; `462` and `464` have trailing text only; `482`'s field is the
+  channel, which its callers already pass. `numeric_carries_command()` in `reply.c`
+  names all four so the rule cannot drift into "every refusal names the verb".
+- **A NULL or empty `command`, or a mid list already at `REPLY_MAX_MID`, falls
+  through unchanged.** A refused reply is silence, and silence is the failure mode
+  these numerics exist to prevent — reached by trying to be more conformant.
+
+**On case and NULL.** Neither is reachable and both are guarded anyway. `message.c`'s
+parser upper-cases the command word and `lookup()` compares with `strcmp`, so a
+dispatch only succeeds on the exact uppercase spelling — which means the field is
+byte-identical to what the client sent and cannot be NULL. The guards exist so that
+property stays a fact about the callers rather than a hazard of the function.
+
+**The tests, and why correcting eighteen needles was not enough.** All eighteen now
+name the verb. That alone would not have caught the defect it fixes, and would not
+catch it again: a needle of `461 alice :Not enough parameters` has no room for the
+missing field, and a needle of `461 alice PRIVMSG :…` passes against a node that
+**hardcoded** `PRIVMSG` — the same defect wearing a hat. So
+`tests/integration/test_numeric_arity.c` is new and asserts the **field list**:
+twenty-two probes over seventeen verbs, each decomposed into RFC 1459 2.3 fields and
+checked positionally; `451` asserted to have three parameters; `482` asserted to keep
+its channel as the field after `<client>`; a `standard-replies` client asserted to
+carry the verb exactly once; one 461 per probe, counted.
 
 ### 6.4 `464` is not `ERR_PASSWDMISMATCH` for `CHOPER` or `AUTHENTICATE`
 
@@ -419,29 +621,51 @@ which is right.
 461 for. It is a mapping choice with no real client depending on it, and it is
 recorded rather than churned.
 
-### 6.5 `472` sends `<channel>` where the RFC sends `<char>`
+### 6.5 `472` sent `<channel>` where the RFC sends `<char>` — FIXED in Phase 11b
 
-RFC 2812 5.1: `472 ERR_UNKNOWNMODE — "<char> :is unknown mode char to me for
-<channel>"`. **The `<char>` is a middle parameter and the channel is named in the
-text.** This node sends the channel as the middle parameter and names no mode
-character:
+**What was wrong.** RFC 2812 5.2: `472 ERR_UNKNOWNMODE "<client> <char> :is unknown
+mode char to me for <channel>"`. Both sites sent `ch->name` as the single middle
+parameter, so the channel was delivered where the character belongs and no
+character was named anywhere:
 
 ```
 :alice MODE #MO +k secret
 :irc.test 472 alice #MO :Unknown mode character
 ```
 
-**Symptom.** Two, and the second is the worse one. (a) The message names no
-character, so a user who mistyped `+k` is told "unknown mode character" without
-being told which one. (b) A client parsing 472 by position reads `#MO` as the mode
-character it got wrong — it will now believe the node rejected the sigil `#`.
+**Symptom, as recorded in Phase 11.** Two, and the second is the worse one. (a) The
+message named no character, so a user who mistyped `+k` was told "unknown mode
+character" without being told which one. (b) A client parsing 472 by position read
+`#MO` as the mode character it got wrong — it would conclude the node rejected the
+sigil `#`.
 
-**Why not changed.** The same reason as §6.3, and it is the same shape of problem:
-three assertion sites pin the current bytes (`test_channels.c` ×2,
-`test_serverinfo.c` ×1). The fix is `<char>` as the middle parameter with the
-channel in the text, i.e. `:irc.test 472 alice k :is unknown mode char to me for
-channel #MO` — and RFC 1459 4.4's own wording, which puts the channel in the text,
-is the better of the two available sentences.
+**Why Phase 11 did not change it.** The same reason as §6.3, and the same shape of
+problem: three assertion sites pinned the current bytes (`test_channels.c` ×2,
+`test_serverinfo.c` ×1). That count was **correct**.
+
+**What Phase 11b sends.** RFC 1459 4.4's sentence, which puts the channel in the text
+and is the better of the two available wordings because it is the only one that
+leaves the channel in the line at all:
+
+```
+:alice MODE #MO +k secret
+:irc.test 472 alice k :is unknown mode char to me for channel #MO
+```
+
+**On the two sites.** They keep the same shape and the same comment rather than
+sharing a helper, because the character is a different *expression* at each —
+`m->params[1][0]` at the first (the byte that is neither `+` nor `-`) and the loop
+variable `mode` at the second, one byte of a string like `+oks` — and what must not
+vary between them is the field list. Each gets a `char[2]` because `message_format()`
+refuses a value it cannot represent in a non-final position, and a bare `char` would
+be one past the end of an object rather than a NUL-terminated string.
+
+**The tests.** The three needles are corrected, and that alone was not enough: the old
+needle had the channel in the same wrong slot, so it could not fail on a field-list
+error. `expect_472_fields()` in `test_channels.c` now decomposes the line into RFC
+1459 2.3 fields and asserts the character by position, the text whole, and the whole
+line byte for byte — **three** cases, not two, because `+s` reaches the mode-loop
+site and the first two never did.
 
 ### 6.6 No ban-mask validation, so `476` cannot happen
 
@@ -501,6 +725,92 @@ CTCP `PING` to a nick is asking the *user* to answer, not the server, and a serv
 that answered would be impersonating a user. A client that sends CTCP `VERSION` to a
 channel and gets no reply sees a timeout, which is the normal outcome for an
 unanswered CTCP and not a protocol fault.
+
+### 6.11 `366` has no `<channel>` when `NAMES` is asked with no argument and there are no channels
+
+**New in Phase 11b, found by the field-list scan, and the cheapest of the three.**
+RFC 2812 5.2: `366 RPL_ENDOFNAMES "<client> <channel> :End of /NAMES list"`. Three of
+this node's four `366` sites go through `send_end_of_names()` and name the channel
+correctly. The fourth does not: `NAMES` with **no argument** on a node with **zero
+channels** takes a short-circuit that calls `reply()` directly with `NULL, 0`:
+
+```
+:alice NAMES
+:irc.test 366 alice :End of /NAMES list
+```
+
+**Symptom.** A client building its channel list from a bare `NAMES` closes it on 366
+and has no channel name to label the window with. Every other 366 on this node — for
+`NAMES #x`, and for the per-channel loop of a bare `NAMES` over a non-empty node —
+carries the name, so a client that reads `<channel>` finds it absent exactly once and
+in the one case where there was nothing to read.
+
+**Why not changed here, stated plainly.** It is a **one-line change** —
+`send_end_of_names(s, c, "*")` instead of the direct `reply()`, which also removes the
+only `366` on this node that bypasses its own helper. It is not made in Phase 11b
+because Phase 11b's code changes are the two arity defects it was given, and widening
+that to a third numeric in a documentation commit is how a pass stops being
+reviewable. The open question it needs answered is small and is stated for the next
+reader: **is `*` the right value?** It is the RFC 1459 2.3 wildcard target, it is
+representable in a non-final position, and every server that answers a channel-less
+`NAMES` this way uses it — but it is a decision about what a client sees, not a
+mechanical substitution, and it is not this document's to take.
+
+### 6.12 `404` has no `<channel>` when the source hostmask will not render
+
+**New in Phase 11b.** RFC 2812 5.2: `404 ERR_CANNOTSENDTOCHAN "<client> <channel
+name> :Cannot send to channel"`. One site gets it right — a channel the client is not
+on, with `t.name` as the field and the RFC's own sentence. One does not:
+
+```c
+if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
+    (void)reply(s, c, "404", NULL, 0, "Cannot send: unrenderable source");
+```
+
+Two deviations on that line: no `<channel name>`, and a sentence that is not the
+RFC's.
+
+**Symptom.** Small, and mostly for a log reader: a client sees 404 with no channel and
+a sentence it has no mapping for. Ordinary client input cannot reach it —
+`conn_hostmask()` fails only on a byte RFC 1459 2.3 will not put in a prefix, and
+`accept()` cannot produce one — so this is a refusal on what `reply.c` calls a bug
+report.
+
+**Why not changed.** The channel name *is* available at this point (`m->params[0]`,
+the arity check has already passed), so the field could be filled — but it has not
+been resolved yet, and `params[0]` may be a nickname, in which case sending it as
+`<channel name>` would be a new falsehood rather than a conformant answer. Resolving
+the target first would mean running `fanout_resolve()` before the prefix check, which
+reorders the handler around a path that exists to catch an internal fault. The
+sentence could be aligned with the RFC's independently, but that leaves the line still
+missing its field, so half a fix would be a cosmetic half. It needs the target-kind
+decision, not a string edit.
+
+### 6.13 `482` has no `<channel>` for `REGISTER` and `UNREGISTER`
+
+**New in Phase 11b.** RFC 2812 5.2: `482 ERR_CHANOPRIVSNEEDED "<client> <channel>
+:You're not channel operator"`. Four sites name `ch->name` and are conformant. The
+fifth is `account_refuse()`, which answers a refused `REGISTER` or `UNREGISTER`:
+
+```c
+(void)reply_refused(s, s, c, verb, "ERR_ACCOUNTREGISTRATIONDISABLED", "482", NULL, 0,
+                    "%s", text);
+```
+
+**Symptom.** A client that keys "you are not a channel operator" on 482 shows that
+message for a `REGISTER` that was refused because the deployment has no open
+registration — which is a different fact, and one the client's wording gets wrong in
+a way that sends a user looking for a channel.
+
+**Why not changed.** There is no channel to name: neither verb has one, and the
+condition is not about a channel at all. So the honest options are §6.7's `481` — which
+is absent because this node has no operator model — or `461`, which is what §6.2's
+neighbouring choices do and which would be as wrong in a different way. `account_refuse()`
+already passes its code as an override, so the fix is one argument; **which** argument
+is the decision §6.7 has not made, and closing §6.13 without it would close it wrongly.
+A client that negotiated `standard-replies` gets
+`FAIL REGISTER ERR_ACCOUNTREGISTRATIONDISABLED`, which is correct and is the reason
+this is a compatibility question rather than a correctness one.
 
 ## 7. `005` completeness
 
@@ -562,7 +872,9 @@ So 436 is absent by design rather than by omission. The cost, stated: a node
 watching a peer KILL a user for a collision sees something this node never does,
 and an operator debugging a mesh has one fewer numeric to look for.
 
-## 10. What Phase 11 changed, in one place
+## 10. What changed, in one place
+
+### 10.1 Phase 11
 
 | Change | Kind | Test |
 |---|---|---|
@@ -574,23 +886,56 @@ and an operator debugging a mesh has one fewer numeric to look for.
 | `317`'s trailing text left at the RFC's literal string, argued at the call site | a decision, recorded | — |
 | `msg_verbs.c`'s USERHOST comment corrected: `MODE <nick>` is 403, not 472 | a doc claim the sweep falsified | — |
 
+### 10.2 Phase 11b
+
+| Change | Kind | Test |
+|---|---|---|
+| `461` sends its `<command>` field, from `reply_refused()` rather than from 29 call sites | arity — §6.3 | eighteen corrected needles, plus the new `test_numeric_arity.c` (field-list, 22 probes over 17 verbs, plus `451`, `482` and the `FAIL` branch) |
+| `472` sends the mode character as its middle field and names the channel in RFC 1459 4.4's sentence | arity — §6.5 | three corrected needles, plus `expect_472_fields()` in `test_channels.c` (positional, three cases) |
+| §1's 84/53/23 split corrected from "130 in 5.1 and 30 in 5.3" | this document was wrong | §1.1 |
+| `303`'s arity recorded — Phase 11 marked it `✓` | this document was wrong | §5.1 |
+| `324`'s trailing parameter recorded — and Phase 11's justification for it retracted | this document was wrong | §5.4 |
+| `366`, `404`, `482` rows corrected from `✓` — each has one non-conformant site | this document was wrong | §6.11, §6.12, §6.13 |
+| §6's count corrected from "eight" to thirteen, and from "None was changed" | this document was wrong | §6 |
+| §2's "fifty-nine rows" corrected to sixty, one of them a §4 numeric | this document was wrong | §2 |
+| Phase 11's count of `461`'s assertion damage corrected from nine sites to eighteen | this document was wrong | §6.3 |
+
+**The pattern is the point, and it is stated rather than buried.** Eight of the ten
+corrections above are to *this document*, not to `src/` — the two code changes are the
+first two rows and everything else is a claim this file made that turned out to be
+wrong. Phase 11 read six source
+files carefully and wrote 596 lines about them; Phase 11b parsed 176 call sites
+against the RFC's own text and found that the table's `✓` column was wrong in five
+places, its counts were wrong in four, and two of its deviation justifications did
+not hold. Every `✓` in §2 is now backed by a mechanical arity comparison rather than
+by a reading, which is the only reason to expect the column to survive the next
+phase.
+
 ## 11. What this document does not claim
 
-- **It is not a claim of full conformance.** Eleven numerics are recorded as open
-  findings and four as deviations; a server with all of them closed would still not
-  be conformant to RFC 2812 section 3's "All commands described in this section MUST
-  be implemented", which this node departs from deliberately in the operator, TRACE,
-  STATS and diagnostics families.
+- **It is not a claim of full conformance.** Thirteen findings are recorded in §6 —
+  eleven open, two fixed — and seven deviations in §5; a server with all of them
+  closed would still not be conformant to RFC 2812 section 3's "All commands
+  described in this section MUST be implemented", which this node departs from
+  deliberately in the operator, TRACE, STATS and diagnostics families.
+- **The mechanical check verified arity, not sense.** §1.1 says what it can and
+  cannot see. It compared *how many* middle parameters reach the wire against *how
+  many* the RFC's field list names. It did not check that the values are right, that
+  the text is the RFC's, or that the numeric answers the question being asked —
+  which is why §5 and §6 are judgement and not output.
 - **It does not claim the count in §1 stays right.** Nothing in CI reads this file,
-  so a numeric added later does not decrement the "absent" figure. The table is a
-  snapshot; §11 says so again.
+  so a numeric added later does not decrement the "absent" figure. §1.1's method is
+  written down so the next sweep can re-run it rather than re-derive it; what it
+  cannot do is notice on its own.
 - **It says nothing about numerics RFC 2812 does not define.** §4 covers the eight
   this node emits and the de-facto names they come from. The wider registry (the
   ISUPPORT `draft/` tokens, the `005` extensions other servers send) is out of
   scope and §7 is the boundary.
 - **The "Here" column is about emission, not correctness.** A numeric marked `E` is
   emitted; whether its field list is right is the last column's job and, where the
-  answer is "no", §5 or §6 says so. Six rows are `E (deviation)`.
+  answer is "no", §5 or §6 says so. Nine rows are `E` and deviate in some way:
+  `256`, `302`, `303`, `317`, `324`, `368`, `432` in §5, plus `366` and `482`, whose
+  deviation is one site out of several and is in §6.
 - **It is a snapshot of `src/` at this commit.** A numeric added in a later phase
   does not appear here, and the check-skips and CI gates do not read this file — a
   stale row is invisible to the build.

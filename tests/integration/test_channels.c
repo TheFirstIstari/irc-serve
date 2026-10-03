@@ -117,6 +117,147 @@ static void client_send(client_t *cl, const char *line)
     TF_CHECK_MSG(tc_send(&cl->c, line) == 0, "tc_send(%s) failed", line);
 }
 
+/* Assert that 472's MIDDLE FIELD is the mode character, by decomposing the line
+ * rather than matching it.
+ *
+ * RFC 2812 5.2 writes 472 as
+ *
+ *     472  "<client> <char> :is unknown mode char to me for <channel>"
+ *
+ * so the field after <client> is the CHARACTER and the channel is named in the
+ * text. RFC 1459 4.4 words the same sentence the same way.
+ *
+ * WHY A PARSER AND NOT A NEEDLE. The two needles this file used to carry were
+ * `:irc.test 472 moa #MO :Unknown mode character` -- one byte apart, both wrong,
+ * both passing. That is the shape of a defect that survives a sweep: the needle
+ * and the line agreed with each other, and neither agreed with the RFC. A needle
+ * has no way to notice that the field the RFC calls <char> held a channel, because
+ * the needle had a channel in that position too.
+ *
+ * So this decomposes the line into RFC 1459 2.3 fields and asserts each by
+ * position. It cannot be satisfied by a 472 whose middle field is a channel, and
+ * it cannot be satisfied by a 472 that names no character at all. It also asserts
+ * the WHOLE line byte for byte, because a parser that only counted fields would
+ * pass `:irc.test 472 moa k :whatever you like`.
+ *
+ * `chan` is the channel the client named and `mode_char` the byte it asked for;
+ * both are written out at the call site rather than derived from `want`, so a
+ * caller cannot assert the channel in the mode slot by accident.
+ *
+ * `from` IS A BUFFER OFFSET, and it is load-bearing rather than hygiene: the first
+ * version of this helper searched the whole accumulated buffer and found the FIRST
+ * 472 ever sent on the connection. It then asserted `MODE #mo +s` answered with `k`
+ * -- the character from an earlier case -- and would have passed a node that never
+ * answered `+s` at all. Every case below sends `send_and_drain()` first and passes
+ * what it returned, which is the offset of the drain PONG and therefore the end of
+ * the window the command under test answered in. */
+#define CHAN_MAX_FIELD 200
+
+static void expect_472_fields(test_client_t *c, size_t from, const char *what,
+                              const char *chan, const char *mode_char)
+{
+    char line[512];
+    char fields[8][CHAN_MAX_FIELD];
+    char text[256];
+    const char *at;
+    const char *p;
+    int n = 0;
+
+    TF_CHECK_MSG(from < tc_received(c),
+                 "%s: the window offset %zu is past the end of the buffer (%zu "
+                 "bytes), so this would be asserting against nothing", what, from,
+                 tc_received(c));
+    at = strstr(tc_buffer(c) + from, ":" BIN_NAME " 472 ");
+    TF_CHECK_MSG(at != NULL, "%s: no 472 line reached the buffer", what);
+    if (at == NULL) {
+        return;
+    }
+    TF_CHECK_MSG(at == tc_buffer(c) || at[-1] == '\n',
+                 "%s: the 472 found is the tail of a longer line, not a line of "
+                 "its own", what);
+    {
+        size_t len = strcspn(at, "\r\n");
+
+        if (len + 1u > sizeof line) {
+            TF_CHECK_MSG(0, "%s: the 472 line is %zu bytes, longer than this "
+                         "file's %zu buffer", what, len, sizeof line);
+            return;
+        }
+        memcpy(line, at, len);
+        line[len] = '\0';
+    }
+
+    /* Strip the prefix, then split on spaces with a leading ':' starting the
+     * trailing parameter -- RFC 1459 2.3's rule, and the only one that survives a
+     * prefix, a nickmask and a mode string that may itself hold a colon. */
+    p = strchr(line, ' ');
+    TF_CHECK_MSG(p != NULL, "%s: the 472 line has no parameters", what);
+    if (p == NULL) {
+        return;
+    }
+    p++;
+    while (*p != '\0' && n < 8) {
+        size_t len;
+
+        if (*p == ':') {
+            len = strlen(p);
+        } else {
+            const char *sp = strchr(p, ' ');
+
+            len = (sp != NULL) ? (size_t)(sp - p) : strlen(p);
+        }
+        if (len >= CHAN_MAX_FIELD) {
+            TF_CHECK_MSG(0, "%s: a 472 field is %zu bytes, longer than this "
+                         "file's bound", what, len);
+            return;
+        }
+        memcpy(fields[n], p, len);
+        fields[n][len] = '\0';
+        n++;
+        if (*p == ':') {
+            break;
+        }
+        p = strchr(p, ' ');
+        if (p == NULL) {
+            break;
+        }
+        p++;
+    }
+    if (n >= 8) {
+        TF_CHECK_MSG(0, "%s: the 472 line has more than 8 fields", what);
+        return;
+    }
+
+    /* 472, <client>, <char>, :<text>. Four is the RFC's field list; three means no
+     * character was sent at all and five means something was added. */
+    TF_CHECK_MSG(n == 4,
+                 "%s: 472 must have 4 parameters (472, <client>, <char>, :<text>) "
+                 "and has %d. RFC 2812 5.2's field list is \"<client> <char> :is "
+                 "unknown mode char to me for <channel>\", so 3 means no character "
+                 "was named and 5 means something was added.\n  line: %s", what, n,
+                 line);
+    if (n != 4) {
+        return;
+    }
+    TF_CHECK_MSG(strcmp(fields[2], mode_char) == 0,
+                 "%s: 472's <char> is \"%s\" and must be \"%s\". This is the whole "
+                 "point of the check: a client parsing 472 by position reads this "
+                 "field as the mode character it got wrong, so a channel here means "
+                 "the node appears to have rejected the channel's own sigil.\n"
+                 "  line: %s", what, fields[2], mode_char, line);
+
+    /* And the channel is still in the line, in the text where the RFC puts it. */
+    (void)snprintf(text, sizeof text, ":is unknown mode char to me for channel %s",
+                   chan);
+    TF_CHECK_MSG(strcmp(fields[3], text) == 0,
+                 "%s: 472's text is \"%s\" and must be \"%s\" -- the channel has to "
+                 "be somewhere, and RFC 1459 4.4 puts it in the sentence rather "
+                 "than in a parameter.\n  line: %s", what, fields[3], text, line);
+    TF_CHECK_MSG(strstr(line, chan) != NULL,
+                 "%s: 472 must still name the channel \"%s\" somewhere\n  line: %s",
+                 what, chan, line);
+}
+
 /* Assert the EXACT line, CRLF included, and that it starts a line. The CRLF is
  * part of the needle so this proves the line is terminated on the wire rather
  * than being a prefix of a longer one, and the leading boundary is checked
@@ -990,17 +1131,56 @@ static void test_mode(nf_node_t *node)
 
     /* A mode this node does not evaluate is 472 by name, not silence and not
      * 421. 004 advertises b,k,l,imnpst and this node acts on b alone; a node
-     * that accepted 'k' would have a 324 that disagrees with its behaviour. */
-    client_send(&a, "MODE #mo +k secret");
-    (void)send_and_drain(&a, "m-472");
-    expect_line(&a.c, "472 for a mode this node does not evaluate",
-                ":irc.test 472 moa #MO :Unknown mode character\r\n");
+     * that accepted 'k' would have a 324 that disagrees with its behaviour.
+     *
+     * THE CHARACTER IS `k` AND THE CHANNEL IS IN THE TEXT, which is 5.2's field
+     * list. It used to be the other way round: the middle parameter was the
+     * channel and no character was named anywhere. */
+    {
+        size_t from = send_and_drain(&a, "m-472");
 
-    /* A mode string with no sign is 472 too. */
-    client_send(&a, "MODE #mo k");
-    (void)send_and_drain(&a, "m-472b");
-    expect_line(&a.c, "472 for a mode string with no sign",
-                ":irc.test 472 moa #MO :Unknown mode character\r\n");
+        client_send(&a, "MODE #mo +k secret");
+        (void)send_and_drain(&a, "m-472-after");
+        expect_line(&a.c, "472 for a mode this node does not evaluate",
+                    ":irc.test 472 moa k :is unknown mode char to me for channel "
+                    "#MO\r\n");
+        expect_472_fields(&a.c, from, "472 for a mode this node does not evaluate",
+                          "#MO", "k");
+    }
+
+    /* A mode string with no sign is 472 too, and the character is the string's
+     * first byte -- here `k`, which is the byte that is neither '+' nor '-'. A
+     * client that sent `MODE #mo 9` would get `9` in the middle field, which is
+     * the whole point of asserting the character rather than a fixed literal. */
+    {
+        size_t from = send_and_drain(&a, "m-472b");
+
+        client_send(&a, "MODE #mo k");
+        (void)send_and_drain(&a, "m-472b-after");
+        expect_line(&a.c, "472 for a mode string with no sign",
+                    ":irc.test 472 moa k :is unknown mode char to me for channel "
+                    "#MO\r\n");
+        expect_472_fields(&a.c, from, "472 for a mode string with no sign", "#MO",
+                          "k");
+    }
+
+    /* A THIRD CHARACTER, to prove the field is the client's byte and not a
+     * constant that happens to be `k`. `s` is advertised in 004 and is not
+     * evaluated either, and `MODE #mo +s` puts a real sign on a character this
+     * node does not act on, so it exercises the OTHER 472 site -- the one inside
+     * the mode loop, where the character is the loop variable rather than the
+     * mode string's first byte. Both sites must render the same field list, and
+     * this case plus the two above is what says they do. */
+    {
+        size_t from = send_and_drain(&a, "m-472c");
+
+        client_send(&a, "MODE #mo +s");
+        (void)send_and_drain(&a, "m-472c-after");
+        expect_line(&a.c, "472 from the mode loop",
+                    ":irc.test 472 moa s :is unknown mode char to me for channel "
+                    "#MO\r\n");
+        expect_472_fields(&a.c, from, "472 from the mode loop", "#MO", "s");
+    }
 
     /* A non-op cannot set a mode. */
     client_send(&b, "MODE #mo +o mob");

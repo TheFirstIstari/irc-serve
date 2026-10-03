@@ -271,12 +271,17 @@ int main(void)
      * would have to special-case it. Three is also 461, for the reason
      * msg_verbs.c's send_message() gives: the grammar has already absorbed
      * everything after a ':', so a third parameter is not text the client meant
-     * to send. */
+     * to send.
+     *
+     * The `CHOPER` between alice and the text is RFC 2812 5.2's `<command>` field,
+     * which 461's field list names. It is asserted in all four needles because
+     * these four cases share one arity check and one answer, and a needle that
+     * stopped at `461 alice` would pass against a 461 that named no verb. */
     from = mark(&alice);
     TF_CHECK_MSG(tc_send(&alice.c, "CHOPER alice") == 0, "tc_send failed");
     end = mark(&alice);
     expect_in_window(&alice, from, end, "461 for one parameter",
-                     ":" BIN_NAME " 461 alice :Not enough parameters\r\n");
+                     ":" BIN_NAME " 461 alice CHOPER :Not enough parameters\r\n");
     expect_absent_in_window(&alice, from, end, "the one-parameter CHOPER",
                             " 464 ");
 
@@ -284,14 +289,14 @@ int main(void)
     TF_CHECK_MSG(tc_send(&alice.c, "CHOPER") == 0, "tc_send failed");
     end = mark(&alice);
     expect_in_window(&alice, from, end, "461 for no parameters",
-                     ":" BIN_NAME " 461 alice :Not enough parameters\r\n");
+                     ":" BIN_NAME " 461 alice CHOPER :Not enough parameters\r\n");
 
     from = mark(&alice);
     TF_CHECK_MSG(tc_send(&alice.c, "CHOPER alice " SECRET " extra") == 0,
                  "tc_send failed");
     end = mark(&alice);
     expect_in_window(&alice, from, end, "461 for three parameters",
-                     ":" BIN_NAME " 461 alice :Not enough parameters\r\n");
+                     ":" BIN_NAME " 461 alice CHOPER :Not enough parameters\r\n");
     expect_absent_in_window(&alice, from, end, "the three-parameter CHOPER",
                             " 464 ");
 
@@ -310,7 +315,7 @@ int main(void)
     TF_CHECK_MSG(tc_send(&alice.c, "CHOPER :" SECRET) == 0, "tc_send failed");
     end = mark(&alice);
     expect_in_window(&alice, from, end, "461 for a trailing password",
-                     ":" BIN_NAME " 461 alice :Not enough parameters\r\n");
+                     ":" BIN_NAME " 461 alice CHOPER :Not enough parameters\r\n");
     expect_absent_in_window(&alice, from, end, "the trailing-password CHOPER",
                             " 464 ");
     expect_absent_in_window(&alice, from, end, "the trailing-password CHOPER",

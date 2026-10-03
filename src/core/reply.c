@@ -444,6 +444,37 @@ int reply_std(server_t *s, conn_t *src, const char *type, const char *command,
     return emit_built(s, src, type, NULL, params, (int)n);
 }
 
+/* Is `numeric` the one legacy code whose RFC 2812 5.2 field list carries a
+ * `<command>` of its own?
+ *
+ * 461 ERR_NEEDMOREPARAMS is "<client> <command> :Not enough parameters", and it is
+ * the ONLY numeric this file renders whose RFC field list has a field before the
+ * trailing text that the caller does not already supply. The four other codes that
+ * come through reply_refused() are the opposite cases and the check is written to
+ * make that explicit rather than accidental:
+ *
+ *   417  not an RFC 2812 numeric at all -- it is in this node's own de-facto
+ *        registry (see docs/RFC2812_CONFORMANCE.md section 4), so there is no
+ *        RFC field list to conform to and nothing to add.
+ *   451  ERR_NOTREGISTERED is ":You have not registered" -- no field before the
+ *        text -- and it is not even routed through reply_refused() today; the one
+ *        site calls reply() directly (commands.c). Naming it here records why the
+ *        rule may never become "every refusal gains a command".
+ *   462  ERR_ALREADYREGISTRED has only the trailing text.
+ *   464  ERR_PASSWDMISMATCH has only the trailing text.
+ *   482  ERR_CHANOPRIVSNEEDED is "<channel> :You're not channel operator", and its
+ *        channel is a field the CALLER passes -- the four sites that use it pass
+ *        ch->name -- so a second copy of the command would be a second, different
+ *        field where the RFC has one.
+ *
+ * Cost: three byte comparisons on a path that is already rendering a string, and
+ * no table to keep in step -- which is the property the real fix depends on. */
+static int numeric_carries_command(const char *numeric)
+{
+    return numeric != NULL && numeric[0] == '4' && numeric[1] == '6' &&
+           numeric[2] == '1' && numeric[3] == '\0';
+}
+
 /* The four numerics this node uses for MORE THAN ONE distinct refusal, and the
  * `FAIL` code each becomes. This is the whole of the migration table and it is
  * here rather than at the call sites for the reason this file is the one place a
@@ -537,16 +568,19 @@ int reply_refused(server_t *s, conn_t *src, const char *command, const char *fai
      * negotiated `standard-replies`?
      *
      * NO -- `reply()` with the legacy numeric, `mid`, `nmid` and the caller's own
-     * format string. Byte-identical to what the caller would have got by calling
-     * `reply()`. That is the guarantee, and it is STRUCTURAL rather than a matter
-     * of each call site being careful: there is exactly one branch and it is the
-     * old call, so there is nothing to be careful about.
+     * format string. Identical to what the caller would have got by calling
+     * `reply()`, with ONE deliberate exception: for 461 the RFC's `<command>`
+     * field is prepended from `command`, which is below and at the point where it
+     * is rendered. The exception is one numeric and one field, it is the field the
+     * RFC names, and it happens here rather than at 29 call sites precisely so
+     * that it cannot be forgotten at the 30th.
      *
      * YES -- `reply_std()` with `FAIL`, the caller's command word, the mapped code,
      * the SAME `mid` list as the `<context>` parameters and the same text as the
      * `<description>`. The middle parameters carry over unchanged because they name
      * the thing the refusal is about (a channel, a nickname) and that is exactly
-     * what `<context>` is for.
+     * what `<context>` is for. `command` is passed as FAIL's OWN `<command>` and is
+     * NOT prepended to that list, because FAIL has one and the two would collide.
      *
      * A NULL `fail_code` AND an unmapped `legacy` falls through to `reply()` too,
      * so this function is SAFE at any call site including one whose numeric this
@@ -597,6 +631,56 @@ int reply_refused(server_t *s, conn_t *src, const char *command, const char *fai
 
     code = std_fail_code(legacy, fail_code);
     if (cap_standard_replies_enabled(src) == 0 || code == NULL) {
+        /* RFC 2812 5.2: 461 ERR_NEEDMOREPARAMS is
+         *     "<client> <command> :Not enough parameters"
+         * and the <command> is a FIELD, not decoration. Every one of this node's 29
+         * call sites passed NULL, 0 for the middle list, so the field was absent from
+         * all 29 and a client could not attribute the refusal to a verb -- it read the
+         * trailing text where the verb should have been.
+         *
+         * THE FIX IS HERE AND NOT AT THE CALL SITES, and that is the whole argument
+         * for it: `command` is already an argument to this function and is already
+         * used on the FAIL branch below, so the value is PRESENT at exactly the point
+         * where the legacy line is rendered and was simply not used. Prepending it
+         * repairs all 29 at once. Editing 29 call sites would leave 29 places to forget
+         * -- which is how the arity drifted into tests in the first place.
+         *
+         * ONLY THE LEGACY BRANCH. A `FAIL` already carries `command` as its own
+         * <command> field (it is a REQUIRED field of FAIL), so prepending here too
+         * would render `FAIL PRIVMSG PRIVMSG NEED_MORE_PARAMS ...` and put the verb
+         * where a client reads its own context parameter.
+         *
+         * ONLY FOR THE ONE NUMERIC THAT HAS THE FIELD. numeric_carries_command()
+         * documents the four that do not; the point of naming 451 explicitly is that
+         * it is the same word, "not enough parameters" is not even its text, and a
+         * rule of "every refusal names the verb" would give it a field the RFC does
+         * not have.
+         *
+         * A NULL OR EMPTY `command` FALLS THROUGH UNCHANGED rather than being
+         * rendered. reply() refuses a NULL middle parameter (bad_param) and
+         * message_format() refuses a value it cannot represent in a non-final
+         * position, so prepending a NULL would turn a delivered 461 into a REFUSED
+         * one -- silence, which is the failure mode this node's numerics exist to
+         * prevent, reached by trying to be more conformant. No site can supply one
+         * today (every argument is a string literal, and message.c's parser
+         * upper-cases the command word, so the field is byte-identical to what the
+         * client sent and cannot be NULL), and the guard is what keeps that a
+         * property of the callers rather than a hazard of this function.
+         *
+         * A FULL mid LIST FALLS THROUGH UNCHANGED for the same reason, and the
+         * arithmetic is the RFC's: target + mids + text must fit IRC_MAX_PARAMS, so
+         * a 461 that already carries REPLY_MAX_MID middle parameters has no room for
+         * the command word. Answering without the field beats not answering. */
+        if (numeric_carries_command(legacy) && command != NULL &&
+            command[0] != '\0' && nmid < REPLY_MAX_MID) {
+            const char *with_cmd[REPLY_MAX_MID];
+
+            with_cmd[0] = command;
+            for (size_t i = 0; i < nmid; i++) {
+                with_cmd[i + 1] = mid[i];
+            }
+            return reply(s, src, legacy, with_cmd, nmid + 1, "%s", text);
+        }
         return reply(s, src, legacy, mid, nmid, "%s", text);
     }
 

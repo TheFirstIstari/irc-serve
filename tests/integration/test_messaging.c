@@ -51,9 +51,9 @@
  * precisely the reason a window is better than a wait.
  *
  * The scoping is not decoration. tc_expect() searches the whole accumulated
- * buffer, so a second ` 461 alice :Not enough parameters` would match the FIRST
- * one and return instantly, and the wait covering the command under test would
- * never happen. That is a test that passes against a node which stopped
+ * buffer, so a second ` 461 alice PRIVMSG :Not enough parameters` would match the
+ * FIRST one and return instantly, and the wait covering the command under test
+ * would never happen. That is a test that passes against a node which stopped
  * answering after the first case. Here the search is always over the span the
  * command could have answered in, and the drain token is unique per call.
  *
@@ -558,9 +558,15 @@ int main(void)
          * three-parameter PRIVMSG is written `PRIVMSG #t a b`, and it is
          * refused rather than guessed at: the node cannot know whether the
          * client meant "a" or "b" as the body, and delivering one of them would
-         * be delivering a message the client did not write. */
-        (void)snprintf(want, sizeof want, ":%s 461 alice :Not enough parameters",
-                       BIN_NAME);
+         * be delivering a message the client did not write.
+         *
+         * The verb BETWEEN alice and the text is 5.2's `<command>` field, and it
+         * is asserted because it is per-verb: this loop runs against PRIVMSG and
+         * NOTICE, so a node that hardcoded one word would pass the other half of
+         * the loop and fail this. RFC 2812 5.2 is
+         * `<client> <command> :Not enough parameters`. */
+        (void)snprintf(want, sizeof want, ":%s 461 alice %s :Not enough parameters",
+                       BIN_NAME, verb);
         (void)snprintf(line, sizeof line, "%s", verb);
         send_expect(&alice, line, want);
         (void)snprintf(line, sizeof line, "%s #t", verb);
@@ -628,8 +634,14 @@ int main(void)
             s2 = drain(&alice);
             e1 = drain(&bob);
             e2 = drain(&carol);
-            expect_in_window(&alice, s1, s2, "the refusal itself",
-                             ":" BIN_NAME " 461 alice :Not enough parameters\r\n");
+            /* Same arity case, checked where the three-parameter probe above is sent, so
+             * the `<command>` field is asserted on a line whose verb is `verb`
+             * rather than a hardcoded PRIVMSG. expect_in_window() takes a
+             * literal needle, so the line is composed first. */
+            (void)snprintf(want, sizeof want,
+                           ":%s 461 alice %s :Not enough parameters\r\n",
+                           BIN_NAME, verb);
+            expect_in_window(&alice, s1, s2, "the refusal itself", want);
             expect_absent_in_window(&bob, f1, e1, "a member, for a refused body",
                                     "leaked");
             expect_absent_in_window(&carol, f2, e2, "a member, for a refused body",

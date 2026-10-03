@@ -335,6 +335,12 @@ static void case_461(void)
 
     TF_CHECK_MSG(nf_spawn_binary(&node) == 0, "could not spawn the node");
 
+    /* The verb BETWEEN the target and the text is RFC 2812 5.2's `<command>`
+     * field, and these three legacy needles assert it. That is the shape a
+     * standard-replies client does NOT get: `command` is already FAIL's own
+     * <command> there, so the paired FAIL lines below must NOT grow one, and
+     * asserting both halves of every pair is what keeps the two renderings from
+     * drifting into each other. */
     /* TOO MANY -- and the text lies.
      *
      * `AWAY one two`, NOT `AWAY :one two`: a trailing parameter swallows the rest
@@ -345,14 +351,14 @@ static void case_461(void)
      * text gets wrong. */
     both_answers(node.port, "away-2", "AWAY with two parameters", NULL,
                  "AWAY one two", "pmany", "smany", NULL, CAP_STANDARD_REPLIES,
-                 ":" SRV " 461 pmany :Not enough parameters\r\n",
+                 ":" SRV " 461 pmany AWAY :Not enough parameters\r\n",
                  ":" SRV " FAIL smany AWAY TOO_MANY_PARAMS :Not enough "
                  "parameters\r\n");
 
     /* TOO FEW -- USERHOST takes at least one. */
     both_answers(node.port, "userhost-0", "USERHOST with no parameter", NULL,
                  "USERHOST", "pfew", "sfew", NULL, CAP_STANDARD_REPLIES,
-                 ":" SRV " 461 pfew :Not enough parameters\r\n",
+                 ":" SRV " 461 pfew USERHOST :Not enough parameters\r\n",
                  ":" SRV " FAIL sfew USERHOST NEED_MORE_PARAMS :Not enough "
                  "parameters\r\n");
 
@@ -364,7 +370,7 @@ static void case_461(void)
     both_answers(node.port, "whois-2", "WHOIS with two parameters", NULL,
                  "WHOIS alice bob", "pneither", "sneither", NULL,
                  CAP_STANDARD_REPLIES,
-                 ":" SRV " 461 pneither :Not enough parameters\r\n",
+                 ":" SRV " 461 pneither WHOIS :Not enough parameters\r\n",
                  ":" SRV " FAIL sneither WHOIS INVALID_PARAMS :Not enough "
                  "parameters\r\n");
 

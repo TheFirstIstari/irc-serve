@@ -1684,8 +1684,37 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
         return; /* 437 already sent */
     }
     if (m->params[1][0] != '+' && m->params[1][0] != '-') {
-        (void)reply(s, c, "472", (const char *const[]){ ch->name }, 1,
-                    "Unknown mode character");
+        /* 472 ERR_UNKNOWNMODE, and RFC 2812 5.2's field list for it is
+         *
+         *     472  "<client> <char> :is unknown mode char to me for <channel>"
+         *
+         * -- so the MODE CHARACTER is the middle parameter and the CHANNEL is named
+         * in the text. RFC 1459 4.4 words the same sentence the same way, and this
+         * is the better of the two available spellings for the reason the call site
+         * used to get wrong: it is the only one that leaves the channel in the line.
+         *
+         * THIS USED TO SEND ch->name AS THE MIDDLE PARAMETER AND NAME NO CHARACTER
+         * AT ALL, which is two faults in one field:
+         *
+         *   - the field the RFC calls <char> held a channel, so a client parsing
+         *     472 by position read `#MO` as the rejected mode character and
+         *     concluded the node had refused the sigil `#`;
+         *   - and because no character was named anywhere, a user who mistyped
+         *     `+k` was told "unknown mode character" without being told which one.
+         *
+         * `ch` HAS A BUFFER because message_format() refuses a value it cannot
+         * represent in a non-final position, and a bare `char` would be one past
+         * the end of an object rather than a NUL-terminated string. The character
+         * here is params[1][0] -- the mode string's first byte -- because that is
+         * the byte that is not '+' or '-', which is the whole condition. */
+        char unknown[2];
+
+        unknown[0] = m->params[1][0];
+        unknown[1] = '\0';
+        (void)reply(s, c, "472", (const char *const[]){ unknown }, 1,
+                    "is unknown mode char to me for channel %s", ch->name);
+        printf("[observable] chan_mode_refused: channel=%s nick=%s reason=%s\n",
+               ch->name, c->nick, unknown);
         return;
     }
     if (m->params[1][1] == '\0') {
@@ -1881,9 +1910,30 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
         /* 004 advertises b,k,l,imnpst; this node evaluates b, and o/v are prefix
          * modes rather than channel modes. A node that accepted a mode it does
          * not act on would have a 324 that disagrees with its behaviour, so the
-         * unevaluated ones are refused by name. */
-        (void)reply(s, c, "472", (const char *const[]){ ch->name }, 1,
-                    "Unknown mode character");
+         * unevaluated ones are refused by name.
+         *
+         * THE SAME FIELD LIST AS THE OTHER 472 ABOVE, and for the same reasons:
+         * RFC 2812 5.2 is "<client> <char> :is unknown mode char to me for
+         * <channel>", so the middle parameter is the CHARACTER the client asked
+         * for and the channel goes in the sentence. Sending ch->name there -- which
+         * is what this did -- is the field-list error docs/RFC2812_CONFORMANCE.md
+         * section 6.5 recorded: a client parsing 472 by position reads the channel
+         * as the mode character it got wrong.
+         *
+         * The two sites are separate because the character is a different
+         * expression at each: here it is the LOOP variable, one byte of a
+         * multi-letter string like "+oks", and up there it is the mode string's
+         * first byte. Sharing a helper would need both passed in, and the one thing
+         * that must not vary between them is the field list -- which is why both
+         * carry the same comment rather than a shared function. */
+        char unknown[2];
+
+        unknown[0] = mode;
+        unknown[1] = '\0';
+        (void)reply(s, c, "472", (const char *const[]){ unknown }, 1,
+                    "is unknown mode char to me for channel %s", ch->name);
+        printf("[observable] chan_mode_refused: channel=%s nick=%s reason=%s\n",
+               ch->name, c->nick, unknown);
         return;
     }
 }

@@ -334,12 +334,17 @@ int main(void)
     /* Bare USERHOST is 461 rather than an empty answer. There is no default
      * name set: RFC 2812 3.3.4's <nickname> is mandatory, and answering an
      * omitted argument with "nobody" would be inventing a question the client
-     * did not ask. */
+     * did not ask.
+     *
+     * `USERHOST` is 5.2's `<command>` field, asserted so that "461 arrived" and
+     * "461 named the verb" are the same check: a needle of `461 alice :Not
+     * enough` would pass against a node that dropped the field. */
     from = mark(&alice);
     TF_CHECK_MSG(tc_send(&alice.c, "USERHOST") == 0, "tc_send failed");
     end = mark(&alice);
     expect_in_window(&alice, from, end, "461 for a bare USERHOST",
-                     ":" BIN_NAME " 461 alice :Not enough parameters\r\n");
+                     ":" BIN_NAME " 461 alice USERHOST :Not enough "
+                     "parameters\r\n");
     TF_CHECK_MSG(count_in_window(&alice, from, end, " 302 ") == 0,
                  "a bare USERHOST produced %zu 302 lines, expected none",
                  count_in_window(&alice, from, end, " 302 "));
