@@ -2567,6 +2567,21 @@ implementation tasks** — chathistory because this design's posture is fail-clo
 with no buffered state, and that is a genuine conflict with §2.2's disposal rules
 rather than an omission.
 
+**Phase 10.15 — the seven that are still not implemented, settled with reasons.**
+SPEC_TRACKING §10.17 is the record and it is deliberately longer than a status table,
+because four of the seven are not "not started" but *decided against in this shape*:
+`chathistory` is a **documented design conflict** with four named things that would have to
+change first; `websocket` is a **transport** and `sts` a **crypto surface** with no
+protocol content at all; `sasl-3.2` splits into a framework this node **has** (`sasl_framework.c`
+implements RFC 4616 `PLAIN` against a credential store) and two mechanisms it does not
+(`SCRAM` needs a credential store that can hold a salted iterated verifier, `EXTERNAL` needs
+TLS or a bouncer), with `sasl-3.1` retired in favour of `3.2`; the five **client-only**
+specifications are **N/A for a server** because their subject is the presentation of a
+message to a human; `oper-tag` is blocked because **the predicate it asks about does not
+exist** on a node with no operator concept; and `account-extban` is blocked on **the one gap
+§4.4.2 already named when it withheld `EXTBAN=` from `005`** — one missing ban-expression
+grammar with three consequences, counted once.
+
 **Phase 10.2a — `account-tag` (issue #117). COMPLETE.** §2.5.3's emission: the tag
 is stamped once per emission in `fanout.c`, gated per destination on the
 recipient's own `account-tag`, withheld from an unidentified sender and withheld

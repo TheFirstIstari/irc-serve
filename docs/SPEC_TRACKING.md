@@ -1150,6 +1150,219 @@ than as the outcome: one connection may hold a nickname (the registry answers `4
 the "other connections" set is empty and case 4 asserts that. Had the feature been built
 to the brief's reading it would have been a no-op with a passing test.
 
+### 10.17 Phase 10.15 — the seven specifications that are NOT implemented, and why
+
+**NO CODE IN THIS PASS.** Every row below is a decision, a block, or a correction of a
+misreading, and each carries its reasoning rather than a shrug. Where a specification is
+blocked, the missing thing is named; where it is out of scope, the scope boundary is named;
+where the brief was wrong about it, that is said first.
+
+| Specification | Status | The reasoning |
+|---|---|---|
+| **`chathistory`** | **NOT IMPLEMENTED — a DESIGN CONFLICT, and the instruction is to document it and leave it** | See below. This is the only item in the phase that is not a "not started" |
+| **`websocket`** | **OUT OF SCOPE — a transport, not a protocol feature** | See below |
+| **`sts`** | **OUT OF SCOPE — a crypto surface** | See below |
+| **`sasl-3.2`** | **OUT OF SCOPE for the MECHANISMS; the framework is present** | See below |
+| **`client-tags/channel-context`, `react`, `reply`, `typing`, `batch/react`** | **N/A FOR A SERVER** | See below |
+| **`oper-tag`** | **BLOCKED — on a subsystem that does not exist** | See below |
+| **`account-extban`** | **BLOCKED — on the one gap already named twice** | See below |
+
+---
+
+#### `chathistory` — a design conflict, documented and NOT implemented
+
+**THE INSTRUCTION WAS EXPLICIT: document the conflict, do not implement.** This section is
+that document, and it is the longest thing in this phase that is not code.
+
+**WHAT IT WOULD REQUIRE.** `draft/chathistory` answers "what was said in `#t` while I was
+away". On this node the answer is: nothing, because nothing is kept. `resume.c`'s restore
+hands a client back the channels it was in at disconnect, and that is a **session** — it
+keeps nothing that was not said while the client was connected, so it cannot answer a
+question about last week. §4.4.2 already refuses to advertise `draft/CHATHISTORY` for
+exactly this reason: "Advertising it would put a client into a state it cannot leave."
+
+**THE CONFLICT IS WITH §2.2's DISPOSAL RULE, and it is not a matter of effort.** §2.2
+frees a channel with no local members and no member-server, and the paragraph above it
+gives the reason in one sentence: "holding one per channel *name* a client ever typed
+would be an **unbounded store reachable from the wire**." A message history is exactly
+that, and worse — it is unbounded in **time** as well as in name, because a channel's
+history grows for as long as anybody is talking.
+
+The design already solved this once, and the solution is the template for what a history
+would need. A channel's **topic** is the one field whose loss a client can see, so
+`topic`/`topic_who`/`topic_when` are copied into a **bounded cache on `server_t`** at
+disposal and copied back at creation. Four limits are stated there rather than left to a
+reader: it does not survive a restart, only the topic is carried, the bound is small, and
+the cache's lifetime is exactly the channel's.
+
+**WHAT WOULD HAVE TO CHANGE IN THE DESIGN, stated as the four things and not as a shrug:**
+
+1. **A bounded, time-boxed history per channel**, on `server_t`, with a bound on **both**
+   axes — messages per channel and age. §2.2's rule is about the first; a history needs the
+   second, and an age bound is a new kind of thing on this node because nothing in the
+   design currently ages anything out on a timer. §3.4 forbids a write inside the event
+   loop, so the eviction would have to run from the poll tick.
+2. **A stated answer to "what is the bound, and who decided".** §2.2's topic cache has a
+   bound this project chose and documented. A history's bound is a *policy* an operator
+   will have opinions about, which makes it a configuration surface — and §4.5's
+   `--sasl-store` / `--account-store` argument is about secrets, not about retention, so
+   there is no existing precedent for it.
+3. **A decision about federation, which is the one that would actually be expensive.** 4.3's
+   frozen verb table has no message verb for history and `SBURST` carries nicks, channels,
+   topics and away — **not messages**. So a mesh member's history would be empty unless a
+   new S-verb were added, and §6 forbids inventing a wire format after Phase 6. The two
+   S-verbs that already exist (`SPRIVMSG`, `SNOTICE`) are live traffic, and a history is
+   not live traffic: replaying old messages through them would put them in every
+   duplicate-suppression store and every `msgid` namespace as though they were new.
+4. **A storage decision, and this is where the fail-closed posture bites.** The posture is
+   fail-closed with no buffered state, and a history is buffered state on purpose. §2.2's
+   channel disposal and §2.3's load reporting both assume that what a node holds can be
+   recomputed from the mesh; a history cannot be, because the mesh does not carry it.
+
+**THE COST OF LEAVING IT OUT, and it is small.** A client that joins a channel after a
+conversation sees nothing of it. Every IRC client already treats that as normal, because
+`chathistory` is a draft and no widely-deployed client requires it. **The cost of
+implementing it without the four decisions above is larger**: unbounded wire-reachable
+memory, which is the exact defect §2.2 names.
+
+---
+
+#### `websocket`, `sts`, `sasl-3.2` — a transport, a crypto surface, and two mechanisms
+
+**`websocket` — a TRANSPORT, not a protocol feature.** The specification changes how bytes
+reach the node: an HTTP upgrade handshake, then a framed stream instead of CRLF lines.
+Everything above that — the parser, `dispatch()`, every capability, every numeric — is
+unchanged, which is a good sign that it is a different layer rather than a missing
+feature. Implementing it means: a listener that speaks HTTP for exactly one request, a
+frame codec, and a decision about what a half-open upgrade costs while a client
+misbehaves. **None of that is protocol work and all of it is this node's job**, which is
+precisely why it is out of scope for a phase about IRCv3 specifications. §4.4.1's rule
+gives the honest alternative: if it is wanted, `WEBSOCKET=302` is an `005` token and
+there is a place to add it.
+
+**`sts` — a CRYPTO SURFACE, and the reason is stronger.** `sts` ("Strict Transport
+Security") tells a client to *only* ever use TLS, and it depends on a `tls` capability
+this node does not have. Advertising `sts` without `tls` would be advertising a promise
+this node cannot keep, which is `cap.h`'s rule in its strongest form. **And it is not
+implementable in isolation**: `sts` is a policy layered on `tls`, and `tls` is Phase 8's
+`STARTTLS` which this node does not implement either. Two specifications, one transport,
+and the bottom one is missing.
+
+**`sasl-3.2` — the FRAMEWORK IS HERE; the two MECHANISMS ARE NOT.** This needs splitting,
+because the brief listed it as one thing and it is two:
+
+- **The SASL framework is implemented.** `sasl_framework.c` implements RFC 4616 `PLAIN`
+  against a credential store, `CAP LS` withholds `sasl` when no store was loaded (a node
+  with no credentials cannot authenticate anybody), and `AUTHENTICATE` is answered inside
+  the registration burst.
+- **`sasl-3.2` names `SCRAM-SHA-1`/`SCRAM-SHA-256` and `EXTERNAL`, and this node
+  implements neither.** `EXTERNAL` authenticates a client by a credential it presented
+  *elsewhere* — a TLS client certificate, or an already-authenticated `sasl` identity from
+  a bouncer — and this node has neither TLS nor bouncer support, so there is nothing for
+  `EXTERNAL` to assert. `SCRAM` is a challenge-response mechanism: the server holds a
+  **salted, iterated hash** rather than a plaintext-equivalent secret, and
+  `account_store.c` holds the latter. Storing SCRAM verifiers correctly is a credential
+  store redesign, and getting it wrong is a silent authentication weakness rather than a
+  loud failure.
+- **`sasl-3.1` IS RETIRED IN FAVOUR OF `3.2`, and that is why `3.1` is not on this list at
+  all.** Implementing the retired version would mean implementing the wrong one.
+
+**WHAT WOULD HAVE TO CHANGE, briefly:** for `websocket`, a transport layer and a new
+listener; for `sts` and `tls`, a TLS listener and `STARTTLS`, and then a policy on top;
+for `sasl-3.2`, a credential store that can hold a SCRAM verifier, which is a change to
+`account_store.c`'s file format and to every test that reads it.
+
+---
+
+#### Client-only specifications — N/A FOR A SERVER, with the reasoning
+
+`client-tags/channel-context`, `client-tags/react`, `client-tags/typing`,
+`client-tags/reply`, and the `batch/react` batch type. **All five are N/A for a server, and
+the reason is one sentence from the specifications themselves: their subject is the
+PRESENTATION OF A MESSAGE TO A HUMAN.**
+
+- **`typing`** is "the user is typing a message". A server can observe the `TAGMSG` but the
+  observation has no meaning without the typing indicator the client draws.
+- **`react`** is a reaction to a message. The IRCv3 registry records it as a **client-only
+  tag**; a server relaying it is a `PRIVMSG`-shaped relay with no semantics, and the
+  specification's own framing is that the client shows the reaction.
+- **`reply`** marks a message as a reply to another `msgid`. The server half of that is
+  **already implemented**: `msgid` is stamped on every line this node relays (Phase 10) and
+  forwarded across a link with 2.4's identity intact. What the `reply` tag adds is the
+  *display* — an indent, a quote — and that is the client's.
+- **`channel-context`** is "display this private message as if it were in `#chan`". A server
+  has no display.
+- **`batch/react`** is a **batch type**, and the `batch` specification says batch types are
+  "not advertised by servers nor explicitly requested by clients" — a server-emitted
+  `react` batch would be a server deciding how a client presents reactions, which is the
+  opposite of what the type is for.
+
+**THE GENERAL RULE, and it is worth having written down**: a **client-only tag** is one the
+IRCv3 specifications define as travelling *directly between clients with no server
+involvement*. A server that recognises one and acts on it is inventing semantics. The one
+partial exception here is `reply`, and the partial exception is `msgid`, which this node
+already emits and which is what the tag's value refers to.
+
+---
+
+#### `oper-tag` — blocked on a subsystem this node does not have
+
+The specification adds a `+` tag to `PRIVMSG`/`NOTICE` **when the sender is an IRC
+operator**. So it needs operator flags.
+
+**This node has no operator concept at all**, and that is not a gap in one handler:
+`conn_t` has no operator field, `004` advertises a user-mode set of `i` that nothing
+evaluates, `CHOPER` answers `464` for every request, and `KNOCK` is refused with `482`
+precisely because "the only thing the RFC names as that authority is an IRC operator". So
+the block is not "the tag is hard" — it is that **the predicate the tag asks about does not
+exist**. A node cannot stamp `+` on messages from operators it does not have.
+
+**WHY IT WAS NOT IMPLEMENTED AS AN ALWAYS-ABSENT TAG.** An absent tag is a smaller lie than
+a wrong one: a client that sees `+` on a message reads "this person is an operator", and a
+client that sees nothing reads nothing. Adding the tag with no operator model behind it
+would produce the first.
+
+**WHAT WOULD HAVE TO CHANGE**, and it is a whole phase rather than a handler: §5's operator
+model — a way to be one, a way to stop being one, a way to be *seen* to be one (the
+capability's own `oper` argument), and a `MODE`-independent privilege set. §9's risk row
+for "fabricating a load metric to decide node lifecycle" is the same shape of problem: a
+node deciding something on the strength of a value it invented.
+
+---
+
+#### `account-extban` — blocked on the ONE gap this document has already named twice
+
+The specification adds `~&account:<name>` mask types to a channel ban list, so that an
+operator can ban an account rather than a hostmask.
+
+**It needs two things and this node has neither:**
+
+1. **The account.** Delivered in Phase 10.1 and available.
+2. **A ban-expression parser.** `+b` stores a mask verbatim and `chan_banned()` tests it by
+   **string equality and a glob**, per §2.2. There is no expression language, so there is
+   no `~&account:` to parse.
+
+**AND THIS IS ONE GAP NAMED TWICE ALREADY**, which is the point of listing it here rather
+than writing a new paragraph: §4.4.2 already records that `EXTBAN=` is **deliberately
+absent from `005`** because "There is no ban-**expression** parser, so there is no
+`~&account:name` and no `EXTBAN` value", and it says in the same breath "This is the same
+missing evaluator that blocks `account-extban`". §10.2's table says it a third time from the
+account side.
+
+**So the honest status is: one missing subsystem, three consequences, and they should be
+counted once.** A `+b` that stores a mask verbatim is not a bug and is not a gap in
+`chan_banned()` — it is a complete implementation of what §2.2 specifies, and the missing
+piece is the *expression grammar* that would sit above it.
+
+**WHAT IT WOULD COST**, and the estimate is deliberately coarse because the design is not
+written: a mask grammar and a parser; an evaluator with a defined precedence and a defined
+answer for a mask it cannot parse (fail closed, or ignore the mask? — the two answers have
+opposite failure modes and §2.2's posture says fail closed); an `EXTBAN=` token rendered
+from the constants the evaluator enforces, in `005`; and a per-channel bound on how much
+work one mask may cost, because a glob over a long mask against a long roster is a place a
+client can spend the node's time. **That last one is the part that has to be designed
+before it is coded**, and it is why this is a decision rather than an omission.
+
 ### 10.11 The honest limits of the account phase
 
 - **The identity is visible on ordinary traffic for LOCAL senders only.**
