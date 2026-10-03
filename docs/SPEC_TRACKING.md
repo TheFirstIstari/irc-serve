@@ -1385,3 +1385,92 @@ before it is coded**, and it is why this is a decision rather than an omission.
   subsystems that do not exist** (no channel-mode evaluator, no operator flags).
 - **Compliance is hand-written tests against spec text**, not a third-party runner:
   `ircv3/ircv3-test-suite` and `ircv3/chathistory-test-suite` do not exist.
+
+## 11. Phase 11 — the RFC 2812 conformance sweep
+
+**The deliverable is [`docs/RFC2812_CONFORMANCE.md`](RFC2812_CONFORMANCE.md)**, a
+table of every numeric RFC 2812 section 5 defines (160 of them) with what this
+node does with each one and why. It is a document in its own right because the
+next sweep — and the TLS work that precedes it, which touches the event loop and
+every read/write path — should start from that table rather than from six source
+files. Counts: **59 emitted**, **91 absent with the reason**, **10 N/A** (in RFC
+2812 5.3 only, with no role on any server), **0 unaccounted for**. The node also
+emits **8** numerics RFC 2812 does not define; §4 of that document names the
+de-facto or IRCv3 origin of each.
+
+### 11.1 What was added, and what it fixes
+
+| Numeric | Why | Test |
+|---|---|---|
+| `319` `RPL_WHOISCHANNELS` | A `WHOIS` named a person and never named a channel. **The one confirmed modern-client defect**, and it is what makes `away-notify`'s own documented promise true: the specification excludes the setter from the notification because `305`/`306` tell the setter their own state, and those two numerics tell nobody else *where* that person is | `test_whois_channels.c` §1, §2 |
+| `367`/`368` for `MODE #chan ±b` | RFC 2812 3.3.2 defines the ban list as a query with no mask. It was answered `461` — a refusal for the form that *asks* — so every client that populates a ban list on window open got an error and an empty list, on a channel where the bans were being enforced perfectly well | `test_banlist.c` §2–§4 |
+| `478` replacing `696` | `696` is `RPL_ENDOFMODES` from the historical `MODE` draft, not a ban-list-full refusal, and it named no mode letter. `478`'s field list is `<channel> <char> :Channel list is full` | `test_banlist.c` §5 |
+| `254` `RPL_LUSERCHANNELS` | RFC 2812 3.4.2 requires it whenever the channel count is non-zero, and it was never sent, so `/LUSERS` omitted a figure every client displays | `test_query_surface.c` §1, §2 |
+
+### 11.2 Two findings the sweep produced that were not numeric gaps
+
+- **`CHAN_MAX_BANS` was never enforced.** `chan_ban_add()` doubled `bcap` on
+  demand with nothing comparing `nbans` to the constant, so `channel.h`'s claim
+  that it is "a real limit rather than a formality" was false and the refusal
+  branch above was **unreachable**. Enforcing it is what makes `478` a fact rather
+  than a comment. Found by asking the obvious question — *is that refusal
+  reachable at all?* — which is a question this document now asks of every numeric
+  it lists.
+- **`MODE <nick>` is answered `403 ERR_NOSUCHCHANNEL`.** `handle_mode()`
+  canonicalises its first parameter as a channel name, so a nickname is refused as
+  an unknown channel, with the name echoed upper-cased. RFC 2812 3.3.2 answers a
+  MODE naming a nickname with `221`, or `501`/`502` for a change. A client that
+  queries a user's modes is told "no such channel" about a connected user, and
+  `501`/`502`/`221` are all unreachable as a result. It was left unchanged: every
+  answer needs a user-mode string this node does not have.
+
+### 11.3 Two arity deviations found, and NOT fixed — this is the open decision
+
+Both are in `docs/RFC2812_CONFORMANCE.md` §6 with their client-visible symptoms.
+Neither was changed, and the reason is the same for both: **the existing tests
+assert the non-conformant bytes**, so correcting the arity means correcting them,
+and this phase's constraint was that the existing suite is not edited.
+
+- **`461` omits the RFC's `<command>` field.** RFC 2812 5.1:
+  `<command> :Not enough parameters`. All ~30 call sites pass `NULL, 0`.
+  *Symptom:* a client that attributes the error to a command cannot.
+  *Pinned by:* `test_knock.c` ×2, `test_messaging.c` ×2, `test_invite.c` ×2,
+  `test_standard_replies.c` ×3, `test_account.c` ×1 — nine sites, seven files.
+- **`472` sends `<channel>` where the RFC sends `<char>`.** RFC 2812 5.1:
+  `<char> :is unknown mode char to me for <channel>`. The node names no mode
+  character at all.
+  *Symptom:* a user who mistyped `+k` is told "unknown mode character" without
+  being told which; and a client parsing 472 positionally reads `#MO` as the mode
+  character that was rejected, so it believes the node rejected the sigil `#`.
+  *Pinned by:* `test_channels.c` ×2, `test_serverinfo.c` ×1 — three sites, two
+  files.
+
+The one assertion Phase 11 DID have to change is `test_away_notify.c`'s two `WHOIS`
+**line counts** (5 → 6 and 4 → 5), because `319` adds a line to every `WHOIS` of
+a user in a channel. That assertion is a count on purpose — it is what makes
+"exactly the lines this WHOIS produced" checkable — so a new numeric has to be
+accounted for in it rather than tolerated.
+
+### 11.4 The `317` decision, recorded
+
+RFC 2812 3.3.4 makes `317`'s trailing parameter free text, so `"seconds idle"` and
+`"seconds idle, signon time"` are equally conformant and conformance cannot choose
+between them. **Left at the RFC's own literal string.** (1) It is the
+specification's literal, so a client whose numeric table carries the RFC's text
+matches this line byte for byte. (2) No client parses the trailing text of `317`;
+every one dispatches on the numeric and reads the middle parameters by position,
+so rewriting decoration nothing reads buys no compatibility. (3) An anchored
+`:seconds idle` match is a real thing in the wild and a rewritten sentence does not
+satisfy it. The full argument is at the call site in `msg_verbs.c`, next to the
+`317` the arithmetic is in.
+
+### 11.5 Teeth
+
+Nine faults across the three new test files, each **build-checked to 0 errors and
+0 warnings before its result was read** — the gate refused three earlier attempts
+that did not compile clean (`-Wunused-function`, `-Wunreachable-code`) rather than
+reporting a result for them. All nine bit. **One did not bite on the first run and
+that is recorded rather than quietly fixed**: the `319` field-order assertion
+covered only the single-line case, so a fault moving the nick into the trailing
+text of the *chunk-flush* `reply()` passed every check. It is now asserted on every
+chunked line, and the fault fails it.
