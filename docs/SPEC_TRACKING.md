@@ -905,7 +905,35 @@ indefinitely.
 - **`extended-ispupport` did not close the `KICKLEN` gap**, and did not try to.
   §10.5 names what a fix would cost.
 
-### 10.8 The honest limits of the account phase
+### 10.9 The three non-account specifications that remain, and the contract they needed first
+
+Issue #117's remaining three are `standard-replies`, `chghost` and `away-notify`.
+None of them reads `conn_t::account`, so §10.2's table was never the thing
+standing in front of them; what stood in front of all three was a **contract**,
+and that is what landed first.
+
+| Spec | Status | What it cost, and what is named as missing |
+|---|---|---|
+| the fanout contract (Phase 10.8a) | **IMPLEMENTED, as a contract rather than a feature.** §3.1.1: a per-destination **gate** beside the existing per-destination shape choice, so one emission has **three** outcomes per destination — the plain shape, the alternate shape, and **nothing**. | `fanout_form_t` chose between two wire **shapes**, and a choice between two answers cannot express "send this member nothing". All three of the remaining specifications publish to a SUBSET of a channel's members, so each would have grown its own member walk — the exact duplication `fanout.c` exists to prevent, and the reason `chan_verbs.c`'s Phase 4 broadcast helper lost its forward arm. The gate is asked **inside the walk that already asks the shape question**, in the order liveness → `exclude` → gate, and it is asked about local destinations only, so there is deliberately **no gated variant of the forwarding entry point**: a peer is not a client that negotiated anything, so the question is unaskable there rather than answerable-but-ignored. Nothing on the wire produces a gated emission until `away-notify` lands, so `test_fanout_gate.c` asserts the three outcomes **against the API** — the same argument `test_nick_index.c` makes — while still comparing the exact CRLF-terminated bytes queued for each descriptor, and asserting **zero bytes** for the refused member rather than the absence of a needle. |
+
+### 10.10 The honest limits of the fanout contract
+
+- **`setname`'s common-channel broadcast is still not implemented**, and the
+  reason has changed. It is no longer "the contract cannot express it" — the
+  contract can, and a caller needs a gate predicate and a walk of `c->chans[]`. It
+  is not landed, and §3.1.1 names the mechanism. What is still undecided is
+  whether the broadcast is gated on the destination's own `setname` negotiation:
+  `cap.h` gates the **confirmation** that way, on the grounds that a `SETNAME`
+  echo must not reach a client that did not ask, and the common-channel half has
+  to make the same decision or contradict it.
+- **The gate answers about a destination, not about a peer's clients.** A relayed
+  emission is never gated, so in a mesh a notification reaches peers' clients
+  according to what THEY negotiated, with no way for the originating node to know.
+  That is the same position `account-tag` takes (§2.5.3) and for the same reason:
+  the originating node has no registry it could ask.
+
+
+### 10.11 The honest limits of the account phase
 
 - **The identity is visible on ordinary traffic for LOCAL senders only.**
   `account-tag` (Phase 10.2a) stamps it on every line an identified client emits

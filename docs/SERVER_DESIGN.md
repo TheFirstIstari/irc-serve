@@ -856,7 +856,73 @@ spreads, never-forward-own-origin stops the copy returning to the server whose
 client wrote it, and the per-node dedup store drops the copy that comes back to a
 node that has already seen that `(origin, epoch, id)`. Exactly one bounce is the
 *designed* behaviour and is asserted as such — `test_fed_loop.c` waits for it,
-requires it to be exactly one, and then requires the counters to stop moving.
+requires it to be exactly once, and then requires the counters to stop moving.
+
+#### 3.1.1 The third outcome: a destination that is sent nothing
+
+The table above says **where** a line goes. It says nothing about **which
+destinations inside a row are addressed**, and per-destination decisions were
+already being made for two other reasons: the two wire *shapes* `extended-join`
+introduces, and the per-member tag block. A third reason arrived with Phase 10.8a
+and it is not a variation on the first two.
+
+**Two shapes is a choice between two answers.** `fanout_form_t` chose between a
+plain parameter list and an extended one, per destination, and a choice between
+two answers cannot express a third: **"send this member nothing."** Three
+specifications need that third answer, and each states its audience as a subset:
+
+| Spec | The sentence that needs a third outcome |
+|---|---|
+| `setname` | "servers MUST send the new name to all clients in common channels, as well as to the client from which it originated" |
+| `chghost` | "servers MUST send the `CHGHOST` message to other clients who share channels with the target client **and who have enabled the `chghost` capability**" |
+| `away-notify` | "clients will be sent an AWAY message when a user sharing a channel with them sets, changes or removes their away state" |
+
+Each is **unsolicited**, which is what makes the outcome an *absence* rather than
+a line. `away-notify` is the sharp case: the notification's whole grammar is
+`:nick!user@host AWAY [:message]`, so a node that "notified" a client which had not
+asked would be sending a line asserting the user is no longer away — a state
+change that did not happen. The same reasoning as `account-tag`'s absent tag
+(§2.5.3): an unsolicited assertion is as wrong as a missing one.
+
+**So the outcome is a per-destination GATE, asked by the caller, inside the walk
+this module already owns.** `fanout_deliver_local_gated()` takes
+`fanout_gate_fn(const conn_t *dst, void *ctx)` and asks it once per destination;
+a destination the gate refuses receives no line, no tag block, and no entry in the
+returned count. `NULL` is "every destination the emission reaches" and is exactly
+the pre-existing `fanout_deliver_local_forms()` — the same sentence this file uses
+for a NULL `extended`.
+
+**The alternative, and why it loses.** Three handlers each walking the roster is
+the duplication this module exists to prevent. `chan_verbs.c` grew its own
+broadcast helper in Phase 4 for exactly that reason and **it had no forward arm,
+and the missing forward was lost**. A handler walk also has to reproduce
+`chan_member_live()`, and one that does not manufactures an `n_reply_refused` —
+the counter `reply.c` holds at zero because a non-zero value is a bug report.
+
+**The gate is asked of a LOCAL DESTINATION and nothing else**, which is why there
+is no gated variant of the forwarding entry point: a peer is not a client that
+negotiated anything, so on that path the question is unaskable rather than
+answerable-but-ignored. A parameter a caller can set on a path where it cannot
+mean anything is a parameter that will be set and believed.
+
+**The order inside the walk is liveness, then `exclude`, then the gate**, cheapest
+first. Asking the gate last would still send the right bytes, but it would have
+rendered a tag block and possibly reported a `fanout_unhandled_form` for a
+destination that was never going to be written to — and the second of those is a
+bug report on the node's observable output caused by a member who was never in the
+conversation.
+
+**Verified where the outcome is not yet reachable from a command.**
+`tests/integration/test_fanout_gate.c` holds one channel, three members and three
+negotiations at once — none, `extended-join`, `extended-join` plus a gate that
+refuses — and asserts all three outcomes from one call: the exact plain line, the
+exact extended line, and **zero queued bytes** for the member the gate refused.
+Zero rather than "the line is absent from the buffer", because absence-from-a-
+buffer is satisfied by a line that arrived somewhere else in the stream. It also
+asserts that the gate is asked once per destination and **not at all** about a
+destination `exclude` had already removed, which is the one property no
+byte-comparison can see.
+
 
 ### 3.2 Message representation
 
@@ -2099,6 +2165,15 @@ dependencies —
 **N/A**: a server implementing them would be implementing something that is not
 their subject.
 
+**Phase 10.8a put a routing-contract change in FRONT of all three**, because all
+three needed one and none of them could have introduced it without duplicating
+it. `setname`'s common-channel broadcast was recorded as unimplemented because the
+per-destination decision was a choice between two wire **shapes**; `chghost` and
+`away-notify` need the same third outcome, and the three together are three member
+walks in three handlers unless the routing module expresses it once. §3.1.1 is that
+expression: a per-destination **GATE** beside the existing per-destination shape
+choice, both asked inside the one walk `fanout.c` already owns.
+
 **There is no official IRCv3 conformance suite.** `ircv3/ircv3-test-suite` and
 `ircv3/chathistory-test-suite` do not exist. Compliance here is hand-written tests
 against spec text, which is a weaker guarantee than a green third-party runner and
@@ -2158,6 +2233,22 @@ Single node:
       `tests/integration/test_userhost_in_names.c` runs three connections against
       one channel and one member: two that negotiated and one that did not, and the
       bare-nick answer is asserted on a connection that has seen nothing else.
+- [x] *Phase 10.8a:* **the routing module can express all THREE per-destination
+      outcomes**, and does so in one place. §3.1.1: a plain shape, an alternate
+      shape, and **nothing at all** for a destination the caller declines to
+      address. This is a precondition for three specifications whose audiences are
+      subsets of a channel — `setname`, `chghost`, `away-notify` — and it is a
+      precondition rather than a feature because the alternative was three member
+      walks in three handlers, which is the duplication `fanout.c` exists to
+      prevent (`chan_verbs.c`'s own broadcast helper lost a forward arm that way in
+      Phase 4).
+      `tests/integration/test_fanout_gate.c` holds one channel, three members and
+      three negotiations at once and asserts the exact plain line, the exact
+      alternate line, **zero queued bytes** for the refused member, and that the
+      gate is asked once per destination and not at all about one `exclude` had
+      already removed. That last claim is invisible on the wire — it is why the
+      file counts rather than searching — and it went green the first time the
+      corresponding fault was injected, which is why the case exists.
 
 Federated:
 - [ ] Two-node fixture: cross-server join visibility, cross-server `PRIVMSG`
@@ -2348,4 +2439,5 @@ Quality:
 | **A realname stored without validation** (Phase 10.6) | an unbounded or under-validated realname is a memory-safety bug and a **log-injection vector** — the field reaches this node's own `printf("%s")` with no escaping, so `0x07` rings a recipient's bell and ESC `[` is a CSI sequence a terminal executes | **One predicate, two writers.** `conn_realname_check()` is called by *both* `handle_user()` and `handle_setname()`, so "SETNAME is not a looser path than registration" is a property of the code rather than a claim about it. It refuses over-long values and every C0 control and DEL; `message_parse_n()` refuses CR/LF/NUL ahead of it, and the test covers the rest. `SETNAME` refuses; `USER` empties rather than refusing, because refusing `USER` would strand a half-registered client — §4.2.1 argues it and the empty result is a legal state |
 | **`SETNAME` silently ignoring a client that did not negotiate** (Phase 10.6) | read as "the command does not exist" by a client that tried it anyway, which `setname` explicitly permits | **It is the specification's instruction**, and it is implemented rather than worked around: no reply, no change. A `FAIL SETNAME CANNOT_CHANGE_REALNAME` needs `standard-replies`, which this node does not have, and inventing a `FAIL` would put a command word on the wire no client here has been told to expect. The test asserts **exhaustively** — the drain `PONG` must be the only line in the window — because a list of absent numerics is not a test of silence (a `482` fault passed the first version of it) |
 | **A message delivered twice to a client that negotiated `echo-message`** (Phase 10.7) | every message the user sends appears twice, from two different-looking prefixes — the defect the capability exists to remove, arrived at from the other side | **There is no second emission.** The capability decides one thing: whether the sender stays in the audience of the delivery that is happening anyway (`msg_verbs.c`'s `exclude`). The sender of a channel `PRIVMSG` was *already* in the audience, so the copy is that one; only `NOTICE`, which RFC 1459 2.4.2 removes, is affected. `test_echo_message.c` **counts** copies rather than searching for them — the two copies are identical apart from the prefix, so a substring assertion passes — and one of its faults adds exactly the extra emission |
+| **An unsolicited notification reaching a client that did not ask** (Phase 10.8a) | the notification is an ASSERTION about a user — their realname changed, their ident and host changed, they are away or no longer away — so sending it to a client that did not negotiate is as wrong as not sending it to one that did. `away-notify` is the sharp case: the line's whole grammar is `:nick!user@host AWAY [:message]`, so a "notification" with no message asserts the user is no longer away | **There is ONE per-destination gate, inside the one walk that decides who gets what (§3.1.1), and it is the absence of a line rather than a third shape.** A gate that returned a third *shape* would still have sent a line, and an empty one reads as "no longer away". The three-handler alternative was rejected for the same reason `fanout.c` exists: `chan_verbs.c`'s own broadcast helper lost a forward arm that way in Phase 4. `test_fanout_gate.c` asserts **zero queued bytes** for the refused member rather than the absence of a needle, because absence-from-a-buffer is satisfied by a line that arrived elsewhere in the stream |
 | **`KICKLEN` has no bound to advertise** (Phase 10.4) | an over-long KICK reason is not refused with a numeric; it reaches `message_format()`, which refuses it as `unrepresentable` — a non-zero `n_reply_refused`, the counter `reply.c` holds at zero because a non-zero value of it is a bug report | **Reported, not fixed, and the reason is scope.** The fix is a reason bound plus a `417` in `handle_kick()`, which is a change to a command this pass did not touch. §4.4.2 states it; the honest mitigation today is that the node logs `reply_refused ... reason=unrepresentable` naming the command, so the condition is visible rather than silent |

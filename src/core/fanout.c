@@ -804,12 +804,20 @@ static void fanout_form_for(const conn_t *dst, const fanout_form_t *extended,
  * be written to, and attempting it is a guaranteed n_reply_refused -- a
  * non-zero value of the counter reply.c keeps at zero precisely because a
  * non-zero value means a bug. A teardown that is correct in every other respect
- * must not manufacture one. */
+ * must not manufacture one.
+ *
+ * `gate` IS ASKED HERE, PER MEMBER, and this is the whole of the third outcome:
+ * a member it refuses is skipped before `all` is built, so it gets no line and
+ * no tag block and is not counted. See fanout.h for why it is a predicate and
+ * not a third shape, and for the order it is asked in relative to liveness and
+ * `exclude` -- the three tests run in that order and each is cheaper than the
+ * next. */
 static int write_to_members(server_t *s, const fanout_target_t *t,
                             const char *prefix, const char *verb,
                             const char *const *params, int nparams,
                             conn_t *exclude, const irc_serve_tags_t *ident,
-                            const char *account, const fanout_form_t *extended)
+                            const char *account, const fanout_form_t *extended,
+                            fanout_gate_fn gate, void *gate_ctx)
 {
     /* THE SHAPE IS DECIDED PER MEMBER AND EVERYTHING ELSE IS NOT, which is the
      * whole of what `extended` adds to this function. The parameter list, the
@@ -861,6 +869,20 @@ static int write_to_members(server_t *s, const fanout_target_t *t,
             continue;
         }
         if (exclude != NULL && m == exclude) {
+            continue;
+        }
+        /* AND THE GATE, AFTER `exclude` AND BEFORE ANY RENDERING, which is the
+         * order that matters twice over. Asking it last means a member this
+         * emission was never going to reach is not asked a question about it,
+         * and asking it before the shape is resolved means a gated-off member
+         * cannot influence anything -- not the `use`/`nuse` locals, not the
+         * arity report below, not the tag buffer. A node that asked the gate
+         * LAST would still send the right bytes, but it would have rendered a
+         * tag block and possibly reported a `fanout_unhandled_form` for a
+         * destination that was never going to be written to, and the second of
+         * those is a bug report on the node's observable output caused by a
+         * member who was never in the conversation. */
+        if (gate != NULL && gate(m, gate_ctx) == 0) {
             continue;
         }
         /* PER MEMBER, and the buffer is per member too rather than hoisted: the
@@ -922,9 +944,22 @@ int fanout_deliver_local(server_t *s, const fanout_target_t *t, const char *pref
 }
 
 int fanout_deliver_local_forms(server_t *s, const fanout_target_t *t,
-                              const char *prefix, const char *verb,
-                              const fanout_form_t *plain,
-                              const fanout_form_t *extended, conn_t *exclude)
+                               const char *prefix, const char *verb,
+                               const fanout_form_t *plain,
+                               const fanout_form_t *extended, conn_t *exclude)
+{
+    /* NO GATE, which is what "one shape for everybody" and "everybody gets it"
+     * both mean here -- the two sentences are the same sentence now, and they
+     * were two independent NULLs before the gate existed. */
+    return fanout_deliver_local_gated(s, t, prefix, verb, plain, extended, NULL, NULL,
+                                      exclude);
+}
+
+int fanout_deliver_local_gated(server_t *s, const fanout_target_t *t,
+                               const char *prefix, const char *verb,
+                               const fanout_form_t *plain,
+                               const fanout_form_t *extended, fanout_gate_fn gate,
+                               void *gate_ctx, conn_t *exclude)
 {
     const char *const *params = (plain != NULL) ? plain->params : NULL;
     int nparams = (plain != NULL) ? plain->nparams : 0;
@@ -936,6 +971,7 @@ int fanout_deliver_local_forms(server_t *s, const fanout_target_t *t,
         nparams < 0) {
         return 0;
     }
+
     /* THE STAMP IS MINTED AND THEN NOT USED, and that is deliberate: a local-only
      * emission still needs an identity because a member's client may be tracking
      * 2.4's msgid, and the one this function computes is the one the SAME
@@ -965,6 +1001,16 @@ int fanout_deliver_local_forms(server_t *s, const fanout_target_t *t,
         if (exclude != NULL && t->user == exclude) {
             return 0;
         }
+        /* THE GATE IS ASKED HERE TOO, and it is the row where skipping it would
+         * be least visible and most wrong: a `nick@server`-free direct delivery
+         * writes to exactly one connection, so a node that honoured the gate for
+         * channels and not for users would be a node whose unsolicited
+         * notification reaches every member of a channel and one named
+         * individual. "One question per destination" has to mean it for both
+         * kinds of destination, or the contract is a contract about channels. */
+        if (gate != NULL && gate(t->user, gate_ctx) == 0) {
+            return 0;
+        }
         {
             const char *all[IRC_MAX_PARAMS + 1];
 
@@ -985,7 +1031,7 @@ int fanout_deliver_local_forms(server_t *s, const fanout_target_t *t,
          * kind of channel it resolved would be asking a question with no answer
          * that changes anything. */
         return write_to_members(s, t, prefix, verb, params, nparams, exclude, &ident,
-                                account, extended);
+                                account, extended, gate, gate_ctx);
 
     case FANOUT_REMOTE_USER:
     case FANOUT_NONE:
@@ -1125,8 +1171,12 @@ int fanout_deliver_forms(server_t *s, const fanout_target_t *t, const char *pref
     }
 
     case FANOUT_LOCAL_CHANNEL: {
+        /* NO GATE, and the reason is fanout.h's: a gate is asked about a LOCAL
+         * DESTINATION and this row also forwards, so the two questions have
+         * different destinations and a gate here would be set by a caller
+         * believing it reached the members rather than the peers. */
         int n = write_to_members(s, t, prefix, verb, params, nparams, exclude,
-                                 &ident, account, extended);
+                                 &ident, account, extended, NULL, NULL);
 
         /* 3.1's two owned rows, AND THEY NOW SHARE ONE FORWARD ARM.
          *
@@ -1200,7 +1250,7 @@ int fanout_deliver_forms(server_t *s, const fanout_target_t *t, const char *pref
          * that do. */
         {
             int n = write_to_members(s, t, prefix, verb, params, nparams, exclude,
-                                     &ident, account, extended);
+                                     &ident, account, extended, NULL, NULL);
 
             (void)fanout_forward_channel(s, t->chan, t->vclass, verb, prefix, params,
                                          nparams, &ident, relayed);
