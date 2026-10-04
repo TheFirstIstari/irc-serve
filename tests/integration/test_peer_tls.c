@@ -195,6 +195,14 @@ int main(void)
      * the build output. DIR_MAX + PATH_MAX_SUFFIX_SLACK is the whole of it. */
     char a_cert[PF_PATH], a_key[PF_PATH], b_cert[PF_PATH], b_key[PF_PATH];
     char a_tls[PF_PATH];
+    /* Cases 4 and 5 need four more path buffers and they are named for what they
+     * hold rather than for which node uses them, because a case 4/5 fixture is
+     * used by BOTH ends: B presents `digit.crt` and A is given the same file as
+     * its --tls-ca. Naming them digit_* and wrongname_* is what makes that
+     * symmetry readable; `b_cert`/`b_key` would suggest B owns them. Same
+     * arithmetic as the buffers above: PF_PATH is PF_DIR_MAX + 128. */
+    char digit_crt[PF_PATH], digit_key[PF_PATH];
+    char wrong_crt[PF_PATH], wrong_key[PF_PATH];
     char buf[256];
     nf_node_t na;
     nf_node_t nb;
@@ -594,6 +602,246 @@ int main(void)
                       "no TLS handshake was attempted for the plaintext link, so "
                       "nothing TLS-related failed on it",
                       NULL);
+                nf_free(&na);
+            }
+            (void)nf_stop(&nb);
+            nf_free(&nb);
+        }
+    }
+
+    /* ============== CASE 4: A PEER WHOSE NAME STARTS WITH A DIGIT ============
+     *
+     * WHY THIS CASE EXISTS AT ALL, and it is a security case that happens to have
+     * a passing half, so the two halves are asserted TOGETHER and neither is
+     * allowed to stand alone:
+     *
+     * tls_openssl.c decided whether a peer name was an IP address or a hostname by
+     * reading its FIRST CHARACTER. A 2.4 server name may start with a digit --
+     * node_main.c's --name says "must start with a letter or digit" and
+     * irc_serve_server_name_valid() enforces exactly that -- so `1peer`, a name
+     * this project accepts everywhere, was sent to X509_VERIFY_PARAM_set1_ip_asc(),
+     * was refused by it, and LEFT THE VERIFY PARAMETER WITH NO NAME IN IT. A
+     * handshake with no expected name verifies the CHAIN and nothing else, so peer
+     * authentication on such a link degraded to "signed by somebody in my mesh CA".
+     * Demonstrated end to end against the shipped binary: node B `--name 1peer`
+     * presenting a CA-issued certificate for `DNS:someone.else`, node A with
+     * `--peer 1peer --peer-tls 1peer --tls-ca ca.crt`, and the log said
+     * `link_established: peer=1peer`.
+     *
+     * THE CONSEQUENCE, and it is what makes this HIGH rather than MEDIUM: the
+     * federation secret is MESH-WIDE. So any node holding any CA-issued
+     * certificate plus that one shared secret could impersonate any digit-named
+     * peer -- read the message stream, inject into it, and be introduced to third
+     * parties as a node this mesh believes is somebody else.
+     *
+     * TWO HALVES, AND THE SECOND IS NOT OPTIONAL. A fix that reads "refuse any
+     * peer name starting with a digit" passes the security assertion below and
+     * breaks every mesh that has one, which is why the MATCHING case is here and
+     * why it asserts an ESTABLISHMENT rather than an absence: `1peer` is a legal
+     * name and a legal DNS label, it must keep working, and the certificate it
+     * presents has to be verified against it.
+     */
+    {
+        static const char *const prog = "irc-serve";
+        static const char *const zero = "0";
+        static const char *const name_opt = "--name";
+        static const char *const secret_opt = "--secret";
+        static const char *const shared = "shared";
+        static const char *const peer_opt = "--peer";
+        static const char *const peer_tls_opt = "--peer-tls";
+        static const char *const cert_opt = "--tls-cert";
+        static const char *const key_opt = "--tls-key";
+        static const char *const ca_opt = "--tls-ca";
+        static const char *const port_opt = "--tls-port";
+        argv_build_t b;
+
+        /* THE SAN NAMES `1peer`. This is the certificate whose name is WRONG for
+         * CASE 5 and right for CASE 4, and the whole pair turns on that one
+         * field: both cases trust this exact file as --tls-ca and B presents this
+         * exact file, so the CHAIN verifies identically in each. */
+        check(tf_tls_make_cert(dir, "digit", "1peer", "DNS:1peer,IP:127.0.0.1", 0,
+                               86400, 0600) == 0,
+              "generate a certificate whose SAN is DNS:1peer -- a name starting "
+              "with a DIGIT, which node_main.c's --name grammar accepts",
+              NULL);
+        (void)snprintf(digit_crt, sizeof digit_crt, "%s/digit.crt", dir);
+        (void)snprintf(digit_key, sizeof digit_key, "%s/digit.key", dir);
+
+        ab_init(&b);
+        ab_add(&b, prog);
+        ab_add(&b, zero);
+        ab_opt(&b, name_opt, "1peer");
+        ab_opt(&b, secret_opt, shared);
+        ab_opt(&b, cert_opt, digit_crt);
+        ab_opt(&b, key_opt, digit_key);
+        ab_opt(&b, ca_opt, a_cert);
+        ab_opt(&b, port_opt, zero);
+        if (nf_spawn_binary_argv(&nb, ab_finish(&b)) != 0) {
+            check(0, "spawn a peer named 1peer", NULL);
+        } else {
+            (void)snprintf(buf, sizeof buf, "1peer,127.0.0.1,%d",
+                           tls_port_of(&nb));
+            ab_init(&b);
+            ab_add(&b, prog);
+            ab_add(&b, zero);
+            ab_opt(&b, name_opt, "irc.a");
+            ab_opt(&b, secret_opt, shared);
+            ab_opt(&b, peer_opt, buf);
+            ab_opt(&b, peer_tls_opt, "1peer");
+            ab_opt(&b, cert_opt, a_cert);
+            ab_opt(&b, key_opt, a_key);
+            ab_opt(&b, ca_opt, digit_crt);
+            ab_opt(&b, port_opt, zero);
+            if (nf_spawn_binary_argv(&na, ab_finish(&b)) != 0) {
+                check(0, "spawn irc.a against the digit-named peer", NULL);
+            } else {
+                check(nf_expect(&na, "link_tls_start: peer=1peer role=client",
+                                15000) == 0,
+                      "irc.a starts a TLS handshake for the DIGIT-named peer", NULL);
+                /* THE ASSERTION THAT A REFUSE-EVERY-DIGIT FIX FAILS. `1peer` is a
+                 * legal server name and its certificate's SAN matches it, so the
+                 * name check has something to check and must PASS. */
+                check(nf_expect(&na, "link_established: peer=1peer", 20000) == 0,
+                      "and the link ESTABLISHES: a peer whose name starts with a "
+                      "digit is a legal name, and fixing the skipped name check "
+                      "must not turn into refusing digit-named peers",
+                      na.out);
+                (void)nf_stop(&na);
+                check(nf_expect_u64(&na, "tls_handshake_failed=", 0u, 5000) == 0,
+                      "no handshake failed for it, because its certificate names "
+                      "it and this node verified that",
+                      NULL);
+                nf_free(&na);
+            }
+            (void)nf_stop(&nb);
+            nf_free(&nb);
+        }
+    }
+
+    /* ==== CASE 5: THE SAME DIGIT-NAMED PEER, PRESENTING A WRONG-NAME CERT ==== */
+    {
+        static const char *const prog = "irc-serve";
+        static const char *const zero = "0";
+        static const char *const name_opt = "--name";
+        static const char *const secret_opt = "--secret";
+        static const char *const shared = "shared";
+        static const char *const peer_opt = "--peer";
+        static const char *const peer_tls_opt = "--peer-tls";
+        static const char *const cert_opt = "--tls-cert";
+        static const char *const key_opt = "--tls-key";
+        static const char *const ca_opt = "--tls-ca";
+        static const char *const port_opt = "--tls-port";
+        argv_build_t b;
+        int b_tls_port;
+
+        /* A CERTIFICATE FOR A DIFFERENT NAME, TRUSTED. The chain verifies -- this
+         * file is what irc.a is given as --tls-ca, and B presents the same file, so
+         * the ONLY thing wrong with it is the name. That is what makes this case
+         * the name check's case rather than a re-run of CASE 2's untrusted-CA
+         * case: here a certificate that merely CHAINS is not enough. */
+        check(tf_tls_make_cert(dir, "wrongname", "someone.else",
+                               "DNS:someone.else", 0, 86400, 0600) == 0,
+              "generate a CA-issued certificate naming DNS:someone.else, which is "
+              "NOT the name of any peer in this test",
+              NULL);
+        (void)snprintf(wrong_crt, sizeof wrong_crt, "%s/wrongname.crt", dir);
+        (void)snprintf(wrong_key, sizeof wrong_key, "%s/wrongname.key", dir);
+
+        ab_init(&b);
+        ab_add(&b, prog);
+        ab_add(&b, zero);
+        ab_opt(&b, name_opt, "1peer");
+        ab_opt(&b, secret_opt, shared);
+        ab_opt(&b, cert_opt, wrong_crt);
+        ab_opt(&b, key_opt, wrong_key);
+        ab_opt(&b, ca_opt, a_cert);
+        ab_opt(&b, port_opt, zero);
+        if (nf_spawn_binary_argv(&nb, ab_finish(&b)) != 0) {
+            check(0, "spawn 1peer presenting a certificate for someone.else", NULL);
+        } else {
+            b_tls_port = tls_port_of(&nb);
+
+            /* ---- 5a: THE ATTACK. The peer is named `1peer` and presents a
+             * certificate for `someone.else`. ---- */
+            (void)snprintf(buf, sizeof buf, "1peer,127.0.0.1,%d", b_tls_port);
+            ab_init(&b);
+            ab_add(&b, prog);
+            ab_add(&b, zero);
+            ab_opt(&b, name_opt, "irc.a");
+            ab_opt(&b, secret_opt, shared);
+            ab_opt(&b, peer_opt, buf);
+            ab_opt(&b, peer_tls_opt, "1peer");
+            ab_opt(&b, cert_opt, a_cert);
+            ab_opt(&b, key_opt, a_key);
+            ab_opt(&b, ca_opt, wrong_crt);
+            ab_opt(&b, port_opt, zero);
+            if (nf_spawn_binary_argv(&na, ab_finish(&b)) != 0) {
+                check(0, "spawn irc.a against it", NULL);
+            } else {
+                check(nf_expect(&na, "link_tls_start: peer=1peer", 15000) == 0,
+                      "irc.a starts the handshake, so the certificate is checked "
+                      "rather than the link being abandoned before the check -- "
+                      "which is what makes the refusal below a NAME refusal",
+                      NULL);
+                /* THE ASSERTION THE SKIPPED NAME CHECK FAILS. Reverted to the
+                 * first-character discriminator this printed
+                 * `link_established: peer=1peer`, and the whole mesh's federation
+                 * secret rides on it. */
+                check(nf_expect(&na, "link_established: peer=1peer", 8000) != 0,
+                      "and the link NEVER ESTABLISHES: a peer name starting with a "
+                      "digit is verified against the peer's NAME like any other, "
+                      "so a certificate for someone.else is refused even though it "
+                      "chains to the configured --tls-ca",
+                      na.out);
+                check(nf_expect(&na, "tls_error", 5000) == 0,
+                      "OpenSSL's reason is on the wire, so an operator can tell "
+                      "this from a socket fault or an untrusted chain", NULL);
+                (void)nf_stop(&na);
+                nf_free(&na);
+            }
+
+            /* ---- 5b: THE CONTROL, and it is why 5a means anything.
+             *
+             * The SAME certificate, the SAME trust anchor, the SAME peer socket --
+             * dialled under a LETTER-initial peer name. Nothing about the
+             * certificate or the store changes; only the name does. So the two
+             * runs together say that the name is what decides, and 5a's refusal
+             * cannot be an artefact of this build refusing something else.
+             *
+             * It also pins the behaviour the fix had to MATCH rather than invent:
+             * a letter-named peer with a wrong-name certificate was already
+             * refused before this fix, and a fix that made the digit case behave
+             * differently would have made the mesh's security depend on the first
+             * character of a name. */
+            (void)snprintf(buf, sizeof buf, "irc.b,127.0.0.1,%d", b_tls_port);
+            ab_init(&b);
+            ab_add(&b, prog);
+            ab_add(&b, zero);
+            ab_opt(&b, name_opt, "irc.a");
+            ab_opt(&b, secret_opt, shared);
+            ab_opt(&b, peer_opt, buf);
+            ab_opt(&b, peer_tls_opt, "irc.b");
+            ab_opt(&b, cert_opt, a_cert);
+            ab_opt(&b, key_opt, a_key);
+            ab_opt(&b, ca_opt, wrong_crt);
+            ab_opt(&b, port_opt, zero);
+            if (nf_spawn_binary_argv(&na, ab_finish(&b)) != 0) {
+                check(0, "spawn irc.a for the letter-named control", NULL);
+            } else {
+                check(nf_expect(&na, "link_established: peer=irc.b", 8000) != 0,
+                      "the CONTROL: the identical certificate dialled under the "
+                      "letter-named peer `irc.b` is refused too, so the digit case "
+                      "now answers exactly as the letter case always did",
+                      na.out);
+                /* nf_stop() BEFORE nf_free(), as every other case here does, and
+                 * the reason is worth recording because it cost a 180-second ctest
+                 * timeout once: nf_free() closes the harness's pipe but does not
+                 * kill the child, and an orphaned node still holds the WRITE end of
+                 * the pipe ctest is reading this test's output through. Under a
+                 * shell redirect that is invisible; under ctest the run does not
+                 * reach EOF until the orphan dies, so the suite times out on a test
+                 * that printed its last line seconds earlier. */
+                (void)nf_stop(&na);
                 nf_free(&na);
             }
             (void)nf_stop(&nb);

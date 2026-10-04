@@ -69,6 +69,7 @@
  */
 #include "tls_backend.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -338,14 +339,16 @@ static const transport_ops_t k_tls_ops = {
  *     a trust anchor: no system roots, because "verify against whatever this host
  *     happens to trust" is a different policy from the one an operator configured
  *     and would silently differ per machine.
- *   - the certificate's NAME must match the host this node dialled. Chain
+ *   - the certificate's NAME must match the peer this node dialled. Chain
  *     verification alone answers "signed by somebody I trust", which is not
  *     "signed by the peer I meant to reach": a certificate for `irc.evil` signed
  *     by the same CA would satisfy the chain check, and a compromised peer could
  *     present it for a link this node believes is somebody else. An IP literal is
  *     matched against iPAddress SANs rather than dNSNames, which is what
  *     X509_VERIFY_PARAM_set1_ip_asc() does and is why a certificate generated with
- *     `subjectAltName = IP:127.0.0.1` works for a --peer irc.b,127.0.0.1,PORT.
+ *     `subjectAltName = IP:127.0.0.1` works for a --peer 127.0.0.1,127.0.0.1,PORT.
+ *     A NAME CHECK THAT COULD NOT BE CONFIGURED IS A REFUSAL, never a handshake
+ *     with no name in the verify parameter -- see "FAIL CLOSED" below.
  *   - the certificate must be INS ITS VALIDITY WINDOW. That is OpenSSL's default
  *     chain-verification behaviour and it is not turned off, which is what makes an
  *     expired or not-yet-valid certificate a refusal rather than a warning.
@@ -359,7 +362,17 @@ static const transport_ops_t k_tls_ops = {
  *     all: SASL PLAIN over TLS is what a client has.
  *   - NO CERTIFICATE REVOCATION. No CRL and no OCSP are consulted, so a revoked
  *     certificate that chains to the CA is accepted until it EXPIRES. This is the
- *     largest gap in the boundary and it is named rather than glossed.
+ *     largest gap in the boundary and it is named rather than glossed -- in the
+ *     `tls_init` startup line as revocation=none, and at runtime only in the sense
+ *     that no line ever claims otherwise.
+ *   - NO SNI / HOSTNAME GATING OF `sts`. The persistence policy is advertised on
+ *     every connection to the plaintext port regardless of the hostname the client
+ *     arrived with, because this node does not know a hostname for itself: it has
+ *     no configuration option that names it. The specification says a persistence
+ *     policy SHOULD NOT be advertised when no hostname is known, and the
+ *     consequence of getting it wrong is visible -- a client that reached this
+ *     node by an unintended name of a wildcard certificate pins the unintended
+ *     name. KNOWN GAP, and named here rather than silently shipped.
  *   - NO CIPHER OR PROTOCOL VERSION PINNING beyond OpenSSL's compiled-in defaults.
  *     There is no SSL_CTX_set_cipher_list() call here, so the policy is whatever
  *     the linked OpenSSL ships. Pinning it is a configuration decision an operator
@@ -379,10 +392,71 @@ static const transport_ops_t k_tls_ops = {
  *   EXPLICIT flag for exactly that reason -- it is the thing an operator types when
  *   they mean it, and its absence is a refusal with a named reason rather than a
  *   downgrade nobody chose. */
-static void tls_peer_verify(SSL *ssl, tls_node_t *node, const char *peer_host,
-                            int fd)
+
+/* ---------------------------------------------------------------------------
+ * IS THIS PEER NAME AN ADDRESS RATHER THAN A NAME?
+ * ---------------------------------------------------------------------------
+ * RFC 6066 3 calls the SNI host_name a "fully qualified domain name", and
+ * X509_VERIFY_PARAM_set1_ip_asc() matches an iPAddress SAN rather than a dNSName.
+ * The two are different questions, so this is the one place both are asked, and
+ * the discriminator is a PARSE rather than a guess.
+ *
+ * IT WAS THE FIRST CHARACTER, and that was a proxy for "is this an address" which
+ * is wrong in the direction that matters. A 2.4 server name may start with a
+ * DIGIT -- node_main.c's --name says exactly that, "must start with a letter or
+ * digit", and irc_serve_server_name_valid() enforces it -- so `1peer` was read as
+ * an address, was refused by the address parser, and lost its SNI. It also lost
+ * its certificate NAME CHECK, which is a security boundary and is tls_peer_verify()
+ * 's business below; the two were the same mistake reached twice.
+ *
+ * THE COST: one inet_pton() per OUTBOUND peer dial, on a path that has already run
+ * a getaddrinfo() and a connect(). It is asked once per dial rather than per poll
+ * tick, so it is on no hot path, and it is two library calls that cannot fail in a
+ * way this code has to handle. */
+static int peer_name_is_ip_literal(const char *name)
+{
+    struct in_addr v4;
+    struct in6_addr v6;
+
+    if (name == NULL || name[0] == '\0') {
+        return 0;
+    }
+    return (inet_pton(AF_INET, name, &v4) == 1 ||
+            inet_pton(AF_INET6, name, &v6) == 1)
+               ? 1
+               : 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * THE NAME CHECK ITSELF, and the ONE place it can fail closed
+ * ---------------------------------------------------------------------------
+ * RETURNS 0 when the handshake may proceed and -1 when the link must be REFUSED,
+ * and the return value is the whole point of this function's signature.
+ *
+ * WHY IT RETURNS ANYTHING AT ALL. This used to return void, print a line when the
+ * name could not be configured, and let the handshake continue anyway. A peer name
+ * beginning with a DIGIT went to X509_VERIFY_PARAM_set1_ip_asc() because that is
+ * what the first-character test chose, was refused by it, and left the verify
+ * parameter carrying NO NAME AT ALL. That is not a weaker check, it is NO check:
+ * OpenSSL verifies the chain, finds no expected name to compare against, and
+ * succeeds. The comment that stood here said the failure "is reported by the
+ * verification itself, which will fail with CERTIFICATE_VERIFY_FAILED", and that
+ * was FALSE -- demonstrated end to end, with a CA-issued certificate for
+ * `DNS:someone.else` presented by a peer this node dialled as `1peer`, and the
+ * link reported `link_established: peer=1peer`. On such a link peer authentication
+ * degraded to "chains to our mesh CA", and because the federation secret is
+ * mesh-wide, ANY node holding ANY CA-issued certificate could impersonate ANY
+ * digit-named peer: read and inject the message stream, and be presented as that
+ * peer to third parties.
+ *
+ * So: a name this node cannot configure a check for is a REFUSAL. It is the only
+ * correct answer to "what should this handshake be verified against?" when the
+ * answer is nothing. */
+static int tls_peer_verify(SSL *ssl, tls_node_t *node, const char *peer_host,
+                           int fd)
 {
     X509_VERIFY_PARAM *param;
+    int configured;
 
     if (node->insecure != 0) {
         /* The OPERATOR SAID SO. SSL_VERIFY_NONE plus no name check: an
@@ -392,24 +466,59 @@ static void tls_peer_verify(SSL *ssl, tls_node_t *node, const char *peer_host,
         SSL_set_verify(ssl, SSL_VERIFY_NONE, NULL);
         printf("[observable] tls_peer_verify: fd=%d mode=INSECURE "
                "reason=--tls-insecure\n", fd);
-        return;
+        return 0;
     }
     SSL_set_verify(ssl, SSL_VERIFY_PEER, NULL);
     param = SSL_get0_param(ssl);
     X509_VERIFY_PARAM_set_hostflags(param,
                                     X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-    if (peer_host != NULL && peer_host[0] != '\0') {
-        int ok = (peer_host[0] >= '0' && peer_host[0] <= '9')
-                     ? X509_VERIFY_PARAM_set1_ip_asc(param, peer_host)
-                     : X509_VERIFY_PARAM_set1_host(param, peer_host, 0);
-        if (ok != 1) {
-            /* Not fatal here: the name check failing is reported by the
-             * verification itself, which will fail with CERTIFICATE_VERIFY_FAILED
-             * and a readable reason. Failing early would produce a worse log. */
-            printf("[observable] tls_peer_name: fd=%d host=%s "
-                   "reason=NOT_A_NAME_OR_IP\n", fd, peer_host);
-        }
+    if (peer_host == NULL || peer_host[0] == '\0') {
+        /* NO NAME AT ALL is the same failure as an unusable name, and it is
+         * refused the same way: an outbound peer link that cannot say which peer
+         * it dialled has no identity to check a certificate against.
+         *
+         * THROUGH THE SHIPPED BINARY THIS ARM IS UNREACHABLE, and saying so is
+         * part of the point: server_dial_progress() passes link->name, and
+         * fed_link_new() refuses a name irc_serve_server_name_valid() rejects, so
+         * the name is never NULL and never empty on this path. It is here because
+         * the lesson of the bug above is that an unreachable-looking arm which
+         * PROCEEDS is what the bug was -- and because tls_backend_starttls() is a
+         * public entry point that forwards a NULL host. */
+        printf("[observable] tls_peer_name: fd=%d host=%s reason=NO_NAME_TO_CHECK "
+               "action=REFUSE\n",
+               fd, (peer_host != NULL) ? peer_host : "(null)");
+        return -1;
     }
+    /* ADDRESS FIRST, FOR ANY INPUT, and the ORDER is the fix rather than a
+     * preference: X509_VERIFY_PARAM_set1_ip_asc() parses its argument and rejects
+     * anything that is not an address literal WITHOUT TOUCHING `param`, so asking
+     * it first costs a name nothing and is the only correct answer for an address.
+     * The byte-0 discriminator that used to stand here cannot tell `1peer` (a
+     * legal server name) from `127.0.0.1` (an address), which is the whole defect.
+     *
+     * A peer name that is BOTH is impossible -- an IPv6 literal contains colons,
+     * which irc_serve_server_name_valid() refuses -- so there is no input for which
+     * this configures the wrong kind of check. */
+    configured = X509_VERIFY_PARAM_set1_ip_asc(param, peer_host);
+    if (configured != 1) {
+        configured = X509_VERIFY_PARAM_set1_host(param, peer_host, 0);
+    }
+    if (configured != 1) {
+        /* BOTH FORMS REJECTED, so there is nothing this link could be verified
+         * against and continuing would mean continuing with no name check. Refused.
+         *
+         * THE COST, stated because fail-closed is not free: a peer name this node
+         * cannot parse is a link that never comes up rather than one that comes up
+         * unauthenticated. Through the shipped binary the name has already been
+         * validated, so this arm is a BACKSTOP rather than the load-bearing half of
+         * the fix. The digit-named peer case is fixed by the RETRY above -- an
+         * address parse that declines `1peer` followed by a hostname parse that
+         * accepts it -- and not by this line. */
+        printf("[observable] tls_peer_name: fd=%d host=%s "
+               "reason=NOT_A_NAME_OR_IP action=REFUSE\n", fd, peer_host);
+        return -1;
+    }
+    return 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -593,11 +702,20 @@ int tls_backend_starttls_peer(conn_t *c, int as_server, const char *peer_host)
                c->fd);
         return -1;
     }
-    /* SNI on the client side, from the host this node dialled. Without it a peer
+    /* SNI on the client side, from the peer this node dialled. Without it a peer
      * serving several names on one address cannot choose, and the certificate it
      * presents may be the wrong one for this link -- which then fails the NAME
      * check in tls_peer_verify() for a reason that looks like a misconfiguration
      * rather than a missing hint.
+     *
+     * NOT SENT FOR AN ADDRESS. RFC 6066 3's host_name is a "fully qualified domain
+     * name" and an address literal is not one, so peer_name_is_ip_literal() decides
+     * it by PARSING rather than by reading byte 0. The byte-0 test used to stand
+     * here and it suppressed SNI for every peer whose name began with a digit --
+     * including `1peer`, which is a legal 2.4 server name and a legal DNS label.
+     * That is the same defect as the one tls_peer_verify() had, in the same commit
+     * and for the same reason, so it is fixed here rather than left to be found
+     * again.
      *
      * THE COPY IS WHY THERE IS A COPY. SSL_set_tlsext_host_name() is a macro that
      * casts its second argument to void *, so handing it a `const char *` trips
@@ -620,7 +738,7 @@ int tls_backend_starttls_peer(conn_t *c, int as_server, const char *peer_host)
      * buffer is the size node_main.c's --peer host field is, which is the longest
      * name that can reach here. */
     if (as_server == 0 && peer_host != NULL && peer_host[0] != '\0' &&
-        (peer_host[0] < '0' || peer_host[0] > '9')) {
+        peer_name_is_ip_literal(peer_host) == 0) {
         char sni[256];
 
         if (strlen(peer_host) < sizeof sni) {
@@ -641,7 +759,23 @@ int tls_backend_starttls_peer(conn_t *c, int as_server, const char *peer_host)
         SSL_set_accept_state(ssl);
     } else {
         SSL_set_connect_state(ssl);
-        tls_peer_verify(ssl, (tls_node_t *)s->tls, peer_host, c->fd);
+        if (tls_peer_verify(ssl, (tls_node_t *)s->tls, peer_host, c->fd) != 0) {
+            /* THE SSL* IS RELEASED HERE RATHER THAN HANDED TO THE CONNECTION, and
+             * this is the only place that can happen: c->t_ctx has NOT been assigned
+             * yet, so nothing outside this function has ever held this pointer and
+             * there is no second release. Assigning it and then failing would leave
+             * the transport ops pointing at a freed SSL*, because conn_free() is the
+             * one place that releases them and this is not it.
+             *
+             * Returning -1 is what makes the link FAIL rather than proceed with no
+             * name check: server_dial_progress() closes the connection and marks
+             * the dial FAILED, so it cannot reach ESTABLISHED and the retry spends
+             * a budget rather than succeeding quietly on the next attempt. */
+            printf("[observable] tls_peer_verify: fd=%d result=REFUSED "
+                   "reason=NO_NAME_CHECK_CONFIGURED\n", c->fd);
+            SSL_free(ssl);
+            return -1;
+        }
     }
     c->t_ops = &k_tls_ops;
     c->t_ctx = ssl;
