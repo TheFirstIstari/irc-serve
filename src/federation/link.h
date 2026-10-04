@@ -637,6 +637,49 @@ int fed_open(server_t *s, const char *secret);
 void fed_set_timeouts(uint64_t dial_ms, uint64_t hs_ms, uint64_t keepalive_ms,
                       uint64_t dead_ms);
 
+/* ---------------------------------------------------------------------------
+ * fed_hs_due: T2's DEADLINE, as a predicate, and why it is not inline
+ * ---------------------------------------------------------------------------
+ * Returns non-zero when a handshake stamped `created_ms` has had the handshake
+ * timeout (fed_set_timeouts()'s `hs_ms`, or IRC_FED_HS_TIMEOUT_MS) by `now_ms`.
+ * `created_ms == 0` means no attempt is stamped, so nothing is due; that is the
+ * reset case link.c's fed_link_reset() creates and T2's own `!= 0u` guard used
+ * to spell out.
+ *
+ * IT IS A FUNCTION AND NOT AN EXPRESSION BECAUSE OF ONE RULE, and the rule is the
+ * whole of it: **a stamp that is not yet in the past is not due.** `now_ms <
+ * created_ms` is reachable WITHOUT THE CLOCK MISBEHAVING, which is the part that
+ * is not obvious and the reason this needed a named predicate to be testable.
+ * poll_loop_step() samples now_ms with server_now_ms() and THEN calls
+ * server_tick(), so the value the tick compares against was read before any of
+ * the tick's work. fed_link_promote() runs inside that tick and stamps
+ * created_ms from a FRESH server_now_ms() of its own -- a later reading in real
+ * time, on a monotonic clock, that can still be numerically larger. So on any tick
+ * that takes at least one millisecond between step 8's clock read and the
+ * promotion, created_ms is newer than the now_ms being compared against it.
+ *
+ * The subtraction is unsigned, so that reads as an age of 2^64-1, which is larger
+ * than any timeout: the handshake was declared timed out ON THE TICK THAT
+ * CREATED IT, the connection was marked CLOSING with its FEDERATE still queued,
+ * and the peer saw a clean close having read nothing. Printed, from a failing
+ * run of tests/integration/test_fed_handshake.c:
+ *
+ *     promote peer=irc.b fd=5 queue_rc=0 pending=80 now=4044447577
+ *     T2       created=4044447577 now=4044447576 age=18446744073709551615 hs=1000
+ *
+ * The cost of getting this wrong is invisible without a load: a tick that
+ * reaches the promotion inside the same millisecond produces an age of 0 and is
+ * correctly not due, so the defect is a race on the tick's own duration. It is
+ * also why raising the timeout is not a fix -- the age is 2^64-1 and no budget is
+ * larger than that.
+ *
+ * tests/federation/test_hs_deadline.c asserts this directly, which is the only
+ * reason it is exported: an integration test can only lose this race
+ * intermittently, and a defect that can only be observed by winning a race
+ * cannot be regression-tested at all.
+ */
+int fed_hs_due(uint64_t created_ms, uint64_t now_ms);
+
 /* Override the three RECONNECT intervals for THIS PROCESS. A 0 argument keeps
  * the built-in, on the same terms as fed_set_timeouts() above.
  *

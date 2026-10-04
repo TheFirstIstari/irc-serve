@@ -2008,6 +2008,22 @@ void fed_set_timeouts(uint64_t dial_ms, uint64_t hs_ms, uint64_t keepalive_ms,
     }
 }
 
+/* T2's deadline. The reasoning, the failure it fixes and the measurement are in
+ * link.h's fed_hs_due() -- the one-line rule is that a stamp not yet in the past
+ * is not due, and it is reachable here without the clock going backwards because
+ * this tick's now_ms was sampled before fed_link_promote() stamped created_ms from
+ * a later reading on the same monotonic clock. */
+int fed_hs_due(uint64_t created_ms, uint64_t now_ms)
+{
+    if (created_ms == 0u) {
+        return 0; /* no attempt stamped: a reset link, nothing to be late for */
+    }
+    if (now_ms < created_ms) {
+        return 0; /* THE RULE. Unsigned, this would be 2^64-1 and always due. */
+    }
+    return (uint64_t)(now_ms - created_ms) >= g_hs_ms;
+}
+
 void fed_set_retry(uint64_t base_ms, uint64_t max_ms, unsigned budget)
 {
     if (base_ms != 0u) {
@@ -2549,10 +2565,66 @@ void fed_tick(server_t *s, uint64_t now_ms)
              * which is why this is gated on fd >= 0 rather than written as
              * c == NULL. The accepting side's own liveness is T2's clock, which
              * is already the next line. */
-            if (link->created_ms != 0u &&
-                ((uint64_t)(now_ms - link->created_ms) >= g_hs_ms ||
-                 (link->fd >= 0 &&
-                  (c == NULL || fed_link_of_conn(s, c) != link)))) {
+            /* ------------------------------------------------------------------------
+             * THE CLOCK HALF IS GUARDED AGAINST A STAMP IN THE FUTURE, and this is
+             * a defect that cost a handshake per tick that took a millisecond.
+             *
+             * `now_ms` is the value poll_loop_step() sampled with
+             * server_now_ms() BEFORE it called server_tick(), and it is the value
+             * every deadline in this switch is measured against. fed_link_promote()
+             * runs INSIDE that same tick -- the promotion is at the top of this
+             * per-link walk and this switch is at the bottom of it -- and it stamps
+             * created_ms from a FRESH server_now_ms() of its own. So on any tick
+             * where at least one millisecond elapses between step 8's clock read and
+             * the promotion, created_ms is one or more milliseconds NEWER than the
+             * now_ms being compared against it, which is not a clock going
+             * backwards at all: CLOCK_MONOTONIC cannot do that, and both readings
+             * are in the right order in real time.
+             *
+             * `now_ms - link->created_ms` is an UNSIGNED subtraction, so a stamp one
+             * millisecond in the future underflows to 2^64-1, that is >= g_hs_ms on
+             * any clock, and T2 fires ON THE VERY TICK THAT PROMOTED THE LINK: the
+             * handshake is declared timed out, the connection is marked CLOSING with
+             * the FEDERATE still sitting in its write queue, the peer sees a clean
+             * close having read nothing, and the link sits in HANDSHAKE_SENT until
+             * the reconnect it never gets to make. Measured on this tree:
+             *
+             *   promote peer=irc.b fd=5 queue_rc=0 pending=80 now=4044447577
+             *   T2       peer=irc.b fd=5 created=4044447577 now=4044447576
+             *            age=18446744073709551615 hs=1000 c=0x... match=1
+             *   MARK_CLOSING fd=5 kind=1
+             *
+             * `match=1` is the socket half of the test saying the connection WAS
+             * this link's, so the printed cause was NO_ANSWER: the second mechanism
+             * PR #119 explicitly declined to fix, and it was never a second
+             * mechanism at all. It is this one, wearing the other cause's name.
+             *
+             * WHY IT NEEDED A MILLISECOND TO SHOW and why it looked like a
+             * timeout problem: a tick that gets from step 8's clock read to the
+             * promotion in under the same millisecond produces age == 0 and the
+             * arm is correctly not taken. It is a race on the tick's own
+             * duration, so it needs a loaded machine to lose -- which is why it
+             * survived a timeout increase (Phase 8 raised the budget 5000 -> 6000
+             * -> 12000 and changed nothing) and why raising g_hs_ms is not the fix:
+             * the age is 2^64-1, and no budget is larger than that.
+             *
+             * THE CLOCK HALF IS fed_hs_due(), and the rule it applies is the
+             * PROJECT'S OWN, from server_tick() and resume_sweep(): a stamp that is
+             * not yet in the past is not due. It lives in a named predicate rather
+             * than inline here so that tests/federation/test_hs_deadline.c can
+             * assert it directly -- a defect that can only be observed by losing a
+             * race on the tick's duration cannot be regression-tested at all, and
+             * exporting the predicate is the whole of what makes it testable.
+             *
+             * THE TWO HALVES ARE NOT GUARDED ALIKE, on purpose. The clock half is
+             * suppressed while the stamp is in the future; the socket half below is
+             * NOT, because "this link's descriptor is gone" is not a question about
+             * elapsed time and is true whenever it is true. PR #119's fix therefore
+             * still fires exactly when it should.
+             * ------------------------------------------------------------------------ */
+            if (fed_hs_due(link->created_ms, now_ms) ||
+                (link->fd >= 0 &&
+                 (c == NULL || fed_link_of_conn(s, c) != link))) {
                 (void)handshake_timeout(&link->hs);
                 fed_link_set_state(link);
                 s->n_fed_hs_timeout++;
