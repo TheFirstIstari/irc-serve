@@ -247,7 +247,7 @@ conformant.
 | 477 | ERR_NOCHANMODES | `<channel> :Channel doesn't support modes` | — | The node does support channel modes (`b`, and the prefix modes `o`/`v`). |
 | 478 | ERR_BANLISTFULL | `<channel> <char> :Channel list is full` | E | **Added in Phase 11**, replacing 696. Both middle parameters. |
 | 481 | ERR_NOPRIVILEGES | `:Permission Denied- You're not an IRC operator` | A | **deviation** — see §6.7. |
-| 482 | ERR_CHANOPRIVSNEEDED | `<client> <channel> :You're not channel operator` | E | ✓ on the four channel sites, which name `ch->name`. **One site is not**: `REGISTER`/`UNREGISTER` refused by `account_refuse()` sends `482` with no `<channel>` and this node's own text, because neither verb has a channel and this node has no operator model to name instead. See §6.13. |
+| 482 | ERR_CHANOPRIVSNEEDED | `<client> <channel> :You're not channel operator` | E | ✓ on the four channel sites, which name `ch->name`. **One site is not**: `REGISTER`/`UNREGISTER` refused by `account_refuse()` sends `482` with no `<channel>` and this node's own text, because neither verb has a channel and this node has no operator model to name instead. **The finding is the numeric, not the field** — `482` is a channel refusal being used for a non-channel one — and it is **blocked on §6.7**, which is the operator-model decision that would also settle `CHOPER` and `KNOCK`. §6.13. |
 | 483 | ERR_CANTKILLSERVER | `:You can't kill a server!` | A | `KILL` is in the dispatch table with a NULL handler, so it answers 421. No operator model. |
 | 484 | ERR_RESTRICTED | `:Your connection is restricted!` | A | No user mode `+r`. 004 advertises user modes `i` only. |
 | 485 | ERR_UNIQOPPRIVSNEEDED | `:You're not the original channel operator` | A | No `+q`/`+a`. |
@@ -567,7 +567,7 @@ one of them, §6.13, is **blocked on another** rather than on a decision of its 
 | [§6.10](#610-time-ping-and-version-are-handled-as-commands-ctcp-is-not) | — | N/A, argued |
 | [§6.11](#611-366-has-no-channel-when-names-is-asked-with-no-argument-and-there-are-no-channels--fixed-in-phase-11c) | `366` | **fixed** in Phase 11c — §6.11 |
 | [§6.12](#612-404-names-no-channel-when-the-source-hostmask-will-not-render--the-text-is-now-the-rfcs) | `404` | **half** — text fixed in Phase 11c, field argued and left |
-| [§6.13](#613-482-has-no-channel-for-register-and-unregister) | `482` | open — **blocked on §6.7** |
+| [§6.13](#613-482-has-no-channel-for-register-and-unregister--open-and-blocked-on-67) | `482` | open — **blocked on §6.7** |
 | [§6.14](#614-366s-trailing-text-is-end-of-names-list-the-rfcs-is-end-of-names-list) | `366` | open — **new in Phase 11c** |
 
 ### 6.1 `MODE <nick>` is answered 403 ERR_NOSUCHCHANNEL
@@ -966,7 +966,7 @@ The reachable `404` — a channel the sender is not on — is asserted in
 `test_labeled_response.c`, which checks the labelled-batch behaviour and the line
 together.
 
-### 6.13 `482` has no `<channel>` for `REGISTER` and `UNREGISTER`
+### 6.13 `482` has no `<channel>` for `REGISTER` and `UNREGISTER` — open, and BLOCKED on §6.7
 
 **New in Phase 11b.** RFC 2812 5.2: `482 ERR_CHANOPRIVSNEEDED "<client> <channel>
 :You're not channel operator"`. Four sites name `ch->name` and are conformant. The
@@ -982,15 +982,38 @@ message for a `REGISTER` that was refused because the deployment has no open
 registration — which is a different fact, and one the client's wording gets wrong in
 a way that sends a user looking for a channel.
 
-**Why not changed.** There is no channel to name: neither verb has one, and the
-condition is not about a channel at all. So the honest options are §6.7's `481` — which
-is absent because this node has no operator model — or `461`, which is what §6.2's
-neighbouring choices do and which would be as wrong in a different way. `account_refuse()`
-already passes its code as an override, so the fix is one argument; **which** argument
-is the decision §6.7 has not made, and closing §6.13 without it would close it wrongly.
-A client that negotiated `standard-replies` gets
-`FAIL REGISTER ERR_ACCOUNTREGISTRATIONDISABLED`, which is correct and is the reason
-this is a compatibility question rather than a correctness one.
+**THE FINDING IS BIGGER THAN "THE FIELD IS ABSENT", and Phase 11c states it that way
+because it changes who owns the fix.** Neither verb has a channel, and the condition
+is not about a channel at all — so the numeric is being used for a refusal **it was
+not defined for**. `481 ERR_NOPRIVILEGES` is the conventional answer, and it is the
+honest one: its own RFC text is *"Permission Denied- You're not an IRC operator"*, and
+the true statement here is that the deployment has no operator concept and therefore
+no way to grant one. §6.7 is the open finding about `481` being absent, and **this is
+the same decision wearing a different verb** — it is the sixth site that answers with
+`482` or `464` because this node has no operator model.
+
+**Why it is NOT changed here, and the dependency is the whole of the reason.** The fix
+is one argument: `account_refuse()` already passes its code as an override, so
+substituting `"481"` would close this finding in a single edit. It is not made,
+because:
+
+- **`481` does not exist on this node yet.** §6.7 is open precisely because choosing
+  between `481` and `482`/`464` for the "not privileged" family *is* the operator-model
+  decision, and that decision has not been made.
+- **Changing only this site would close §6.13 wrongly.** It would make `REGISTER` the
+  one refusal on the node answered with a numeric nothing else uses, while `CHOPER`
+  (§6.4) and `KNOCK` still answer `464`/`482`. That trades one inconsistency for a
+  more confusing one, and it does so without recording the decision that caused it.
+- So the ordering is fixed: **§6.7 decides, §6.13 follows.** A pass that closes §6.13
+  first has skipped the question rather than answered it.
+
+**What this means concretely, so the next pass does not have to re-derive it.** If
+§6.7 is decided as "adopt `481` for every refusal whose true content is 'you are not
+privileged here'", then this site becomes `reply_refused(..., "481", NULL, 0, "%s",
+text)` and a client that negotiated `standard-replies` — which already gets
+`FAIL REGISTER ERR_ACCOUNTREGISTRATIONDISABLED`, which is correct — is unaffected.
+The sentence in `text` is this node's own and is not what §6.7 is about, so it does not
+have to move with the numeric.
 
 ### 6.14 `366`'s trailing text is "End of /NAMES list"; the RFC's is "End of NAMES list"
 
@@ -1121,6 +1144,7 @@ phase.
 | `404`'s `<text>` becomes the RFC's literal; the reason moves to the `msg_refused` log line | §6.12 — the half that was not blocked | none possible: the check cannot fail at any `conn_hostmask()` call site, so the line was verified by temporary instrumentation and the observation is in §6.12 |
 | `302`'s duplicated middle parameter recorded | this document was wrong — §5.1 | — |
 | `366`'s trailing text recorded as a deviation | **new finding** — §6.14 | — |
+| `482` for `REGISTER`/`UNREGISTER` restated as *the numeric is wrong, not the field*, and blocked on §6.7 | §6.13 — recorded, not changed | — |
 
 ## 11. What this document does not claim
 
