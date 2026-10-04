@@ -185,7 +185,7 @@ conformant.
 |---|---|---|---|---|
 | 352 | RPL_WHOREPLY | `<channel> <user> <host> <server> <nick> ( "H" / "G" ) ["*"] [ ( "@" / "+" ) ] :<hopcount> <real name>` | E | ✓ `H`/`G` first letter, then the sigil. Honours `multi-prefix` when negotiated and says so in 005. |
 | 353 | RPL_NAMREPLY | `( "=" / "*" / "@" ) <channel> :[ "@" / "+" ] <nick> *( … )` | E | ✓ Chunked at `CHAN_NAMES_LINE`. |
-| 366 | RPL_ENDOFNAMES | `<channel> :End of /NAMES list` | E | ✓ on every site that has a channel, and always last. **One site is not**: `NAMES` with no argument on a node with **zero** channels sends `366 <client> :End of /NAMES list` with no `<channel>`, because there is none to name. See §6.11. |
+| 366 | RPL_ENDOFNAMES | `<channel> :End of /NAMES list` | E | ✓ **on every site as of Phase 11c**, and always last. The last non-conformant site — a bare `NAMES` on a node with **zero** channels, which answered with no `<channel>` at all — now sends `<channel>` = `*`. Every 366 on this node now goes through `send_end_of_names()`. The field list is conformant; the trailing TEXT is not, which is §6.14. |
 | 367 | RPL_BANLIST | `<channel> <banmask>` | E | **Added in Phase 11.** Two middle parameters and no trailing field. |
 | 368 | RPL_ENDOFBANLIST | `<channel> :End of channel ban list` | E | **deviation** on one path — see §5.3. |
 | 369 | RPL_ENDOFWHOWAS | `<nick> :End of WHOWAS` | A | No WHOWAS command. |
@@ -476,14 +476,15 @@ with the prefix. Re-verified: zero middle parameters where the RFC names one.
 
 ## 6. Open findings
 
-Thirteen, and the count is now the number of subsections rather than a number
+Fourteen, and the count is now the number of subsections rather than a number
 typed earlier. Each is a real deviation with a named client-visible symptom.
 
 **Two of them were open findings in Phase 11 and were FIXED in Phase 11b** — §6.3
 and §6.5, kept in place and rewritten as the record of what was wrong and what
 replaced it, because a table that quietly deletes the defect it was written to
-track loses the reason the fix looks the way it does. The other eleven are open,
-and each says why.
+track loses the reason the fix looks the way it does. **Two more were fixed in
+Phase 11c** — §6.11 and §6.12 — on the same terms. **§6.14 is new in Phase 11c**
+and was found while fixing §6.11. The remaining ten are open, and each says why.
 
 | | Numeric | Status |
 |---|---|---|
@@ -497,9 +498,10 @@ and each says why.
 | [§6.8](#68-501-and-502-are-unreachable) | `501`, `502` | open — same cause as §6.1 |
 | [§6.9](#69-version-is-not-a-command) | `351` | open — needs a new verb |
 | [§6.10](#610-time-ping-and-version-are-handled-as-commands-ctcp-is-not) | — | N/A, argued |
-| [§6.11](#611-366-has-no-channel-when-names-is-asked-with-no-argument-and-there-are-no-channels) | `366` | open — **new in Phase 11b**, and one line |
-| [§6.12](#612-404-has-no-channel-when-the-source-hostmask-will-not-render) | `404` | open — **new in Phase 11b** |
-| [§6.13](#613-482-has-no-channel-for-register-and-unregister) | `482` | open — **new in Phase 11b** |
+| [§6.11](#611-366-has-no-channel-when-names-is-asked-with-no-argument-and-there-are-no-channels--fixed-in-phase-11c) | `366` | **fixed** in Phase 11c — §6.11 |
+| [§6.12](#612-404-has-no-channel-when-the-source-hostmask-will-not-render) | `404` | **fixed** in Phase 11c — §6.12 |
+| [§6.13](#613-482-has-no-channel-for-register-and-unregister) | `482` | open — **blocked on §6.7** |
+| [§6.14](#614-366s-trailing-text-is-end-of-names-list-the-rfcs-is-end-of-names-list) | `366` | open — **new in Phase 11c** |
 
 ### 6.1 `MODE <nick>` is answered 403 ERR_NOSUCHCHANNEL
 
@@ -726,13 +728,12 @@ that answered would be impersonating a user. A client that sends CTCP `VERSION` 
 channel and gets no reply sees a timeout, which is the normal outcome for an
 unanswered CTCP and not a protocol fault.
 
-### 6.11 `366` has no `<channel>` when `NAMES` is asked with no argument and there are no channels
+### 6.11 `366` has no `<channel>` when `NAMES` is asked with no argument and there are no channels — FIXED in Phase 11c
 
-**New in Phase 11b, found by the field-list scan, and the cheapest of the three.**
-RFC 2812 5.2: `366 RPL_ENDOFNAMES "<client> <channel> :End of /NAMES list"`. Three of
+**What was wrong.** RFC 2812 5.2: `366 RPL_ENDOFNAMES "<client> <channel> :End of /NAMES list"`. Three of
 this node's four `366` sites go through `send_end_of_names()` and name the channel
-correctly. The fourth does not: `NAMES` with **no argument** on a node with **zero
-channels** takes a short-circuit that calls `reply()` directly with `NULL, 0`:
+correctly. The fourth did not: `NAMES` with **no argument** on a node with **zero
+channels** took a short-circuit that called `reply()` directly with `NULL, 0`:
 
 ```
 :alice NAMES
@@ -745,16 +746,64 @@ and has no channel name to label the window with. Every other 366 on this node �
 carries the name, so a client that reads `<channel>` finds it absent exactly once and
 in the one case where there was nothing to read.
 
-**Why not changed here, stated plainly.** It is a **one-line change** —
-`send_end_of_names(s, c, "*")` instead of the direct `reply()`, which also removes the
-only `366` on this node that bypasses its own helper. It is not made in Phase 11b
-because Phase 11b's code changes are the two arity defects it was given, and widening
-that to a third numeric in a documentation commit is how a pass stops being
-reviewable. The open question it needs answered is small and is stated for the next
-reader: **is `*` the right value?** It is the RFC 1459 2.3 wildcard target, it is
-representable in a non-final position, and every server that answers a channel-less
-`NAMES` this way uses it — but it is a decision about what a client sees, not a
-mechanical substitution, and it is not this document's to take.
+**The decision: `<channel>` is `*`, and the line is now**
+
+```
+:alice NAMES
+:irc.test 366 alice * :End of /NAMES list
+```
+
+RFC 2812 **defines no value here, and saying so is the whole of the first half of the
+argument.** §5.1's field list is `"<channel> :End of NAMES list"` and its own prose for
+the case says only *"If there is no channel found as in the query, then only
+RPL_ENDOFNAMES is returned"* — it does not say what the channel field holds. So there
+is no conformance argument available and this is a decision about what a client sees.
+
+**What a client sees, either way.** The field is where a client looks for the channel a
+list belongs to, and a client that splits the line into RFC 1459 2.3 fields gets three
+of them from the old line where the RFC promises four:
+
+| | old wire form | parameters a positional client parses |
+|---|---|---|
+| no field | `366 alice :End of /NAMES list` | `366`, `alice`, `End of /NAMES list` |
+| `*` | `366 alice * :End of /NAMES list` | `366`, `alice`, `*`, `End of /NAMES list` |
+
+On the old line the client reads **the trailing SENTENCE** as the channel name, or, if
+it bounds its read by the expected field count, gets an out-of-range default and drops
+the entry. Either way it has a channel *string* where the RFC says there is a channel
+*field*, and nothing on the line distinguishes "there are no channels" from "the
+server sent a malformed reply" — which is the one distinction this reply exists to
+carry. With `*` the line is parseable and the client can label the answer "no
+channels".
+
+**Why `*` and not the empty string.** An empty field renders
+`:irc.test 366 alice  :End of /NAMES list` — a doubled space — which
+`message_format()` does not produce for an empty middle parameter and which a client
+reading positionally sees as a missing parameter anyway. So the empty string buys a
+different spelling of the same unparseable line. `*` is one byte, contains nothing
+`message_format()` refuses in a non-final position, and is RFC 1459 2.3's own wildcard,
+so it is also the value the rest of the protocol already uses for "the thing asked
+for, which does not exist".
+
+**The cost, stated.** A client that builds a window per 366 may open one titled `*` on
+a channel-less node. That is one cosmetic artifact on a node with no channels, against
+a mislabelled or absent field on every bare `NAMES` a client ever sends. The trade is
+deliberate and one-sided.
+
+**Where the change lives.** In the helper, not at the call site: `send_end_of_names()`
+is now the only renderer of a 366 on this node, so "a 366 carries its channel field"
+is a property of one function rather than of four call sites plus a short-circuit. The
+value is named `NAMES_NO_CHANNEL` in `chan_verbs.c` so the decision is greppable.
+
+**The test.** Section 5 of `tests/integration/test_numeric_arity.c`, and it is a
+**field-count** assertion rather than a needle, because a needle cannot see this defect:
+`:irc.test 366 alice :End of /NAMES list` is not a substring of either the old line or
+the new one, and a needle written as `366 alice * :` would pass a node whose field was
+absent only if the needle itself were wrong. It asserts four parameters, the value `*`
+by position, the whole line byte for byte, **exactly one** 366, and **no 353** — RFC
+2812 5.1's "only RPL_ENDOFNAMES is returned" being a statement about both. It runs
+before the first JOIN in that binary, because a bare `NAMES` on a node that *has* a
+channel answers with that channel's name and the check would pass for the wrong reason.
 
 ### 6.12 `404` has no `<channel>` when the source hostmask will not render
 
@@ -811,6 +860,26 @@ is the decision §6.7 has not made, and closing §6.13 without it would close it
 A client that negotiated `standard-replies` gets
 `FAIL REGISTER ERR_ACCOUNTREGISTRATIONDISABLED`, which is correct and is the reason
 this is a compatibility question rather than a correctness one.
+
+### 6.14 `366`'s trailing text is "End of /NAMES list"; the RFC's is "End of NAMES list"
+
+**New in Phase 11c, found while fixing §6.11, and recorded rather than changed.** RFC
+2812 5.1 writes `366 RPL_ENDOFNAMES "<channel> :End of NAMES list"` — no forward slash.
+This node sends `"End of /NAMES list"`, which is the spelling RFC 1459 2.3.1's prose
+uses and the one clients' own strings are built from.
+
+**Symptom.** Only for a reader of decoration: every client dispatches on the numeric
+and reads the middle parameters by position, so nothing parses 366's trailing text. A
+human or a log parser that anchors on the RFC's literal would not match.
+
+**Why not changed here.** It is a one-line change with **no test churn that does not
+churn** — thirteen assertion sites across `test_channels.c`, `test_userhost_in_names.c`
+and `test_fed_burst.c` pin these bytes, and the correct text is a compatibility
+question about which spelling clients' string tables carry, not a conformance repair.
+Phase 11b's own reasoning for `317`'s trailing text (§5.2) applies almost verbatim and
+is recorded there: the trade is a hypothetical reader of decoration against a concrete
+reader who matches it, and here the concrete reader is the RFC's own literal. It
+belongs to whoever reads this next, with the decision stated rather than assumed.
 
 ## 7. `005` completeness
 
@@ -913,8 +982,8 @@ phase.
 
 ## 11. What this document does not claim
 
-- **It is not a claim of full conformance.** Thirteen findings are recorded in §6 —
-  eleven open, two fixed — and seven deviations in §5; a server with all of them
+- **It is not a claim of full conformance.** Fourteen findings are recorded in §6 —
+  ten open, four fixed — and the deviations in §5; a server with all of them
   closed would still not be conformant to RFC 2812 section 3's "All commands
   described in this section MUST be implemented", which this node departs from
   deliberately in the operator, TRACE, STATS and diagnostics families.
