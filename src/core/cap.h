@@ -203,15 +203,37 @@
  * out of the table: a client that asked and got an ACK would believe it had
  * negotiated a policy that governs what it may connect to.
  *
- * The two keys, and which is REQUIRED when:
+ * The two keys, and WHICH IS REQUIRED when:
  *
- *   port=       REQUIRED on an INSECURE connection -- it is the port the client
- *               must reconnect to. Omitted when this node has no --tls-port,
- *               because there is then no port a client could be told to use, and
- *               advertising one that does not exist would send every client to a
- *               closed port. Its absence is CORRECT: the specification says a
+ *   port=       REQUIRED on an INSECURE connection -- which is where `CAP LS`
+ *               travels, so in practice it is always required here. It is the port
+ *               the client must reconnect to. **A `sts` WITH NO `port` IS NOT
+ *               RENDERED AT ALL**, and that is a change: this comment used to say
+ *               the key was "omitted when this node has no --tls-port" and called
+ *               that absence CORRECT, on the grounds that "the specification says a
  *               client that receives a persistence policy with no port over an
- *               insecure connection ignores it.
+ *               insecure connection ignores it". The specification says the
+ *               opposite, and the difference is the whole of the fix:
+ *
+ *                 "If any required part is missing, clients MUST continue as if no
+ *                  STS policy was advertised."
+ *
+ *               So the absence was not a client ignoring a malformed policy -- it
+ *               was a client doing exactly what it was told, which is to behave as
+ *               though this node had no policy, indistinguishable from a node that
+ *               has no downgrade protection at all. Meanwhile an operator reading
+ *               `CAP LS` concluded protection that did not exist, which is the
+ *               "advertise before the feature exists" failure this file exists to
+ *               prevent, and a client that honoured only `duration` cached a
+ *               persistence policy for a hostname with no secure port and then
+ *               refused to connect.
+ *
+ *               The rule is also that `sts` is "incompatible with servers that offer
+ *               secure connections only via STARTTLS on an insecure port", and a
+ *               node with a certificate and no --tls-port is exactly that node. So
+ *               there is no configuration in which omitting `port` was the honest
+ *               rendering: cap.c's sts_possible() withholds the NAME instead, and
+ *               plain `tls` -- which is merely true -- is still advertised.
  *   duration=   REQUIRED on a SECURE connection -- how long the client must keep
  *               using TLS. 0 means "no persistence policy", which is the shipped
  *               default on the specification's own advice: "Server
@@ -219,7 +241,10 @@
  *               duration=0 in their example configurations. This will require
  *               server administrators to deliberately choose an expiry according
  *               to their specific needs rather than (perhaps unknowingly) rely on
- *               an arbitrary generic value."
+ *               an arbitrary generic value." **A `duration=0` WITH a `port` is
+ *               correct and is deliberately not changed** -- it names where TLS is
+ *               available and asserts no persistence, which is the default the
+ *               specification recommends.
  *
  * The buffer is a constant rather than a caller-chosen size for the same reason
  * CAP_LS_MAX is: `sts=duration=4294967295,port=65535` is 34 bytes, and a capability

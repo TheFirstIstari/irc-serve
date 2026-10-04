@@ -45,6 +45,7 @@
  */
 #include <errno.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -525,6 +526,108 @@ static void case_plaintext_build_has_no_tls_surface(const char *dir)
     nf_free(&n);
 }
 
+/* ===========================================================================
+ * CASE GROUP 1b: `sts` IS ONLY ADVERTISED WHERE IT IS HONOURABLE
+ * ===========================================================================
+ *
+ * A node with a certificate and key, a chosen --tls-sts-duration, and NO
+ * --tls-port. Its only route to TLS is STARTTLS on the plaintext port, which the
+ * IRCv3 strict-transport-security specification says `sts` is INCOMPATIBLE with:
+ * "STS expects that servers instead offer a port that directly services secure
+ * connections and it is incompatible with servers that offer secure connections
+ * only via STARTTLS on an insecure port."
+ *
+ * This node used to answer `CAP LS` on that plaintext port with
+ * `sts=duration=15552000` and no `port` key at all. Two things were wrong with
+ * that and neither is a matter of taste:
+ *
+ *   1. `port` is REQUIRED on an insecure connection, and `CAP LS` travels on the
+ *      insecure port. The specification's rule for a missing required part is
+ *      "if any required part is missing, clients MUST continue as if no STS
+ *      policy was advertised" -- so a conforming client was being told to behave
+ *      as though this node had no downgrade protection, which is exactly what the
+ *      `tls` capability alone would have told it truthfully. And a LENIENT client
+ *      honouring only `duration` caches a persistence policy for a hostname with
+ *      no secure port and then refuses to connect: a self-inflicted outage, and the
+ *      hazard the specification's own denial-of-service section names.
+ *
+ *   2. An operator reading `sts` in `CAP LS` concludes this node has downgrade
+ *      protection. It has none: the port is still served in the clear and the only
+ *      upgrade is STARTTLS, which is the shape the specification excludes. That is
+ *      the "advertise before the feature exists" failure cap.h exists to prevent.
+ *
+ * `tls` STAYS, because it is true -- this node does answer STARTTLS -- and
+ * withholding a true fact is the opposite mistake. So the assertions below are
+ * about `sts` being ABSENT and `tls` being PRESENT, and the pair matters: a fix
+ * that suppressed both would pass the first assertion and be wrong.
+ *
+ * THE POSITIVE HALF IS ALREADY ASSERTED ELSEWHERE in this file: the node spawned
+ * above, which HAS a --tls-port, must advertise `sts=duration=15552000` with
+ * `port=` naming the port it bound. Neither half is interesting alone -- a build
+ * that suppressed `sts` unconditionally, or one that suppressed it everywhere, each
+ * passes one of the two cases.
+ */
+static void case_sts_requires_a_secure_port(const char *cert, const char *key)
+{
+    nf_node_t n;
+    test_client_t c;
+    char a0[] = "irc-serve";
+    char a1[] = "0";
+    char a2[] = "--name";
+    char a3[] = "irc.tls";
+    char *argv[12];
+
+    argv[0] = a0; argv[1] = a1; argv[2] = a2; argv[3] = a3;
+    argv[4] = "--tls-cert"; argv[5] = (char *)(uintptr_t)(const void *)cert;
+    argv[6] = "--tls-key"; argv[7] = (char *)(uintptr_t)(const void *)key;
+    /* NO --tls-port, and NO --tls-require: this is a perfectly ordinary node that
+     * offers STARTTLS and nothing else, which is the configuration under test. */
+    argv[8] = "--tls-sts-duration"; argv[9] = "15552000";
+    argv[10] = NULL; argv[11] = NULL;
+    if (nf_spawn_binary_argv(&n, argv) != 0) {
+        check(0, "spawn a node with a certificate and NO --tls-port", NULL);
+        return;
+    }
+    check(nf_expect(&n, "tls=configured", 5000) == 0,
+          "the certificate loaded, so this is a node that genuinely has TLS and "
+          "merely lacks a secure port",
+          n.out);
+    /* THE ANCHOR. The assertions below are only about the `sts` policy if this
+     * node really is in the configuration that suppresses it, so the absence of a
+     * listener is asserted rather than assumed -- a reader (and a future change
+     * that made --tls-port implied) can tell the two situations apart. */
+    check(nf_expect(&n, "tls_port=-1", 5000) == 0,
+          "and it bound NO implicit-TLS listener, which is the state the "
+          "specification's REQUIRED-`port` rule is about",
+          n.out);
+
+    if (tc_connect(&c, n.port) != 0) {
+        check(0, "connect to that node's plaintext port", NULL);
+    } else {
+        check(tc_send(&c, "CAP LS") == 0, "send CAP LS to it", NULL);
+        check(tc_expect(&c, " LS :", 10000) == 0,
+              "the plaintext port still answers CAP LS", tc_buffer(&c));
+        /* THE ASSERTION THAT A REVERTED SUPPRESSION FAILS. Reverted to
+         * tls_node_possible() for both names, this line reads
+         * `sts=duration=15552000` with no `port`, which is the malformed policy. */
+        check(strstr(tc_buffer(&c), "sts") == NULL,
+              "CAP LS does NOT carry `sts` at all on a node with no secure port: "
+              "`port` is REQUIRED on an insecure connection and a policy missing a "
+              "required part tells a conforming client to behave as though none "
+              "was advertised -- while telling an operator protection that does "
+              "not exist",
+              tc_buffer(&c));
+        check(strstr(tc_buffer(&c), " tls") != NULL,
+              "and `tls` IS still advertised, because it is TRUE -- this node does "
+              "answer STARTTLS -- and withholding a true fact is the opposite "
+              "mistake",
+              tc_buffer(&c));
+        tc_close(&c);
+    }
+    (void)nf_stop(&n);
+    nf_free(&n);
+}
+
 int main(void)
 {
     char dir[TF_DIR_MAX];
@@ -757,6 +860,9 @@ int main(void)
                   NULL);
             nf_free(&n);
         }
+
+        /* --- A CERTIFICATE WITH NO --tls-port: `sts` IS NOT ADVERTISED --- */
+        case_sts_requires_a_secure_port(g_cert, g_key);
 
         /* --- THE FOUR REFUSED HANDSHAKES, against ONE node --- */
         {

@@ -1024,20 +1024,36 @@ int main(int argc, char **argv)
      *   absent     this build or this node has no certificate. No `tls`, no `sts`,
      *              and STARTTLS is answered 691.
      *   configured a certificate and key loaded and the key MATCHED the
-     *              certificate. `tls` and `sts` are advertised.
+     *              certificate. `tls` is advertised, and `sts` is advertised ONLY
+     *              if --tls-port gave this node a secure port -- see the paragraph
+     *              below, which is why these two are not always the same state.
      *   insecure   as above, AND --tls-insecure: an unverifiable peer certificate
      *              is accepted. Named here as well as on each link, because this is
      *              the line an operator reads once.
      *   required   as above, and PLAINTEXT client connections are refused at
      *              accept.
      *
-     * `tls_port` and `sts_duration` are the two halves of the advertised `sts`
-     * value, printed so a reader can check what clients will be told without having
-     * to know the formatting rule. A negative tls_port means there is no
-     * implicit-TLS listener, which is also when the `sts` value carries no `port`
-     * key -- the specification makes that key REQUIRED on an insecure connection,
-     * so without a secure port `sts` is advertised with a duration only and an
-     * insecure client correctly ignores it. */
+     * `tls_port` and `sts_duration` are printed so a reader can check what clients
+     * will be told without having to know the formatting rule. A negative tls_port
+     * means there is no implicit-TLS listener, and THAT IS WHY `sts` IS NOT
+     * ADVERTISED AT ALL ON SUCH A NODE.
+     *
+     * It used to be advertised with a duration and no port, and this comment used
+     * to say that was fine because "the specification makes that key REQUIRED on an
+     * insecure connection, so without a secure port `sts` is advertised with a
+     * duration only and an insecure client correctly ignores it". The
+     * specification's rule is the opposite of "correctly ignores": "If any
+     * required part is missing, clients MUST continue as if no STS policy was
+     * advertised" -- so the client was not ignoring a policy, it was being told to
+     * behave as though this node had none, which is indistinguishable from a node
+     * that has no downgrade protection. And `sts` is by definition "incompatible
+     * with servers that offer secure connections only via STARTTLS on an insecure
+     * port", which is exactly a node with a certificate and no --tls-port.
+     *
+     * So `sts_duration` here is the value that WOULD be stated, not a promise that
+     * one is: a reader comparing two startup lines can tell which node offers the
+     * policy by whether tls_port is positive. cap.c's sts_possible() is what
+     * withholds the name. */
     {
         const char *tls_state = "absent";
 
