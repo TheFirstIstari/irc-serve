@@ -1,5 +1,6 @@
 /* test_numeric_arity.c -- 461's `<command>` field, asserted POSITIONALLY, and
- * the numerics that must NOT grow one.
+ * the numerics that must NOT grow one -- plus 366's `<channel>`, which was absent
+ * on one site.
  *
  * ---------------------------------------------------------------------------
  * WHY THIS FILE EXISTS WHEN SEVENTEEN OTHER ASSERTIONS ALREADY PIN 461's BYTES
@@ -33,6 +34,14 @@
  * rather than a hopeful one. A rule of "every refusal names the verb" would give
  * 451 a field it does not have and would replace 482's channel with a verb, and
  * both faults would pass every 461 needle in the suite.
+ *
+ * 366 IS HERE FOR THE SAME REASON AND THE OPPOSITE DIRECTION: RFC 2812 5.1 gives
+ * it "<channel> :End of NAMES list", and one site answered a bare NAMES on a
+ * channel-less node with THREE parameters where the RFC names four. A needle for
+ * the trailing text alone passes a line whose channel field is missing, for the
+ * same reason a needle for 461's text alone passed a line whose command field was
+ * missing -- the field the needle does not have is the field the defect is about.
+ * See section 5 and docs/RFC2812_CONFORMANCE.md 6.11.
  *
  * ---------------------------------------------------------------------------
  * THE STANDARD-REPLIES HALF, AND WHY IT IS HERE RATHER THAN LEFT TO
@@ -244,23 +253,29 @@ static void register_client(test_client_t *c, int port, const char *nick,
     TF_CHECK_MSG(tc_expect(c, " 001 ", T_IO_MS) == 0, "%s never registered", nick);
 }
 
-/* The first CRLF-terminated line in `buf` that begins `:irc.test 461 `, copied to
- * `out`. Returns 0 on success, -1 when the window holds no such line.
+/* The first CRLF-terminated line in `buf` from `from` onward that begins
+ * `:irc.test <code> `, copied to `out`. Returns 0 on success, -1 when the window
+ * holds no such line.
  *
- * The PREFIX is matched rather than any occurrence of "461" because a 461 in the
- * trailing text of some other numeric is not a 461 -- and because a needle that
- * matched a suffix of a longer line would pass a node that never sent the line. */
-static int find_461(const char *buf, size_t from, char *out, size_t out_cap)
+ * The PREFIX is matched rather than any occurrence of the three digits because a
+ * numeric in the trailing text of some other line is not that numeric -- and
+ * because a needle that matched a suffix of a longer line would pass a node that
+ * never sent the line. Taking the code as an argument rather than hardcoding 461
+ * is what lets the 366 check below share this parser instead of a second one. */
+static int find_numeric(const char *buf, size_t from, const char *code, char *out,
+                        size_t out_cap)
 {
     const char *at = buf + from;
     const char *stop;
+    char head[16];
 
+    (void)snprintf(head, sizeof head, ":" BIN_NAME " %s ", code);
     while (*at != '\0') {
         stop = strstr(at, "\r\n");
         if (stop == NULL) {
             return -1;
         }
-        if (strncmp(at, ":" BIN_NAME " 461 ", sizeof(":" BIN_NAME " 461 ") - 1) == 0) {
+        if (strncmp(at, head, strlen(head)) == 0) {
             size_t len = (size_t)(stop - at);
 
             if (len + 1u > out_cap) {
@@ -401,7 +416,7 @@ static void check_legacy_arity(test_client_t *c)
                      "\"%s\" produced no window, so every claim below would be "
                      "about the read schedule rather than the wire", k_arity[i].send);
 
-        if (find_461(tc_buffer(c), from, found, sizeof found) != 0) {
+        if (find_numeric(tc_buffer(c), from, "461", found, sizeof found) != 0) {
             TF_CHECK_MSG(strstr(tc_buffer(c) + from, " 461 ") != NULL,
                          "\"%s\" (%s) must be answered 461 and no line beginning "
                          "\":irc.test 461 \" appeared in its window.\n  window: %s",
@@ -669,6 +684,111 @@ static void check_fail_carries_the_verb_once(test_client_t *c)
                  "  window: %s", tc_buffer(c));
 }
 
+/* ===========================================================================
+ * 5. 366 CARRIES ITS <channel> ON A CHANNEL-LESS NODE
+ * ====================================================================== */
+/* The other open finding in this tree that is a FIELD LIST rather than a mapping
+ * question, so it belongs here for the same reason 482 does: the bytes every other
+ * needle pins cannot see it.
+ *
+ * RFC 2812 5.1: 366 RPL_ENDOFNAMES "<channel> :End of NAMES list", and its prose
+ * says that when no channel is found "then only RPL_ENDOFNAMES is returned" --
+ * without saying what the channel field holds in that case. This node sends the
+ * RFC 1459 2.3 wildcard, so:
+ *
+ *     :irc.test 366 alice * :End of /NAMES list
+ *
+ * The needle that would have missed the defect is `:irc.test 366 alice :End of
+ * /NAMES list`, which is a legal substring of neither the old line nor the new
+ * one -- so the field count is what the assertion is really made of. The OLD wire
+ * form decomposes into THREE parameters where the RFC names four, and a client
+ * reading the channel positionally gets either the trailing SENTENCE or an
+ * out-of-range default. That is the whole of docs/RFC2812_CONFORMANCE.md 6.11.
+ *
+ * IT MUST RUN BEFORE ANY CLIENT JOINS A CHANNEL. A bare NAMES on a node with
+ * channels answers one 353 plus one 366 PER CHANNEL, so on a node that has one the
+ * same command produces a line with a real channel name and this check would pass
+ * for the wrong reason. main() calls it between alice's registration and her JOIN,
+ * and each test binary spawns its own node, so the node provably has zero channels
+ * here. */
+static void check_366_names_a_channel_when_there_is_none(test_client_t *c)
+{
+    size_t from;
+    size_t end;
+    char line[512];
+    char fields[8][ARITY_MAX_FIELD];
+    int n;
+
+    from = mark(c);
+    TF_CHECK_MSG(tc_send(c, "NAMES") == 0, "the bare NAMES could not be sent");
+    end = mark(c);
+    TF_CHECK_MSG(end > from, "the bare NAMES produced no window");
+
+    if (find_numeric(tc_buffer(c), from, "366", line, sizeof line) != 0) {
+        TF_CHECK_MSG(0,
+                     "a bare NAMES on a node with no channels must be answered 366 "
+                     "and no \":irc.test 366 \" line appeared. RFC 2812 5.1 says "
+                     "\"only RPL_ENDOFNAMES is returned\", so silence here would be "
+                     "indistinguishable from a dropped command.\n  window: %s",
+                     tc_buffer(c) + from);
+        return;
+    }
+    n = split_line(line, fields, 8);
+    TF_CHECK_MSG(n >= 0, "366 has no trailing parameter, so the line is not an IRC "
+                         "message at all: \"%s\"", line);
+    if (n < 0) {
+        return;
+    }
+    /* Parameters, prefix stripped: 366, <client>, <channel>, :<text>. THREE is
+     * the defect 6.11 records -- a client reading positionally finds the channel
+     * absent -- and four is the RFC's list. Five would mean something was added. */
+    TF_CHECK_MSG(n == 4,
+                 "366 must have 4 parameters (366, <client>, <channel>, :<text>) and "
+                 "has %d. RFC 2812 5.1 gives it \"<channel> :End of NAMES list\", so "
+                 "3 means <channel> is ABSENT -- which is docs/RFC2812_CONFORMANCE.md "
+                 "6.11 -- and 5 means something was added to it.\n  line: %s", n,
+                 line);
+    if (n != 4) {
+        return;
+    }
+    TF_CHECK_MSG(strcmp(fields[0], "366") == 0,
+                 "366's first parameter is \"%s\" and must be \"366\"\n  line: %s",
+                 fields[0], line);
+    TF_CHECK_MSG(strcmp(fields[1], "alice") == 0,
+                 "366's <client> is \"%s\" and must be \"alice\"\n  line: %s",
+                 fields[1], line);
+    /* The wildcard, by value. This node has no channel to name, so the field is
+     * NAMES_NO_CHANNEL's "*" -- one byte, representable in a non-final position,
+     * and RFC 1459 2.3's own wildcard. An EMPTY field is not an alternative: it
+     * renders `:irc.test 366 alice  :End of /NAMES list`, which message_format()
+     * does not produce and a client would read as a missing parameter anyway. */
+    TF_CHECK_MSG(strcmp(fields[2], "*") == 0,
+                 "366's <channel> is \"%s\" and must be \"*\" on a node with no "
+                 "channels, so a client parsing the line positionally gets a "
+                 "parseable four-parameter answer instead of the trailing "
+                 "SENTENCE.\n  line: %s", fields[2], line);
+    TF_CHECK_MSG(strcmp(fields[3], ":End of /NAMES list") == 0,
+                 "366's trailing text is \"%s\"\n  line: %s", fields[3], line);
+    /* And the whole line byte for byte, so the four checks above cannot be
+     * satisfied by a differently-spelled line that happens to have four fields. */
+    TF_CHECK_MSG(strcmp(line,
+                         ":" BIN_NAME " 366 alice * :End of /NAMES list") == 0,
+                 "the 366 line is not the expected line.\n  got:  %s\n  want: :"
+                 BIN_NAME " 366 alice * :End of /NAMES list", line);
+    /* Exactly one 366, and no 353: RFC 2812 5.1's "only RPL_ENDOFNAMES is
+     * returned" is a statement about BOTH, and a roster for a channel that does
+     * not exist would be a list of nothing presented as a list of something. */
+    TF_CHECK_MSG(tf_count(tc_buffer(c) + from, " 366 ") == 1u,
+                 "a bare NAMES on a channel-less node produced %zu 366 lines and "
+                 "must produce exactly one -- it is the only line in the answer\n"
+                 "  window: %s", tf_count(tc_buffer(c) + from, " 366 "),
+                 tc_buffer(c) + from);
+    TF_CHECK_MSG(strstr(tc_buffer(c) + from, " 353 ") == NULL,
+                 "a bare NAMES on a node with no channels produced a 353, and RFC "
+                 "2812 5.1 says only RPL_ENDOFNAMES is returned when no channel is "
+                 "found\n  window: %s", tc_buffer(c) + from);
+}
+
 int main(void)
 {
     nf_node_t node;
@@ -699,6 +819,10 @@ int main(void)
      * are asserting. */
     tc_init(&legacy);
     register_client(&legacy, node.port, "alice", NULL);
+    /* BEFORE the JOIN, and the order is the assertion: see the section's
+     * comment. A node with a channel answers this same command with that
+     * channel's name, so running it later would pass for the wrong reason. */
+    check_366_names_a_channel_when_there_is_none(&legacy);
     join_arity_channel(&legacy);
 
     check_legacy_arity(&legacy);

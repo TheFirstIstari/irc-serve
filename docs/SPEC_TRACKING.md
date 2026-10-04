@@ -1474,3 +1474,120 @@ that is recorded rather than quietly fixed**: the `319` field-order assertion
 covered only the single-line case, so a fault moving the nick into the trailing
 text of the *chunk-flush* `reply()` passed every check. It is now asserted on every
 chunked line, and the fault fails it.
+
+## 12. Phase 11c — the `NO_ANSWER` federation flake, and what it actually was
+
+**`ci_test` is a required status check and it was intermittently red.** The
+symptom was `tests/integration/test_fed_handshake.c` failing at roughly one run in
+three under ASan, and `link_timeout: ... cause=NO_ANSWER` in the child's log. PR
+#119 had already fixed the sibling mechanism (`SOCKET_GONE`) and **explicitly
+declined this one**, on the reasoning that the socket was not gone,
+`fed_link_of_conn()` matched, and the handshake was simply unanswered for the full
+`IRC_FED_HS_TIMEOUT_MS`.
+
+**`NO_ANSWER` was never a second mechanism. It was `SOCKET_GONE`'s twin wearing the
+other cause's name, and both are one unsigned subtraction.**
+
+### 12.1 The mechanism
+
+```
+promote peer=irc.b fd=5 queue_rc=0 pending=80 now=4044447577
+T2       peer=irc.b fd=5 created=4044447577 now=4044447576
+         age=18446744073709551615 hs=1000 c=0x... match=1
+MARK_CLOSING fd=5 kind=1
+```
+
+`poll_loop_step()` samples `now_ms` with `server_now_ms()` and **then** calls
+`server_tick()`, so the value every deadline in a tick is measured against was read
+**before any of that tick's work**. `fed_link_promote()` runs *inside* that tick —
+the promotion is at the top of `fed_tick()`'s per-link walk and T2's switch arm is
+at the bottom of the same walk — and it stamps `link->created_ms` from a **fresh**
+`server_now_ms()` of its own.
+
+So on any tick that takes **at least one millisecond** between step 8's clock read
+and the promotion, `created_ms` is numerically **newer** than the `now_ms` it is
+about to be compared against. Both readings are in the right order in real time and
+`CLOCK_MONOTONIC` cannot run backwards, so **this is not a clock fault** — which is
+precisely why the existing guard idiom in `server_tick()` and `resume_sweep()`, both
+of which explain themselves in terms of "a clock that went backwards", would have
+led a reader to conclude the guard was unnecessary here.
+
+`now_ms - link->created_ms` is unsigned, so a stamp one millisecond in the future
+reads as an age of `2^64-1`, which is larger than any possible timeout. T2 declared
+the handshake timed out **on the tick that created it**: `conn_mark_closing()` with
+the `FEDERATE` still sitting in the write queue, the reaper closing it at step 7 of
+the next tick, the peer observing a clean close having read nothing, and the link
+sitting in `HANDSHAKE_SENT` until a retry that never came. `match=1` in the trace
+is the socket half of the test saying the connection **was** this link's, which is
+why the printed cause was `NO_ANSWER`.
+
+### 12.2 Why it looked like a timeout problem, and why raising the timeout never worked
+
+A tick that reaches the promotion inside the same millisecond produces `age == 0`
+and is correctly not due. **The defect is a race on the tick's own duration**, so
+it needs a loaded machine to lose: 26 failures in 384 runs under load, 0 in 40 on an
+idle one. And the age is `2^64-1`, so **no budget is larger than it** — which is
+consistent with Phase 8 raising the handshake budget `5000 → 6000 → 12000` and
+changing nothing. The measured `WINDOW_LINES`-style starvation in `test_autoscale.c`
+is a separate symptom and is not claimed to be this.
+
+### 12.3 The fix, and why it is a named predicate
+
+`fed_hs_due(created_ms, now_ms)` in `src/federation/link.c`, exported in `link.h`,
+and the rule is one line: **a stamp that is not yet in the past is not due.** It is
+a predicate rather than an inline expression because
+`tests/federation/test_hs_deadline.c` has to assert it directly — a defect that can
+only be observed by losing a race cannot be regression-tested at all, and exporting
+the predicate is the whole of what makes it testable.
+
+It lives in the predicate rather than being fixed at the source
+(`fed_link_promote()` stamping from the tick's own `now_ms` instead) on purpose: the
+invariant becomes a property of the code that **depends on** `created_ms`, so a
+future caller that stamps it from another live clock read cannot reopen this.
+
+**The two halves of T2's test are guarded differently, deliberately.** The clock
+half is suppressed while the stamp is in the future; the socket half is **not**,
+because "this link's descriptor is gone" is not a question about elapsed time and is
+true whenever it is true. PR #119's `SOCKET_GONE` fix therefore still fires exactly
+when it should, which is the reason not to have guarded the whole condition.
+
+### 12.4 What was ruled out, and how
+
+Everything the brief listed was not re-chased, and the two candidates it named as
+next were checked against the trace rather than by experiment: the acceptor's queue
+was never the problem (`client_connect:` proves the connection was **accepted**),
+and `server_dial()`'s documented loose end — `SO_ERROR` reading 0 not proving a
+nonblocking `connect()` reached a live peer — is **not** this defect either, because
+the peer did accept and the handshake bytes were queued (`queue_rc=0 pending=80`)
+before the connection was marked closing. The trace discriminated the three
+candidates the brief listed (`server_dial()`'s `SO_ERROR`, the acceptor's queue, a
+silent failure of the `FEDERATE` write) directly: the write was never *attempted*,
+because the connection was skipped out of the poll set by `state == CONN_CLOSING`
+before `poll()` ever saw it.
+
+### 12.5 Teeth
+
+One fault, **build-checked to 0 errors and 0 warnings before its result was read**:
+deleting the `now_ms < created_ms` rule makes
+`tests/federation/test_hs_deadline.c` abort at its central assertion,
+`fed_hs_due(1000, 999) == 0`, exit 134. Restored, and the file's other twelve
+assertions — the reset case, both sides of the timeout boundary, and the fact that
+the predicate reads the value `fed_set_timeouts()` set rather than a copy — pass.
+
+### 12.6 The honest limits
+
+- **The fix is a guard, not a change of clock discipline.** `fed_link_promote()`
+  still stamps from a live read, so `created_ms` can still be up to one tick's
+  duration newer than the `now_ms` of the tick that created it. That is now
+  harmless because nothing treats it as elapsed time, and the predicate says so.
+- **`test_autoscale.c`'s one-in-twenty is NOT claimed closed.** It was measured at
+  1-in-20 with `lines=11` against `WINDOW_LINES = 16`, which is a starvation symptom
+  on a client-side path with no federation in it. Six full ASan suites at `-j 2` and
+  ten full Release suites at `-j 8` were green after this fix, which is what 1-in-20
+  looks like over sixteen runs, so the honest statement is that it was **not
+  reproduced and not diagnosed here**.
+- **The measurements are from Darwin.** CI's ASan job is Linux. The mechanism is
+  arithmetic rather than platform-specific — an unsigned subtraction and a tick's
+  stale timestamp — so it is not expected to be Darwin-specific, but the *rates*
+  are: the load figures below are 10-core Darwin under a synthetic busy-loop, and
+  the runner is a different machine.

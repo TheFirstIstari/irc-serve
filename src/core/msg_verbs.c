@@ -69,9 +69,53 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
      * user's hostmask), and c->host is what accept() OBSERVED -- not what USER
      * claimed. commands.c's handle_user() is why that is deliberate; this is
      * where the decision stops being internal and becomes visible to a third
-     * party reading the wire. */
+     * party reading the wire.
+     *
+     * ---------------------------------------------------------------------------
+     * THE 404 HERE, AND WHY IT NAMES NO CHANNEL -- a decision, not an oversight
+     * ---------------------------------------------------------------------------
+     * RFC 2812 5.2 gives 404 the field list "<channel name> :Cannot send to
+     * channel". The <text> is SPECIFIED by that entry rather than free, so the
+     * sentence below is the RFC's own and not a paraphrase. The <channel name>
+     * is still absent, and that is deliberate:
+     *
+     *   RESOLVING FIRST IS NOT AFFORDABLE. fanout_resolve() answers 401 or 403
+     *   ITSELF on failure -- it is a resolve-or-refuse function, not a lookup
+     *   that returns a status. Moving it ahead of this check would mean a
+     *   PRIVMSG with an unknown target AND an unrenderable source produces TWO
+     *   error numerics on one connection, which is a protocol fault rather than
+     *   a fix. The ordering above is what keeps this to exactly one.
+     *
+     *   NAMING m->params[0] WITHOUT RESOLVING WOULD BE A NEW FALSEHOOD. The
+     *   target has not been resolved, so it is not known to be a channel: an
+     *   ISON-like `PRIVMSG somenick :hi` would have a NICKNAME rendered into
+     *   <channel name>. The field is also not the client's raw target on purpose
+     *   -- the sibling refusal below sends t.name, the RESOLVED name -- so
+     *   echoing params[0] here would make the same numeric carry two different
+     *   spellings of its field depending on which site sent it.
+     *
+     * A target beginning `#` or `&` IS provably a channel without being resolved
+     * (RFC 1459 2.3.1 fixes the sigil), so the field COULD be filled on that
+     * case alone. It is not, and the reason is the reader: this check cannot
+     * fail at this site at all -- CONN_HOSTMASK_MAX is the SUM of the three
+     * struct widths, so conn_hostmask() would have to truncate a string built
+     * from those same three widths, which is a compile-time impossibility. The
+     * only reader of this line is a log reader, and for that reader one uniform
+     * shape plus the reason on stdout below is worth more than a second shape
+     * that is conformant on a path nothing can reach. The reasoning is recorded
+     * in docs/RFC2812_CONFORMANCE.md 6.12.
+     *
+     * AND WHY THE TEXT CHANGED ANYWAY. "Cannot send: unrenderable source" was
+     * this node's own sentence in a field the RFC specifies, so it was a
+     * deviation on every count. The reason it existed -- that the SOURCE is
+     * unrenderable -- is not lost: it moves to the log line below, which is
+     * where the sibling 404 and the 417 above already put theirs, and where the
+     * RFC does not constrain what may be said. */
     if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
-        (void)reply(s, c, "404", NULL, 0, "Cannot send: unrenderable source");
+        (void)reply(s, c, "404", NULL, 0, "Cannot send to channel");
+        printf("[observable] msg_refused: verb=%s nick=%s target=%s "
+               "reason=unrenderable_source\n",
+               verb, c->nick, m->params[0]);
         return;
     }
 
@@ -771,14 +815,28 @@ void handle_whois(server_t *s, conn_t *c, const message_t *m)
  * below that range -- and it is the same gap 301 is: RFC 2812 3.3.4 defines 303
  * as the reply to ISON, and nothing else is a reply to it.
  *
- * The nickname list is CHUNKED at REPLY_MAX_MID rather than refused past that
- * point. The wire grammar caps a message at IRC_MAX_PARAMS and the client itself
- * holds one of those slots, so a single 303 can carry at most 13 nicknames, and
- * reply() refuses a longer one outright. RFC 1459 2.4.3 anticipates exactly
- * this: a client MAY ask about more nicknames than fit in one reply, and the
- * server reports those it can. Refusing the whole command past 13 would be worse
- * than splitting it, because the caller could not tell a refusal from an answer
- * that happened to be empty. */
+ * The nickname list is CHUNKED rather than refused past what one reply can carry,
+ * and the bound is a BYTE count (ISON_CHUNK_MAX, below) rather than a count of
+ * names, because RFC 2812 5.1 puts the whole list in one trailing parameter and
+ * the thing that limits it is the size of that parameter. Refusing the whole
+ * command instead would be worse than splitting it, because the caller could not
+ * tell a refusal from an answer that happened to be empty. The chunking argument
+ * in full is at the loop; what matters here is that a split is forced by the wire
+ * and not chosen. */
+/* The trailing parameter's budget, IN BYTES, and derived from the buffer that
+ * refuses it rather than written out here: reply() renders the trailing text into
+ * a char[REPLY_TEXT_MAX] and REFUSES a write that would reach sizeof text, so
+ * REPLY_TEXT_MAX - 1 is the largest trailing parameter this node can put on the
+ * wire. Raising REPLY_TEXT_MAX moves this with it.
+ *
+ * IT IS BYTES AND NOT A NICK COUNT, which is what conforming 303 cost. With the
+ * list in middle parameters the bound was REPLY_MAX_MID -- a count -- because that
+ * was the limit the renderer enforced. With the list in ONE trailing parameter the
+ * limit that bites is the buffer's size, so a count would be the wrong bound and a
+ * chunk of thirteen 63-byte nicknames would be refused by reply() as
+ * "text_too_long", which reply.c documents as a bug report rather than a metric. */
+#define ISON_CHUNK_MAX (REPLY_TEXT_MAX - 1)
+
 void handle_ison(server_t *s, conn_t *c, const message_t *m)
 {
     /* Sized by the WIRE, not by the reply. The parser accepts up to
@@ -791,6 +849,11 @@ void handle_ison(server_t *s, conn_t *c, const message_t *m)
     const char *found[IRC_MAX_PARAMS];
     size_t nfound = 0;
     size_t nout = 0;
+    /* The nick list as ONE trailing parameter, NUL-terminated at `used`. + 1 is
+     * the terminator and ISON_CHUNK_MAX is the most bytes reply() will render, so
+     * `chunk[ISON_CHUNK_MAX]` is the last index this can write. */
+    char chunk[ISON_CHUNK_MAX + 1u];
+    size_t used = 0u;
 
     if (m->nparams < 1 || m->nparams > (int)(sizeof found / sizeof found[0])) {
         (void)reply_refused(s, c, "ISON", "INVALID_PARAMS", "461", NULL, 0,
@@ -807,18 +870,81 @@ void handle_ison(server_t *s, conn_t *c, const message_t *m)
         found[nfound++] = who->nick;
     }
 
-    /* At least one 303, even with nothing found: RFC 1459 2.4.3 is explicit
-     * that an empty 303 is the answer when no nickname matches, and silence
-     * would be indistinguishable from a dropped command. */
+    /* RFC 2812 5.1 gives 303 exactly ONE field:
+     *
+     *     303 RPL_ISON  ":*1<nick> *( " " <nick> )"
+     *
+     * which is a TRAILING parameter holding the whole nick list, space-separated,
+     * and nothing else. So the list is rendered into one trailing parameter here
+     * rather than into middle parameters with a sentence after them.
+     *
+     * WHY THAT IS NOT COSMETIC, and why it is the opposite of 302's shape. This
+     * used to send the nicks as middle parameters and the string "are online" as
+     * the trailing one. 302 sends the SAME VALUE in both positions, so a client
+     * reading either one gets a correct answer and the duplication is inert.
+     * 303 did not: the trailing slot held a sentence, so the two readers
+     * disagreed. A client written to the RFC reads the trailing parameter -- the
+     * only position the RFC defines -- and gets "are online", i.e. a nick list of
+     * ["are", "online"], and concludes that every nickname it asked about is
+     * OFFLINE. ISON exists to answer exactly that question, so the old shape was
+     * a FALSE NEGATIVE on a query numeric, not decoration: the worst failure a
+     * query reply can have. Conforming also costs no compatibility, because every
+     * deployed ircd sends the RFC's shape and none sends this one.
+     *
+     * "are online" is therefore GONE rather than moved, and it has to be: the
+     * trailing parameter is the list, so appending the sentence would hand a
+     * client two phantom nicks at the end of it.
+     *
+     * THE SPLIT ACROSS REPLIES IS NOT THE DEVIATION AND IS NOT BEING REMOVED,
+     * because it cannot be. A nick list too long for one line cannot be rendered
+     * in one line whatever the parameter position, so some split is forced by the
+     * wire and not by a choice here. RFC 1459 2.4.3 anticipates it, and RFC 2812
+     * 5.1's own prose for 366 speaks of "a series of RPL_NAMEREPLY messages". A
+     * client that concatenates the chunks gets the whole list under this shape --
+     * which is what concatenation is for -- whereas truncating instead would
+     * report online users as offline for everyone past the cut, the same false
+     * negative as the defect above. Truncation is not on the table.
+     */
     do {
-        size_t batch = nfound - nout;
-        const char *const *slice = (batch > 0u) ? (found + nout) : NULL;
+        chunk[0] = '\0';
+        used = 0u;
+        while (nout < nfound) {
+            size_t len = strlen(found[nout]);
+            size_t sep = (used > 0u) ? 1u : 0u; /* no leading space on the first */
 
-        if (batch > (size_t)REPLY_MAX_MID) {
-            batch = (size_t)REPLY_MAX_MID;
+            /* `used > 0u` IS LOADING-BEARING and is what makes this terminate.
+             * A nickname is at most IRC_MAX_NICK (63) bytes -- conn_t::nick is
+             * IRC_MAX_NICK + 1 -- and ISON_CHUNK_MAX is 511, so an EMPTY chunk
+             * always has room for the nickname about to go into it. `break` is
+             * therefore reachable only with a non-empty chunk, so every pass of
+             * the outer loop consumes at least one nickname and nout strictly
+             * increases. Without the guard an over-long nickname would break on an
+             * empty chunk, emit it, and re-enter the loop with nout unmoved: an
+             * infinite loop rather than a wrong reply. */
+            if (used > 0u && used + sep + len > (size_t)ISON_CHUNK_MAX) {
+                break;
+            }
+            /* THE SEPARATOR IS WRITTEN, NOT JUST SKIPPED. `sep` moves the
+             * destination one byte along, and the byte it moves past is the NUL the
+             * previous iteration left at `chunk[used]` -- so without this line the
+             * list renders as "Bob\0carol" and `%s` reports "Bob". That is not a
+             * hypothetical: it is what the first version of this loop did, and the
+             * unit test that would have caught it asserts a two-nickname ISON while
+             * every other 303 assertion in the suite names one nickname. */
+            if (sep != 0u) {
+                chunk[used] = ' ';
+            }
+            memcpy(chunk + used + sep, found[nout], len);
+            used += sep + len;
+            chunk[used] = '\0';
+            nout++;
         }
-        (void)reply(s, c, "303", slice, batch, "are online");
-        nout += batch;
+        /* reply_colon(), not reply(): see the long argument above and reply.h's. A
+         * ONE-nickname list contains no space, so RFC 1459's "colonned only when it
+         * has to be" rule would render it bare -- and `:irc.test 303 alice Bob` is
+         * byte for byte the shape the middle-parameter version sent, so the
+         * conformance change would have been invisible on the most common case. */
+        (void)reply_colon(s, c, "303", NULL, 0, "%s", chunk);
     } while (nout < nfound);
 
     printf("[observable] ison: by=%s asked=%d online=%zu\n", c->nick, m->nparams,

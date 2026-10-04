@@ -577,9 +577,33 @@ static void send_names_list(server_t *s, conn_t *dst, const chan_t *ch)
     }
 }
 
+/* The <channel> field of a 366 that answers a bare NAMES on a node with no
+ * channels. RFC 2812 5.1 NAMES 366's field list is "<channel> :End of NAMES
+ * list" and its own prose for the no-channel case says only "then only
+ * RPL_ENDOFNAMES is returned" -- it does NOT say what the channel field holds
+ * there, so the RFC defines no value and this is a decision about what a client
+ * sees rather than a substitution. It is `*`, and the argument is in
+ * docs/RFC2812_CONFORMANCE.md 6.11; the short of it is that the field is where a
+ * client looks for the channel a list belongs to, so it must EXIST on every 366
+ * or the one reply a client is parsing positionally has three parameters where
+ * RFC 2812 promises four. `*` is one byte, is representable in a non-final
+ * position (message_format() refuses anything else), and is RFC 1459 2.3's own
+ * wildcard -- so a client reading it positionally gets a parseable line and can
+ * label the answer "no channels" instead of finding the channel field absent.
+ *
+ * NAMED so the decision is greppable: this is the only 366 on the node that has
+ * no channel to name, and a future site that needs the same answer should pass
+ * this rather than spell "*" and re-decide it. */
+#define NAMES_NO_CHANNEL "*"
+
 /* 366 terminates a names list, and 7/Phase 4's requirement is that it is LAST.
  * It is emitted after every 353 and after the topic numerics, so nothing this
- * node sends in answer to a JOIN, NAMES or TOPIC query can follow it. */
+ * node sends in answer to a JOIN, NAMES or TOPIC query can follow it.
+ *
+ * EVERY 366 on this node goes through here. It took a direct reply() with NULL, 0
+ * to answer a bare NAMES on a channel-less node, which is the only way the field
+ * could be absent from a 366 -- there is one way to render this numeric and this
+ * is it. */
 static void send_end_of_names(server_t *s, conn_t *dst, const char *channel)
 {
     (void)reply(s, dst, "366", (const char *const[]){ channel }, 1,
@@ -1282,7 +1306,12 @@ void handle_names(server_t *s, conn_t *c, const message_t *m)
     /* NAMES with no argument: every channel on the node, in creation order, each
      * with its own 366. */
     if (server_chan_count(s) == 0) {
-        (void)reply(s, c, "366", NULL, 0, "End of /NAMES list");
+        /* No channel, and NAMES_NO_CHANNEL rather than no field: 366's field list
+         * is "<channel> :End of NAMES list" and the reply still has to carry one,
+         * because this is the ONLY line a client gets when it asks a channel-less
+         * node what channels there are. See send_end_of_names() for why the value
+         * is `*`. */
+        send_end_of_names(s, c, NAMES_NO_CHANNEL);
         return;
     }
     for (size_t i = 0; i < server_chan_count(s); i++) {

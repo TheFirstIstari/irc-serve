@@ -13,18 +13,31 @@ add_executable(test_heartbeat test_heartbeat.c)
 # (tests/integration/test_nick_duplicate.c) asserts the mesh; this asserts the
 # arithmetic the mesh's convergence rests on.
 add_executable(test_nick_policy test_nick_policy.c)
+# T2's handshake DEADLINE as a unit test, and the reason it cannot be an
+# integration test is the defect it pins: created_ms is stamped inside the same
+# tick whose now_ms was sampled before it, so `now_ms - created_ms` can underflow
+# and read as an age of 2^64-1. Whether it does depends on whether the tick took
+# a millisecond to reach the promotion, which is a RACE -- the integration suite
+# could only measure it as a one-in-three flake under load, and a defect that can
+# only be observed by losing a race cannot be regression-tested. The predicate is
+# exported so the rule ("a stamp not yet in the past is not due") is assertable
+# directly. See src/federation/link.h's fed_hs_due() and the file's header.
+add_executable(test_hs_deadline test_hs_deadline.c)
 
 target_link_libraries(test_federate_handshake PRIVATE irc_core)
 target_link_libraries(test_heartbeat PRIVATE irc_core)
 target_link_libraries(test_nick_policy PRIVATE irc_core)
+target_link_libraries(test_hs_deadline PRIVATE irc_core)
 
 add_test(NAME FederateHandshake COMMAND test_federate_handshake)
 add_test(NAME Heartbeat COMMAND test_heartbeat)
 add_test(NAME NickPolicy COMMAND test_nick_policy)
+add_test(NAME HsDeadline COMMAND test_hs_deadline)
 
 set_tests_properties(FederateHandshake PROPERTIES LABELS Federation)
 set_tests_properties(Heartbeat PROPERTIES LABELS Federation)
 set_tests_properties(NickPolicy PROPERTIES LABELS Federation)
+set_tests_properties(HsDeadline PROPERTIES LABELS Federation)
 
 # ---------------------------------------------------------------------------
 # The two that were SKIPS and are now REAL tests, and WHY THEY MOVED

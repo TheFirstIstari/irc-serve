@@ -140,6 +140,41 @@ int reply(server_t *s, conn_t *src, const char *code,
     ;
 
 /*
+ * As reply(), with the ':' marker on the trailing text whether or not RFC 1459
+ * requires it to survive a re-parse. The symmetric counterpart of
+ * send_line_colon(), and for the same reason it is a separate function rather
+ * than a flag on reply(): a numeric's trailing text is usually prose, and prose
+ * gets colonned by the existing rule, so a flag would be an argument every caller
+ * has to think about to get the default it already has.
+ *
+ * WHY 303 NEEDS IT, which is the whole of the current argument. RFC 2812 5.1
+ * gives 303 the field list ":*1<nick> *( " " <nick> )" -- ONE trailing parameter
+ * holding the nick list. A list of exactly one nickname contains no space and does
+ * not begin with ':', so RFC 1459's "colonned only when it has to be" rule would
+ * render it bare and `:irc.test 303 alice Bob` is, byte for byte, the shape this
+ * node used to send when the nicks were MIDDLE parameters. The two are the same
+ * bytes, so the conformance change would have been invisible on the most common
+ * case -- a one-nickname ISON -- and visible only when two or more names matched.
+ *
+ * A parser that indexes parameters cannot tell them apart (both give
+ * params[1] == "Bob"), but a client that renders the reply, or one that checks
+ * whether the server followed the field list, cannot either. And every deployed
+ * ircd writes the colon. message_format_ex()'s own comment says the choice there
+ * is "the specification's bytes over RFC 1459's minimality"; this is the same
+ * trade for the same reason, on the numeric where RFC 2812 spells the field list
+ * out with a trailing parameter.
+ *
+ * Everything else -- the destination rules, the refusals and the counters -- is
+ * reply()'s, because it is the same door.
+ */
+int reply_colon(server_t *s, conn_t *src, const char *code,
+                const char *const *mid, size_t nmid, const char *fmt, ...)
+#if defined(__GNUC__)
+    __attribute__((format(printf, 6, 7)))
+#endif
+    ;
+
+/*
  * Emit ONE non-numeric message to one client, through exactly the same
  * destination rules as reply().
  *

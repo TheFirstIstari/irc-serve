@@ -43,6 +43,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "core/connection.h"
+#include "core/message.h"
+#include "core/reply.h"
 #include "harness/irc_client.h"
 #include "harness/node_fixture.h"
 #include "harness/test_util.h"
@@ -272,7 +275,7 @@ static void expect_who_entry(client_t *cl, size_t from, size_t end,
 int main(void)
 {
     nf_node_t node;
-    client_t alice, bob, carol;
+    client_t alice, bob, carol, dave_client;
     size_t from, end;
     /* The away body is AWAY_MAX bytes, and it is composed into command and
      * expectation strings from there. The buffers are sized from the bound
@@ -692,7 +695,7 @@ int main(void)
     TF_CHECK_MSG(tc_send(&alice.c, "ISON bob") == 0, "tc_send failed");
     end = drain(&alice);
     expect_in_window(&alice, from, end, "303 for one online nick",
-                     ":" BIN_NAME " 303 alice bob :are online\r\n");
+                     ":" BIN_NAME " 303 alice :bob\r\n");
 
     /* Mixed: two present and two absent. The absent ones produce NO numeric and
      * no text -- their absence IS the answer, and the wire has no numeric for
@@ -703,7 +706,7 @@ int main(void)
                  "tc_send failed");
     end = drain(&alice);
     expect_in_window(&alice, from, end, "303 naming only the online nicks",
-                     ":" BIN_NAME " 303 alice bob carol :are online\r\n");
+                     ":" BIN_NAME " 303 alice :bob carol\r\n");
     TF_CHECK_MSG(count_in_window(&alice, from, end, " 303 ") == 1,
                  "ISON produced %zu 303 lines where one reply was expected",
                  count_in_window(&alice, from, end, " 303 "));
@@ -720,14 +723,14 @@ int main(void)
     TF_CHECK_MSG(tc_send(&alice.c, "ISON ghost1 ghost2") == 0, "tc_send failed");
     end = drain(&alice);
     expect_in_window(&alice, from, end, "303 with no names",
-                     ":" BIN_NAME " 303 alice :are online\r\n");
+                     ":" BIN_NAME " 303 alice :\r\n");
 
     /* Case folding, for the same reason WHOIS has it. */
     from = open_window(&alice);
     TF_CHECK_MSG(tc_send(&alice.c, "ISON BOB") == 0, "tc_send failed");
     end = drain(&alice);
     expect_in_window(&alice, from, end, "303 for a differently-cased nick",
-                     ":" BIN_NAME " 303 alice bob :are online\r\n");
+                     ":" BIN_NAME " 303 alice :bob\r\n");
 
     /* An AWAY user is still ONLINE. ISON asks whether a nickname is connected,
      * not whether it is idle, and answering "no" for an away user would be the
@@ -743,117 +746,202 @@ int main(void)
     TF_CHECK_MSG(tc_send(&alice.c, "ISON bob") == 0, "tc_send failed");
     end = drain(&alice);
     expect_in_window(&alice, from, end, "303 for an AWAY user",
-                     ":" BIN_NAME " 303 alice bob :are online\r\n");
+                     ":" BIN_NAME " 303 alice :bob\r\n");
 
-    /* More names than fit in one reply. RFC 1459 2.4.3 allows a client to ask
-     * about more nicknames than a single 303 can carry, and reply() refuses a
-     * 303 with more than REPLY_MAX_MID of them -- so the node must CHUNK rather
-     * than drop the overflow. The list below is longer than one reply can hold.
-     *
-     * "At least two lines" is the property, not an exact count: RFC 1459 leaves
-     * the split point to the server, so pinning it would pin an internal
-     * constant the RFC does not fix. A node that dropped the overflow would
-     * emit exactly one, which is what this catches. */
+    /* More names than fit in one reply. RFC 1459 2.4.3 allows a client to ask about
+ * more nicknames than a single 303 can carry, and reply() refuses a trailing
+ * parameter that does not fit -- so the node must CHUNK rather than drop the
+ * overflow.
+ *
+ * THE PROBE CHANGED WHEN 303 BECAME CONFORMANT, and the reason is the bound, not
+ * the spelling. RFC 2812 5.1 puts the whole nick list in ONE trailing parameter,
+ * so what limits a chunk is the SIZE OF THAT PARAMETER and not how many names it
+ * holds. The old probe sent fourteen five-byte names, which exceeded the old bound
+ * (thirteen middle parameters) and now occupies 69 bytes -- so it would have passed
+ * while testing nothing at all, which is worse than a failing probe. A probe has to
+ * exceed the bound that is actually there.
+ *
+ * So it names one client whose nickname is the node's advertised maximum, fifteen
+ * times: 15 * (63 + 1) - 1 = 959 bytes, against a budget of REPLY_TEXT_MAX - 1.
+ * Fifteen is also the most an ISON can ask about -- the parser takes at most
+ * IRC_MAX_PARAMS parameters -- so the probe is at the protocol's own ceiling and
+ * cannot be pushed further without inventing a verb.
+ *
+ * "At least two lines" is the property, not an exact count: RFC 1459 leaves the
+ * split point to the server, so pinning it would pin an internal constant the RFC
+ * does not fix. A node that dropped the overflow would emit exactly one, which is
+ * what this catches. And the SECOND assertion is the one that matters most: every
+ * name asked about appears in the window, so the split delivered the list rather
+ * than truncating it. RFC 2812 366's own prose ("a series of RPL_NAMEREPLY
+ * messages") and the general rule are both that a client CONCATENATES the chunks,
+ * and this asserts that concatenation yields the whole list. */
     {
-        char many[512];
+        char longnick[IRC_MAX_NICK + 1];
+        char many[IRC_MAX_PARAMS * (IRC_MAX_NICK + 1u) + 8u];
         size_t chunks;
+        size_t asks = (size_t)IRC_MAX_PARAMS;
 
-        /* 74 bytes of text into a 512-byte buffer, so this cannot overflow
-          * as written -- and that is the problem with leaving it: the count 7
-          * is two lines above the buffer size 512, nothing ties them together,
-          * and `n += snprintf(...)` advances by the length snprintf WOULD have
-          * written, so raising either number reopens it with nothing failing
-          * to compile.
-          *
-          * The check before the loop is the bound that makes the relationship
-          * machine-checked rather than arithmetic someone has to redo. The
-          * per-append checks keep `many + n` a valid address for the next
-          * append: snprintf documents n < size on success. */
-            const size_t n_names = 7u;
+        /* OPENED HERE AND NOT AT THE TOP, and the placement is load-bearing: a
+         * bare WHO on this node lists every nickname on it, so a fourth client
+         * registered before the WHO cases would change counts this file has
+         * nothing to do with. Registering immediately before the only probe that
+         * needs a long nickname keeps every earlier assertion about the same
+         * three clients it was written against. Holding a nickname is enough for an
+         * ISON to find him; he joins no channel. */
+
+        /* The nickname under test, at the node's advertised maximum, so the list's
+         * BYTE length is a function of IRC_MAX_NICK rather than a number someone
+         * typed. It begins with a letter and the rest is 'q', which RFC 1459 2.3.2
+         * permits: alphanumerics and a small set of punctuation, no leading digit
+         * and nothing a parser would read as a prefix. */
+        {
             size_t k;
-            size_t need = strlen("ISON");
 
-            for (k = 0; k < n_names; k++) {
-                need += strlen(" carol");
+            longnick[0] = 'L';
+            for (k = 1u; k < (size_t)IRC_MAX_NICK; k++) {
+                longnick[k] = 'q';
             }
-            for (k = 0; k < n_names; k++) {
-                need += strlen(" bob");
-            }
-            TF_CHECK_MSG(need + 1u <= sizeof many,
-                         "the ISON line needs %zu bytes and the buffer holds %zu,"
-                         " so this case would assert on a truncated request",
-                         need + 1u, sizeof many);
+            longnick[IRC_MAX_NICK] = '\0';
+        }
+        client_open(&dave_client, &node, longnick);
 
-            /* Built with ONE snprintf from a computed length, not by accumulating
-             * snprintf return values.
-             *
-             * The obvious version is `n += snprintf(many + n, sizeof many - n, ...)`
-             * in a loop, and that is the pattern CodeQL flags as an overflowing
-             * snprintf and the pattern behind the Phase-8 stack overflow:
-             * snprintf returns the length it WOULD have written, so on truncation
-             * `n` passes the end of the buffer and `sizeof many - n` underflows.
-             *
-             * Bounds checks around that loop are not the same as not doing it. The
-             * checks below made this SAFE and left the flagged shape in place, and
-             * CodeQL is right that the shape is what reopens if someone raises the
-             * count. So the text is assembled once, in a buffer whose size is
-             * computed first, and the length is asserted against the real buffer
-             * before a single byte is written.
-             */
-            {
-                char text[256];
-                size_t used = 0;
-                int w;
+        /* THE PROBE MUST ACTUALLY EXCEED ONE REPLY, and saying so out loud is what
+         * stops this case decaying into a test that passes vacuously. The budget is
+         * the source's own ISON_CHUNK_MAX, spelled from the same two constants
+         * msg_verbs.c derives it from, so raising REPLY_TEXT_MAX moves both and the
+         * assertion below is what notices if the relationship ever inverts.
+         *
+         * The budget itself is NOT pinned here, and cannot be: a test written in
+         * terms of the same constant the code uses cannot catch a wrong value in
+         * it. That constant is pinned where it is decided instead. */
+        {
+            size_t one_reply = (size_t)(REPLY_TEXT_MAX - 1);
+            size_t list_bytes = asks * ((size_t)IRC_MAX_NICK + 1u) - 1u;
 
-                w = snprintf(text, sizeof text, "ISON");
-                TF_CHECK_MSG(w > 0 && (size_t)w < sizeof text,
-                             "the ISON prefix did not fit");
-                used = (size_t)w;
-                for (k = 0; k < n_names; k++) {
-                    w = snprintf(text + used, sizeof text - used, " carol");
-                    TF_CHECK_MSG(w > 0 && (size_t)w < sizeof text - used,
-                                 "carol %zu does not fit", k);
-                    used += (size_t)w;
-                }
-                for (k = 0; k < n_names; k++) {
-                    w = snprintf(text + used, sizeof text - used, " bob");
-                    TF_CHECK_MSG(w > 0 && (size_t)w < sizeof text - used,
-                                 "bob %zu does not fit", k);
-                    used += (size_t)w;
-                }
-                TF_CHECK_MSG(used + 1u <= sizeof many,
-                             "the ISON line needs %zu bytes and the buffer holds %zu,"
-                             " so this case would assert on a truncated request",
-                             used + 1u, sizeof many);
-                memcpy(many, text, used + 1u);
+            TF_CHECK_MSG(list_bytes > one_reply,
+                         "the probe's nick list is %zu bytes and one reply holds "
+                         "%zu, so it no longer forces a split and this case would "
+                         "pass while testing nothing", list_bytes, one_reply);
+        }
+
+        /* Built with ONE snprintf from a computed length, not by accumulating
+         * snprintf return values.
+         *
+         * The obvious version is `n += snprintf(many + n, sizeof many - n, ...)`
+         * in a loop, and that is the pattern CodeQL flags as an overflowing
+         * snprintf and the pattern behind the Phase-8 stack overflow:
+         * snprintf returns the length it WOULD have written, so on truncation
+         * `n` passes the end of the buffer and `sizeof many - n` underflows.
+         *
+         * Bounds checks around that loop are not the same as not doing it, so the
+         * text is assembled once in a buffer whose size is derived from the two
+         * constants above, and the length is asserted against that buffer before a
+         * single byte is written. */
+        {
+            size_t need = strlen("ISON") + asks * (1u + (size_t)IRC_MAX_NICK);
+            size_t used = 0u;
+            size_t k;
+            int w;
+
+            TF_CHECK_MSG(need + 2u <= sizeof many,
+                         "the ISON line needs %zu bytes and the buffer holds %zu, so "
+                         "this case would assert on a truncated request", need + 2u,
+                         sizeof many);
+            /* The verb goes in FIRST, by the same measured write as every name
+             * after it. `used = strlen("ISON")` without this copy leaves the buffer
+             * beginning with the first nickname, and the node then parses the
+             * nickname as the command word and answers nothing -- which is what the
+             * first version of this block did. */
+            w = snprintf(many, sizeof many, "ISON");
+            TF_CHECK_MSG(w > 0 && (size_t)w < sizeof many, "the ISON verb did not fit");
+            used = (size_t)w;
+            for (k = 0u; k < asks; k++) {
+                w = snprintf(many + used, sizeof many - used, " %s", longnick);
+                TF_CHECK_MSG(w > 0 && (size_t)w < sizeof many - used,
+                             "longnick %zu does not fit", k);
+                used += (size_t)w;
             }
+            TF_CHECK_MSG(used + 2u <= sizeof many,
+                         "the ISON line needs %zu bytes and the buffer holds %zu, so "
+                         "this case would assert on a truncated request", used + 2u,
+                         sizeof many);
+            many[used] = '\r';
+            many[used + 1u] = '\n';
+            many[used + 2u] = '\0';
+        }
         from = open_window(&alice);
         TF_CHECK_MSG(tc_send(&alice.c, many) == 0, "tc_send failed");
         end = drain(&alice);
         chunks = count_in_window(&alice, from, end, " 303 ");
         TF_CHECK_MSG(chunks >= 2u,
-                     "a 14-nick ISON produced %zu 303 lines, expected at least 2: "
+                     "a %zu-name ISON produced %zu 303 lines, expected at least 2: "
                      "the overflow was dropped rather than chunked",
-                     chunks);
-        /* Every nick asked about is in the LAST chunk, which is what proves the
-         * overflow was delivered rather than merely not refused. bob is the
-         * seventh of the second batch, so he is past any plausible split point. */
+                     asks, chunks);
+        /* THE ORDER OF THE TWO CHECKS BELOW IS THE ORDER THEY ARE WRITTEN, and it is
+         * deliberate: the per-chunk shape is cheaper to check and more specific, so
+         * it runs first and a chunk that renders names in the middle is reported as
+         * that rather than as a wrong name count. Swapping them would not lose a
+         * fault -- TF_CHECK_MSG exits on the first failure either way -- but it would
+         * make the second fault's message describe the wrong defect.
+         *
+         * And EVERY chunk line has the RFC's shape, not just the first. 303's field
+         * list is "<client> :<list>", so a line that still put nicks in the middle
+         * would read ":irc.test 303 alice Lqqq... :Lqqq..." and this would miss it.
+         * Checking every line rather than the first is what makes the assertion about
+         * the CHUNKING as well as the spelling -- a defect that only appeared once
+         * the list got long enough to split would pass a first-line-only needle,
+         * which is exactly the phase-11b mistake on 319's chunks. */
         {
             const char *base = tc_buffer(&alice.c);
-            const char *last = NULL;
+            const char *p = base + from;
+            size_t seen = 0;
 
-            for (const char *p = base + from; p < base + end; p++) {
-                if (strncmp(p, " 303 ", 5) == 0) {
-                    last = p;
+            while ((size_t)(p - base) < end) {
+                const char *nl = strstr(p, "\r\n");
+
+                if (nl == NULL || (size_t)(nl - base) > end) {
+                    break;
                 }
+                if (strncmp(p, ":" BIN_NAME " 303 ",
+                            sizeof(":" BIN_NAME " 303 ") - 1) == 0) {
+                    TF_CHECK_MSG(strncmp(p, ":" BIN_NAME " 303 alice :",
+                                         sizeof(":" BIN_NAME " 303 alice :") - 1) == 0,
+                                 "303 chunk %zu is \"%.*s\" and must begin "
+                                 "\":irc.test 303 alice :\" -- the nick list belongs "
+                                 "in the TRAILING parameter, so a nick before the "
+                                 "colon means it is still being sent as a middle "
+                                 "field", seen, (int)(nl - p), p);
+                    seen++;
+                }
+                p = nl + 2;
             }
-            TF_CHECK_MSG(last != NULL, "no 303 line was found in the window");
-            if (last != NULL) {
-                TF_CHECK_MSG(strstr(last, " bob") != NULL &&
-                                 strstr(last, " bob") < base + end,
-                             "the final 303 chunk is missing bob, so the "
-                             "overflow was truncated rather than delivered");
+            TF_CHECK_MSG(seen == chunks,
+                         "the window holds %zu 303 lines and %zu of them began with "
+                         "the expected prefix, so some line was not parsed as a 303 "
+                         "at all", chunks, seen);
+        }
+        /* EVERY name asked about is on the wire, so the chunks concatenate back to
+         * the whole list. This is the assertion that a split is not a truncation:
+         * the old one checked that a name was present in the LAST chunk, which a
+         * node that emitted one chunk containing everything would also satisfy.
+         * Counting occurrences is what distinguishes "chunked" from "dropped". */
+        {
+            size_t seen = 0;
+            const char *p = tc_buffer(&alice.c) + from;
+
+            while (p != NULL && (size_t)(p - tc_buffer(&alice.c)) < end) {
+                p = strstr(p, longnick);
+                if (p == NULL) {
+                    break;
+                }
+                seen++;
+                p += (size_t)IRC_MAX_NICK;
             }
+            TF_CHECK_MSG(seen == asks,
+                         "the ISON asked about %s %zu times and the 303 lines carry "
+                         "it %zu times, so the list was truncated rather than "
+                         "chunked\n  window: %s", longnick, asks, seen,
+                         tc_buffer(&alice.c) + from);
         }
     }
 
@@ -874,6 +962,7 @@ int main(void)
     tc_close(&alice.c);
     tc_close(&bob.c);
     tc_close(&carol.c);
+    tc_close(&dave_client.c);
     nf_free(&node);
     tf_done("queries");
     return 0;
