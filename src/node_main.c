@@ -208,7 +208,8 @@ static void usage(FILE *out, const char *argv0)
 {
     fprintf(out, "usage: %s [port] [--name NAME] [--secret S]\n", argv0);
     fprintf(out, "            [--sasl-store PATH] [--account-store PATH]\n");
-
+    fprintf(out, "            [--peer NAME,HOST,PORT]... [--peer-tls NAME]...\n");
+    fprintf(out, "            [--tls-cert PATH --tls-key PATH] [--tls-ca PATH]\n");
     fprintf(out, "            [--tls-port PORT] [--tls-require] [--tls-insecure]\n");
     fprintf(out, "            [--tls-sts-duration SECONDS]\n");
     fprintf(out, "\n");
@@ -253,6 +254,16 @@ static void usage(FILE *out, const char *argv0)
                  "         BOTH files agree on its name and password, so a node\n"
                  "         with neither keeps exactly the behaviour it has today.\n"
                  "         Same secret-file rules, same refusals.\n");
+    fprintf(out, "\n");
+    fprintf(out, "  --peer-tls NAME\n"
+                 "         require that the link to peer NAME carries TLS. The\n"
+                 "         requirement is STICKY for the life of the link: a link\n"
+                 "         configured for TLS re-dials with TLS or does not come\n"
+                 "         back. A mesh may MIX TLS and plaintext links; what is\n"
+                 "         not permitted is one silently changing mode. Repeatable\n"
+                 "         up to %d, and a NAME with no matching --peer is an\n"
+                 "         error rather than a setting that does nothing.\n",
+            NODE_MAX_PEERS);
     fprintf(out, "\n");
     fprintf(out, "  --tls-cert PATH, --tls-key PATH\n"
                  "         the server certificate and its private key, PEM. BOTH\n"
@@ -393,6 +404,12 @@ typedef struct {
      * to be written down. */
     int         tls_insecure;
     uint32_t    tls_sts_duration;
+    /* The peers whose links must carry TLS. Names rather than indices, because
+     * --peer and --peer-tls are separate options in any order and an index would
+     * depend on which came first. A name here with no matching --peer is a startup
+     * ERROR rather than a setting that quietly does nothing -- see main(). */
+    char        tls_peers[NODE_MAX_PEERS][IRC_MAX_SERVER_NAME + 1];
+    int         ntls_peers;
 } node_opts_t;
 
 static void opts_defaults(node_opts_t *o)
@@ -489,7 +506,7 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
         if (strcmp(arg, "--name") == 0 || strcmp(arg, "--secret") == 0 ||
             strcmp(arg, "--peer") == 0 || strcmp(arg, "--sasl-store") == 0 ||
             strcmp(arg, "--account-store") == 0 ||
-
+            strcmp(arg, "--peer-tls") == 0 || strcmp(arg, "--tls-cert") == 0 ||
             strcmp(arg, "--tls-key") == 0 || strcmp(arg, "--tls-ca") == 0 ||
             strcmp(arg, "--tls-sts-duration") == 0) {
             if (i + 1 >= argc) {
@@ -566,6 +583,22 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
                 return -1;
             }
             o->tls_sts_duration = (uint32_t)seconds;
+        } else if (strcmp(arg, "--peer-tls") == 0) {
+            /* The name is validated here with the SAME predicate the --peer name
+             * goes through, so a --peer-tls naming something that could never be a
+             * server name is an error rather than a flag that matches nothing. */
+            if (value[0] == '\0' || strlen(value) > (size_t)IRC_MAX_SERVER_NAME ||
+                !irc_serve_server_name_valid(value)) {
+                fprintf(stderr, "irc-serve: bad --peer-tls name: %s\n", value);
+                return -1;
+            }
+            if (o->ntls_peers >= NODE_MAX_PEERS) {
+                fprintf(stderr, "irc-serve: at most %d --peer-tls options\n",
+                        NODE_MAX_PEERS);
+                return -1;
+            }
+            memcpy(o->tls_peers[o->ntls_peers], value, strlen(value) + 1u);
+            o->ntls_peers++;
         } else {
             if (o->npeers >= NODE_MAX_PEERS) {
                 fprintf(stderr, "irc-serve: at most %d --peer options\n",
@@ -826,11 +859,32 @@ int main(int argc, char **argv)
             server_shutdown(&srv);
             return 1;
         }
+        if (opts.ntls_peers > 0) {
+            fprintf(stderr, "irc-serve: --peer-tls was given but this node has "
+                            "no TLS\n");
+            server_shutdown(&srv);
+            return 1;
+        }
     }
 
     /* Resolve and configure the peers, still before the loop. */
     for (i = 0; i < opts.npeers; i++) {
         if (resolve_peer(&srv, &opts.peers[i]) != 0) {
+            server_shutdown(&srv);
+            return 1;
+        }
+    }
+
+    /* --peer-tls, AFTER the links exist and BEFORE the loop can dial them. A
+     * freshly configured link has retry_at_ms == 0, which fed_tick()'s T7 arm
+     * treats as DUE NOW -- so a require_tls set after the first tick would be set
+     * after the first plaintext attempt, which is the whole downgrade this flag
+     * exists to prevent. */
+    for (i = 0; i < opts.ntls_peers; i++) {
+        if (fed_link_set_tls(&srv, opts.tls_peers[i], 1) != 0) {
+            fprintf(stderr, "irc-serve: --peer-tls %s names no configured peer. "
+                            "Each --peer-tls must match a --peer.\n",
+                    opts.tls_peers[i]);
             server_shutdown(&srv);
             return 1;
         }

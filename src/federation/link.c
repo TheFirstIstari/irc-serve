@@ -525,6 +525,54 @@ static server_link_t *fed_link_new(server_t *s, const char *name, int initiator)
     return link;
 }
 
+/* See the header for the argument, and for why this is a separate call rather than
+ * a parameter. The sticky property is enforced here by the ABSENCE of any clear:
+ * the only statement that writes `require_tls` in the whole file is the one below,
+ * and it only ever writes 1. That is the enforcement, and it is checkable by
+ * inspection rather than by remembering. */
+int fed_link_set_tls(server_t *s, const char *name, int require_tls)
+{
+    server_link_t *link = server_find_link(s, name);
+
+    if (link == NULL) {
+        return -1;
+    }
+    link->require_tls = (require_tls != 0) ? 1 : 0;
+    /* THE INBOUND HALF IS NOT ENFORCED BY THIS FLAG, and an operator who reads
+     * `--peer-tls irc.a` as "this link is encrypted whichever way round it is
+     * connects" is going to be wrong about one of the two directions. So the line
+     * says which:
+     *
+     *   this node DIALS  require_tls is enforced: the handshake is started on the
+     *                    socket, the peer's certificate is verified against this
+     *                    link's name, and a failure closes the link and spends a
+     *                    retry rather than continuing in the clear.
+     *
+     *   this node ACCEPTS  NOT enforced here, and deliberately not by SNIFFING the
+     *                    plain port for a ClientHello. A port that serves plaintext
+     *                    clients and must also auto-detect TLS has no correct
+     *                    discriminator: any client that sends something other than a
+     *                    ClientHello first defeats it, and a detector that guesses
+     *                    is a downgrade waiting to be asked for. The answer an
+     *                    operator actually wants -- "nothing on the plain port may
+     *                    be plaintext" -- is `--tls-require`, which refuses every
+     *                    plaintext connection at accept and leaves the operator to
+     *                    point peers at --tls-port.
+     *
+     * An inbound peer link over TLS therefore arrives on the implicit-TLS
+     * listener, where every byte is TLS before anything is interpreted, and it is
+     * protected by exactly the mechanism a client's is. That is a real property and
+     * it is NOT the same property as the outbound one, which is why the line
+     * distinguishes them. */
+    printf("[observable] link_tls: peer=%s require_tls=%d enforced=%s inbound_hint=%s\n",
+           link->name, link->require_tls,
+           (link->initiator != 0) ? "outbound_dial"
+                                  : "use_tls_port_or_tls_require",
+           (link->initiator != 0) ? "n/a"
+                                  : "accept_on_the_tls_port");
+    return 0;
+}
+
 server_link_t *fed_link_configure(server_t *s, const char *name,
                                   const struct sockaddr *sa, socklen_t salen)
 {

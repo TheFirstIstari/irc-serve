@@ -616,3 +616,16 @@ irc_add_integration_test(test_numeric_arity test_numeric_arity.c)
 # a key in git history is public for ever while an "expired is refused" case needs a
 # certificate whose expiry is computed at run time.
 irc_add_integration_test(test_tls test_tls.c)
+
+# Phase 12 item 5: TLS on a PEER LINK, and the mixed-mesh decision. Its own file
+# because the decision is the deliverable as much as the code is: a mesh may MIX TLS
+# and plaintext links, and what makes that safe is that a link's mode is STICKY --
+# `server_link_t::require_tls` is written once from the operator's command line and
+# is never cleared by anything, which is asserted by inspection because the only way
+# to prove it behaviourally would be to have a downgrade path to observe.
+#
+# It runs against the SHIPPED BINARY on a command line, because --peer-tls and
+# --tls-ca are main()'s options and an inline child has no command line. In the
+# default build it asserts the one thing that build can: --peer-tls is REFUSED at
+# startup rather than accepted and ignored.
+irc_add_integration_test(test_peer_tls test_peer_tls.c)

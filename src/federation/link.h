@@ -723,6 +723,28 @@ void fed_set_retry(uint64_t base_ms, uint64_t max_ms, unsigned budget);
  * do. The CLI's own cap of IRC_FED_MAX_PEERS --peer options is therefore a
  * limit on the command line, not on the table, and the two being different is
  * recorded rather than hidden. */
+/* Mark the link to `name` as one that must carry TLS, or as one that need not.
+ *
+ * THE STICKINESS IS THE POINT and it is why this is a separate call rather than an
+ * argument to fed_link_configure(): `require_tls` is set here and is never cleared
+ * for the life of the link -- not by a tick, not by the retry arm, not by
+ * fed_link_reset(). A link that was TLS and came back in the clear would mean that
+ * compromising the plaintext path ONCE was enough to downgrade it permanently,
+ * because the attacker would simply answer the next dial.
+ *
+ * Returns 0 on success and -1 when there is no such link, which is a startup error
+ * rather than a runtime possibility: main() calls it once per --peer-tls, right
+ * after fed_link_configure(), so a name that matches nothing is a mistyped command
+ * line and is reported as one instead of being a setting that quietly does
+ * nothing.
+ *
+ * CALL IT BEFORE THE FIRST DIAL. fed_tick()'s T7 arm dials a link whose retry_at_ms
+ * is 0, which is the state a freshly configured link is in -- so a require_tls set
+ * after the first tick would be set after the first plaintext attempt. main() does
+ * it before the loop is armed, which is the same reason peer resolution happens
+ * there. */
+int fed_link_set_tls(server_t *s, const char *name, int require_tls);
+
 server_link_t *fed_link_configure(server_t *s, const char *name,
                                   const struct sockaddr *sa, socklen_t salen);
 

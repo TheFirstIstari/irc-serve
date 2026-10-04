@@ -2130,6 +2130,75 @@ int server_dial_progress(server_t *s, const struct pollfd *pfds, size_t nfds)
         s->dials[i].state = DIAL_CONNECTED;
         s->n_dial_connected++;
 
+        /* --------------------------------------------------------------------
+         * PHASE 12: THE OUTBOUND PEER LINK'S TLS, and where it starts
+         * --------------------------------------------------------------------
+         * HERE, and not in fed_tick's dial arm, because this is the only place the
+         * socket is KNOWN to be connected. The dial arm has a descriptor that is
+         * still DIAL_CONNECTING -- connect() may not have completed -- and starting
+         * a handshake on it would write a ClientHello into a socket whose SYN is
+         * unanswered. The connection exists and peer_name is on it; this is the
+         * moment.
+         *
+         * THE NAME IS WHAT IS VERIFIED, not the address, and that is a decision
+         * rather than an accident of what was to hand:
+         *
+         *   2.3 makes a peer's IDENTITY its server name -- name uniqueness is a
+         *   handshake-time rejection and every rejection names a server. The
+         *   certificate names a peer too. Verifying one against the other is what
+         *   makes the link mean "this is irc.b", and irc.b is the thing the rest of
+         *   this node believes about it: `nick@server`, `irc-serve-origin`, the
+         *   hop path, every 2.4 tag.
+         *
+         *   The --peer HOST is only a DIAL HINT, and this codebase resolved it once
+         *   at startup and threw the name away (node_main.c's resolve_peer() takes
+         *   the first result and frees the rest, for the reason its comment gives).
+         *   There is no hostname left to check a certificate against, and checking
+         *   against the resolved IP instead would be both worse and more brittle: a
+         *   certificate issued for `irc.example.com` would fail, and the failure
+         *   would appear and disappear as DNS moved.
+         *
+         *   THE COST AN OPERATOR PAYS, stated so it is not a surprise: certificates
+         *   for this mesh must be issued for the SERVER NAMES, not for the
+         *   addresses. A node whose peers' certificates are for their hostnames
+         *   cannot use --peer-tls, and the refusal names CERTIFICATE_VERIFY_FAILED
+         *   rather than being mysterious.
+         */
+        {
+            server_link_t *link = server_find_link(s, s->dials[i].peer_name);
+
+            if (link != NULL && link->require_tls != 0) {
+                if (s->tls == NULL) {
+                    /* UNREACHABLE THROUGH THE SHIPPED BINARY, and refused anyway.
+                     * main() refuses a --peer-tls on a node with no certificate, so
+                     * a link cannot reach here with require_tls set and no TLS. The
+                     * arm exists because the alternative is a null dereference if
+                     * that check is ever moved, and because a link that is REQUIRING
+                     * TLS and finds none must fail loudly rather than continue in the
+                     * clear -- which is the downgrade this whole field exists to
+                     * prevent. */
+                    s->n_tls_handshake_failed++;
+                    printf("[observable] tls_handshake_failed: peer=%s "
+                           "reason=NO_TLS_CONFIGURED action=CLOSE\n", link->name);
+                    server_close_conn(s, s->dials[i].fd);
+                    s->dials[i].state = DIAL_FAILED;
+                    s->n_dial_failed++;
+                    continue;
+                }
+                if (transport_starttls_peer(c, 0, link->name) != 0) {
+                    s->n_tls_handshake_failed++;
+                    printf("[observable] tls_handshake_failed: peer=%s "
+                           "reason=START_FAILED action=CLOSE\n", link->name);
+                    server_close_conn(s, s->dials[i].fd);
+                    s->dials[i].state = DIAL_FAILED;
+                    s->n_dial_failed++;
+                    continue;
+                }
+                link->tls_active = 1;
+                printf("[observable] link_tls_start: peer=%s role=client\n",
+                       link->name);
+            }
+        }
     }
     return 0;
 }
