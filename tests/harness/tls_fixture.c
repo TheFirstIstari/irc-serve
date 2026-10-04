@@ -123,12 +123,38 @@ void tf_tls_rmtree(const char *dir)
         return;
     }
     while ((e = readdir(d)) != NULL) {
-        char path[1024];
+        char path[TF_PATH_MAX];
 
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
             continue;
         }
-        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        /* THE LENGTH IS CHECKED RATHER THAN TRUSTED, and this is the same decision
+         * as tls_fixture_none.c's, applied to the third of the three sites that
+         * gcc-16 refuses to compile.
+         *
+         * `snprintf(path, sizeof path, "%s/%s", dir, e->d_name)` is diagnosable as
+         * a possible truncation because `dir` is a caller's buffer of unknown size,
+         * `e->d_name` can be a NAME_MAX string, and nothing in the types says the
+         * sum fits `path`. The two clang builds do not diagnose it at all, which is
+         * how the same line survived here after its twin in the .none file was
+         * fixed -- the difference between the two files is only which compiler
+         * compiled them.
+         *
+         * So: a name that would not fit is SKIPPED rather than truncated, because a
+         * truncated path here unlinks a file whose name is not the one just read.
+         * Nothing is left behind either way -- the directory is per-process and
+         * under the build tree -- and skipping is strictly safer than guessing. */
+        {
+            size_t dlen = strlen(dir);
+            size_t nlen = strlen(e->d_name);
+
+            if (dlen + 1u + nlen + 1u > sizeof path) {
+                continue;
+            }
+            memcpy(path, dir, dlen);
+            path[dlen] = '/';
+            memcpy(path + dlen + 1u, e->d_name, nlen + 1u);
+        }
         (void)unlink(path);
     }
     (void)closedir(d);
