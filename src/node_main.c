@@ -87,6 +87,8 @@
 #include <errno.h>
 #include <netdb.h>
 #include <signal.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -319,6 +321,80 @@ static void usage(FILE *out, const char *argv0)
                  "EITHER side connects, so two nodes that both list each other\n"
                  "as a peer will both dial and neither will accept. Configure\n"
                  "each pair in ONE direction.\n");
+}
+
+/* ---------------------------------------------------------------------------
+ * A PRIVATE KEY'S PERMISSIONS, and this is a security boundary
+ * ---------------------------------------------------------------------------
+ * A PRIVATE KEY IS THE ONE FILE IN THIS PROJECT WHERE "group or other can read it"
+ * IS THE WHOLE DEFEAT. The federation secret this node already protects
+ * (account_store.c's and sasl_framework.c's checks) leaks one mesh's peering; the
+ * server key leaks the ability to IMPERSONATE this node to every client that
+ * verifies a certificate -- which, once an `sts` policy is advertised, is every
+ * client that has ever connected to it, for as long as the policy lasts.
+ *
+ * SO THE RULE IS STRICTER THAN THOSE TWO FILES USE, and the difference is
+ * deliberate: S_IRWXG | S_IRWXO is refused, which means a key readable by its
+ * OWNER'S GROUP is refused too. A private key a group account can read has been
+ * shared with a group account. There is no deployment this hurts that is not a
+ * deployment that has already given the key away. A fault injection on this file
+ * confirmed why the distinction is worth a test: reducing the check to S_IRWXO alone
+ * left every world-readable-key case green, because a 0644 key still trips the
+ * other bits. Only a 0640 key -- group-readable, not world-readable -- tells the
+ * two rules apart, so that is the mode tests/integration/test_tls.c asserts with.
+ *
+ * WHY IT IS HERE AND NOT IN THE TLS BACKEND, which is not where a reader would
+ * look. It was in the backend, and a fault injection showed the cost: the check was
+ * COMPILED OUT of a `-DWITH_TLS=OFF` build along with the rest of that file, so the
+ * DEFAULT build -- the one every CI runner compiles -- could not refuse an unsafe
+ * key at all. This is a statement about the OPERATOR'S CONFIGURATION and it belongs
+ * where the configuration is decided. A node with no TLS library still refuses to
+ * accept a key other people can read, which is the right answer to "here is a
+ * private key that is not private" whether or not this node was going to load it.
+ *
+ * OPEN-THEN-fstat, for account_store.c's reason and in the same order: stat() then
+ * open() leaves a window in which the file judged is not the file read, and this
+ * file's content is the ability to impersonate a server. fstat() on the descriptor
+ * cannot race. A symlink is followed and not special-cased, because fstat() judges
+ * the TARGET, which is the file whose bytes would be read -- the same decision
+ * those two loaders make, for the same reason.
+ *
+ * OpenSSL will not do this for us: the file's mode is not part of the PEM format
+ * and there is nowhere in the library to report it.
+ */
+static int key_file_is_private(const char *path)
+{
+    struct stat sb;
+    FILE *f;
+
+    if (path == NULL || path[0] == '\0') {
+        return -1;
+    }
+    f = fopen(path, "re");
+    if (f == NULL) {
+        printf("[observable] tls_key: state=REFUSED path=%s reason=open\n", path);
+        return -1;
+    }
+    if (fstat(fileno(f), &sb) != 0) {
+        printf("[observable] tls_key: state=REFUSED path=%s reason=fstat\n", path);
+        (void)fclose(f);
+        return -1;
+    }
+    if (!S_ISREG(sb.st_mode)) {
+        printf("[observable] tls_key: state=REFUSED path=%s reason=not_regular\n",
+               path);
+        (void)fclose(f);
+        return -1;
+    }
+    if ((sb.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        printf("[observable] tls_key: state=REFUSED path=%s reason=mode_%03o "
+               "(a private key readable by group or other has been shared)\n",
+               path, (unsigned)(sb.st_mode & 0777));
+        (void)fclose(f);
+        return -1;
+    }
+    (void)fclose(f);
+    return 0;
 }
 
 /* Parse the port argument. Returns 0 on success, -1 if it is not a number in
@@ -822,6 +898,17 @@ int main(int argc, char **argv)
         return 1;
     }
     if (opts.tls_cert != NULL) {
+        /* THE KEY'S MODE IS CHECKED BEFORE ANYTHING IS LOADED, and it is a refusal
+         * of the whole CONFIGURATION rather than of the file: a node that cannot
+         * prove its key is private must not come up offering a certificate, because
+         * half-configured TLS that looks configured is the worst of the three
+         * states -- an operator reading `tls=configured` would believe in it. */
+        if (key_file_is_private(opts.tls_key) != 0) {
+            fprintf(stderr, "irc-serve: the TLS private key is readable by group "
+                            "or other; refusing to start\n");
+            server_shutdown(&srv);
+            return 1;
+        }
         if (tls_backend_node_init(&srv.tls, opts.tls_cert, opts.tls_key,
                                   opts.tls_ca, opts.tls_insecure) != 0) {
             /* A CERTIFICATE THAT DID NOT LOAD IS A STARTUP FAILURE, and this is

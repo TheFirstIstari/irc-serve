@@ -67,6 +67,14 @@ int tf_tls_available(void)
 /* ---------------------------------------------------------------------------
  * FILE HELPERS
  * --------------------------------------------------------------------------- */
+/* Every path this file builds is `"<dir>/<stem><.suffix>"`, where dir is a
+ * caller-supplied buffer. The destination is sized for the LONGEST such
+ * composition rather than for a single component, because gcc-16 will not accept a
+ * same-sized destination under -Werror while the two clang builds do not diagnose
+ * it -- and three compilers disagreeing about whether a construct is a defect is a
+ * situation to satisfy the strictest in rather than to suppress. */
+#define TF_PATH_MAX 2048
+
 int tf_tls_write_file(const char *path, const void *data, size_t n,
                       unsigned mode)
 {
@@ -169,7 +177,7 @@ int tf_tls_make_cert(const char *dir, const char *stem, const char *cn,
     EVP_PKEY *pkey = NULL;
     X509 *cert = NULL;
     BIO *bio = NULL;
-    char path[1024];
+    char path[TF_PATH_MAX];
     int ok = -1;
 
     if (dir == NULL || stem == NULL || cn == NULL) {

@@ -78,6 +78,22 @@
 #include "harness/test_util.h"
 #include "harness/tls_fixture.h"
 
+/* THE FIXTURE'S DIRECTORY AND THE PATHS BUILT FROM IT.
+ *
+ * PF_PATH is deliberately LARGER than PF_DIR_MAX, and that is arithmetic rather
+ * than taste. Every path below is `"%s/<name>"` where the first %s is `dir`, so the
+ * compiler has to prove PF_DIR_MAX + strlen(name) + 1 fits the destination -- and
+ * with a same-sized destination it cannot, so gcc-16 refuses to compile under
+ * -Werror while Apple clang 21 and upstream clang 23 do not diagnose it at all.
+ *
+ * Three compilers disagreeing about whether a construct is a defect is exactly the
+ * situation where satisfying the strictest is right: the alternative is a
+ * -Wno-format-truncation suppression, and a suppression is invisible to a reader of
+ * the build output and permanent. 128 bytes is room for the longest suffix used
+ * here (`/wrongca.crt`). */
+#define PF_DIR_MAX 512
+#define PF_PATH (PF_DIR_MAX + 128)
+
 static int failures;
 
 static void check(int cond, const char *what, const char *detail)
@@ -166,9 +182,19 @@ static int tls_port_of(const nf_node_t *n)
 
 int main(void)
 {
-    char dir[512];
-    char a_cert[512], a_key[512], b_cert[512], b_key[512];
-    char a_tls[512];
+    char dir[PF_DIR_MAX];
+    /* THE PATH BUFFERS ARE 640 AND NOT 512, and that is arithmetic rather than
+     * taste. `dir` is `char dir[512]` and each of these is built as
+     * `"%s/<name>"`, so the compiler has to prove 512 + strlen(name) + 1 fits --
+     * and with a same-sized destination it cannot, so gcc-16 refuses to compile
+     * under -Werror while Apple clang and upstream clang do not diagnose it at all.
+     *
+     * Three compilers that disagree about whether a construct is a defect is
+     * exactly the situation where satisfying the strictest is right: the
+     * alternative is a suppression, and a suppression is invisible to a reader of
+     * the build output. DIR_MAX + PATH_MAX_SUFFIX_SLACK is the whole of it. */
+    char a_cert[PF_PATH], a_key[PF_PATH], b_cert[PF_PATH], b_key[PF_PATH];
+    char a_tls[PF_PATH];
     char buf[256];
     nf_node_t na;
     nf_node_t nb;

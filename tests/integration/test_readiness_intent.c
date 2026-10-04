@@ -799,15 +799,26 @@ static void case_structural(void)
           "every path that ends a connection ends in conn_free(), so this is "
           "where an SSL* must be freed");
 
+    /* tf_calls() IS A BOOLEAN, so it answers "is there a call here" and not "how
+     * many". That is enough for the claim being made -- conn_pump() REACHES
+     * transport_send(), from the queued write and from the empty handshake pass --
+     * and the `detail` argument carries the distinction as prose rather than as a
+     * number.
+     *
+     * AND THE BUFFER IS SIZED FOR IT. The first version snprintf'd this text into
+     * `char detail[128]`, which gcc-16 rejects: the string is 217 bytes, and
+     * -Werror turns the possible truncation into a build failure. A diagnostic
+     * message that cannot hold its own text is a diagnostic that would have been
+     * silently cut in half on the one machine that reached the check. */
     {
-        char detail[128];
+        char detail[320];
         int n = tf_calls(code, "transport_send");
 
-        snprintf(detail, sizeof detail,
-                 "conn_pump() must reach transport_send() from the queued write "
-                 "and from the empty handshake pass (tf_calls() is a boolean, "
-                 "so it reports 1 when either exists; the count of raw "
-                 "occurrences is what distinguishes the two)");
+        (void)snprintf(detail, sizeof detail,
+                       "tf_calls() found %d (it is a boolean: 1 means the call "
+                       "site is there); conn_pump() must reach transport_send() "
+                       "from the queued write and from the empty handshake pass, "
+                       "and connection.c must call no send() of its own", n);
         check(n == 1,
               "conn_pump() reaches transport_send(), and it is the only writer",
               detail);

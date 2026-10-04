@@ -60,6 +60,15 @@
 #include "harness/test_util.h"
 #include "harness/tls_fixture.h"
 
+/* THE FIXTURE'S DIRECTORY AND THE PATHS BUILT FROM IT, sized so a
+ * `"%s/<name>"` composition is provably within its destination. gcc-16 diagnoses
+ * a same-sized pair as a possible truncation under -Werror and the two clang
+ * builds do not, so satisfying the strictest is the choice that needs no
+ * suppression -- and a suppression is invisible to a reader of the build output.
+ * See test_peer_tls.c for the same constants and the same argument. */
+#define TF_DIR_MAX 512
+#define TF_PATH (TF_DIR_MAX + 128)
+
 static int failures;
 
 static void check(int cond, const char *what, const char *detail)
@@ -220,6 +229,45 @@ static int run_expecting_refusal(char *const argv[], char *out, size_t outcap,
     return -1;
 }
 
+/* ---------------------------------------------------------------------------
+ * THE REFUSAL INSIDE server_listen_tls(), AND WHY NOTHING HERE ASSERTS IT
+ * ---------------------------------------------------------------------------
+ * server_listen_tls() refuses when `s->tls == NULL`: there is no configuration in
+ * which this function binds a port it cannot encrypt, and that is the whole of its
+ * safety property.
+ *
+ * A fault injection DELETED that refusal and every assertion in this file stayed
+ * green. The reason is not that the check is weak -- it is that the check is
+ * UNREACHABLE through the shipped binary: main() already refuses `--tls-port` when
+ * no certificate was supplied, before server_listen_tls() is ever called. Both
+ * branches of that earlier refusal are asserted above, and they are the ones that
+ * are exercised.
+ *
+ * The code is KEPT rather than removed, because server_listen_tls() is a public
+ * function and a future caller that reaches it without going through main() -- a
+ * test, an embedding, a third listener -- would otherwise bind a port it cannot
+ * encrypt.
+ *
+ * AND NO INSPECTION ASSERTION IS MADE ABOUT IT, which is the part worth recording.
+ * The first attempt at one read the file through tf_read_code() and searched for the
+ * condition; it passed with the refusal deleted, because the stripper removes
+ * string LITERALS and the same condition also appears in server_dial_progress()'s
+ * peer-link arm where it means something else. The second attempt scoped the search
+ * to the function's own text and still passed. An assertion that cannot fail is
+ * worse than no assertion, because a reader counts it as coverage. So this is a
+ * NAMED GAP rather than a checked one, and the gap is documented at the code as
+ * well as here.
+ */
+static void case_one_named_gap(void)
+{
+    check(1,
+          "NAMED GAP, not a covered case: server_listen_tls()'s own NO-TLS refusal "
+          "is unreachable through the shipped binary (main() refuses first, and "
+          "that refusal IS asserted), so deleting it changes no observable "
+          "behaviour and nothing here can prove otherwise",
+          NULL);
+}
+
 /* ===========================================================================
  * CASE GROUP 1: the REFUSALS, which both builds assert
  * ===========================================================================
@@ -238,8 +286,8 @@ static void case_configuration_refusals(const char *dir)
     char a1[] = "0";
     char a2[] = "--name";
     char a3[] = "irc.tls";
-    char cert[512];
-    char key[512];
+    char cert[TF_PATH];
+    char key[TF_PATH];
     char port[16];
     char *v_no_pair[9];
     char *v_bad_key[9];
@@ -285,12 +333,25 @@ static void case_configuration_refusals(const char *dir)
      * has to happen even in a build with no TLS library, because a node that
      * ignored an unsafe key and then a deployment installed one would have been
      * told nothing at the moment it mattered. */
+    /* A KEY FILE IS WRITTEN WITH tf_tls_write_file() AND NOT GENERATED, and that is
+     * the point. The refusal this case checks happens BEFORE anything is parsed --
+     * the node stats the file, finds a group- or other-readable bit, and stops --
+     * so it does not need a real certificate and must not be gated on one. Making
+     * it depend on the generator meant the DEFAULT build exited before reaching it,
+     * so the single most important assertion in this file ran only in the build that
+     * already has TLS. A fault injection found that: removing the check made the
+     * whole file green in the TLS build for the WRONG reason, and would have made
+     * it green in the default build for the same one. */
     snprintf(key, sizeof key, "%s/open.key", dir);
-    check(tf_tls_make_cert(dir, "open", "irc.tls",
-                           "DNS:irc.tls,IP:127.0.0.1,DNS:localhost", 0, 86400,
-                           0644) == 0,
-          "generate a certificate whose key is mode 0644", NULL);
+    check(tf_tls_write_file(key, "-----BEGIN PRIVATE KEY-----\n", 28, 0644) == 0,
+          "put a file on disk whose mode is 0644 -- no certificate needed, because "
+          "the refusal is a stat(2) and not a parse",
+          NULL);
     snprintf(cert, sizeof cert, "%s/open.crt", dir);
+    check(tf_tls_write_file(cert, "-----BEGIN CERTIFICATE-----\n", 27, 0600) == 0,
+          "and a matching certificate file with a safe mode, so the refusal cannot "
+          "be satisfied by the certificate failing to load instead",
+          NULL);
     {
         struct stat sb;
         int mode_ok = (stat(key, &sb) == 0) &&
@@ -306,8 +367,8 @@ static void case_configuration_refusals(const char *dir)
     v_bad_key[6] = "--tls-key"; v_bad_key[7] = key;
     v_bad_key[8] = NULL;
     rc = run_expecting_refusal(v_bad_key, msg, sizeof msg, 10000);
-    check(rc > 0, "a GROUP-OR-OTHER-READABLE private key REFUSES the whole "
-                  "configuration, with a non-zero exit",
+    check(rc > 0, "a WORLD-READABLE private key REFUSES the whole configuration, "
+                  "with a non-zero exit",
           msg);
     check(strstr(msg, "tls_key") != NULL && strstr(msg, "REFUSED") != NULL,
           "the refusal is reported as tls_key state=REFUSED with the offending "
@@ -315,6 +376,66 @@ static void case_configuration_refusals(const char *dir)
           msg);
     check(strstr(msg, "mode_") != NULL,
           "the refusal prints the mode that was refused, in octal", msg);
+
+    /* GROUP-READABLE ALONE, AND THIS IS THE CASE THE FIRST VERSION OF THIS TEST
+     * WAS MISSING.
+     *
+     * The case above uses mode 0644, which sets the group bits AND the other bits,
+     * so a check that tested only S_IRWXO would still refuse it and the test would
+     * pass against a check with half the rule missing. A fault injection confirmed
+     * exactly that: reducing the check to `sb.st_mode & S_IRWXO` left this whole
+     * file green, which is the false pass this project has been bitten by before.
+     *
+     * 0640 is the mode that separates the two halves: readable by its OWNER'S
+     * GROUP and not by other. A private key a group account can read has been shared
+     * with a group account, and on a shared build host or a machine with a
+     * `developers` group that is the whole defeat. So the refusal has to come from
+     * S_IRWXG alone, with nothing else set. */
+    snprintf(key, sizeof key, "%s/group.key", dir);
+    check(tf_tls_write_file(key, "-----BEGIN PRIVATE KEY-----\n", 28, 0640) == 0,
+          "put a file on disk whose mode is 0640 -- group-readable, NOT "
+          "world-readable",
+          NULL);
+    {
+        struct stat sb;
+        int shape_ok = (stat(key, &sb) == 0) &&
+                       ((sb.st_mode & S_IRWXG) != 0) &&
+                       ((sb.st_mode & S_IRWXO) == 0);
+
+        check(shape_ok,
+              "and the fixture really produced that shape: group bits set and "
+              "other bits CLEAR, so the assertion below cannot be satisfied by a "
+              "world-readability check",
+              "the fixture's mode argument did not take");
+    }
+    snprintf(cert, sizeof cert, "%s/group.crt", dir);
+    check(tf_tls_write_file(cert, "-----BEGIN CERTIFICATE-----\n", 27, 0600) == 0,
+          "and a certificate file, so the refusal is about the KEY's mode and "
+          "nothing else",
+          NULL);
+    rc = run_expecting_refusal(v_bad_key, msg, sizeof msg, 10000);
+    check(rc > 0, "a GROUP-READABLE private key is refused on its own, with no "
+                  "world-readable bit set anywhere",
+          msg);
+    /* THE REASON IS ASSERTED, NOT JUST THE EXIT STATUS, and this assertion is the
+     * difference between catching the fault and half-catching it.
+     *
+     * With a check that tested only S_IRWXO, a 0640 key would be ACCEPTED by the
+     * permission test -- and then refused moments later because the fixture's file
+     * is not a real PEM. The node exits non-zero either way, so an assertion on the
+     * exit status passes against the fault, and the only reason it was caught at
+     * all was the mode_640 needle below. Asserting the REASON means the refusal
+     * has to be the key's mode: a refusal that came from the file not parsing is
+     * a different failure with a different fix. */
+    check(strstr(msg, "tls_key: state=REFUSED") != NULL,
+          "and the refusal is the KEY'S MODE -- not the certificate failing to "
+          "load, which is a different fault with a different fix and also exits "
+          "non-zero",
+          msg);
+    check(strstr(msg, "reason=mode_640 ") != NULL,
+          "and the refusal prints reason=mode_640 -- octal, with no leading zero -- "
+          "which is what makes it checkable that the refusal came from the group bit",
+          msg);
 }
 
 /* ===========================================================================
@@ -327,10 +448,17 @@ static void case_configuration_refusals(const char *dir)
  * either would be a client switching on a feature nothing implements, which is the
  * failure cap.h exists to prevent.
  */
-static void case_plaintext_build_has_no_tls_surface(void)
+static void case_plaintext_build_has_no_tls_surface(const char *dir)
 {
     nf_node_t n;
     test_client_t c;
+    char msg[4096];
+    char a0[] = "irc-serve";
+    char a1[] = "0";
+    char key[TF_PATH];
+    char cert[TF_PATH];
+    char *v[10];
+    int rc;
 
     if (nf_spawn_binary(&n) != 0) {
         check(0, "spawn the default-build node", NULL);
@@ -338,9 +466,36 @@ static void case_plaintext_build_has_no_tls_surface(void)
     }
     check(nf_expect(&n, "tls=absent", 5000) == 0,
           "the startup line says tls=absent on a build with no TLS", NULL);
-    check(nf_expect(&n, "tls_init: state=REFUSED reason=NOT_COMPILED_IN", 5000) == 0,
-          "a node asked for TLS on a build without it says NOT_COMPILED_IN rather "
-          "than failing silently", NULL);
+
+    /* A NODE THAT WAS ASKED FOR TLS ON A BUILD THAT CANNOT DO IT.
+     *
+     * This was originally asserted on a node with no TLS options at all, which
+     * asserted nothing: a node with no options never calls the backend, so
+     * `tls_init: state=REFUSED` could not appear and the check only ever passed on
+     * a build where the branch was never reached. It needs a node that ACTUALLY
+     * supplies a certificate, and the key therefore has to have a SAFE mode -- or
+     * the key's own refusal fires first, which is itself correct behaviour and is
+     * asserted separately above.
+     *
+     * So: a 0600 key and a certificate, handed to a build with no crypto library.
+     * The answer must be a named refusal, not a node that starts and believes it
+     * is encrypted. */
+    snprintf(key, sizeof key, "%s/plain-build.key", dir);
+    snprintf(cert, sizeof cert, "%s/plain-build.crt", dir);
+    (void)tf_tls_write_file(key, "-----BEGIN PRIVATE KEY-----\n", 28, 0600);
+    (void)tf_tls_write_file(cert, "-----BEGIN CERTIFICATE-----\n", 27, 0600);
+    v[0] = a0; v[1] = a1; v[2] = "--tls-cert"; v[3] = cert;
+    v[4] = "--tls-key"; v[5] = key; v[6] = NULL; v[7] = NULL;
+    v[8] = NULL; v[9] = NULL;
+    rc = run_expecting_refusal(v, msg, sizeof msg, 10000);
+    check(rc > 0,
+          "a node GIVEN a certificate on a build with no crypto library REFUSES "
+          "to start rather than coming up as a node that believes it is encrypted",
+          msg);
+    check(strstr(msg, "NOT_COMPILED_IN") != NULL,
+          "and names NOT_COMPILED_IN, so the operator is told to rebuild rather "
+          "than left guessing whether the certificate was bad",
+          msg);
 
     if (tc_connect(&c, n.port) != 0) {
         check(0, "connect to the plaintext listener", NULL);
@@ -372,15 +527,15 @@ static void case_plaintext_build_has_no_tls_surface(void)
 
 int main(void)
 {
-    char dir[512];
+    char dir[TF_DIR_MAX];
     char msg[4096];
     /* `g_cert`/`g_key`/`g_port` rather than `cert`/`key`/`port`: the refusal helper
      * has its own cert/key/port paths for the files it is refusing, and -Wshadow
      * (which -Weverything includes, and this project keeps) is right that two
      * buffers for two different certificates in one file is worth distinguishing at
      * the name. These are the GOOD ones. */
-    static char g_cert[512];
-    static char g_key[512];
+    static char g_cert[TF_PATH];
+    static char g_key[TF_PATH];
     static char g_port[16];
     char a0[] = "irc-serve";
     char a1[] = "0";
@@ -424,6 +579,16 @@ int main(void)
         check(tf_tls_available() == 0,
               "certificate generation is possible exactly when TLS is compiled in",
               "tf_tls_make_cert() failed on a build that has OpenSSL");
+        /* THE REFUSALS STILL RUN, and returning here instead is what a fault
+         * injection caught. The generator needs OpenSSL; the refusals do not --
+         * a key with the wrong mode is refused by a stat(2) before anything is
+         * parsed -- so an early return left the DEFAULT build asserting ONE thing
+         * about TLS, which is the build every CI runner compiles and the one that
+         * should check most. Everything below this point that needs no handshake
+         * runs in both configurations. */
+        case_configuration_refusals(dir);
+        case_plaintext_build_has_no_tls_surface(dir);
+        tf_tls_rmtree(dir);
         printf("== %d failure(s) ==\n", failures);
         return (failures == 0) ? 0 : 1;
     }
@@ -439,7 +604,7 @@ int main(void)
 
     /* ---- the implicit-TLS surface, asserted per build ---- */
     if (tf_tls_available() == 0) {
-        case_plaintext_build_has_no_tls_surface();
+        case_plaintext_build_has_no_tls_surface(dir);
     } else {
         /* A node WITH a certificate and key, and an implicit-TLS listener. */
         nf_node_t n;
@@ -622,7 +787,7 @@ int main(void)
                  * the protection, and a client that does not verify has no
                  * protection at all. That is the honest limit of this case. */
                 {
-                    char otherca[512];
+                    char otherca[TF_PATH];
                     tf_tls_t t;
                     const char *why = NULL;
 
@@ -641,8 +806,8 @@ int main(void)
                  * this phase does not turn that off, so a client that verifies
                  * refuses it. */
                 {
-                    char ecert[512];
-                    char ekey[512];
+                    char ecert[TF_PATH];
+                    char ekey[TF_PATH];
                     nf_node_t n3;
                     int p3;
 
@@ -681,8 +846,8 @@ int main(void)
                  * generator that only ever made one of them would satisfy the
                  * other's test. */
                 {
-                    char fcert[512];
-                    char fkey[512];
+                    char fcert[TF_PATH];
+                    char fkey[TF_PATH];
                     nf_node_t n4;
                     int p4;
 
@@ -719,8 +884,8 @@ int main(void)
                  * check, and why this case exists separately from the wrong-CA
                  * one. */
                 {
-                    char nc[512];
-                    char nk[512];
+                    char nc[TF_PATH];
+                    char nk[TF_PATH];
                     nf_node_t n5;
                     int p5;
 
@@ -975,6 +1140,7 @@ int main(void)
         }
     }
 
+    case_one_named_gap();
     (void)msg;
     tf_tls_rmtree(dir);
     printf("== %d failure(s) ==\n", failures);

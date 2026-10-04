@@ -43,6 +43,8 @@
 #include "harness/tls_fixture.h"
 
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -72,20 +74,55 @@ int tf_tls_make_cert(const char *dir, const char *stem, const char *cn,
     return -1;
 }
 
+/* IMPLEMENTED, and the reason it is here rather than stubbed is a coverage hole a
+ * fault injection found.
+ *
+ * `tf_tls_write_file()` is plain POSIX -- open, write, fchmod -- and needs no crypto
+ * at all, so it compiles and works in a build with no OpenSSL. It was stubbed out
+ * here on the reasoning that "the only caller is the generator, which cannot run",
+ * and that reasoning was wrong about what the TESTS do with it: tests/integration/
+ * test_tls.c uses it to put a key file on disk with mode 0644 and mode 0640 so the
+ * node can be asked to REFUSE it. With the stub, the default build's copy of that
+ * test exited at the generator and asserted one thing -- so the world-readable-key
+ * refusal, which is the single most important thing in this file, was asserted in
+ * the TLS build only. The build that every CI runner compiles was the one that
+ * checked least.
+ *
+ * So it is implemented here, and the fifteen lines are the same fifteen lines as in
+ * tls_fixture.c because duplicating them is cheaper than a third source file in the
+ * harness -- and because a stub that silently returns -1 for something that does
+ * not need the thing it was stubbed for is the shape of bug this project has been
+ * bitten by repeatedly. */
 int tf_tls_write_file(const char *path, const void *data, size_t n,
                       unsigned mode)
 {
-    /* NOT REIMPLEMENTED HERE, and that is a real gap in this stub rather than an
-     * oversight to be papered over: it has no caller on a default build, because the
-     * only user is the generator above, which cannot run. Reimplementing fifteen
-     * lines of open/write/chmod to serve a function nothing calls would be a second
-     * thing to keep correct for no reader. A caller that needed it in this build
-     * would get -1 and a test failure, which is the honest outcome. */
-    (void)path;
-    (void)data;
-    (void)n;
-    (void)mode;
-    return -1;
+    /* The fchmod() AFTER the open is the load-bearing half and the comment in
+     * tls_fixture.c explains why: the mode argument to open() is modified by the
+     * process umask, so asking for 0644 and getting 0644 depends on the runner.
+     * O_TRUNC matters because the mode-change case reopens an existing file. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
+
+    if (fd < 0) {
+        return -1;
+    }
+    if (fchmod(fd, (mode_t)mode) != 0) {
+        (void)close(fd);
+        return -1;
+    }
+    while (n > 0u) {
+        ssize_t w = write(fd, data, n);
+
+        if (w < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            (void)close(fd);
+            return -1;
+        }
+        data = (const char *)data + (size_t)w;
+        n -= (size_t)w;
+    }
+    return close(fd);
 }
 
 void tf_tls_rmtree(const char *dir)
@@ -113,7 +150,30 @@ void tf_tls_rmtree(const char *dir)
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
             continue;
         }
-        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        /* THE LENGTH IS CHECKED RATHER THAN TRUSTED, and the reason is gcc-16:
+         * `snprintf(path, sizeof path, "%s/%s", dir, e->d_name)` is diagnosed as
+         * a possible truncation because dir[] is 512 bytes, d_name can be a
+         * NAME_MAX string, and nothing in the types says the sum fits path[].
+         * It does (769 < 1024) and it always has, but "it does" is not something
+         * a compiler can see and this project builds with -Werror on three
+         * compilers.
+         *
+         * So the check is explicit: a name that would not fit is skipped rather
+         * than truncated, because a TRUNCATED path here would unlink a file whose
+         * name is not the one read. There is nothing left behind either way -- the
+         * directory is under the build tree and per-process -- and skipping is
+         * strictly safer than guessing. */
+        {
+            size_t dlen = strlen(dir);
+            size_t nlen = strlen(e->d_name);
+
+            if (dlen + 1u + nlen + 1u > sizeof path) {
+                continue;
+            }
+            memcpy(path, dir, dlen);
+            path[dlen] = '/';
+            memcpy(path + dlen + 1u, e->d_name, nlen + 1u);
+        }
         (void)unlink(path);
     }
     (void)closedir(d);

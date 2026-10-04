@@ -330,67 +330,6 @@ static const transport_ops_t k_tls_ops = {
 };
 
 /* ---------------------------------------------------------------------------
- * THE KEY FILE'S PERMISSIONS, and this is a security boundary
- * ---------------------------------------------------------------------------
- * A PRIVATE KEY IS THE ONE FILE IN THIS PROJECT WHERE "group or other can read
- * it" is not a hygiene point but the whole defeat. The federation secret this
- * node already protects (account_store.c's and sasl_framework.c's check) leaks
- * one mesh's peering; the server key here leaks the ability to impersonate this
- * node to every client that verifies a certificate -- which, once an `sts` policy
- * is advertised, is every client that has ever connected.
- *
- * SO THE RULE IS STRICTER THAN THOSE TWO FILES USE, and the difference is
- * deliberate: S_IRWXG | S_IRWXO is refused, which means a key readable by its
- * OWNER'S GROUP is refused too. A private key that a group account can read has
- * been shared with a group account. There is no deployment this hurts that is not
- * a deployment that has already given the key away.
- *
- * OPEN-THEN-fstat, for account_store.c's reason and in the same order: stat() then
- * open() leaves a window in which the file judged is not the file read, and this
- * file's content is the ability to impersonate a server. fstat() on the descriptor
- * cannot race. A symlink is followed and not special-cased, because fstat() judges
- * the TARGET, which is the file whose bytes would be read -- the same decision
- * those two loaders make, for the same reason.
- *
- * The permission check happens HERE rather than being left to OpenSSL, because
- * OpenSSL will happily load a world-readable key and say nothing: the file's mode
- * is not part of the PEM format and there is nowhere in the library to report it. */
-static int key_file_is_private(const char *path)
-{
-    struct stat sb;
-    FILE *f;
-
-    if (path == NULL || path[0] == '\0') {
-        return -1;
-    }
-    f = fopen(path, "re");
-    if (f == NULL) {
-        printf("[observable] tls_key: state=REFUSED path=%s reason=open\n", path);
-        return -1;
-    }
-    if (fstat(fileno(f), &sb) != 0) {
-        printf("[observable] tls_key: state=REFUSED path=%s reason=fstat\n", path);
-        (void)fclose(f);
-        return -1;
-    }
-    if (!S_ISREG(sb.st_mode)) {
-        printf("[observable] tls_key: state=REFUSED path=%s reason=not_regular\n",
-               path);
-        (void)fclose(f);
-        return -1;
-    }
-    if ((sb.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
-        printf("[observable] tls_key: state=REFUSED path=%s reason=mode_%03o "
-               "(a private key readable by group or other has been shared)\n",
-               path, (unsigned)(sb.st_mode & 0777));
-        (void)fclose(f);
-        return -1;
-    }
-    (void)fclose(f);
-    return 0;
-}
-
-/* ---------------------------------------------------------------------------
  * VERIFY A PEER'S CERTIFICATE, and this is the other security boundary
  * ---------------------------------------------------------------------------
  * WHAT IS ENFORCED, in full:
@@ -520,14 +459,22 @@ int tls_backend_node_init(tls_node_t **out, const char *cert, const char *key,
     if (cert == NULL || key == NULL) {
         return -1;
     }
-    /* THE PERMISSION CHECK COMES FIRST, before anything is loaded, and it is a
-     * refusal of the whole CONFIGURATION rather than of the key. A node that
-     * cannot prove its key is private must not come up offering a certificate:
-     * half-configured TLS that looks configured is the worst of the three states,
-     * because an operator reading the startup line would believe in it. */
-    if (key_file_is_private(key) != 0) {
-        return -1;
-    }
+    /* THE KEY'S PERMISSIONS ARE NOT CHECKED HERE, and where they ARE checked is a
+     * decision worth stating because it was the other way round first.
+     *
+     * A backend that loaded a world-readable key without a murmur would be a
+     * footgun for whoever wrote the next one, so the check belongs somewhere. It was
+     * here -- and a fault injection showed what that cost: the key's permission
+     * rule was COMPILED OUT of a `-DWITH_TLS=OFF` build along with everything else
+     * in this file, so the default build -- the one every CI runner compiles, and
+     * the one that should check most -- could not refuse an unsafe key at all, and
+     * tests/integration/test_tls.c had to assert a different reason in each build.
+     *
+     * So it is in main(), where an operator's options are turned into a
+     * configuration, and it holds in EVERY build. A node with no TLS library still
+     * refuses to accept a key other people can read, which is the right answer to
+     * "here is a private key that is not private" whether or not this node was ever
+     * going to load it. See key_file_is_private() in node_main.c. */
 
     node = (tls_node_t *)calloc(1, sizeof *node);
     if (node == NULL) {

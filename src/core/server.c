@@ -1014,7 +1014,16 @@ int server_listen_tls(server_t *s, int port)
     }
     /* THE REFUSAL, and it is checked BEFORE socket(). There is no point creating a
      * descriptor this node is not going to be able to use, and on a build without
-     * TLS there is no point at all. */
+     * TLS there is no point at all.
+     *
+     * IT IS DEFENCE IN DEPTH AND NO TEST COVERS IT, and both halves of that are
+     * deliberate. main() already refuses `--tls-port` when no certificate was
+     * supplied, so this branch is UNREACHABLE through the shipped binary --
+     * tests/integration/test_tls.c deletes it and stays green, which is how it was
+     * found. It is kept because this function is public and a future caller that
+     * does not go through main() would otherwise bind a port it cannot encrypt.
+     * See test_tls.c's case_one_named_gap() for why there is no inspection
+     * assertion on it either. */
     if (s->tls == NULL) {
         printf("[observable] tls_listen: state=REFUSED port=%d "
                "reason=NO_TLS_CONFIGURED\n", port);
