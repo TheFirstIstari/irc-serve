@@ -1322,8 +1322,23 @@ int server_accept_one(server_t *s)
     if (s->tls_require != 0) {
         close(fd);
         s->n_tls_client_refused++;
+        /* THE HINT NAMES ONLY WHAT IS ACTUALLY REACHABLE FROM HERE, and it used to
+         * name two things of which one is a dead end. It said
+         * `hint=use_the_tls_port_or_STARTTLS`, but STARTTLS cannot be reached from
+         * this site at all: the refusal happens HERE, at accept, BEFORE a conn_t
+         * exists, so there is no connection to answer 670 on and no line the client
+         * could ever see. A client following that half of the hint would connect,
+         * send STARTTLS, and get a FIN and zero bytes -- the same outcome as not
+         * trying -- which is a worse answer than silence because it looks like the
+         * command is broken.
+         *
+         * So the hint names the one thing that works. --tls-require is a refusal at
+         * accept by design (see the paragraph above: a client refused late would
+         * have a working, unencrypted session), and a client that cannot open the
+         * implicit-TLS port has no route to this node at all -- which is the correct
+         * consequence of the flag rather than a gap in the hint. */
         printf("[observable] client_refused: fd=%d reason=TLS_REQUIRED "
-               "hint=use_the_tls_port_or_STARTTLS\n", fd);
+               "hint=connect_to_the_tls_port\n", fd);
         return 1;
     }
     if (set_nonblocking(fd) != 0) {
@@ -2203,7 +2218,25 @@ int server_dial_progress(server_t *s, const struct pollfd *pfds, size_t nfds)
                     s->n_dial_failed++;
                     continue;
                 }
-                link->tls_active = 1;
+                /* NO LINK FIELD IS SET HERE, and that is the third of this phase's
+                 * three "looks like TLS but is not" states removed.
+                 *
+                 * There used to be `link->tls_active = 1;` on exactly this line --
+                 * set the moment the handshake STARTS, before a byte has been
+                 * exchanged, and read NOWHERE in the tree. An optimistic flag with
+                 * no reader is the shape a future reader trusts: the name says
+                 * "this link is carrying TLS" and the value says the opposite of
+                 * what the certificate will turn out to be.
+                 *
+                 * `link_tls_start` is the observable that replaces it, and it is
+                 * honest about what it knows: a handshake has begun. Whether it
+                 * COMPLETED is answered by `link_established` on the far side of the
+                 * handshake, or by `tls_error` / `tls_handshake_failed` if it did
+                 * not. A field written at the start could never carry the second
+                 * half of that without a second writer, and the second writer is
+                 * where this would have gone wrong.
+                 *
+                 * See server.h for why there is no such field. */
                 printf("[observable] link_tls_start: peer=%s role=client\n",
                        link->name);
             }

@@ -94,6 +94,10 @@ typedef struct tls_node {
     SSL_CTX *cli;   /* dialling role: peer links. See "THE CONTEXTS" above. */
     int      insecure; /* --tls-insecure: do NOT fail an unverifiable peer */
     int      have_ca;  /* a --tls-ca was loaded into cli */
+    /* What the startup line's `verify=` says. Held on the node rather than
+     * recomputed at print time so there is one definition of the four states, and
+     * see verify_label_for() for why there are four. */
+    const char *verify_label;
 } tls_node_t;
 
 /* ---------------------------------------------------------------------------
@@ -556,6 +560,46 @@ void tls_backend_node_free(tls_node_t *node)
     free(node);
 }
 
+/* ---------------------------------------------------------------------------
+ * WHAT THIS NODE WILL DO WITH A PEER'S CERTIFICATE, IN ONE WORD
+ * ---------------------------------------------------------------------------
+ * This is the `verify=` field of the `tls_init` startup line, and it is FOUR states
+ * rather than the two it was.
+ *
+ * It was two because it asked one question -- "is the policy chain-and-name?" -- and
+ * answered the other three with the same word, NONE_WITHOUT_CA. That is wrong in a
+ * way that matters operationally rather than cosmetically: a node configured with
+ * BOTH --tls-ca and --tls-insecure prints NONE_WITHOUT_CA, which reads as "no CA
+ * configured" to anyone grepping the startup output of exactly the node where the
+ * distinction is the whole point. --tls-insecure returns from tls_peer_verify()
+ * BEFORE the CA is consulted, so the CA is loaded, held, and never used -- and the
+ * label said the store was absent.
+ *
+ * THE FOUR, and each is one thing an operator can act on:
+ *
+ *   PEER_CHAIN_AND_NAME             a CA is loaded and nothing overrides it, so a
+ *                                   peer certificate is verified against that store
+ *                                   AND against the link's server name.
+ *   NONE_INSECURE_CA_CONFIGURED     --tls-insecure with a --tls-ca: the store is
+ *                                   loaded and deliberately not consulted. This is
+ *                                   the state that used to claim otherwise.
+ *   NONE_INSECURE_NO_CA             --tls-insecure and no store at all: nothing
+ *                                   would be verifiable, so nothing is.
+ *   NONE_WITHOUT_CA                 no store and no override, so a peer link that
+ *                                   requires TLS is refused by main() before it can
+ *                                   be dialled -- which is why this label describes
+ *                                   what would happen rather than what is checked.
+ *
+ * `revocation=none` is printed beside all four, and is the same fact in all four. */
+static const char *verify_label_for(int have_ca, int insecure)
+{
+    if (have_ca != 0) {
+        return (insecure != 0) ? "NONE_INSECURE_CA_CONFIGURED"
+                               : "PEER_CHAIN_AND_NAME";
+    }
+    return (insecure != 0) ? "NONE_INSECURE_NO_CA" : "NONE_WITHOUT_CA";
+}
+
 int tls_backend_node_init(tls_node_t **out, const char *cert, const char *key,
                           const char *ca, int insecure)
 {
@@ -649,6 +693,7 @@ int tls_backend_node_init(tls_node_t **out, const char *cert, const char *key,
         }
         node->have_ca = 1;
     }
+    node->verify_label = verify_label_for(node->have_ca, node->insecure);
 
     *out = node;
     /* ONE LINE, THE WHOLE POLICY. `verify=` is the peer-certificate policy this
@@ -656,12 +701,17 @@ int tls_backend_node_init(tls_node_t **out, const char *cert, const char *key,
      * `revocation=none` is the largest gap in it -- no CRL and no OCSP are
      * consulted, so a revoked certificate is accepted until it EXPIRES. It is on
      * this line rather than only in a comment because an operator who greps the
-     * startup output should not have to read the source to learn that. */
+     * startup output should not have to read the source to learn that.
+     *
+     * AND `verify=` IS NOT TWO STATES, which is what it was. It read
+     * NONE_WITHOUT_CA whenever the policy was not "chain and name" -- including
+     * the case where a CA WAS configured and --tls-insecure overrode it, so the
+     * label said "no CA configured" to anyone grepping for it on a node that had
+     * one. Four states, and each names what is actually enforced. */
     printf("[observable] tls_init: state=READY ca=%s insecure=%d verify=%s "
            "revocation=none\n",
            node->have_ca ? "configured" : "none", node->insecure,
-           (node->have_ca && node->insecure == 0) ? "PEER_CHAIN_AND_NAME"
-                                                  : "NONE_WITHOUT_CA");
+           node->verify_label);
     return 0;
 }
 

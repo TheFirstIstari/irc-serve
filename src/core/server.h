@@ -298,14 +298,29 @@ typedef struct server_link {
      */
     int      require_tls;
 
-    /* Whether this link's CURRENT socket is carrying TLS. 0 until the handshake
-     * completes, and it is a REPORT rather than a decision: the sticky field above
-     * is what the next dial reads. It exists because "this link was established
-     * in the clear" is the single fact an operator most needs when reading a mesh,
-     * and because a link that was TLS and is now not is a finding worth a line of
-     * its own. A link with require_tls == 1 that finds this 0 has FAILED -- the
-     * handshake aborts and the link is retried; it never continues in the clear. */
-    int      tls_active;
+    /* THERE IS NO `tls_active` FIELD HERE, and there used to be one, which is worth
+     * a sentence because the reason it was removed is the shape of a bug rather
+     * than a style.
+     *
+     * It was set to 1 the moment an outbound handshake STARTED -- before a single
+     * byte had been exchanged -- and it was never read anywhere in the tree. So it
+     * was an optimistic flag with no reader: a field whose name says "this link is
+     * carrying TLS", set before that was true, consulted by nothing. The next
+     * reader to trust it would have read "1" on a link whose certificate had not
+     * been verified, or whose handshake then failed.
+     *
+     * The property the field's comment said it existed for -- "this link was
+     * established in the clear is the single fact an operator most needs when
+     * reading a mesh" -- is ALREADY ON THE WIRE and is not derived from this field.
+     * `link_established:` is printed when a link reaches ESTABLISHED,
+     * `tls_handshake_start:` and `tls_handshake_failed:` are printed around each
+     * handshake, and the `[observable] link: peer=... state=ESTABLISHED` dump
+     * reports the state. An operator reading a mesh already has the fact; a field
+     * that nobody reads does not add to it.
+     *
+     * If a reader is ever wanted, it must be written on COMPLETION -- that is, from
+     * the same place link_established() is called, not where the handshake starts.
+     * A flag set at the start is a claim about an intention. */
 
     uint64_t created_ms;
     uint64_t last_sent_ms;
