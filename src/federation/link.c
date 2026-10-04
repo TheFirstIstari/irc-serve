@@ -24,6 +24,10 @@
 #include <unistd.h>
 
 #include "core/connection.h"
+/* Phase 12: the drain in fed_send_shutdown() reads through the transport, so this
+ * is the third of the tree's three I/O sites to name it. See the comment on that
+ * block for what happens to the node's departure if it did not. */
+#include "core/transport.h"
 #include "federation/burst.h"
 #include "federation/dedup.h"
 /* Phase 9: 2.1's remote-nick registry, swept from fed_tick() because a store
@@ -521,6 +525,54 @@ static server_link_t *fed_link_new(server_t *s, const char *name, int initiator)
     return link;
 }
 
+/* See the header for the argument, and for why this is a separate call rather than
+ * a parameter. The sticky property is enforced here by the ABSENCE of any clear:
+ * the only statement that writes `require_tls` in the whole file is the one below,
+ * and it only ever writes 1. That is the enforcement, and it is checkable by
+ * inspection rather than by remembering. */
+int fed_link_set_tls(server_t *s, const char *name, int require_tls)
+{
+    server_link_t *link = server_find_link(s, name);
+
+    if (link == NULL) {
+        return -1;
+    }
+    link->require_tls = (require_tls != 0) ? 1 : 0;
+    /* THE INBOUND HALF IS NOT ENFORCED BY THIS FLAG, and an operator who reads
+     * `--peer-tls irc.a` as "this link is encrypted whichever way round it is
+     * connects" is going to be wrong about one of the two directions. So the line
+     * says which:
+     *
+     *   this node DIALS  require_tls is enforced: the handshake is started on the
+     *                    socket, the peer's certificate is verified against this
+     *                    link's name, and a failure closes the link and spends a
+     *                    retry rather than continuing in the clear.
+     *
+     *   this node ACCEPTS  NOT enforced here, and deliberately not by SNIFFING the
+     *                    plain port for a ClientHello. A port that serves plaintext
+     *                    clients and must also auto-detect TLS has no correct
+     *                    discriminator: any client that sends something other than a
+     *                    ClientHello first defeats it, and a detector that guesses
+     *                    is a downgrade waiting to be asked for. The answer an
+     *                    operator actually wants -- "nothing on the plain port may
+     *                    be plaintext" -- is `--tls-require`, which refuses every
+     *                    plaintext connection at accept and leaves the operator to
+     *                    point peers at --tls-port.
+     *
+     * An inbound peer link over TLS therefore arrives on the implicit-TLS
+     * listener, where every byte is TLS before anything is interpreted, and it is
+     * protected by exactly the mechanism a client's is. That is a real property and
+     * it is NOT the same property as the outbound one, which is why the line
+     * distinguishes them. */
+    printf("[observable] link_tls: peer=%s require_tls=%d enforced=%s inbound_hint=%s\n",
+           link->name, link->require_tls,
+           (link->initiator != 0) ? "outbound_dial"
+                                  : "use_tls_port_or_tls_require",
+           (link->initiator != 0) ? "n/a"
+                                  : "accept_on_the_tls_port");
+    return 0;
+}
+
 server_link_t *fed_link_configure(server_t *s, const char *name,
                                   const struct sockaddr *sa, socklen_t salen)
 {
@@ -943,13 +995,27 @@ int fed_send_shutdown(server_t *s, const char *reason)
              * MSG_DONTWAIT rather than relying on the socket's flags: the drain must
              * not be able to block a teardown even if some other code path made this
              * descriptor blocking, and a blocking recv() in server_shutdown() would be
-             * a hang rather than a missed goodbye. */
+             * a hang rather than a missed goodbye.
+             *
+             * PHASE 12: IT READS THROUGH transport_recv(), AND THAT IS THE WHOLE
+             * REASON THIS BLOCK IS NOT A recv(). This is the third and last of the
+             * tree's three I/O sites, and it is the one most easily left behind because
+             * it is a read into a sink rather than a read into the connection: on a
+             * TLS peer link a raw recv() would pull CIPHERTEXT into a stack buffer and
+             * count it as "drained", which is at best a wrong number on a log line and
+             * at worst a handshake failure on the way out of the node. The transport
+             * answers in its own four-value vocabulary -- bytes, EOF, TRANSPORT_RETRY,
+             * TRANSPORT_FATAL -- and TRANSPORT_FATAL is the one case this loop must not
+             * spin on: it breaks, which is what the old `break` on a non-EINTR error
+             * did. The loop's own bound is unchanged, so the cost of this path on a
+             * plaintext mesh is one function call per pending chunk on a path that runs
+             * once per process. */
             {
                 char sink[512];
                 size_t drained = 0u;
 
                 for (;;) {
-                    ssize_t got = recv(c->fd, sink, sizeof sink, MSG_DONTWAIT);
+                    ssize_t got = transport_recv(c, sink, sizeof sink);
 
                     if (got > 0) {
                         drained += (size_t)got;
@@ -958,10 +1024,21 @@ int fed_send_shutdown(server_t *s, const char *reason)
                         }
                         continue;
                     }
-                    if (got < 0 && errno == EINTR) {
-                        continue;
-                    }
-                    break;
+                    /* BREAK ON TRANSPORT_RETRY, AND THAT IS NOT AN INVERSION OF
+                     * THE OLD LOOP -- IT IS THE OLD LOOP.
+                     *
+                     * The pre-Phase-12 code was `if (got < 0 && errno == EINTR)
+                     * continue; break;`, so it retried ONLY on EINTR and BROKE on
+                     * EAGAIN, because EAGAIN is the kernel saying the peer's queue
+                     * is empty -- which is the very condition the drain exists to
+                     * reach. An earlier version of this block treated every
+                     * TRANSPORT_RETRY as "try again", which made an idle peer link
+                     * spin here for ever: six federation tests hung at nf_stop()
+                     * until the harness's own 15 s deadline killed them, with the
+                     * node reporting perfectly healthy counters the whole time.
+                     * The transport cannot distinguish "empty" from "parked on a
+                     * write", and for a drain both mean the same thing: stop. */
+                    break; /* EOF, EAGAIN, or a fatal transport error: stop */
                 }
                 if (drained > 0u) {
                     /* PRINTED, because "the goodbye was discarded by the close" is

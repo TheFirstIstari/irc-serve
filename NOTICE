@@ -54,6 +54,15 @@ than an oversight.
 Licensing third-party components
 --------------------------------
 
-irc-serve has no third-party runtime dependencies. The build requires a C11
-compiler and CMake. If that changes, the corresponding licences must be recorded
-here.
+irc-serve has no REQUIRED third-party runtime dependencies. The default build
+requires a C11 compiler and CMake and nothing else.
+
+There is ONE OPTIONAL dependency, and it is off by default: `-DWITH_TLS=ON` links
+OpenSSL (libssl and libcrypto) for the transport-encryption layer described in
+SECURITY.md. Building with it does not change irc-serve's own licence, and
+OpenSSL's licence is not recorded here because the components are not distributed
+with this source tree -- an operator who enables the option is linking against an
+OpenSSL they have installed, and their own obligations are theirs. If this project
+ever ships a build that bundles OpenSSL, its licence must be recorded here.
+
+If the required set ever changes, the corresponding licences must be recorded here.

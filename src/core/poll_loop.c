@@ -4,9 +4,9 @@
  * loop and everything it forces). The order of the steps below is the contract,
  * and it is not arbitrary:
  *
- *   1. build the poll sets          (listener, connections, in-flight dials)
+ *   1. build the poll sets          (listeners, connections, in-flight dials)
  *   2. poll()                       EINTR is counted and retried, never fatal
- *   3. accept                       nonblocking, drained
+ *   3. accept                       nonblocking, drained, both listeners
  *   4. read + frame + parse + dispatch
  *   5. write                        drain the retained write-queue offsets
  *   6. dial progress                nonblocking connect() completion
@@ -232,7 +232,16 @@ static void conn_on_readable(server_t *s, int fd)
 /* One connection's worth of write work. A short write is expected and is not
  * an error: the retained woff keeps the remainder queued for a later
  * iteration, and the counter below is what makes "the queue really did
- * short-write" an observable fact rather than an assumption. */
+ * short-write" an observable fact rather than an assumption.
+ *
+ * PHASE 12: THIS IS NOW REACHED BY POLLOUT FOR A CONNECTION WITH NOTHING TO
+ * SEND, and that is the point of the readiness intent. A TLS handshake that has
+ * been told it wants writability gets here, conn_pump() makes its one
+ * unconditional empty pass over the transport, and the handshake moves. Before
+ * Phase 12 the loop only asked for POLLOUT when there were bytes to write, so
+ * there was no such thing as "reachable with an empty queue" and no need for
+ * conn_pump() to do anything about it. The partial-write counter below is
+ * guarded by `before > 0` and so cannot be moved by that pass. */
 static void conn_on_writable(server_t *s, int fd)
 {
     conn_t *c = server_conn(s, fd);
@@ -260,6 +269,7 @@ int poll_loop_step(server_t *s, int timeout_ms)
     size_t nconn_pfd = 0;
     nfds_t nfds = 0;
     nfds_t dial_nfds = 0;
+    nfds_t tls_listen_pfd = 0;
     size_t i;
     int n;
 
@@ -268,23 +278,78 @@ int poll_loop_step(server_t *s, int timeout_ms)
     }
 
     /* --- 1. build the sets --- */
+    /* TWO LISTENERS, OR ONE. The plaintext listener is slot 0 and is ALWAYS slot
+     * 0 when present, because step 3's accept arm tests `pfds[0].fd ==
+     * s->listen_fd`. The implicit-TLS listener (Phase 12) is appended after the
+     * listener and BEFORE the connections, so a connection's index does not shift
+     * when an operator adds --tls-port -- conn_pfd[] records indices, and a set
+     * whose meaning changed when an unrelated option appeared would be a very hard
+     * bug to find.
+     *
+     * The TLS listener's INDEX is recorded in tls_listen_pfd rather than assumed,
+     * because it depends on whether the plaintext listener was there: with both,
+     * the TLS one is slot 1; with only --tls-port and no --port (which the parser
+     * allows -- the port argument has a default), it is slot 0. Assuming an index
+     * is how a two-listener loop ends up polling the wrong descriptor for the
+     * accept, and the symptom would be a node that serves TLS on one port and
+     * nothing on the other. */
     if (s->listen_fd >= 0) {
         pfds[nfds].fd = s->listen_fd;
         pfds[nfds].events = POLLIN;
         pfds[nfds].revents = 0;
         nfds++;
     }
+    if (s->tls_listen_fd >= 0) {
+        pfds[nfds].fd = s->tls_listen_fd;
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        tls_listen_pfd = nfds;
+        nfds++;
+    }
     for (i = 0; i < SERVER_FD_TABLE && nfds < POLL_MAX_FDS; i++) {
         conn_t *c = s->by_fd[i];
+        short events = 0;
 
         if (c == NULL || c->state == CONN_CLOSING) {
             continue; /* a CLOSING conn is already out of the set */
         }
-        pfds[nfds].fd = c->fd;
-        pfds[nfds].events = POLLIN;
-        if (conn_write_pending(c) > 0) {
-            pfds[nfds].events |= POLLOUT;
+        /* PHASE 12: THE POLL SET IS NOW THE CONNECTION'S OWN INTENT, and this is
+         * the single line the whole phase's structural change amounts to.
+         *
+         * It used to be derived from data -- POLLIN always, POLLOUT when there
+         * were unsent bytes -- and for a plaintext socket those two facts are the
+         * same fact, so the derivation was free. It stops being free the moment a
+         * transport can be waiting to WRITE with nothing to send, which is what a
+         * TLS handshake is: the server flight goes out before this node has an
+         * application byte, and then the handshake parks waiting for a write the
+         * loop is not asking for. There is no way to recover that information
+         * from poll()'s REPORTS -- an empty socket reports nothing, so the loop
+         * would sleep through the event entirely -- and the only place the
+         * information exists is inside OpenSSL. So the transport publishes it and
+         * the loop reads it. See conn_t::want_read for the full argument.
+         *
+         * FOR A PLAINTEXT CONNECTION THIS IS BYTE-IDENTICAL, and the reason is
+         * that plain_recv() and plain_send() publish want_read = 1 on every path
+         * and want_write = (unsent bytes), while conn_queue() raises want_write
+         * the moment the queue grows. The mask below therefore equals the old
+         * derivation at every point the loop can observe one.
+         *
+         * A CONNECTION THAT WANTS NEITHER IS LEFT OUT OF THE SET ENTIRELY rather
+         * than added with a zero mask: poll() would never report it, so including
+         * it would only spend a slot in POLL_MAX_FDS and make the cost of a node
+         * with many parked TLS handshakes proportional to a number it does not
+         * need to be. */
+        if (c->want_read) {
+            events |= POLLIN;
         }
+        if (c->want_write) {
+            events |= POLLOUT;
+        }
+        if (events == 0) {
+            continue;
+        }
+        pfds[nfds].fd = c->fd;
+        pfds[nfds].events = events;
         pfds[nfds].revents = 0;
         conn_pfd[nconn_pfd++] = nfds;
         nfds++;
@@ -313,22 +378,38 @@ int poll_loop_step(server_t *s, int timeout_ms)
     }
 
     if (n > 0) {
-        /* --- 3. accept --- */
+        /* --- 3. accept, on BOTH listeners ---
+         *
+         * The plain listener is index 0 when it exists, so the two arms below are
+         * independent tests rather than a loop over listener indices -- and each
+         * one drains fully, which is the property server_accept_one()'s comment
+         * gives: a listener that stays readable with a full backlog would
+         * otherwise be re-polled with the queue still full. The fd >= FD_SETSIZE
+         * rejection is -2, and it is NOT a reason to stop draining -- the rest of
+         * the queue is perfectly good. */
         if (s->listen_fd >= 0 && pfds[0].fd == s->listen_fd &&
             (pfds[0].revents & POLLIN) != 0) {
-            /* Drain the listener rather than taking one connection per tick: a
-             * listener that stays readable with a full backlog would otherwise
-             * be re-polled with the queue still full. The fd >= FD_SETSIZE
-             * rejection is -2, and it is NOT a reason to stop draining -- the
-             * rest of the queue is perfectly good. */
             for (;;) {
                 int rc = server_accept_one(s);
 
                 if (rc == 0) {
-                    break; /* nothing pending */
+                    break;
                 }
                 if (rc < 0 && rc != SERVER_ACCEPT_REJECTED) {
                     break; /* fatal accept error; the next tick retries */
+                }
+            }
+        }
+        if (s->tls_listen_fd >= 0 &&
+            (pfds[tls_listen_pfd].revents & POLLIN) != 0) {
+            for (;;) {
+                int rc = server_accept_tls_one(s);
+
+                if (rc == 0) {
+                    break;
+                }
+                if (rc < 0 && rc != SERVER_ACCEPT_REJECTED) {
+                    break;
                 }
             }
         }

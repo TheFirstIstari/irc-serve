@@ -103,6 +103,30 @@
 
 struct chan; /* opaque until Phase 4 (2.2) */
 
+/* PHASE 12: the transport ops vtable, OPAQUE HERE ON PURPOSE.
+ *
+ * connection.h must not include core/transport.h, because transport.h includes
+ * connection.h -- the ops take a conn_t. So this struct is forward-declared and
+ * the two fields above hold a pointer to it; a reader who wants the operations
+ * opens transport.h, which is where the three I/O sites' shared contract is
+ * written down. The relationship runs transport.h -> connection.h, never back. */
+struct transport_ops;
+
+/* PHASE 12: the node this connection belongs to.
+ *
+ * It exists because the TLS backend needs the node's SSL_CTX and the call site
+ * cannot supply it. conn_pump() starts a STARTTLS handshake from inside the
+ * CONNECTION layer -- that is where the ordering guarantee lives, that the 670 has
+ * to reach the client in the clear before the handshake begins -- and the
+ * connection layer has a conn_t and no server_t.
+ *
+ * It is set by server_add_conn() and by nothing else, which is the same rule
+ * server.h's by_fd table follows one field over: a connection is registered exactly
+ * once, so it acquires its node exactly once, and a conn_t that was never
+ * registered has owner == NULL -- which the backend treats as "not configured"
+ * rather than dereferencing. */
+struct server;
+
 /* conn_t::kind */
 #define CONN_CLIENT 0
 #define CONN_SERVER 1
@@ -503,6 +527,96 @@ typedef struct conn {
     char        batch_type[CONN_MAX_BATCH_TYPE + 1];
     char        batch_once[CONN_MAX_BATCH_REF + 1];
     int         batch_suppress;
+    /* ------------------------------------------------------------------------
+     * PHASE 12: THE READINESS INTENT, and it is the first thing on this struct
+     * that POLL LOOP MAY NOT DERIVE FOR ITSELF.
+     * ------------------------------------------------------------------------
+     * Until this phase the loop built a connection's event mask from DATA --
+     * POLLIN always, plus POLLOUT when there were unsent bytes -- and that was
+     * correct, because for a plaintext socket the two facts are the same fact.
+     *
+     * THEY ARE NOT THE SAME FACT ONCE THE TRANSPORT CAN GO WANTS-WRITING-WITHOUT-
+     * HAVING-BYTES. A nonblocking TLS handshake writes the server's flight
+     * (ServerHello, Certificate, ...) before this node has a single application
+     * byte to send, and then blocks waiting for the client's flight. At that
+     * instant the write queue is EMPTY -- so the old derivation asks poll() for
+     * POLLIN only -- and the handshake can never advance, because the only thing
+     * that would wake the loop is a write that the loop is not asking for. The
+     * connection hangs at 100% CPU-free, indefinitely, with no error anywhere.
+     *
+     * WHY POLL REVENTS CANNOT SUBSTITUTE FOR THIS, and it is worth being exact
+     * because the obvious alternative is to look at what poll() REPORTED and
+     * decide then:
+     *
+     *   revents is a report about the SOCKET, and the question the transport
+     *   must answer is about the PROTOCOL STATE. SSL_read() returning
+     *   SSL_ERROR_WANT_WRITE means "the handshake is parked awaiting a write",
+     *   and the socket at that instant may be entirely uninteresting -- no bytes
+     *   queued in either direction. POLLIN | POLLOUT would report nothing, so
+     *   poll() would return a zero count and the loop would go straight back to
+     *   sleep having learned nothing. The information exists ONLY inside
+     *   OpenSSL, and the only way to get it out is to ask, which means asking at
+     *   the moment the call is made -- which is what the fields below are for.
+     *
+     * SO THESE ARE WRITTEN BY THE I/O PATH AND READ BY THE LOOP, and that
+     * direction is the whole contract: whoever last touched the socket says what
+     * it wants next. On a plaintext connection they are 1 and "there are unsent
+     * bytes", which is exactly what the loop computed for itself, so the
+     * plaintext poll set is byte-for-byte what it has always been -- a property
+     * tests/integration/test_readiness_intent.c asserts and the rest of the suite
+     * proves.
+     *
+     * THE COST, in the two fields and one predicate: two ints per connection
+     * (eight bytes on a conn_t that is already several hundred), set in three
+     * places, read in one. The alternative -- a transport type test inside the
+     * loop -- was rejected because it would put the transport's knowledge in the
+     * loop, which is the coupling Phase 12 exists to remove.
+     *
+     * A CONNECTION WITH NEITHER SET IS LEFT OUT OF THE POLL SET ENTIRELY, and
+     * that is correct rather than a liveness bug: poll() reports nothing for an
+     * entry whose mask is zero, so including it would only spend a slot. It is
+     * reachable only for a transport that has said it wants nothing, and the
+     * plaintext transport never says it (want_read is always 1). */
+    int         want_read;         /* poll() must include POLLIN */
+    int         want_write;        /* poll() must include POLLOUT */
+    /* PHASE 12: THE TRANSPORT this connection's bytes go through. `t_ops` is
+     * NULL until conn_new() installs the plaintext ops, and `t_ctx` is the
+     * transport's own state -- NULL for plaintext, the SSL* for TLS. The ops
+     * POINTER is a vtable rather than a boolean so that "is this connection
+     * encrypted" is not a second thing a reader has to keep in step with the
+     * dispatch: it is asked, through transport_is_tls(), by every module that
+     * needs the answer. */
+    const struct transport_ops *t_ops;
+    void       *t_ctx;
+    struct server *owner;        /* the node this conn is registered with */
+    /* 1 once this connection's transport is TLS, and 1 while a STARTTLS has been
+     * agreed and the 670 is queued but the handshake has not been started. The
+     * second is the ordering guarantee that the upgrade's confirmation is sent in
+     * the CLEAR and the handshake begins only after it has been written: see
+     * conn_pump(). */
+    int         tls_active;
+    int         starttls_pending;
+    /* 1 once this connection has carried a CREDENTIAL in the clear: a PASS value
+     * or an AUTHENTICATE payload, offered or not.
+     *
+     * IT IS A FIELD RATHER THAN A QUESTION ABOUT c->sasl, and the reason is that
+     * `c->sasl != SASL_ABORTED` does NOT answer it. An AUTHENTICATE that was
+     * REFUSED -- a mechanism this node does not implement, a payload that would
+     * not decode, a credential with no store behind it -- has still put a
+     * credential on the wire, and a STARTTLS after it is exactly the downgrade
+     * the field exists to prevent. `c->sasl` records whether the exchange reached
+     * a verdict; this records whether there was one to reach.
+     *
+     * TWO WRITERS, handle_pass() and handle_authenticate(), and they are set at
+     * the TOP of each handler -- before any parsing, before any refusal -- because
+     * the interesting case is precisely the one that failed. It is written in two
+     * places rather than through a helper because both are one line and a helper
+     * called from two handlers would be a function whose only job is to make the
+     * rule less visible at the sites where the rule matters.
+     *
+     * IT GRANTS NOTHING and revokes nothing; it is a fact about the connection's
+     * history and nothing reads it except STARTTLS's refusal. */
+    int         credential_seen;
     char       *rbuf;              /* read buffer */
     size_t      rlen;
     size_t      rcap;
@@ -572,7 +686,16 @@ int conn_next_line(conn_t *c, char *dst, size_t dstcap, size_t *len);
 /* Append `len` bytes to the write queue. Returns 0 on success, -1 when the
  * append would push the unsent tail past CONN_WQ_MAX, in which case nothing
  * is buffered and nothing is written: the caller marks the connection CLOSING
- * and records the overflow. This function never blocks and never closes. */
+ * and records the overflow. This function never blocks and never closes.
+ *
+ * PHASE 12: RAISES `want_write`, and this is the ONLY writer that may. The
+ * transport publishes the intent after every read and every write, and those
+ * two moments are the only places a transport's own opinion can be mistaken for
+ * a fact; a queue that grew after the last publish is invisible to it. So the
+ * one thing that can create unsent bytes raises the intent itself, and the
+ * loop's next poll set is built after this returns. Without this arm, a reply
+ * queued by a handler would sit in the write queue until the peer happened to
+ * send something -- which on an idle client is never. */
 int conn_queue(conn_t *c, const char *data, size_t len);
 
 /* Push as much of the write queue as the socket will take. Returns 0 when the
@@ -580,8 +703,33 @@ int conn_queue(conn_t *c, const char *data, size_t len);
  * ECONNRESET, EBADF), in which case the caller must mark the connection
  * CLOSING. A short write is NOT an error and is NOT a failure: the retained
  * woff is advanced by whatever was sent and the rest is drained on a later
- * poll iteration. This function never closes the fd. */
+ * poll iteration. This function never closes the fd.
+ *
+ * PHASE 12: IT ALSO MAKES ONE UNCONDITIONAL PASS OVER THE TRANSPORT WITH AN
+ * EMPTY QUEUE, and that is what lets a handshake finish. A TLS handshake writes
+ * the server's flight before this node has any application data at all, so a
+ * pump that only called the transport when the queue was non-empty could never
+ * start one -- and readiness intent (see conn_t::want_read) is what lets poll()
+ * then wake the loop for a connection that still has nothing to send. On a
+ * plaintext connection the empty pass is a call the plaintext transport answers
+ * without touching the descriptor, so the ordinary path is unchanged. */
 int conn_pump(conn_t *c);
+
+/* Publish this connection's readiness intent: poll() must include POLLIN when
+ * `read`, POLLOUT when `write`.
+ *
+ * IT IS THE INTERFACE, NOT A HELPER. The transport implementations call it and
+ * nothing else may, which is what makes "the loop reads an intent and the
+ * transport writes it" a structural property rather than a convention: there is
+ * no second function that sets either field. conn_queue() is the single
+ * documented exception, for the reason its own comment gives.
+ *
+ * A value of 0 for `read` is NOT "keep whatever was there": it clears it. A
+ * transport that wants neither leaves the connection out of the poll set, and
+ * that is the state a handshake parked on SSL_ERROR_WANT_WRITE-with-nothing-to-
+ * write must NOT be in -- the whole point of the field is that the two states
+ * are distinguishable. */
+void conn_want(conn_t *c, int read, int write);
 
 /* Bytes still unsent: wlen - woff. */
 size_t conn_write_pending(const conn_t *c);

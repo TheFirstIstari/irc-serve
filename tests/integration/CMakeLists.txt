@@ -14,6 +14,14 @@ add_library(test_harness STATIC
   ../harness/irc_client.c
   ../harness/node_fixture.c
   ../harness/test_util.c
+  # Phase 12: the TLS client and the certificate generator. Compiled ONLY when
+  # WITH_TLS is ON, because it includes <openssl/ssl.h> and there is no point (and
+  # no header path) in the default build. The tests that use it ask
+  # tf_tls_available() at runtime and assert the PLAINTEXT consequences instead, so
+  # no test is skipped in the default build and none is skipped in the TLS build --
+  # they assert different things about the build they are in.
+  $<$<BOOL:${WITH_TLS}>:../harness/tls_fixture.c>
+  $<$<NOT:$<BOOL:${WITH_TLS}>>:../harness/tls_fixture_none.c>
 )
 target_link_libraries(test_harness PUBLIC irc_core)
 target_include_directories(test_harness PUBLIC ${PROJECT_SOURCE_DIR}/tests)
@@ -26,7 +34,12 @@ target_include_directories(test_harness PUBLIC ${PROJECT_SOURCE_DIR}/tests)
 # any test that execs it.
 target_compile_definitions(test_harness PUBLIC
   NF_SERVER_BIN="$<TARGET_FILE:irc-serve>"
-  IRCSERVE_SRC_DIR="${PROJECT_SOURCE_DIR}")
+  IRCSERVE_SRC_DIR="${PROJECT_SOURCE_DIR}"
+  # Where the TLS fixture writes its generated certificates. A build directory
+  # rather than /tmp, and per-process rather than shared, so two runs of this test
+  # -- which a developer does while bisecting -- cannot collide over a directory
+  # full of private keys.
+  IRCSERVE_BUILD_DIR="${PROJECT_BINARY_DIR}")
 
 # `ctest_name` is optional and defaults to `name`. It exists for exactly one
 # caller: a test that MOVED out of tests/compliance/ or tests/protocol/ and whose
@@ -78,6 +91,19 @@ irc_add_integration_test(test_conn_lifecycle test_conn_lifecycle.c)
 
 # 3.3: partial writes, drained across poll iterations, byte for byte.
 irc_add_integration_test(test_partial_write test_partial_write.c)
+
+# Phase 12, the STRUCTURAL commit: poll() reads a readiness INTENT off the
+# connection instead of deriving the event mask from data, because a nonblocking
+# TLS handshake parks waiting to WRITE with an empty write queue and poll()'s
+# revents cannot report that. Its own file, and it is the only test that asserts
+# on conn_t fields, because the invariant it asserts IS a field invariant --
+# "on a plaintext connection want_read is always 1 and want_write is exactly
+# 'there are unsent bytes'" is what makes the plaintext poll set byte-identical,
+# and no wire line can check it. The wire case is here too, though, and it is the
+ # one that carries the claim: a connection whose intent says "do not read me" is
+# never read while a second client on the same node is served normally, so a loop
+# that mentions want_read and ignores it cannot pass.
+irc_add_integration_test(test_readiness_intent test_readiness_intent.c)
 
 # 3.4: bounded write queues; a saturated link is dropped and nobody else is.
 irc_add_integration_test(test_writeq_overflow test_writeq_overflow.c)
@@ -571,3 +597,35 @@ irc_add_integration_test(test_query_surface test_query_surface.c)
 # answer, so "the field is present" and "the field is the right verb" are separate
 # failures with separate messages.
 irc_add_integration_test(test_numeric_arity test_numeric_arity.c)
+
+# Phase 12: TLS. Its own file, and its own SHAPE, because of the optional-dependency
+# decision: `-DWITH_TLS=ON` is off by default, so this test exists in both builds and
+# asserts, in each, the behaviour THAT BUILD ACTUALLY HAS. In the default build it
+# asserts the refusals and the absence of any `tls`/`sts` capability -- which are the
+# assertions that matter most for the configuration this project ships. In the TLS
+# build it adds a real implicit-TLS handshake, a real STARTTLS upgrade, three refused
+# handshakes (wrong CA, expired, not-yet-valid, wrong name) and --tls-require's
+# refusal of a plaintext client.
+#
+# NEITHER BRANCH SKIPS. `tests/known_skips.txt` stays empty, which is the point: a
+# test that returned the skip code would assert nothing on the default build, and
+# that is the exact failure scripts/check-skips.sh exists to prevent.
+#
+# Certificates are GENERATED INTO A TEMPORARY DIRECTORY by tests/harness/tls_fixture.c
+# and never committed; tls_fixture.h says why at length, and the short version is that
+# a key in git history is public for ever while an "expired is refused" case needs a
+# certificate whose expiry is computed at run time.
+irc_add_integration_test(test_tls test_tls.c)
+
+# Phase 12 item 5: TLS on a PEER LINK, and the mixed-mesh decision. Its own file
+# because the decision is the deliverable as much as the code is: a mesh may MIX TLS
+# and plaintext links, and what makes that safe is that a link's mode is STICKY --
+# `server_link_t::require_tls` is written once from the operator's command line and
+# is never cleared by anything, which is asserted by inspection because the only way
+# to prove it behaviourally would be to have a downgrade path to observe.
+#
+# It runs against the SHIPPED BINARY on a command line, because --peer-tls and
+# --tls-ca are main()'s options and an inline child has no command line. In the
+# default build it asserts the one thing that build can: --peer-tls is REFUSED at
+# startup rather than accepted and ignored.
+irc_add_integration_test(test_peer_tls test_peer_tls.c)

@@ -203,14 +203,60 @@ jobs:
   # believed, and a new gate reports its first findings as failures; making that
   # merge-blocking on the day it is added would be a way of not finding out.
   ci_sanitizers:
-    name: ci_sanitizers (ASan+UBSan)
+    name: ci_sanitizers (ASan+UBSan) WITH_TLS=${{ matrix.with_tls }}
     runs-on: ubuntu-22.04
     timeout-minutes: 40
     continue-on-error: true
     permissions:
       contents: read
+    # TWO CELLS, AND THE SECOND ONE IS THE ONLY DYNAMIC LEAK CHECK THIS PROJECT
+    # WILL EVER HAVE FOR THE TLS CODE.
+    #
+    # LeakSanitizer is Linux-only: it is not supported on Darwin, and an ASan binary
+    # built with detect_leaks=1 HANGS on macOS rather than reporting, which is why
+    # the job below is hosted Linux and why every other sanitizer claim in this file
+    # says "Linux only". That has a consequence worth stating plainly: before this
+    # matrix dimension, EVERY sanitizer run in this repository was a build with
+    # -DWITH_TLS=OFF, and a WITH_TLS=OFF build compiles ZERO tokens of OpenSSL. So
+    # the dynamic leak check was proving nothing whatsoever about `SSL*` or
+    # `SSL_CTX*` -- the two allocation families that Phase 12 introduces, and the
+    # two that a refactor is most likely to leak.
+    #
+    # The TLS code's own release paths are therefore argued STATICALLY, in
+    # src/tls_openssl.c's header comment ("WHERE EVERY SSL* IS FREED, reasoned
+    # statically"), which names the single release site per allocation and says
+    # plainly that the argument cannot be verified on Darwin. That comment is not a
+    # substitute for this cell; it is the reason this cell is mandatory rather than
+    # nice-to-have. Nothing about the TLS teardown may be changed on the strength of
+    # a local run.
+    #
+    # fail-fast: false so a leak in the TLS cell does not hide the OFF cell's result
+    # (or the other way round); the two answer different questions and one of them
+    # failing is information.
+    strategy:
+      fail-fast: false
+      matrix:
+        # QUOTED, and that is not tidiness. `ON` and `OFF` are YAML 1.1 booleans,
+        # so an unquoted pair is a matrix of `true`/`false` to at least one parser,
+        # and `-DWITH_TLS=true` is a value no reader of the log would recognise as
+        # the OFF cell. Quoted, the configure line reads
+        # `-DWITH_TLS=OFF` / `-DWITH_TLS=ON` exactly as the documented gate runs it,
+        # and `matrix.with_tls == 'ON'` compares against the string.
+        with_tls: ["OFF", "ON"]
     steps:
       - uses: actions/checkout@v4
+      # libssl-dev for the WITH_TLS=ON cell. Conditional rather than unconditional
+      # so the OFF cell still proves the zero-dependency build needs no third-party
+      # development package at all -- which is the dependency decision Phase 12 was
+      # built around, and a step that installed OpenSSL unconditionally would stop
+      # that from being checked by this job.
+      - name: Install OpenSSL headers (WITH_TLS=ON only)
+        if: matrix.with_tls == 'ON'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev
+          openssl version
       - name: Toolchain
         run: |
           set -euo pipefail
@@ -227,6 +273,7 @@ jobs:
           cmake -B build -S . \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTING=ON \
+            -DWITH_TLS=${{ matrix.with_tls }} \
             -DBUILD_BENCHMARK=ON \
             -DIRC_SANITIZE=ON \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON

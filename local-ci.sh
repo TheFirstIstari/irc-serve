@@ -32,7 +32,14 @@ echo "[local-ci] Branch: $BRANCH"
 
 BUILD_TYPE=${BUILD_TYPE:-Release}
 
-cmake -B build -S . -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" -DBUILD_TESTING=ON
+# IRC_FORTIFY is forwarded so the fortify cell is a real cell rather than a
+# claim: `IRC_FORTIFY=1 ./local-ci.sh` builds and runs the whole suite with
+# -D_FORTIFY_SOURCE=2. Read CMakeLists.txt's IRC_FORTIFY comment before reading
+# anything into what that catches -- on macOS it is a measured no-op, and this
+# class of Linux-only diagnostic lives in glibc's declaration of read(), which no
+# macOS build can see. It is NOT a substitute for the Linux CI job.
+cmake -B build -S . -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" -DBUILD_TESTING=ON \
+  -DIRC_FORTIFY="${IRC_FORTIFY:-OFF}"
 cmake --build build --parallel "${NPROC}"
 # -j matters: the suite is 61 independent processes and ctest defaults to one
 # at a time, so serial execution spends most of the wall clock waiting. Override
