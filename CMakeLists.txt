@@ -48,6 +48,46 @@ option(BUILD_TESTING "Build tests" ON)
 option(BUILD_BENCHMARK "Build benchmarks" ON)
 
 # ---------------------------------------------------------------------------
+# IRC_FORTIFY: -D_FORTIFY_SOURCE=2, opt-in, and READ THIS BEFORE TRUSTING IT
+# ---------------------------------------------------------------------------
+# Added because of a Linux-only build break this option cannot catch. glibc
+# declares read() (and write(), fread(), pipe()) with __wur, i.e.
+# __attribute__((warn_unused_result)), and GCC honours that attribute only when
+# the result is really used -- `(void)read(...)` is an error, not a discard. A
+# test discarded one exactly that way; all twelve macOS gate cells and both
+# ci_linux jobs went red with -Werror=unused-result, and every macOS cell had
+# built it clean, because macOS does not declare read() with that attribute at
+# all. Clang additionally exempts an explicit (void) cast, so even a real glibc
+# declaration compiled through clang would have stayed quiet.
+#
+# SO WHAT DOES THIS OPTION ACTUALLY BUY? Measured, on this machine, at -O0 and
+# -O2, with gcc-16 and with Apple clang under the full -Weverything set:
+# NOTHING. The macOS SDK declares zero __*_chk entry points -- no __read_chk, no
+# __memcpy_chk -- so _FORTIFY_SOURCE selects code that does not exist there. The
+# cell below is clean before the flag and clean after it.
+#
+# The reason is the point: this class of defect lives in the PLATFORM'S
+# DECLARATION of a function, not in a fortify header and not in a warning flag.
+# No -D flag on macOS can conjure a glibc declaration, so no macOS cell can ever
+# see this diagnostic. THIS IS NOT A SUBSTITUTE FOR THE LINUX CI JOB. That job
+# already exists and already caught this; it is the gate for this class, and
+# ci_macos is not a slower version of it -- it is blind to it.
+#
+# What the option does buy is narrow and worth stating precisely: it makes the
+# fortify define part of a configuration the developer actually builds and runs
+# the suite in, so a future diagnostic that IS reachable from a -D flag is
+# reached here rather than first in CI, and the flag set stays visibly in step
+# with the Linux one. It also would catch a real overflow bug in the fortified
+# string calls -- just not on this platform, where those calls are not fortified.
+#
+# OFF by default so no existing configuration changes: the same argument as
+# IRC_SANITIZE below.
+option(IRC_FORTIFY "Build with -D_FORTIFY_SOURCE=2 (see the note above: no-op on macOS)" OFF)
+if(IRC_FORTIFY)
+  add_compile_definitions(_FORTIFY_SOURCE=2)
+endif()
+
+# ---------------------------------------------------------------------------
 # IRC_SANITIZE: the opt-in AddressSanitizer + UndefinedBehaviorSanitizer build
 # ---------------------------------------------------------------------------
 # OFF, and it has to STAY off by default. These flags go on every target in the

@@ -203,8 +203,37 @@ static int run_expecting_refusal(char *const argv[], char *out, size_t outcap,
                 }
             } else {
                 char sink[512];
+                /* DRAIN-ONLY, and the count genuinely has no use: once the
+                 * caller's buffer is full there is nothing left to collect, but
+                 * the child is still writing into this pipe, and a pipe nobody
+                 * reads fills and blocks the writer. Stopping here would turn
+                 * "refused and exited" into "hung until the deadline kills it",
+                 * which is the other half of what this function distinguishes.
+                 *
+                 * THE CAST IS ON THE VARIABLE, NOT ON THE CALL, and that is the
+                 * whole fix. glibc declares read() __wur (warn_unused_result),
+                 * and GCC honours that attribute only when the result is
+                 * actually used -- so `(void)read(...)` is not a discard, it is
+                 * an error: -Werror=unused-result, and every Linux CI job red.
+                 * Clang is the opposite and exempts an explicit cast, so this
+                 * line built clean on every macOS cell for as long as it
+                 * existed. Nothing about the code was wrong; only the platform
+                 * disagreed about whether the result mattered.
+                 *
+                 * Naming the result is also the form that cannot rot. Assigning
+                 * to the `r` of the branch above satisfies the attribute too --
+                 * but only because `r` happens to be read elsewhere in this
+                 * function. Delete that read and this line breaks again in the
+                 * same place, with nothing local to explain why.
+                 *
+                 * No pragma and no -Wno-unused-result: suppressing the attribute
+                 * here also suppresses the one that catches a genuinely dropped
+                 * write(), and this project never narrows the warning set.
+                 * Cost: one named local and one statement, both of which the
+                 * optimiser deletes. */
+                ssize_t drained = read(fds[0], sink, sizeof sink);
 
-                (void)read(fds[0], sink, sizeof sink);
+                (void)drained;
             }
         }
         if (waitpid(pid, &status, WNOHANG) == pid) {

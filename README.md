@@ -38,6 +38,7 @@ skipped, 0 code-scanning alerts, 0 required third-party dependencies.**
 |---|---|
 | Tests | **85 passing, 0 skipped**, 0 failing |
 | Warnings | **0**, on gcc-16, upstream Clang 23 and Apple clang 21 (`-Weverything`), Release **and** Debug |
+| Fortify cell | `-D_FORTIFY_SOURCE=2` (`IRC_FORTIFY=1 ./local-ci.sh`) — a **no-op on macOS**, see below |
 | Sanitizers | ASan + UBSan clean locally; **LeakSanitizer clean** on the Linux CI job |
 | Code scanning | **0 open alerts** (CodeQL) |
 | Language | strict C11, **no required third-party libraries**; TLS (`-DWITH_TLS=ON`) adds the optional one |
@@ -161,6 +162,27 @@ ctest --test-dir build --output-on-failure
 ```
 
 `make local-ci` reproduces the CI warning flags exactly.
+
+### The fortify cell, and what it does not buy
+
+`IRC_FORTIFY=1 ./local-ci.sh` adds `-D_FORTIFY_SOURCE=2` to a whole
+build-and-test run. It is worth being precise about it, because the reason it
+exists is a diagnostic it **cannot** catch.
+
+glibc declares `read()`, `write()`, `fread()` and `pipe()` with `__wur` —
+`__attribute__((warn_unused_result))` — and GCC honours that attribute only when
+the result is genuinely used, so `(void)read(...)` is an error
+(`-Werror=unused-result`), not a discard. A test did exactly that, every Linux
+CI job went red, and every macOS cell had built it clean: macOS does not declare
+`read()` with that attribute at all, and Clang exempts an explicit `(void)` cast
+even when it does.
+
+So the fortify cell was measured before it was trusted, at `-O0` and `-O2`, on
+gcc-16 and Apple clang: **it changes nothing**, because the macOS SDK declares no
+`__*_chk` entry points for fortify to select. This class of defect lives in the
+platform's *declaration* of a function, and no `-D` flag on macOS can produce a
+glibc declaration. **`ci_macos` is not a slower version of the Linux gate for
+this class — it is blind to it**, and the Linux job is the gate.
 
 ### Platforms
 
