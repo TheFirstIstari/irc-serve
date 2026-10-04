@@ -69,9 +69,53 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
      * user's hostmask), and c->host is what accept() OBSERVED -- not what USER
      * claimed. commands.c's handle_user() is why that is deliberate; this is
      * where the decision stops being internal and becomes visible to a third
-     * party reading the wire. */
+     * party reading the wire.
+     *
+     * ---------------------------------------------------------------------------
+     * THE 404 HERE, AND WHY IT NAMES NO CHANNEL -- a decision, not an oversight
+     * ---------------------------------------------------------------------------
+     * RFC 2812 5.2 gives 404 the field list "<channel name> :Cannot send to
+     * channel". The <text> is SPECIFIED by that entry rather than free, so the
+     * sentence below is the RFC's own and not a paraphrase. The <channel name>
+     * is still absent, and that is deliberate:
+     *
+     *   RESOLVING FIRST IS NOT AFFORDABLE. fanout_resolve() answers 401 or 403
+     *   ITSELF on failure -- it is a resolve-or-refuse function, not a lookup
+     *   that returns a status. Moving it ahead of this check would mean a
+     *   PRIVMSG with an unknown target AND an unrenderable source produces TWO
+     *   error numerics on one connection, which is a protocol fault rather than
+     *   a fix. The ordering above is what keeps this to exactly one.
+     *
+     *   NAMING m->params[0] WITHOUT RESOLVING WOULD BE A NEW FALSEHOOD. The
+     *   target has not been resolved, so it is not known to be a channel: an
+     *   ISON-like `PRIVMSG somenick :hi` would have a NICKNAME rendered into
+     *   <channel name>. The field is also not the client's raw target on purpose
+     *   -- the sibling refusal below sends t.name, the RESOLVED name -- so
+     *   echoing params[0] here would make the same numeric carry two different
+     *   spellings of its field depending on which site sent it.
+     *
+     * A target beginning `#` or `&` IS provably a channel without being resolved
+     * (RFC 1459 2.3.1 fixes the sigil), so the field COULD be filled on that
+     * case alone. It is not, and the reason is the reader: this check cannot
+     * fail at this site at all -- CONN_HOSTMASK_MAX is the SUM of the three
+     * struct widths, so conn_hostmask() would have to truncate a string built
+     * from those same three widths, which is a compile-time impossibility. The
+     * only reader of this line is a log reader, and for that reader one uniform
+     * shape plus the reason on stdout below is worth more than a second shape
+     * that is conformant on a path nothing can reach. The reasoning is recorded
+     * in docs/RFC2812_CONFORMANCE.md 6.12.
+     *
+     * AND WHY THE TEXT CHANGED ANYWAY. "Cannot send: unrenderable source" was
+     * this node's own sentence in a field the RFC specifies, so it was a
+     * deviation on every count. The reason it existed -- that the SOURCE is
+     * unrenderable -- is not lost: it moves to the log line below, which is
+     * where the sibling 404 and the 417 above already put theirs, and where the
+     * RFC does not constrain what may be said. */
     if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
-        (void)reply(s, c, "404", NULL, 0, "Cannot send: unrenderable source");
+        (void)reply(s, c, "404", NULL, 0, "Cannot send to channel");
+        printf("[observable] msg_refused: verb=%s nick=%s target=%s "
+               "reason=unrenderable_source\n",
+               verb, c->nick, m->params[0]);
         return;
     }
 

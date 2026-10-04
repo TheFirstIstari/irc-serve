@@ -206,7 +206,7 @@ conformant.
 | 401 | ERR_NOSUCHNICK | `<nickname> :No such nick/channel` | E | ✓ |
 | 402 | ERR_NOSUCHSERVER | `<server name> :No such server` | E | ✓ Used for a mask that does not name this node. |
 | 403 | ERR_NOSUCHCHANNEL | `<channel name> :No such channel` | E | **deviation** on the `MODE <nick>` path — see §6.1. |
-| 404 | ERR_CANNOTSENDTOCHAN | `<channel name> :Cannot send to channel` | E | ✓ on the site that answers the real condition — a channel the client is not on, with `t.name` as the field. **One site is not**: when the source hostmask itself will not render, the line carries no `<channel name>` and a different sentence. See §6.12. |
+| 404 | ERR_CANNOTSENDTOCHAN | `<channel name> :Cannot send to channel` | E | ✓ **on the site that answers the real condition** — a channel the client is not on, with `t.name` as the field and the RFC's own sentence, asserted in `test_labeled_response.c`. **The `<text>` is now the RFC's at the other site too**, as of Phase 11c; the `<channel name>` is still absent there and §6.12 has the three-part argument for that, plus the fact that the check cannot fail at any call site in the tree. |
 | 405 | ERR_TOOMANYCHANNELS | `<channel name> :You have joined too many channels` | A | **There is no per-client channel limit on this node**, so the condition cannot arise. That is a resource decision, not an oversight: channels are bounded only by the descriptor table. See §8. |
 | 406 | ERR_WASNOSUCHNICK | `<nickname> :There was no such nickname` | A | No WHOWAS. |
 | 407 | ERR_TOOMANYTARGETS | `<target> :<error code> recipients. <abort message>` | A | 005 advertises `MAXTARGETS=1`, so a multi-recipient line is refused as a parameter-count problem (461) rather than as too many recipients. The token is the honest disclosure. |
@@ -546,9 +546,12 @@ typed earlier. Each is a real deviation with a named client-visible symptom.
 **Two of them were open findings in Phase 11 and were FIXED in Phase 11b** — §6.3
 and §6.5, kept in place and rewritten as the record of what was wrong and what
 replaced it, because a table that quietly deletes the defect it was written to
-track loses the reason the fix looks the way it does. **Two more were fixed in
-Phase 11c** — §6.11 and §6.12 — on the same terms. **§6.14 is new in Phase 11c**
-and was found while fixing §6.11. The remaining ten are open, and each says why.
+track loses the reason the fix looks the way it does. **Phase 11c closed §6.11 in
+full and §6.12 in half** — §6.12's `<text>` is now the RFC's literal and its
+`<channel name>` is still absent, because §6.12 argues that filling it would require
+either a falsehood or two error numerics for one command. **§6.14 is new in Phase
+11c**, found while fixing §6.11. The remaining ten are open, and each says why;
+one of them, §6.13, is **blocked on another** rather than on a decision of its own.
 
 | | Numeric | Status |
 |---|---|---|
@@ -563,7 +566,7 @@ and was found while fixing §6.11. The remaining ten are open, and each says why
 | [§6.9](#69-version-is-not-a-command) | `351` | open — needs a new verb |
 | [§6.10](#610-time-ping-and-version-are-handled-as-commands-ctcp-is-not) | — | N/A, argued |
 | [§6.11](#611-366-has-no-channel-when-names-is-asked-with-no-argument-and-there-are-no-channels--fixed-in-phase-11c) | `366` | **fixed** in Phase 11c — §6.11 |
-| [§6.12](#612-404-has-no-channel-when-the-source-hostmask-will-not-render) | `404` | **fixed** in Phase 11c — §6.12 |
+| [§6.12](#612-404-names-no-channel-when-the-source-hostmask-will-not-render--the-text-is-now-the-rfcs) | `404` | **half** — text fixed in Phase 11c, field argued and left |
 | [§6.13](#613-482-has-no-channel-for-register-and-unregister) | `482` | open — **blocked on §6.7** |
 | [§6.14](#614-366s-trailing-text-is-end-of-names-list-the-rfcs-is-end-of-names-list) | `366` | open — **new in Phase 11c** |
 
@@ -869,11 +872,11 @@ by position, the whole line byte for byte, **exactly one** 366, and **no 353** �
 before the first JOIN in that binary, because a bare `NAMES` on a node that *has* a
 channel answers with that channel's name and the check would pass for the wrong reason.
 
-### 6.12 `404` has no `<channel>` when the source hostmask will not render
+### 6.12 `404` names no `<channel>` when the source hostmask will not render — the TEXT is now the RFC's
 
-**New in Phase 11b.** RFC 2812 5.2: `404 ERR_CANNOTSENDTOCHAN "<client> <channel
-name> :Cannot send to channel"`. One site gets it right — a channel the client is not
-on, with `t.name` as the field and the RFC's own sentence. One does not:
+**The original Phase 11b finding.** RFC 2812 5.2: `404 ERR_CANNOTSENDTOCHAN "<client>
+<channel name> :Cannot send to channel"`. One site got it right — a channel the client
+is not on, with `t.name` as the field and the RFC's own sentence. One did not:
 
 ```c
 if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
@@ -883,21 +886,85 @@ if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
 Two deviations on that line: no `<channel name>`, and a sentence that is not the
 RFC's.
 
-**Symptom.** Small, and mostly for a log reader: a client sees 404 with no channel and
-a sentence it has no mapping for. Ordinary client input cannot reach it —
-`conn_hostmask()` fails only on a byte RFC 1459 2.3 will not put in a prefix, and
-`accept()` cannot produce one — so this is a refusal on what `reply.c` calls a bug
-report.
+**What Phase 11b's §6.12 got wrong, and it is the half that mattered.** It wrote
+*"The sentence could be aligned with the RFC's independently, but that leaves the line
+still missing its field, so half a fix would be a cosmetic half. It needs the
+target-kind decision, not a string edit."* **That is backwards, and the sentence is not
+the cosmetic half.** Checking what RFC 2812 5.2 actually permits: `404`'s `<text>` is
+**"Cannot send to channel" — specified by the entry, not free text.** So this node's
+own sentence was a deviation from a *literal the RFC dictates*, which is a stronger
+kind of wrong than a missing field, and it did not need the target-kind decision to
+fix. The two halves of the finding are independent, and only one of them was blocked.
 
-**Why not changed.** The channel name *is* available at this point (`m->params[0]`,
-the arity check has already passed), so the field could be filled — but it has not
-been resolved yet, and `params[0]` may be a nickname, in which case sending it as
-`<channel name>` would be a new falsehood rather than a conformant answer. Resolving
-the target first would mean running `fanout_resolve()` before the prefix check, which
-reorders the handler around a path that exists to catch an internal fault. The
-sentence could be aligned with the RFC's independently, but that leaves the line still
-missing its field, so half a fix would be a cosmetic half. It needs the target-kind
-decision, not a string edit.
+**What changed in Phase 11c.** The text is now the RFC's own:
+
+```
+:irc.test 404 alice :Cannot send to channel
+```
+
+and the reason the refusal happened moved to the node's own stdout, which is where
+the sibling `404` and the `417` above it already put theirs:
+
+```
+[observable] msg_refused: verb=PRIVMSG nick=alice target=#chan reason=unrenderable_source
+```
+
+That is the whole trade: the RFC constrains what may be said **on the wire**, and does
+not constrain what may be said **in the log**. The diagnostic is not lost, it is moved
+to the place it was always going to be read from.
+
+**The `<channel name>` field stays absent, and here is the full argument.**
+
+**1. Resolving first is NOT AFFORDABLE, and the reason is mechanical.** Phase 11b
+guessed that "running `fanout_resolve()` before the prefix check reorders the handler
+around a path that exists to catch an internal fault". The real obstacle is stronger:
+`fanout_resolve()` is a **resolve-or-refuse** function, not a lookup that returns a
+status — it answers `401` or `403` *itself* on failure. Moving it ahead of the prefix
+check would therefore let one `PRIVMSG` with an unknown target **and** an unrenderable
+source produce **two error numerics on one connection**. That is a protocol fault
+introduced by the fix, so the ordering stays and the field stays empty.
+
+**2. Naming `m->params[0]` without resolving would be a NEW falsehood.** The target has
+not been resolved, so it is not known to be a channel; a `PRIVMSG somenick :hi` would
+have a **nickname rendered into `<channel name>`**. It is also not the client's raw
+target on purpose: the sibling refusal sends `t.name`, the **resolved** name, so
+echoing `params[0]` would make one numeric carry two spellings of its field depending
+on which site sent it.
+
+**3. The `#`/`&` case WAS considered, and declined.** RFC 1459 2.3.1 fixes the channel
+sigil, so a target beginning `#` or `&` *is* provably a channel without being resolved
+and the field could be filled on that case alone. It is not, and the reason is the
+reader rather than the RFC: **this check cannot fail at this site.** `CONN_HOSTMASK_MAX`
+is defined as the **sum** of `conn_t::nick`, `::user` and `::host` (connection.h), so
+`conn_hostmask()` would have to truncate a string assembled from those same three
+widths — a compile-time impossibility, not merely something hard for a client to
+provoke. All ten `conn_hostmask()` call sites in the tree pass a buffer of exactly
+that size. So the only reader of this line is a log reader, and for that reader **one
+uniform shape plus the reason on stdout** is worth more than a second shape that is
+conformant on a path nothing can reach.
+
+**Symptom, restated honestly.** None reachable. Phase 11b said "ordinary client input
+cannot reach it … so this is a refusal on what `reply.c` calls a bug report"; §3 of the
+argument above strengthens that from *hard to provoke* to *impossible at every call
+site in this tree*.
+
+**Why there is no committed test for the text change, stated rather than hidden.** The
+path cannot be reached, so there is no client input that produces the line and no wire
+assertion to write. Fabricating one would mean a test that asserts a string constant
+rather than the node's behaviour. The line was therefore verified by **temporary
+instrumentation** — `char prefix[8]` in `send_message()`, forcing `conn_hostmask()` to
+return 0 — with the build checked clean before each observation, and the change then
+reverted:
+
+| source | wire |
+|---|---|
+| new text | `:irc.test 404 alice :Cannot send to channel` |
+| old text | `:irc.test 404 alice :Cannot send: unrenderable source` |
+| new text, `PRIVMSG somenick :hi` | `:irc.test 404 alice :Cannot send to channel` — **identical**, which is what point 2 above is about |
+
+The reachable `404` — a channel the sender is not on — is asserted in
+`test_labeled_response.c`, which checks the labelled-batch behaviour and the line
+together.
 
 ### 6.13 `482` has no `<channel>` for `REGISTER` and `UNREGISTER`
 
@@ -1051,16 +1118,17 @@ phase.
 | `366` sends `<channel>` = `*` on a channel-less node, through `send_end_of_names()` | field list — §6.11 | `test_numeric_arity.c` §5 (field count, `*` by position, whole line, one 366, no 353) |
 | `303` sends the nick list as ONE trailing parameter, RFC 2812 5.1's shape | field list — §5.1 | nine corrected needles; `test_queries.c`'s chunking probe rebuilt around a 15 × 63-byte ISON, with per-chunk shape and whole-window name count |
 | `reply_colon()` added: `reply()` with the trailing text always colonned | the mechanism §5.1 needs | the one-nick 303 needles, in `test_queries.c` and `test_nick_case.c` |
+| `404`'s `<text>` becomes the RFC's literal; the reason moves to the `msg_refused` log line | §6.12 — the half that was not blocked | none possible: the check cannot fail at any `conn_hostmask()` call site, so the line was verified by temporary instrumentation and the observation is in §6.12 |
 | `302`'s duplicated middle parameter recorded | this document was wrong — §5.1 | — |
 | `366`'s trailing text recorded as a deviation | **new finding** — §6.14 | — |
 
 ## 11. What this document does not claim
 
 - **It is not a claim of full conformance.** Fourteen findings are recorded in §6 —
-  ten open, four fixed — and the deviations in §5; a server with all of them
-  closed would still not be conformant to RFC 2812 section 3's "All commands
-  described in this section MUST be implemented", which this node departs from
-  deliberately in the operator, TRACE, STATS and diagnostics families.
+  ten open, two fixed, two partly fixed — and the six deviations in §5; a server with
+  all of them closed would still not be conformant to RFC 2812 section 3's "All
+  commands described in this section MUST be implemented", which this node departs
+  from deliberately in the operator, TRACE, STATS and diagnostics families.
 - **The mechanical check verified arity, not sense.** §1.1 says what it can and
   cannot see. It compared *how many* middle parameters reach the wire against *how
   many* the RFC's field list names. It did not check that the values are right, that
