@@ -24,6 +24,10 @@
 #include <unistd.h>
 
 #include "core/connection.h"
+/* Phase 12: the drain in fed_send_shutdown() reads through the transport, so this
+ * is the third of the tree's three I/O sites to name it. See the comment on that
+ * block for what happens to the node's departure if it did not. */
+#include "core/transport.h"
 #include "federation/burst.h"
 #include "federation/dedup.h"
 /* Phase 9: 2.1's remote-nick registry, swept from fed_tick() because a store
@@ -943,13 +947,27 @@ int fed_send_shutdown(server_t *s, const char *reason)
              * MSG_DONTWAIT rather than relying on the socket's flags: the drain must
              * not be able to block a teardown even if some other code path made this
              * descriptor blocking, and a blocking recv() in server_shutdown() would be
-             * a hang rather than a missed goodbye. */
+             * a hang rather than a missed goodbye.
+             *
+             * PHASE 12: IT READS THROUGH transport_recv(), AND THAT IS THE WHOLE
+             * REASON THIS BLOCK IS NOT A recv(). This is the third and last of the
+             * tree's three I/O sites, and it is the one most easily left behind because
+             * it is a read into a sink rather than a read into the connection: on a
+             * TLS peer link a raw recv() would pull CIPHERTEXT into a stack buffer and
+             * count it as "drained", which is at best a wrong number on a log line and
+             * at worst a handshake failure on the way out of the node. The transport
+             * answers in its own four-value vocabulary -- bytes, EOF, TRANSPORT_RETRY,
+             * TRANSPORT_FATAL -- and TRANSPORT_FATAL is the one case this loop must not
+             * spin on: it breaks, which is what the old `break` on a non-EINTR error
+             * did. The loop's own bound is unchanged, so the cost of this path on a
+             * plaintext mesh is one function call per pending chunk on a path that runs
+             * once per process. */
             {
                 char sink[512];
                 size_t drained = 0u;
 
                 for (;;) {
-                    ssize_t got = recv(c->fd, sink, sizeof sink, MSG_DONTWAIT);
+                    ssize_t got = transport_recv(c, sink, sizeof sink);
 
                     if (got > 0) {
                         drained += (size_t)got;
@@ -958,10 +976,21 @@ int fed_send_shutdown(server_t *s, const char *reason)
                         }
                         continue;
                     }
-                    if (got < 0 && errno == EINTR) {
-                        continue;
-                    }
-                    break;
+                    /* BREAK ON TRANSPORT_RETRY, AND THAT IS NOT AN INVERSION OF
+                     * THE OLD LOOP -- IT IS THE OLD LOOP.
+                     *
+                     * The pre-Phase-12 code was `if (got < 0 && errno == EINTR)
+                     * continue; break;`, so it retried ONLY on EINTR and BROKE on
+                     * EAGAIN, because EAGAIN is the kernel saying the peer's queue
+                     * is empty -- which is the very condition the drain exists to
+                     * reach. An earlier version of this block treated every
+                     * TRANSPORT_RETRY as "try again", which made an idle peer link
+                     * spin here for ever: six federation tests hung at nf_stop()
+                     * until the harness's own 15 s deadline killed them, with the
+                     * node reporting perfectly healthy counters the whole time.
+                     * The transport cannot distinguish "empty" from "parked on a
+                     * write", and for a drain both mean the same thing: stop. */
+                    break; /* EOF, EAGAIN, or a fatal transport error: stop */
                 }
                 if (drained > 0u) {
                     /* PRINTED, because "the goodbye was discarded by the close" is

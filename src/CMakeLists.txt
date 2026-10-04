@@ -1,18 +1,76 @@
 # CMake for src
 #
-# sasl_framework.c is here because it was NOT, and that was the defect (#86): it
-# was compiled as a source of the test_sasl_handshake executable from
-# tests/compliance/CMakeLists.txt, so SASL was absent from the shipped library
-# entirely -- a Phase-8 feature with no place in irc_core to grow into. It is
-# still the Phase-8 placeholder implementation (see docs/SERVER_DESIGN.md and
-# #82), and being in the library now means the code that replaces it has a target
-# to live in and a header (src/sasl_framework.h) that is on the include path for
-# everything linking irc_core, rather than a test-local extern declaration.
+#   sasl_framework.c is here because it was NOT, and that was the defect (#86): it
+#   was compiled as a source of the test_sasl_handshake executable from
+#   tests/compliance/CMakeLists.txt, so SASL was absent from the shipped library
+#   entirely -- a Phase-8 feature with no place in irc_core to grow into. It is
+#   still the Phase-8 placeholder implementation (see docs/SERVER_DESIGN.md and
+#   #82), and being in the library now means the code that replaces it has a target
+#   to live in and a header (src/sasl_framework.h) that is on the include path for
+#   everything linking irc_core, rather than a test-local extern declaration.
+
+# ---------------------------------------------------------------------------
+# WITH_TLS: THE OPTIONAL THIRD-PARTY DEPENDENCY (Phase 12)
+# ---------------------------------------------------------------------------
+# OFF BY DEFAULT, and the reason is in README.md's own claim. This project had no
+# third-party dependencies for eleven phases and said so in three places; making
+# OpenSSL mandatory would falsify all three AND make every CI runner grow a
+# package step -- which is how a runner that cannot install it fails, in a build
+# log rather than as a decision.
+#
+# WHAT "OPTIONAL" BUYS, concretely:
+#   - the default build compiles ZERO tokens of OpenSSL and links nothing beyond
+#     libc and pthread, which is what makes "no REQUIRED dependencies" true
+#     rather than aspirational;
+#   - the regression suite runs against the default build, so "plaintext is
+#     byte-identical" is a claim about the configuration this project ships;
+#   - a deployment that does not want TLS does not link a TLS stack.
+#
+# WHAT IT COSTS, and this is the honest half: a node built with the default
+# options cannot upgrade any connection. There is no `sts` capability, no `tls`
+# capability, and STARTTLS is answered 691. The startup line says so.
+#
+# WHY find_package(OpenSSL) RATHER THAN A HAND-ROLLED -lssl -lcrypto: pkg-config
+# on this machine reports an include path inside a versioned Homebrew Cellar
+# directory, so a hand-rolled one would make the DEFAULT build depend on a
+# Homebrew layout -- exactly the dependency this option exists to keep out. The
+# find module is also what puts the OpenSSL headers on the SYSTEM include path,
+# which is what lets -Weverything's -Wsystem-headers stop firing on them (see the
+# -Wno- third-party scoping in the top-level CMakeLists.txt).
+#
+# IT IS DECLARED HERE, ABOVE add_library(), because the two backend source files
+# are selected with a generator expression that reads WITH_TLS -- and a generator
+# expression is evaluated at generate time, so an option defined after
+# add_library() is undefined to it and $<NOT:${WITH_TLS}> expands to nothing.
+option(WITH_TLS "Build the optional OpenSSL TLS layer (adds a third-party dependency)" OFF)
+if(WITH_TLS)
+  find_package(OpenSSL 1.1.1 REQUIRED)
+endif()
+
 add_library(irc_core STATIC
   protocol_parse.c
   ircv3_tags.c
   federation_handshake.c
   sasl_framework.c
+  # Phase 12: the TLS BACKEND, and why it is two mutually exclusive files rather
+  # than one #ifdef. `WITH_TLS` selects between them at configure time, so a
+  # no-TLS build does not contain a single token of OpenSSL and a TLS build does
+  # not contain the stub. The header both of them implement is src/tls_backend.h,
+  # and it is the ONLY place the rest of the tree names TLS at all -- see its
+  # comment for why that file has one function in it.
+  #
+  # IT IS NOT A LINK-TIME OPTION. OpenSSL could have been a find_package() with a
+  # stub for the not-found case, but that makes a typo in a build directory's
+  # cache decide whether a node is encrypted, silently. An explicit -DWITH_TLS=ON
+  # is a thing an operator has to write down, and it is what the README will say.
+  $<$<BOOL:${WITH_TLS}>:tls_openssl.c>
+  $<$<NOT:$<BOOL:${WITH_TLS}>>:tls_none.c>
+  # Phase 12: the TRANSPORT. Compiled in EVERY configuration, because plaintext is
+  # not "TLS with the crypto stubbed out" -- it is the implementation this project
+  # shipped for eleven phases, and the zero-dependency build is the one the
+  # regression suite runs against. transport.h has the interface and the argument
+  # for why it is three functions wide.
+  core/transport.c
   # Phase 10.1: the ACCOUNT REGISTRY. It sits beside sasl_framework.c and NOT
   # inside core/ for the same reason sasl_framework.c is at this level: it is a
   # file-backed secret store whose layout and bounds belong to one module, and
@@ -89,6 +147,18 @@ add_library(irc_core STATIC
 )
 
 target_link_libraries(irc_core PRIVATE pthread)
+
+if(WITH_TLS)
+  # PUBLIC, because a test that drives a real handshake links OpenSSL headers of
+  # its own -- see tests/integration/CMakeLists.txt's TLS block.
+  target_link_libraries(irc_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+  # PRIVATE: the rest of the tree must not learn that TLS exists from a macro. The
+  # one fact anything outside the backend needs is tls_backend_available(), and
+  # tls_backend.h is the header for it.
+  target_compile_definitions(irc_core PRIVATE IRC_WITH_TLS=1)
+  message(STATUS "irc-serve: TLS ENABLED (${OPENSSL_VERSION}); "
+                 "the zero-dependency build is OFF")
+endif()
 
 # Expose src/ headers to anything linking irc_core (tests, benchmarks).
 target_include_directories(irc_core PUBLIC ${PROJECT_SOURCE_DIR}/src)

@@ -79,6 +79,19 @@ irc_add_integration_test(test_conn_lifecycle test_conn_lifecycle.c)
 # 3.3: partial writes, drained across poll iterations, byte for byte.
 irc_add_integration_test(test_partial_write test_partial_write.c)
 
+# Phase 12, the STRUCTURAL commit: poll() reads a readiness INTENT off the
+# connection instead of deriving the event mask from data, because a nonblocking
+# TLS handshake parks waiting to WRITE with an empty write queue and poll()'s
+# revents cannot report that. Its own file, and it is the only test that asserts
+# on conn_t fields, because the invariant it asserts IS a field invariant --
+# "on a plaintext connection want_read is always 1 and want_write is exactly
+# 'there are unsent bytes'" is what makes the plaintext poll set byte-identical,
+# and no wire line can check it. The wire case is here too, though, and it is the
+ # one that carries the claim: a connection whose intent says "do not read me" is
+# never read while a second client on the same node is served normally, so a loop
+# that mentions want_read and ignores it cannot pass.
+irc_add_integration_test(test_readiness_intent test_readiness_intent.c)
+
 # 3.4: bounded write queues; a saturated link is dropped and nobody else is.
 irc_add_integration_test(test_writeq_overflow test_writeq_overflow.c)
 

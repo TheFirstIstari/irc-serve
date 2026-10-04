@@ -1,4 +1,13 @@
-/* connection.c -- conn_t buffers and RFC 1459 2.3 line framing (3.3). */
+/* connection.c -- conn_t buffers and RFC 1459 2.3 line framing (3.3).
+ *
+ * PHASE 12: this file no longer calls recv() or send(). Both went to
+ * core/transport.h -- see transport.h for the contract and for why there are
+ * three call sites and not the twelve a grep suggests. What stayed here is the
+ * part that is about the CONNECTION (framing, the bounded write queue, the
+ * lifecycle) rather than about the bytes, and conn_pump()'s STARTTLS ordering
+ * arm is the one piece of transport policy that has to live here, for the
+ * reason its own comment gives.
+ */
 #include "core/connection.h"
 
 #include <errno.h>
@@ -8,6 +17,8 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
+
+#include "core/transport.h"
 
 /* Grow `*buf` to at least `need` bytes, doubling from the current capacity and
  * clamping to `limit` so a capped buffer cannot be grown past its bound. Sets
@@ -49,6 +60,25 @@ conn_t *conn_new(int fd, int kind)
     c->fd = fd;
     c->kind = kind;
     c->state = CONN_REG_PASS;
+    /* Phase 12: the READINESS INTENT a plaintext connection starts with, and
+     * the value that makes the loop's poll set for this connection byte-for-byte
+     * what it was before the intent existed. See the block in connection.h.
+     *
+     * want_read is 1 unconditionally on a plaintext connection, because a
+     * plaintext socket always wants to be read; want_write is 0 because there
+     * is nothing queued, and conn_queue() raises it the first time that stops
+     * being true. Nothing here talks to a transport: conn_new() installs the
+     * plaintext ops below and a TLS connection's own ops publish their intent
+     * the moment they exist. */
+    c->want_read = 1;
+    c->want_write = 0;
+    /* ...and the transport, which is the plaintext one because a brand-new
+     * conn_t has no TLS on it and the only two ways to get any are
+     * transport_starttls() (a STARTTLS, or an implicit-TLS listener's accept)
+     * and the peer-link dial. This call is what makes "every connection has a
+     * transport from the instant it exists" true rather than something each
+     * construction site has to remember -- see transport.h. */
+    transport_init_plaintext(c);
     /* The two 317 RPL_WHOISIDLE timestamps, stamped where the connection comes
      * into existence rather than where they are asked for. signon_at is the
      * answer to "when did this user connect", which is a fact about accept and
@@ -74,6 +104,24 @@ void conn_free(conn_t *c)
     if (c == NULL) {
         return;
     }
+    /* Phase 12: the transport is released HERE, and this is the only place an
+     * SSL* is freed on the connection path -- conn_free() is what
+     * server_close_conn(), server_dial_progress()'s two failure arms and
+     * server_shutdown()'s walk all end in, so "every TLS connection frees its
+     * SSL" is one call in one function rather than four call sites somebody has
+     * to keep in step.
+     *
+     * It runs BEFORE the buffers because the drain in
+     * fed_send_shutdown() has already run by then and nothing below it needs the
+     * transport; and it runs whether or not the connection was ever TLS, because
+     * the plaintext close is a no-op and branching on that here would be a
+     * second place that has to know what the transport is.
+     *
+     * NOT CLOSING THE DESCRIPTOR: 3.4 makes the reaper the single close site and
+     * this function does not close the fd, so the TLS close must not either.
+     * OpenSSL is told about the teardown with SSL_shutdown() and then dropped;
+     * the socket is closed by close() a line later in server_close_conn(). */
+    transport_close(c);
     free(c->rbuf);
     free(c->wbuf);
     free(c->peer_name);
@@ -86,6 +134,7 @@ void conn_free(conn_t *c)
 int conn_fill(conn_t *c)
 {
     for (;;) {
+        size_t room;
         ssize_t n;
 
         if (c->rlen == c->rcap) {
@@ -97,7 +146,17 @@ int conn_fill(conn_t *c)
             }
         }
 
-        n = recv(c->fd, c->rbuf + c->rlen, c->rcap - c->rlen, 0);
+        room = c->rcap - c->rlen;
+        /* Phase 12: the read goes through the transport, which is where the
+         * recv() and the errno policy moved to. What is left here is the part
+         * that is about the CONNECTION rather than about the bytes: appending,
+         * the idle stamp, and the three outcomes the loop's EOF and error arms
+         * already distinguish. The buffer is never full at this point -- the
+         * block above guarantees room -- which matters for TLS: a transport with
+         * decrypted bytes already buffered returns them without touching the
+         * descriptor, and it may only do that because the caller always has
+         * somewhere to put them. */
+        n = transport_recv(c, c->rbuf + c->rlen, room);
         if (n > 0) {
             c->rlen += (size_t)n;
             /* Bytes arrived, so the connection is not idle. This is the only
@@ -112,11 +171,8 @@ int conn_fill(conn_t *c)
         if (n == 0) {
             return CONN_FILL_EOF; /* the peer closed its half */
         }
-        if (errno == EINTR) {
-            continue;
-        }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return 0;
+        if (n == TRANSPORT_RETRY) {
+            return 0; /* drained to EAGAIN, or the transport wants something else */
         }
         return -1;
     }
@@ -203,34 +259,74 @@ int conn_queue(conn_t *c, const char *data, size_t len)
     }
     memcpy(c->wbuf + c->wlen, data, len);
     c->wlen += len;
+    /* Phase 12: the queue grew, so poll() must be asked for POLLOUT. This is the
+     * ONE place outside a transport that may set the intent, and the reason is
+     * in connection.h: a transport's last publish predates these bytes, so it
+     * cannot know they exist. See conn_queue()'s comment. */
+    c->want_write = 1;
     return 0;
+}
+
+void conn_want(conn_t *c, int read, int write)
+{
+    if (c == NULL) {
+        return;
+    }
+    c->want_read = read ? 1 : 0;
+    c->want_write = write ? 1 : 0;
 }
 
 int conn_pump(conn_t *c)
 {
-    while (c->woff < c->wlen) {
-        /* MSG_NOSIGNAL: a peer that has already gone away must surface as
-         * EPIPE from send(), never as a process-killing SIGPIPE. */
-        ssize_t n = send(c->fd, c->wbuf + c->woff, c->wlen - c->woff,
-                         MSG_NOSIGNAL);
-        if (n > 0) {
-            c->woff += (size_t)n;
-            continue;
+    for (;;) {
+        size_t pending = c->wlen - c->woff;
+
+        /* Phase 12: the EMPTY pass. A TLS handshake writes before this node has
+         * any application bytes to send, so the transport gets one unconditional
+         * call with a zero-length buffer even when there is nothing queued; the
+         * plaintext transport answers it without touching the descriptor. This
+         * is reached only after the queue has drained, which is why the ordinary
+         * path below it is unchanged. */
+        if (pending == 0u) {
+            (void)transport_send(c, NULL, 0u);
+            break;
         }
-        if (n < 0) {
-            if (errno == EINTR) {
+        /* MSG_NOSIGNAL for the plaintext case is the transport's business and
+         * not this file's -- a peer that has already gone away must surface as
+         * EPIPE, never as a process-killing SIGPIPE, whichever transport is
+         * carrying the bytes. */
+        {
+            ssize_t n = transport_send(c, c->wbuf + c->woff, pending);
+
+            if (n > 0) {
+                c->woff += (size_t)n;
                 continue;
             }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (n == TRANSPORT_RETRY) {
                 break; /* partial write: the rest is drained on a later tick */
             }
+            return -1;
         }
-        return -1;
     }
 
     if (c->woff == c->wlen) {
         c->wlen = 0;
         c->woff = 0;
+    }
+    /* Phase 12: a STARTTLS whose 670 has now been fully written may start its
+     * handshake. Doing it HERE rather than in the handler is the whole of the
+     * ordering: the confirmation has to reach the client IN THE CLEAR, and a
+     * handler that began the handshake at once would have OpenSSL's first
+     * flight racing the 670 down the same socket -- a client that received a
+     * ServerHello before the line that authorised it would have no way to know
+     * the ordering was intended. See transport_starttls(). */
+    if (c->starttls_pending && c->woff == c->wlen) {
+        c->starttls_pending = 0;
+        if (transport_starttls(c, 1) != 0) {
+            printf("[observable] starttls_failed: fd=%d reason=HANDSHAKE_START\n",
+                   c->fd);
+            return -1;
+        }
     }
     return 0;
 }
