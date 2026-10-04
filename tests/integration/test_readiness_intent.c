@@ -724,10 +724,14 @@ static void case_structural(void)
           "poll_loop.c reads conn_t::want_write",
           "the loop must ask the connection what it wants");
     {
-        /* The literal `events = POLLIN;` is the pre-Phase-12 derivation. It may
-         * appear ONCE, for the listener, which genuinely always wants to be read
-         * and has no transport to publish anything. A second one means a
-         * connection's mask is being derived from data again. */
+        /* The literal `events = POLLIN;` is the pre-Phase-12 derivation. It is
+         * legal for a LISTENER -- which genuinely always wants to be read and has
+         * no transport to publish an intent -- and for nothing else. Phase 12
+         * added a SECOND listener (the implicit-TLS one), so the count is two, and
+         * the assertion is an equality rather than "at least one" for the reason
+         * that matters: a THIRD occurrence would be a connection's mask derived
+         * from data again, which is the whole regression this file exists to
+         * catch. */
         int count = 0;
         const char *p = code;
 
@@ -735,10 +739,11 @@ static void case_structural(void)
             count++;
             p += 16;
         }
-        check(count == 1,
-              "poll_loop.c derives POLLIN exactly once, for the LISTENER",
-              "a second one means a connection's mask is derived from data "
-              "again and the readiness intent is being ignored");
+        check(count == 2,
+              "poll_loop.c derives POLLIN exactly twice -- once for each of the "
+              "two LISTENERS, which have no transport to publish an intent",
+              "each LISTENER is one; a third means a connection's mask is derived "
+              "from data again and the readiness intent is being ignored");
     }
     free(code);
 

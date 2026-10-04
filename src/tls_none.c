@@ -43,9 +43,39 @@ int tls_backend_available(void)
     return 0;
 }
 
+int tls_backend_node_init(struct tls_node **out, const char *cert,
+                          const char *key, const char *ca, int insecure)
+{
+    (void)cert;
+    (void)key;
+    (void)ca;
+    (void)insecure;
+    printf("[observable] tls_init: state=REFUSED reason=NOT_COMPILED_IN "
+           "hint=rebuild_with_-DWITH_TLS=ON\n");
+    if (out != NULL) {
+        *out = NULL;
+    }
+    return -1;
+}
+
+void tls_backend_node_free(struct tls_node *node)
+{
+    (void)node; /* there is nothing this build allocated */
+}
+
 int tls_backend_starttls(conn_t *c, int as_server)
 {
     (void)as_server;
+    printf("[observable] tls_unavailable: fd=%d reason=NOT_COMPILED_IN "
+           "hint=rebuild_with_-DWITH_TLS=ON\n",
+           (c != NULL) ? c->fd : -1);
+    return -1;
+}
+
+int tls_backend_starttls_peer(conn_t *c, int as_server, const char *peer_host)
+{
+    (void)as_server;
+    (void)peer_host;
     printf("[observable] tls_unavailable: fd=%d reason=NOT_COMPILED_IN "
            "hint=rebuild_with_-DWITH_TLS=ON\n",
            (c != NULL) ? c->fd : -1);

@@ -4,9 +4,9 @@
  * loop and everything it forces). The order of the steps below is the contract,
  * and it is not arbitrary:
  *
- *   1. build the poll sets          (listener, connections, in-flight dials)
+ *   1. build the poll sets          (listeners, connections, in-flight dials)
  *   2. poll()                       EINTR is counted and retried, never fatal
- *   3. accept                       nonblocking, drained
+ *   3. accept                       nonblocking, drained, both listeners
  *   4. read + frame + parse + dispatch
  *   5. write                        drain the retained write-queue offsets
  *   6. dial progress                nonblocking connect() completion
@@ -269,6 +269,7 @@ int poll_loop_step(server_t *s, int timeout_ms)
     size_t nconn_pfd = 0;
     nfds_t nfds = 0;
     nfds_t dial_nfds = 0;
+    nfds_t tls_listen_pfd = 0;
     size_t i;
     int n;
 
@@ -277,10 +278,32 @@ int poll_loop_step(server_t *s, int timeout_ms)
     }
 
     /* --- 1. build the sets --- */
+    /* TWO LISTENERS, OR ONE. The plaintext listener is slot 0 and is ALWAYS slot
+     * 0 when present, because step 3's accept arm tests `pfds[0].fd ==
+     * s->listen_fd`. The implicit-TLS listener (Phase 12) is appended after the
+     * listener and BEFORE the connections, so a connection's index does not shift
+     * when an operator adds --tls-port -- conn_pfd[] records indices, and a set
+     * whose meaning changed when an unrelated option appeared would be a very hard
+     * bug to find.
+     *
+     * The TLS listener's INDEX is recorded in tls_listen_pfd rather than assumed,
+     * because it depends on whether the plaintext listener was there: with both,
+     * the TLS one is slot 1; with only --tls-port and no --port (which the parser
+     * allows -- the port argument has a default), it is slot 0. Assuming an index
+     * is how a two-listener loop ends up polling the wrong descriptor for the
+     * accept, and the symptom would be a node that serves TLS on one port and
+     * nothing on the other. */
     if (s->listen_fd >= 0) {
         pfds[nfds].fd = s->listen_fd;
         pfds[nfds].events = POLLIN;
         pfds[nfds].revents = 0;
+        nfds++;
+    }
+    if (s->tls_listen_fd >= 0) {
+        pfds[nfds].fd = s->tls_listen_fd;
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        tls_listen_pfd = nfds;
         nfds++;
     }
     for (i = 0; i < SERVER_FD_TABLE && nfds < POLL_MAX_FDS; i++) {
@@ -355,22 +378,38 @@ int poll_loop_step(server_t *s, int timeout_ms)
     }
 
     if (n > 0) {
-        /* --- 3. accept --- */
+        /* --- 3. accept, on BOTH listeners ---
+         *
+         * The plain listener is index 0 when it exists, so the two arms below are
+         * independent tests rather than a loop over listener indices -- and each
+         * one drains fully, which is the property server_accept_one()'s comment
+         * gives: a listener that stays readable with a full backlog would
+         * otherwise be re-polled with the queue still full. The fd >= FD_SETSIZE
+         * rejection is -2, and it is NOT a reason to stop draining -- the rest of
+         * the queue is perfectly good. */
         if (s->listen_fd >= 0 && pfds[0].fd == s->listen_fd &&
             (pfds[0].revents & POLLIN) != 0) {
-            /* Drain the listener rather than taking one connection per tick: a
-             * listener that stays readable with a full backlog would otherwise
-             * be re-polled with the queue still full. The fd >= FD_SETSIZE
-             * rejection is -2, and it is NOT a reason to stop draining -- the
-             * rest of the queue is perfectly good. */
             for (;;) {
                 int rc = server_accept_one(s);
 
                 if (rc == 0) {
-                    break; /* nothing pending */
+                    break;
                 }
                 if (rc < 0 && rc != SERVER_ACCEPT_REJECTED) {
                     break; /* fatal accept error; the next tick retries */
+                }
+            }
+        }
+        if (s->tls_listen_fd >= 0 &&
+            (pfds[tls_listen_pfd].revents & POLLIN) != 0) {
+            for (;;) {
+                int rc = server_accept_tls_one(s);
+
+                if (rc == 0) {
+                    break;
+                }
+                if (rc < 0 && rc != SERVER_ACCEPT_REJECTED) {
+                    break;
                 }
             }
         }

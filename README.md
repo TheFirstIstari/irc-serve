@@ -1,6 +1,7 @@
 # irc-serve
 
-A federated IRC server in C11. Single-threaded, no third-party dependencies.
+A federated IRC server in C11. Single-threaded, **no required third-party
+dependencies** — TLS is available and off by default.
 
 [![CI](https://github.com/TheFirstIstari/irc-serve/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/TheFirstIstari/irc-serve/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
@@ -30,16 +31,16 @@ into a temporary one that clears on the next resync.
 
 ## Status
 
-**v1.0.0 — the nine-phase plan plus an IRCv3 phase is complete. 77 tests, 0
-skipped, 0 code-scanning alerts, 0 third-party dependencies.**
+**v1.0.0 — the nine-phase plan plus an IRCv3 phase is complete. 85 tests, 0
+skipped, 0 code-scanning alerts, 0 required third-party dependencies.**
 
 | | |
 |---|---|
-| Tests | **77 passing, 0 skipped**, 0 failing |
+| Tests | **85 passing, 0 skipped**, 0 failing |
 | Warnings | **0**, on gcc-16, upstream Clang 23 and Apple clang 21 (`-Weverything`), Release **and** Debug |
 | Sanitizers | ASan + UBSan clean locally; **LeakSanitizer clean** on the Linux CI job |
 | Code scanning | **0 open alerts** (CodeQL) |
-| Language | strict C11, **no third-party libraries** |
+| Language | strict C11, **no required third-party libraries**; TLS (`-DWITH_TLS=ON`) adds the optional one |
 | Size | ~36,700 lines of C |
 
 All ten phases shipped. Every test that was ever a CTest skip is now a real test
@@ -76,7 +77,12 @@ socket** — not inferred from the source:
 - **IRCv3** — `CAP` negotiation, SASL PLAIN, real tag escaping, `multi-prefix`,
   `message-ids`, `account-tag`, `account-notify`, `extended-join`,
   `extended-isupport`, `userhost-in-names`, `setname`, `echo-message`,
-  `standard-replies`, `away-notify`, `batch`, `labeled-response`, `invite-notify`
+  `standard-replies`, `away-notify`, `batch`, `labeled-response`, `invite-notify`,
+  `tls` and `sts` (Strict Transport Security)
+- **TLS** — optional, off by default, and the build has **no required third-party
+  dependency** without it. With `-DWITH_TLS=ON`: implicit TLS on its own port
+  (RFC 7194's 6697), `STARTTLS` on the plaintext port with the IRCv3 refusal rules,
+  peer links that can require TLS, and an `sts` policy a client acts on
 
 ### Not implemented, and why
 
@@ -85,15 +91,14 @@ Each is documented where it is excluded.
 
 | Missing | Why |
 |---|---|
-| **TLS / any transport encryption** | nothing on the wire is encrypted, including SASL PLAIN. The single largest gap; see [SECURITY.md](SECURITY.md) |
 | Rate limiting | none. A client may open connections as fast as the node accepts them |
 | Operator (IRCop) model | none. `CHOPER` answers `482` for every request by design, so it cannot succeed |
 | Services (NickServ, ChanServ) | none. Accounts exist but are **operator-created by editing a file**; `REGISTER` is refused `482` |
 | Account **federation** | the account registry is per node. Two nodes with two registries **disagree** about who somebody is, and `+account` deliberately does not cross a link |
 | `chathistory` | needs per-client message history, which conflicts with §2.2's disposal rule and the fail-closed posture. A design conflict, not a task |
 | `oper-tag`, `account-extban` | blocked on a subsystem that does not exist — an operator model, and a ban-expression parser |
-| WebSocket transport, `sasl-3.2` (SCRAM/EXTERNAL) | a transport and a crypto surface, rather than protocol features |
-| `websocket`, `sts` | as above |
+| WebSocket transport | a second transport for the `core/transport.h` interface, which now has two implementations |
+| `sasl-3.2` (SCRAM/EXTERNAL) | a crypto surface for *authentication*, which is a different problem from *transport* encryption and is not solved by TLS |
 | epoll | the `FD_SETSIZE` ceiling of 1024 is accepted and documented; every accept and dial site rejects above it rather than truncating |
 
 Client-only IRCv3 specs (`react`, `typing`, `channel-context`, `batch/react`) are
@@ -105,7 +110,47 @@ That is a weaker guarantee than a third-party runner and is not described as mor
 
 ## Build
 
-Requires CMake 3.20+ and a C11 compiler.
+Requires CMake 3.20+ and a C11 compiler. **Nothing else**, unless you ask for TLS:
+the default build links libc and pthread and nothing else, which is what "no
+required third-party dependencies" means.
+
+### TLS (optional)
+
+```sh
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DWITH_TLS=ON
+cmake --build build --parallel
+```
+
+This is the **only** thing in the build that adds a third-party library, and it is
+off by default for three reasons that are each a real cost avoided:
+
+- the default build stays buildable and testable on any machine, including a CI
+  runner with no OpenSSL development package;
+- "plaintext is byte-identical" stays a claim about the configuration this project
+  actually ships, so the 85-test regression suite means what it says;
+- a deployment that does not want TLS does not link a TLS stack.
+
+The cost, stated plainly: **a node built with the default options cannot encrypt
+anything.** No `tls` and no `sts` capability, and `STARTTLS` is answered `691`. The
+startup line says `tls=absent`, so that state is visible rather than inferred.
+
+```sh
+# implicit TLS on 6697, STARTTLS on 6667, an `sts` policy clients will act on
+./build/src/irc-serve 6667 --name irc.example   --tls-cert /etc/irc/cert.pem --tls-key /etc/irc/key.pem   --tls-port 6697 --tls-sts-duration 15552000
+
+# require TLS, and verify peer certificates against a CA
+./build/src/irc-serve 6667 --name irc.example   --tls-cert cert.pem --tls-key key.pem --tls-ca /etc/irc/ca.pem   --tls-require
+```
+
+| Option | What it does |
+|---|---|
+| `--tls-cert PATH` `--tls-key PATH` | The server certificate and its key, PEM. **Both**, or neither. The key must not be readable by group or other. |
+| `--tls-ca PATH` | The CA store used to verify **peer** certificates. A peer link that requires TLS is **refused** without one rather than verified against system roots. |
+| `--tls-insecure` | Accept a peer certificate this node cannot verify. An explicit opt-in; the default is a refusal with a named reason. |
+| `--tls-port PORT` | A second listener where every byte is TLS from the first. `sts` requires it. |
+| `--tls-require` | Refuse plaintext client connections, at accept. |
+| `--tls-sts-duration N` | The `sts` persistence policy, in seconds. Default `0` — no policy. |
+| `--peer-tls NAME` | Require that the link to peer `NAME` carries TLS. Sticky for the life of the link. |
 
 ```sh
 git clone https://github.com/TheFirstIstari/irc-serve.git
@@ -156,6 +201,11 @@ Two things to know:
 
 - **`--secret` is required.** A node without one refuses every inbound
   `FEDERATE`. It will listen and serve clients but will not federate.
+- **A peer link that carries TLS needs `--peer-tls NAME` on the node that DIALS
+  it**, and it must reach the other node's `--tls-port`. An inbound TLS peer link
+  arrives on the implicit-TLS port rather than being sniffed for: a port serving
+  plaintext clients has no honest way to guess. Use `--tls-require` to stop
+  serving plaintext at all.
 - **Declare the peer on one node only.** If both nodes list each other, both dial
   and each rejects the other's inbound claim with `NAME_IN_USE`, leaving no link.
 
@@ -179,6 +229,7 @@ docs/             SERVER_DESIGN, DEVELOPMENT, SPEC_TRACKING, STATS
 | [`docs/SERVER_DESIGN.md`](docs/SERVER_DESIGN.md) | Architecture and the phase plan. Start here. |
 | [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) | Branching, what `main` enforces, runner setup, rollback |
 | [`docs/SPEC_TRACKING.md`](docs/SPEC_TRACKING.md) | Per-feature status against RFC 1459 / 2812 / IRCv3 |
+| [`SECURITY.md`](SECURITY.md) | Threat model, what TLS does and does not cover |
 | [`docs/STATS.md`](docs/STATS.md) | Generated test counts |
 
 ## Contributing

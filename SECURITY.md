@@ -35,12 +35,48 @@ controls this project does not yet have.
 
 - **No authentication.** `PASS` records a password and does not check it. SASL
   is Phase 8. Anyone who can reach the port can claim any nickname.
-- **No TLS.** Traffic is plaintext, so credentials and messages are readable on
-  the path.
 - **No rate limiting or connection limits.** A client can open connections as
   fast as it likes.
 - **No operator privileges are enforced beyond channel `+o`.** There is no
   server operator role.
+
+## TLS
+
+Available, and **off by default**. With `-DWITH_TLS=ON` this node can serve
+implicit TLS on its own port (RFC 7194's 6697), upgrade a plaintext connection with
+`STARTTLS`, require TLS on a peer link, and advertise an IRCv3 `sts` policy that a
+conforming client acts on by refusing to make insecure connections at all.
+
+Without it, nothing on the wire is encrypted — including SASL PLAIN — and the
+startup line says `tls=absent`.
+
+**What TLS protects.** Everything a passive or active network attacker can read or
+alter on a connection this node is carrying: credentials sent over SASL after the
+upgrade, messages, and the peer-link traffic that carries the shared federation
+secret.
+
+**What it does not protect, and this list is the point:**
+
+- **A node built without `-DWITH_TLS=ON` encrypts nothing.** There is no runtime
+  fallback. If TLS is not compiled in there is no `sts` capability and `STARTTLS` is
+  answered `691`.
+- **There is no client-certificate authentication.** A client is never asked for a
+  certificate and one it offers is not verified against anything. SASL PLAIN over
+  TLS is what a client has here.
+- **There is no revocation checking.** No CRL and no OCSP. A revoked certificate
+  that chains to the configured CA is accepted until it expires. This is the largest
+  gap in the boundary.
+- **No cipher or protocol pinning beyond the linked OpenSSL's defaults.** There is no
+  operator-facing cipher-suite list, so the policy is whatever the library ships.
+- **A peer link in the clear still carries the shared federation secret.** A mixed
+  mesh — some links TLS, some not — is supported and is the only way to adopt TLS
+  one link at a time, but the plaintext links widen the blast radius of that secret
+  to everyone on their path. Do not use one secret for both kinds of link.
+- **`--tls-insecure` accepts any peer certificate.** It is a flag, and every link it
+  affects prints `mode=INSECURE` when it establishes.
+- **STARTTLS cannot un-send what came before it.** A connection that has already
+  carried a `PASS` value or an `AUTHENTICATE` payload is refused, because upgrading
+  it does not retract the credential that already crossed the wire in the clear.
 
 **Bound on damage while unauthenticated:** a client can send commands and read
 what it is sent. It cannot, by design of the current build, reach the filesystem

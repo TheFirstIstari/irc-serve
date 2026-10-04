@@ -19,6 +19,10 @@
 #include "core/reply.h"
 #include "account_store.h"
 #include "sasl_framework.h"
+/* Phase 12: the ONE question cap.c asks about TLS, which is "is TLS compiled in". The
+ * certificate itself is a field on server_t, so this file never names a TLS type
+ * -- which is what keeps the zero-dependency build the default one. */
+#include "tls_backend.h"
 
 /* --------------------------------------------------------------------------
  * The table
@@ -43,7 +47,14 @@ enum {
     CAPBIT_AWAY_NOTIFY = 1u << 11,
     CAPBIT_BATCH = 1u << 12,
     CAPBIT_LABELED_RESPONSE = 1u << 13,
-    CAPBIT_INVITE_NOTIFY = 1u << 14
+    CAPBIT_INVITE_NOTIFY = 1u << 14,
+    /* Phase 12. 1u << 15 and 1u << 16 are the LAST two of the 32 an `unsigned`
+     * holds, and taking them last is what keeps every existing bit index stable:
+     * conn_t::caps is a bitmask that a conn_t can hold across an upgrade of the
+     * binary only within one process, but the point is that adding a capability
+     * never MOVES one, which is the failure CAPBIT_*'s own comment warns about. */
+    CAPBIT_TLS = 1u << 15,
+    CAPBIT_STS = 1u << 16
 };
 
 /* THE BIT ORDER IS FIXED AND THE TABLE BELOW IS THE CLAIM.
@@ -80,7 +91,15 @@ static const cap_def_t k_caps[] = {
     { CAP_AWAY_NOTIFY, CAPBIT_AWAY_NOTIFY },
     { CAP_BATCH, CAPBIT_BATCH },
     { CAP_LABELED_RESPONSE, CAPBIT_LABELED_RESPONSE },
-    { CAP_INVITE_NOTIFY, CAPBIT_INVITE_NOTIFY }
+    { CAP_INVITE_NOTIFY, CAPBIT_INVITE_NOTIFY },
+    /* Phase 12. `tls` and `sts` are in the table BECAUSE the features exist: a
+     * node with no certificate refuses both at cap_available() below, which is
+     * this file's whole rule applied to a property of the node's configuration
+     * rather than of its build. Neither is in the table on a build compiled
+     * without TLS -- see tls_node_possible() for why that is a RUNTIME question
+     * rather than a build-time one. */
+    { CAP_TLS, CAPBIT_TLS },
+    { CAP_STS, CAPBIT_STS }
 };
 
 static const size_t k_ncaps = sizeof k_caps / sizeof k_caps[0];
@@ -143,6 +162,34 @@ int cap_known(const char *name)
     return 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * CAN THIS NODE ENCRYPT ANYTHING AT ALL?
+ * ---------------------------------------------------------------------------
+ * TWO QUESTIONS AND THE ORDER THEY ARE ASKED IN, because the answer is not one
+ * thing:
+ *
+ *   tls_backend_available()  is TLS COMPILED IN? A false here is a build fact and
+ *                           is a false on every node running that binary.
+ *   s->tls != NULL           did an operator give this NODE a certificate and key
+ *                           that loaded? A false here is a configuration fact and
+ *                           can differ between two nodes running the SAME binary.
+ *
+ * BOTH ARE ASKED, and a node that fails either does not advertise `tls` or `sts`.
+ * That is cap.h's rule and it is why neither name is advertised by default: the
+ * default build has neither, and a node built with -DWITH_TLS=ON that was not
+ * given a certificate has neither either. A client that saw `sts` on a node with no
+ * certificate would cache a persistence policy pointing at a port where nothing
+ * answers, and the specification's own denial-of-service section names exactly
+ * that as a way STS can hurt an operator.
+ *
+ * THE COST of asking at runtime rather than at build time is one pointer test per
+ * CAP LS, and the benefit is that "advertise only what is real" survives a build
+ * flag -- which is the same reason `sasl` consults a store instead of a macro. */
+static int tls_node_possible(const server_t *s)
+{
+    return (tls_backend_available() != 0 && s != NULL && s->tls != NULL) ? 1 : 0;
+}
+
 int cap_available(const server_t *s, const char *name)
 {
     if (cap_known(name) == 0) {
@@ -154,7 +201,45 @@ int cap_available(const server_t *s, const char *name)
     if (strcasecmp(name, CAP_ACCOUNT_TAG) == 0) {
         return account_possible(s);
     }
+    if (strcasecmp(name, CAP_TLS) == 0 || strcasecmp(name, CAP_STS) == 0) {
+        return tls_node_possible(s);
+    }
     return 1;
+}
+
+/* ---------------------------------------------------------------------------
+ * A CAPABILITY'S VALUE, or the empty string for the ones that have none
+ * ---------------------------------------------------------------------------
+ * ONLY `sts` HAS ONE, and the asymmetry is the specification's rather than this
+ * file's: IRCv3's capability negotiation describes a value as something a client
+ * REQUESTS, and `sts` is the one capability in this table that must not be
+ * requested -- "Clients MUST NOT request this capability with `CAP REQ`." So the
+ * value is rendered into CAP LS and the REQ is refused, which is a shape the
+ * negotiation specification does not otherwise describe.
+ *
+ * WHICH KEYS APPEAR, and why `port` is conditional, is argued at CAP_STS_VALUE_MAX
+ * in cap.h. What is worth repeating here is that `port` is omitted when there is no
+ * implicit-TLS listener, because a `sts=port=N` naming a port nothing is listening
+ * on is a client being told to disconnect and reconnect into a closed port. */
+static size_t cap_value(const server_t *s, const char *name, char *out, size_t cap)
+{
+    int n;
+
+    out[0] = '\0';
+    if (s == NULL || cap == 0u || strcasecmp(name, CAP_STS) != 0) {
+        return 0;
+    }
+    if (server_tls_port(s) > 0) {
+        n = snprintf(out, cap, "duration=%u,port=%d", (unsigned)s->sts_duration,
+                     server_tls_port(s));
+    } else {
+        n = snprintf(out, cap, "duration=%u", (unsigned)s->sts_duration);
+    }
+    if (n < 0 || (size_t)n >= cap) {
+        out[0] = '\0';
+        return 0;
+    }
+    return (size_t)n;
 }
 
 size_t cap_available_list(const server_t *s, char *out, size_t cap)
@@ -167,10 +252,19 @@ size_t cap_available_list(const server_t *s, char *out, size_t cap)
     out[0] = '\0';
     for (size_t i = 0; i < k_ncaps; i++) {
         const size_t klen = strlen(k_caps[i].name);
+        char value[CAP_STS_VALUE_MAX];
+        size_t vlen;
 
         if (cap_available(s, k_caps[i].name) == 0) {
             continue;
         }
+        /* THE VALUE IS PART OF THE NAME ON THE WIRE, so it is accounted for in the
+         * same bound as the name. Rendering it without that is how a capability
+         * list gets silently truncated exactly when the one capability with a
+         * policy is the one being written -- and a truncated `sts=duration=` is a
+         * policy no client can parse, which the specification says makes every
+         * client behave as though no policy had been advertised at all. */
+        vlen = cap_value(s, k_caps[i].name, value, sizeof value);
         if (n != 0u) {
             if (n + 1u >= cap) {
                 out[0] = '\0';
@@ -178,12 +272,17 @@ size_t cap_available_list(const server_t *s, char *out, size_t cap)
             }
             out[n++] = ' ';
         }
-        if (n + klen + 1u > cap) {
+        if (n + klen + vlen + 1u > cap) {
             out[0] = '\0';
             return 0;
         }
         memcpy(out + n, k_caps[i].name, klen);
         n += klen;
+        if (vlen > 0u) {
+            out[n++] = '=';
+            memcpy(out + n, value, vlen);
+            n += vlen;
+        }
     }
     out[n] = '\0';
     return n;
@@ -703,6 +802,28 @@ static void cap_do_req(server_t *s, conn_t *c, const message_t *m)
         const int known = cap_known(names[i]);
         const int have = cap_available(s, names[i]);
 
+        /* `sts` IS REFUSED EVEN THOUGH THIS NODE OFFERS IT, and that is the
+         * specification's rule rather than this file's opinion: "Clients MUST NOT
+         * request this capability with `CAP REQ`. Servers MAY reply with a `CAP
+         * NAK` message if a client requests this capability."
+         *
+         * ACKING IT WOULD BE WORSE THAN THE SPECIFICATION THREATENS. `sts` is not
+         * a feature a client switches on; it is a POLICY the server states, and a
+         * client that has "negotiated" one has been told the server believes the
+         * client's own request has a bearing on what the client may connect to.
+         * A client that cached a policy on the strength of an ACK and then had
+         * that policy dropped would have been told it was under a constraint it is
+         * not. So the NAK is the honest answer to a request that should not have
+         * been made, and the policy is delivered in CAP LS where it belongs.
+         *
+         * IT IS CHECKED BEFORE `have`, so the refusal is the SAME on a node with no
+         * certificate: a client that sent `CAP REQ :sts` to a plaintext node gets
+         * a NAK naming a capability that exists, not one that does not, and the
+         * difference between "not implemented" and "not for you" is visible. */
+        if (strcasecmp(names[i], CAP_STS) == 0) {
+            rn += cap_append_name(refused, sizeof refused, rn, names[i]);
+            continue;
+        }
         if (known == 0 || have == 0) {
             rn += cap_append_name(refused, sizeof refused, rn, names[i]);
             continue;

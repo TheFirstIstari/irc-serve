@@ -164,6 +164,67 @@
 #define CAP_BATCH "batch"
 #define CAP_LABELED_RESPONSE "labeled-response"
 #define CAP_INVITE_NOTIFY "invite-notify"
+/* PHASE 12. Two names, and they are NOT interchangeable -- the `tls`
+ * specification is deprecated in favour of `sts`, and this codebase implements
+ * both because they answer different questions about the same node.
+ *
+ *   tls   "the server supports the STARTTLS command". A hint. Deprecated by the
+ *         IRCv3 working group in favour of `sts`, but implemented here because the
+ *         STARTTLS command is implemented here and a client that wants to upgrade
+ *         has to be able to find out that it can. Its specification is also the
+ *         only one that says when STARTTLS may be used, which is load-bearing for
+ *         commands.c's handler.
+ *
+ *   sts   Strict Transport Security. NOT a hint: it carries a policy value
+ *         (`sts=duration=...,port=...`) that a conforming client acts on by
+ *         refusing to make insecure connections at all. It is the only part of
+ *         this phase that protects a RETURN visit, which is why it is the one that
+ *         matters, and why the implicit-TLS listener exists at all.
+ *
+ * BOTH ARE WITHHELD ON A NODE WITH NO CERTIFICATE, which is cap.h's rule rather
+ * than a decision of this phase: a node that advertised either could not honour
+ * it. */
+#define CAP_TLS "tls"
+#define CAP_STS "sts"
+
+/* The `sts` capability's VALUE, rendered for CAP LS.
+ *
+ * IT IS RENDERED AND NOT REQUESTED, which is the part of the specification that
+ * is easy to get backwards. From the `sts` specification:
+ *
+ *   - "When enabled, the capability has a REQUIRED value: a comma (,) separated
+ *     list of tokens."
+ *   - "Clients MUST NOT request this capability with `CAP REQ`. Servers MAY reply
+ *     with a `CAP NAK` message if a client requests this capability."
+ *
+ * So `CAP LS` carries `sts=...`, a `CAP REQ :sts` is NAKed, and a client never
+ * negotiates it. That is why `sts` is the ONE name in this file whose REQ is
+ * refused, and why it is refused in cap.c's REQ handler rather than by leaving it
+ * out of the table: a client that asked and got an ACK would believe it had
+ * negotiated a policy that governs what it may connect to.
+ *
+ * The two keys, and which is REQUIRED when:
+ *
+ *   port=       REQUIRED on an INSECURE connection -- it is the port the client
+ *               must reconnect to. Omitted when this node has no --tls-port,
+ *               because there is then no port a client could be told to use, and
+ *               advertising one that does not exist would send every client to a
+ *               closed port. Its absence is CORRECT: the specification says a
+ *               client that receives a persistence policy with no port over an
+ *               insecure connection ignores it.
+ *   duration=   REQUIRED on a SECURE connection -- how long the client must keep
+ *               using TLS. 0 means "no persistence policy", which is the shipped
+ *               default on the specification's own advice: "Server
+ *               implementations should consider using a default value of
+ *               duration=0 in their example configurations. This will require
+ *               server administrators to deliberately choose an expiry according
+ *               to their specific needs rather than (perhaps unknowingly) rely on
+ *               an arbitrary generic value."
+ *
+ * The buffer is a constant rather than a caller-chosen size for the same reason
+ * CAP_LS_MAX is: `sts=duration=4294967295,port=65535` is 34 bytes, and a capability
+ * that could be truncated is a capability that silently hides its own policy. */
+#define CAP_STS_VALUE_MAX 48
 
 /* 410 ERR_INVALIDCAPSUBCOMMAND. Not in design 4.4's numeric list, which is a gap
  * in the list rather than in the protocol, for the same reason 301, 303, 417,

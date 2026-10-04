@@ -14,6 +14,14 @@ add_library(test_harness STATIC
   ../harness/irc_client.c
   ../harness/node_fixture.c
   ../harness/test_util.c
+  # Phase 12: the TLS client and the certificate generator. Compiled ONLY when
+  # WITH_TLS is ON, because it includes <openssl/ssl.h> and there is no point (and
+  # no header path) in the default build. The tests that use it ask
+  # tf_tls_available() at runtime and assert the PLAINTEXT consequences instead, so
+  # no test is skipped in the default build and none is skipped in the TLS build --
+  # they assert different things about the build they are in.
+  $<$<BOOL:${WITH_TLS}>:../harness/tls_fixture.c>
+  $<$<NOT:$<BOOL:${WITH_TLS}>>:../harness/tls_fixture_none.c>
 )
 target_link_libraries(test_harness PUBLIC irc_core)
 target_include_directories(test_harness PUBLIC ${PROJECT_SOURCE_DIR}/tests)
@@ -26,7 +34,12 @@ target_include_directories(test_harness PUBLIC ${PROJECT_SOURCE_DIR}/tests)
 # any test that execs it.
 target_compile_definitions(test_harness PUBLIC
   NF_SERVER_BIN="$<TARGET_FILE:irc-serve>"
-  IRCSERVE_SRC_DIR="${PROJECT_SOURCE_DIR}")
+  IRCSERVE_SRC_DIR="${PROJECT_SOURCE_DIR}"
+  # Where the TLS fixture writes its generated certificates. A build directory
+  # rather than /tmp, and per-process rather than shared, so two runs of this test
+  # -- which a developer does while bisecting -- cannot collide over a directory
+  # full of private keys.
+  IRCSERVE_BUILD_DIR="${PROJECT_BINARY_DIR}")
 
 # `ctest_name` is optional and defaults to `name`. It exists for exactly one
 # caller: a test that MOVED out of tests/compliance/ or tests/protocol/ and whose
@@ -584,3 +597,22 @@ irc_add_integration_test(test_query_surface test_query_surface.c)
 # answer, so "the field is present" and "the field is the right verb" are separate
 # failures with separate messages.
 irc_add_integration_test(test_numeric_arity test_numeric_arity.c)
+
+# Phase 12: TLS. Its own file, and its own SHAPE, because of the optional-dependency
+# decision: `-DWITH_TLS=ON` is off by default, so this test exists in both builds and
+# asserts, in each, the behaviour THAT BUILD ACTUALLY HAS. In the default build it
+# asserts the refusals and the absence of any `tls`/`sts` capability -- which are the
+# assertions that matter most for the configuration this project ships. In the TLS
+# build it adds a real implicit-TLS handshake, a real STARTTLS upgrade, three refused
+# handshakes (wrong CA, expired, not-yet-valid, wrong name) and --tls-require's
+# refusal of a plaintext client.
+#
+# NEITHER BRANCH SKIPS. `tests/known_skips.txt` stays empty, which is the point: a
+# test that returned the skip code would assert nothing on the default build, and
+# that is the exact failure scripts/check-skips.sh exists to prevent.
+#
+# Certificates are GENERATED INTO A TEMPORARY DIRECTORY by tests/harness/tls_fixture.c
+# and never committed; tls_fixture.h says why at length, and the short version is that
+# a key in git history is public for ever while an "expired is refused" case needs a
+# certificate whose expiry is computed at run time.
+irc_add_integration_test(test_tls test_tls.c)

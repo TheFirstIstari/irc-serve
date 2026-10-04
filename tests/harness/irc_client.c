@@ -44,6 +44,25 @@ static void pump_hook(void)
     }
 }
 
+/* PHASE 12: THE SAME HOOP, CALLABLE FROM OUTSIDE.
+ *
+ * tls_fixture.c's tf_tls_expect() has to run its OWN select() loop, because after a
+ * TLS handshake the decrypted bytes are inside OpenSSL and reading the descriptor
+ * would return the NEXT record rather than the one the test is waiting for. That
+ * makes it a wait outside every loop in this file, and therefore a wait that does
+ * not keep the parent reading -- which the block above this function's file header
+ * says is not a tidiness matter: a child's stdout is a 64 KiB pipe, a child that
+ * fills it blocks INSIDE its event loop, and then it serves nobody.
+ *
+ * So the hook is exported rather than re-implemented. The alternative -- each
+ * fixture growing its own reference to node_fixture.c's internals -- is worse,
+ * because the two would have to agree about it by convention rather than by
+ * linkage. */
+void tc_pump(void)
+{
+    pump_hook();
+}
+
 static uint64_t now_ms(void)
 {
     struct timespec ts;

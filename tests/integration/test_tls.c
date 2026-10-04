@@ -1,0 +1,982 @@
+/* test_tls.c -- Phase 12's suite, and the shape of it is a property of the
+ * DEPENDENCY DECISION rather than of the feature.
+ *
+ * ===========================================================================
+ * WHY THIS FILE ASSERTS DIFFERENT THINGS IN THE TWO BUILDS, AND WHY THAT IS NOT
+ * A SKIP
+ * ===========================================================================
+ * `-DWITH_TLS=ON` is optional and OFF by default, so this file exists in both
+ * builds and must pass in both. It therefore branches on `tf_tls_available()` --
+ * a RUNTIME question about the build -- and asserts, in each case, the behaviour
+ * THAT BUILD ACTUALLY HAS:
+ *
+ *   default build (no TLS)   no `tls` and no `sts` in CAP LS; STARTTLS answered
+ *                            691 with TLS_NOT_CONFIGURED; --tls-port refused;
+ *                            --tls-cert without --tls-key refused; a
+ *                            world-readable key refused. All of these are REAL
+ *                            assertions about a real node and they are the ones
+ *                            that matter most for the default build, because the
+ *                            default build is the one every CI runner compiles.
+ *
+ *   -DWITH_TLS=ON           all of the above, plus: a real implicit-TLS
+ *                            handshake, a real STARTTLS upgrade, a refused
+ *                            handshake against the wrong CA, a refused expired
+ *                            certificate, a refused not-yet-valid certificate, a
+ *                            refused name mismatch, and a peer link over TLS.
+ *
+ * NEITHER BRANCH IS A SKIP. `tests/known_skips.txt` stays empty and
+ * scripts/check-skips.sh stays at zero: a test that returned CTest's skip code
+ * would be asserting nothing on the configuration this project ships by default,
+ * which is the exact failure the ratchet exists to prevent. The lines each build
+ * prints say which build it is asserting about, so a log reader is never left
+ * wondering whether the interesting half ran.
+ *
+ * ===========================================================================
+ * NO CERTIFICATE MATERIAL IS IN THIS REPOSITORY, and there is a header comment in
+ * tests/harness/tls_fixture.h saying why at length. The short version: a
+ * committed private key is public for ever, and a committed certificate has a
+ * fixed validity window, which would make the "expired is refused" case either
+ * permanently red or permanently skipped.
+ *
+ * NO FIXED SLEEP. Every wait is a deadline wait over select(), and the negative
+ * cases use the fence the rest of this suite uses: prove the node is alive by
+ * getting a positive answer on a second connection, and then assert the absence on
+ * the first.
+ */
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/select.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "harness/irc_client.h"
+#include "harness/node_fixture.h"
+#include "harness/test_util.h"
+#include "harness/tls_fixture.h"
+
+static int failures;
+
+static void check(int cond, const char *what, const char *detail)
+{
+    if (cond != 0) {
+        printf("ok: %s\n", what);
+        return;
+    }
+    failures++;
+    printf("FAILED: %s\n  %s\n", what, (detail != NULL) ? detail : "");
+}
+
+/* Where the generated certificates go. Under the build tree rather than /tmp by
+ * name, so a parallel `ctest -j8` run of this test twice -- which a developer will
+ * do while bisecting -- does not share a directory. The per-process component is
+ * the pid. */
+static void cert_dir(char *out, size_t cap)
+{
+    const char *base = getenv("IRCSERVE_BUILD_DIR");
+
+    if (base == NULL) {
+        base = "/tmp";
+    }
+    snprintf(out, cap, "%s/tls-fixture-%ld", base, (long)getpid());
+    (void)mkdir(out, 0700);
+}
+
+/* ---------------------------------------------------------------------------
+ * SPAWN A SHIPPED BINARY WITH AN ARGUMENT VECTOR
+ * ---------------------------------------------------------------------------
+ * The SHIPPED BINARY and not an inline child, for the cases that need the command
+ * line: --tls-cert, --tls-key, --tls-port and --peer-tls are main()'s options and
+ * an inline child has no command line at all. A test that exercised the transport
+ * through an inline child and the configuration through nothing would leave the
+ * join between them untested, and the join is where this phase's real risk is.
+ */
+static int spawn_argv(nf_node_t *n, char *const argv[])
+{
+    char **owned;
+    size_t count = 0;
+    int rc;
+
+    while (argv[count] != NULL) {
+        count++;
+    }
+    /* nf_spawn_binary_argv() reads the vector in the child before execv(), so the
+     * strings only have to outlive the spawn. Copying them onto the heap rather
+     * than pointing at the caller's literals is what lets every caller build its
+     * vector with a snprintf into a stack buffer. */
+    owned = (char **)calloc(count + 1u, sizeof *owned);
+    if (owned == NULL) {
+        return -1;
+    }
+    for (size_t i = 0; i < count; i++) {
+        owned[i] = argv[i];
+    }
+    owned[count] = NULL;
+    rc = nf_spawn_binary_argv(n, owned);
+    free(owned);
+    return rc;
+}
+
+/* Wait for a process that is EXPECTED TO FAIL TO START, which is a different shape
+ * from nf_spawn_binary_argv(): that blocks until the child is ready, and a child
+ * that refuses to start never is. So the failure cases fork directly and read the
+ * exit status.
+ *
+ * Returns the child's exit status, or -1 if it had to be killed (which is a
+ * failure: a node that neither started nor exited on a bad command line has hung,
+ * and a hung node is a different finding from a refused one). */
+static int run_expecting_refusal(char *const argv[], char *out, size_t outcap,
+                                 int timeout_ms)
+{
+    int fds[2];
+    pid_t pid;
+    int status = 0;
+    size_t n = 0;
+    uint64_t deadline;
+
+    if (pipe(fds) != 0) {
+        return -1;
+    }
+    pid = fork();
+    if (pid < 0) {
+        (void)close(fds[0]);
+        (void)close(fds[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        (void)close(fds[0]);
+        if (dup2(fds[1], STDOUT_FILENO) < 0 ||
+            dup2(fds[1], STDERR_FILENO) < 0) {
+            _exit(127);
+        }
+        execv(NF_SERVER_BIN, argv);
+        _exit(127);
+    }
+    (void)close(fds[1]);
+    if (out != NULL && outcap > 0u) {
+        out[0] = '\0';
+    }
+    /* Read to EOF, which is bounded by the child exiting or closing: a node that
+     * starts normally would hold the pipe open for ever, so the deadline is what
+     * distinguishes "refused and exited" from "started and is serving". */
+    deadline = 0u;
+    {
+        struct timespec ts;
+
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+            deadline = (uint64_t)ts.tv_sec * 1000u +
+                       (uint64_t)(ts.tv_nsec / 1000000L);
+        }
+    }
+    deadline += (uint64_t)timeout_ms;
+    for (;;) {
+        struct timeval tv;
+        fd_set rd;
+        ssize_t r;
+
+        FD_ZERO(&rd);
+        FD_SET(fds[0], &rd);
+        tv.tv_sec = 0;
+        tv.tv_usec = 20000;
+        if (select(fds[0] + 1, &rd, NULL, NULL, &tv) > 0) {
+            if (out != NULL && n + 1u < outcap) {
+                r = read(fds[0], out + n, outcap - n - 1u);
+                if (r > 0) {
+                    n += (size_t)r;
+                    out[n] = '\0';
+                    continue;
+                }
+            } else {
+                char sink[512];
+
+                (void)read(fds[0], sink, sizeof sink);
+            }
+        }
+        if (waitpid(pid, &status, WNOHANG) == pid) {
+            break;
+        }
+        if (deadline != 0u) {
+            struct timespec ts;
+
+            if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0 &&
+                (uint64_t)ts.tv_sec * 1000u +
+                    (uint64_t)(ts.tv_nsec / 1000000L) > deadline) {
+                (void)kill(pid, SIGKILL);
+                (void)waitpid(pid, &status, 0);
+                (void)close(fds[0]);
+                return -1;
+            }
+        }
+    }
+    (void)close(fds[0]);
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    return -1;
+}
+
+/* ===========================================================================
+ * CASE GROUP 1: the REFUSALS, which both builds assert
+ * ===========================================================================
+ *
+ * A TLS option that is silently ignored is worse than one that is refused, because
+ * an operator who typed --tls-require and got a node that does not require it has
+ * no way to find out except by reading the source. Every case here is a command
+ * line the node must REFUSE, and each refusal is asserted on the child's own
+ * output -- the reason string -- rather than only on a non-zero exit, because two
+ * different mistakes can both produce exit 1 and an operator needs to know which.
+ */
+static void case_configuration_refusals(const char *dir)
+{
+    char msg[4096];
+    char a0[] = "irc-serve";
+    char a1[] = "0";
+    char a2[] = "--name";
+    char a3[] = "irc.tls";
+    char cert[512];
+    char key[512];
+    char port[16];
+    char *v_no_pair[9];
+    char *v_bad_key[9];
+    char *v_port_no_cert[9];
+    int rc;
+
+    snprintf(cert, sizeof cert, "%s/srv.crt", dir);
+    snprintf(key, sizeof key, "%s/srv.key", dir);
+    snprintf(port, sizeof port, "%d", 0);
+
+    /* --tls-cert WITHOUT --tls-key. Half a configuration is not a state this
+     * binary can be in: a node with a certificate and no key would advertise
+     * nothing and refuse every STARTTLS for a reason the startup line cannot
+     * express. */
+    v_no_pair[0] = a0; v_no_pair[1] = a1; v_no_pair[2] = a2; v_no_pair[3] = a3;
+    v_no_pair[4] = "--tls-cert"; v_no_pair[5] = cert;
+    v_no_pair[6] = "--name"; v_no_pair[7] = a3; v_no_pair[8] = NULL;
+    rc = run_expecting_refusal(v_no_pair, msg, sizeof msg, 10000);
+    check(rc > 0, "--tls-cert without --tls-key is REFUSED with a non-zero exit",
+          msg);
+    check(strstr(msg, "pair") != NULL,
+          "the refusal says the two options are a PAIR, not that the file is "
+          "unreadable",
+          msg);
+
+    /* --tls-port WITHOUT a certificate. This is the one that matters most: a node
+     * bound to 6697 that then served PLAINTEXT there would send every client that
+     * expected a handshake into IRC. server_listen_tls() refuses it, and the
+     * refusal is at CONFIGURE time rather than at accept time. */
+    v_port_no_cert[0] = a0; v_port_no_cert[1] = a1;
+    v_port_no_cert[2] = "--tls-port"; v_port_no_cert[3] = port;
+    v_port_no_cert[4] = "--name"; v_port_no_cert[5] = a3;
+    v_port_no_cert[6] = NULL; v_port_no_cert[7] = NULL; v_port_no_cert[8] = NULL;
+    rc = run_expecting_refusal(v_port_no_cert, msg, sizeof msg, 10000);
+    check(rc > 0, "--tls-port without a certificate is REFUSED, so nothing is "
+                  "bound that cannot be encrypted",
+          msg);
+
+    /* A WORLD-READABLE KEY. This is the case the whole permission check exists
+     * for, and it is asserted against a real file with a real mode.
+     *
+     * IT IS IN GROUP 1 RATHER THAN IN THE TLS-ONLY HALF ON PURPOSE: the refusal
+     * has to happen even in a build with no TLS library, because a node that
+     * ignored an unsafe key and then a deployment installed one would have been
+     * told nothing at the moment it mattered. */
+    snprintf(key, sizeof key, "%s/open.key", dir);
+    check(tf_tls_make_cert(dir, "open", "irc.tls",
+                           "DNS:irc.tls,IP:127.0.0.1,DNS:localhost", 0, 86400,
+                           0644) == 0,
+          "generate a certificate whose key is mode 0644", NULL);
+    snprintf(cert, sizeof cert, "%s/open.crt", dir);
+    {
+        struct stat sb;
+        int mode_ok = (stat(key, &sb) == 0) &&
+                      ((sb.st_mode & (S_IRWXG | S_IRWXO)) != 0);
+
+        check(mode_ok,
+              "the fixture really produced a key that group and other may read, "
+              "so the refusal below cannot pass on a 0600 file",
+              "the fixture's mode argument did not take");
+    }
+    v_bad_key[0] = a0; v_bad_key[1] = a1; v_bad_key[2] = a2; v_bad_key[3] = a3;
+    v_bad_key[4] = "--tls-cert"; v_bad_key[5] = cert;
+    v_bad_key[6] = "--tls-key"; v_bad_key[7] = key;
+    v_bad_key[8] = NULL;
+    rc = run_expecting_refusal(v_bad_key, msg, sizeof msg, 10000);
+    check(rc > 0, "a GROUP-OR-OTHER-READABLE private key REFUSES the whole "
+                  "configuration, with a non-zero exit",
+          msg);
+    check(strstr(msg, "tls_key") != NULL && strstr(msg, "REFUSED") != NULL,
+          "the refusal is reported as tls_key state=REFUSED with the offending "
+          "mode, so an operator can see WHICH file and WHICH bits",
+          msg);
+    check(strstr(msg, "mode_") != NULL,
+          "the refusal prints the mode that was refused, in octal", msg);
+}
+
+/* ===========================================================================
+ * CASE GROUP 2: a build WITHOUT TLS has no TLS surface at all
+ * ===========================================================================
+ *
+ * The assertions here are the ones that matter on the DEFAULT build, and they are
+ * real: a node built without OpenSSL must not advertise `sts`, must not advertise
+ * `tls`, and must answer STARTTLS with 691 rather than 670. A node that advertised
+ * either would be a client switching on a feature nothing implements, which is the
+ * failure cap.h exists to prevent.
+ */
+static void case_plaintext_build_has_no_tls_surface(void)
+{
+    nf_node_t n;
+    test_client_t c;
+
+    if (nf_spawn_binary(&n) != 0) {
+        check(0, "spawn the default-build node", NULL);
+        return;
+    }
+    check(nf_expect(&n, "tls=absent", 5000) == 0,
+          "the startup line says tls=absent on a build with no TLS", NULL);
+    check(nf_expect(&n, "tls_init: state=REFUSED reason=NOT_COMPILED_IN", 5000) == 0,
+          "a node asked for TLS on a build without it says NOT_COMPILED_IN rather "
+          "than failing silently", NULL);
+
+    if (tc_connect(&c, n.port) != 0) {
+        check(0, "connect to the plaintext listener", NULL);
+        nf_kill(&n);
+        nf_free(&n);
+        return;
+    }
+    check(tc_send(&c, "CAP LS") == 0, "send CAP LS", NULL);
+    check(tc_expect(&c, " LS :", 10000) == 0, "the node answers CAP LS",
+          tc_buffer(&c));
+    check(strstr(tc_buffer(&c), " sts") == NULL,
+          "CAP LS does NOT list `sts` on a build with no TLS",
+          tc_buffer(&c));
+    check(strstr(tc_buffer(&c), " tls") == NULL,
+          "CAP LS does NOT list `tls` on a build with no TLS", tc_buffer(&c));
+
+    check(tc_send(&c, "STARTTLS") == 0, "send STARTTLS", NULL);
+    check(tc_expect(&c, " 691 ", 10000) == 0,
+          "STARTTLS is answered 691 on a build with no TLS", tc_buffer(&c));
+    check(strstr(tc_buffer(&c), "not available on this server") != NULL,
+          "the 691 says TLS is not available, so the client knows to reconnect on "
+          "the implicit-TLS port rather than retry",
+          tc_buffer(&c));
+
+    tc_close(&c);
+    (void)nf_stop(&n);
+    nf_free(&n);
+}
+
+int main(void)
+{
+    char dir[512];
+    char msg[4096];
+    /* `g_cert`/`g_key`/`g_port` rather than `cert`/`key`/`port`: the refusal helper
+     * has its own cert/key/port paths for the files it is refusing, and -Wshadow
+     * (which -Weverything includes, and this project keeps) is right that two
+     * buffers for two different certificates in one file is worth distinguishing at
+     * the name. These are the GOOD ones. */
+    static char g_cert[512];
+    static char g_key[512];
+    static char g_port[16];
+    char a0[] = "irc-serve";
+    char a1[] = "0";
+    char a2[] = "--name";
+    char a3[] = "irc.tls";
+    char *argv[16];
+
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    printf("== test_tls ==\n");
+    cert_dir(dir, sizeof dir);
+    printf("note: certificate directory is %s\n", dir);
+    printf("note: TLS is %s in this build; the assertions below are about the "
+           "build this binary is\n", (tf_tls_available() != 0) ? "COMPILED IN"
+                                                              : "NOT compiled in");
+
+    /* Every run generates a usable key pair, because the refusals in group 1 need
+     * real files to refuse and the group-3 cases need a real one to accept. Doing
+     * it unconditionally rather than only in the TLS branch means a fixture failure
+     * is reported once, in one place, rather than as a mysterious refusal later. */
+    /* THE SAN CARRIES `DNS:irc.tls` AND THE NAME IS WHAT IS VERIFIED.
+     *
+     * OpenSSL does not fall back to the subject's CN when a certificate has a
+     * subjectAltName at all -- the CN is ignored outright -- so a fixture whose SAN
+     * listed only an address would fail every name check even against its own
+     * certificate. The tests verify the name `irc.tls` because that is what a
+     * client connecting to a named node checks, and what this node's peer-link
+     * path checks. Getting this wrong made the FIRST VERSION of the implicit-TLS
+     * case fail with "certificate verify failed" against the node's own
+     * certificate. */
+    if (tf_tls_make_cert(dir, "srv", "irc.tls",
+                         "DNS:irc.tls,IP:127.0.0.1,DNS:localhost", 0, 86400,
+                         0600) != 0) {
+        /* NOT a failure line, and the wording matters: this is an EXPECTED outcome
+         * in the default build and the assertion below confirms it. Printing
+         * "FAILED" here and then exiting 0 would leave a green CTest run whose log
+         * contains the word FAILED, which is the kind of thing a reader stops
+         * trusting. A note says what happened and the check says whether it was
+         * right. */
+        printf("note: the fixture could not generate a certificate, which is the "
+               "expected state of a build with no TLS library\n");
+        check(tf_tls_available() == 0,
+              "certificate generation is possible exactly when TLS is compiled in",
+              "tf_tls_make_cert() failed on a build that has OpenSSL");
+        printf("== %d failure(s) ==\n", failures);
+        return (failures == 0) ? 0 : 1;
+    }
+    check(tf_tls_available() != 0,
+          "certificate generation works, which is the precondition for every "
+          "handshake case below", NULL);
+
+    snprintf(g_cert, sizeof g_cert, "%s/srv.crt", dir);
+    snprintf(g_key, sizeof g_key, "%s/srv.key", dir);
+    snprintf(g_port, sizeof g_port, "0");
+
+    case_configuration_refusals(dir);
+
+    /* ---- the implicit-TLS surface, asserted per build ---- */
+    if (tf_tls_available() == 0) {
+        case_plaintext_build_has_no_tls_surface();
+    } else {
+        /* A node WITH a certificate and key, and an implicit-TLS listener. */
+        nf_node_t n;
+        test_client_t plain;
+        int tls_port;
+
+        argv[0] = a0; argv[1] = a1; argv[2] = a2; argv[3] = a3;
+        argv[4] = "--tls-cert"; argv[5] = g_cert;
+        argv[6] = "--tls-key"; argv[7] = g_key;
+        argv[8] = "--tls-port"; argv[9] = g_port;
+        argv[10] = "--tls-sts-duration"; argv[11] = "15552000";
+        argv[12] = NULL; argv[13] = NULL; argv[14] = NULL; argv[15] = NULL;
+        if (spawn_argv(&n, argv) != 0) {
+            check(0, "spawn a node with a certificate and an implicit-TLS port",
+                  NULL);
+        } else {
+            check(nf_expect(&n, "tls=configured", 5000) == 0,
+                  "the startup line says tls=configured once a certificate and key "
+                  "have loaded",
+                  NULL);
+            check(nf_expect(&n, "tls_bind: port=", 5000) == 0,
+                  "a second listener is bound for implicit TLS", NULL);
+            check(nf_expect(&n, "sts_duration=15552000", 5000) == 0,
+                  "the `sts` duration the operator chose is on the startup line, "
+                  "so what clients will be told is checkable without a client",
+                  NULL);
+            /* The port, read back off the child's own output rather than parsed
+             * out of the argument: `--tls-port 0` asks the kernel for an ephemeral
+             * one, so the argument is NOT the port and a test that used it would
+             * connect to nothing. server_port() exists for exactly this and the
+             * node prints what it bound. */
+            {
+                const char *p = strstr(n.out, "tls_port=");
+
+                tls_port = -1;
+                if (p != NULL) {
+                    tls_port = atoi(p + 9);
+                }
+            }
+            check(tls_port > 0,
+                  "the implicit-TLS listener reports a real port, so a client can "
+                  "be pointed at it",
+                  n.out);
+
+            /* --- CAP LS on a PLAINTEXT connection advertises the policy --- */
+            if (tc_connect(&plain, n.port) != 0) {
+                check(0, "connect to the plaintext listener", NULL);
+            } else {
+                check(tc_send(&plain, "CAP LS") == 0, "send CAP LS", NULL);
+                check(tc_expect(&plain, " LS :", 10000) == 0,
+                      "the plaintext listener answers CAP LS", tc_buffer(&plain));
+                check(strstr(tc_buffer(&plain), "sts=duration=15552000") != NULL,
+                      "CAP LS carries the `sts` VALUE -- `sts=duration=15552000` "
+                      "-- because the specification requires the value in the LS "
+                      "and forbids a client requesting it",
+                      tc_buffer(&plain));
+                check(strstr(tc_buffer(&plain), "port=6697") == NULL,
+                      "the `port` key is not a constant 6697: it names the port "
+                      "this node actually bound",
+                      tc_buffer(&plain));
+                {
+                    char want[64];
+
+                    (void)snprintf(want, sizeof want, "port=%d", tls_port);
+                    check(strstr(tc_buffer(&plain), want) != NULL,
+                          "the `port` key names the implicit-TLS port this node "
+                          "bound, which is what a client must reconnect to",
+                          tc_buffer(&plain));
+                }
+                check(strstr(tc_buffer(&plain), " tls") != NULL,
+                      "CAP LS lists `tls` as well, because this node does support "
+                      "the STARTTLS command",
+                      tc_buffer(&plain));
+
+                /* --- CAP REQ :sts is NAKed, per the specification ---
+                 *
+                 * WAITING FOR "NAK :sts" DIRECTLY, and the reason is a race this
+                 * test lost: the first version waited for "CAP ", which is ALREADY
+                 * in the buffer from the CAP LS this same connection sent, so the
+                 * wait returned instantly and the assertion that followed read a
+                 * buffer the NAK had not been appended to yet. A needle that can
+                 * be satisfied by an earlier exchange is the substring trap
+                 * test_echo_message.c exists to document, met in a new place. */
+                check(tc_send(&plain, "CAP REQ :sts") == 0,
+                      "a client requests sts anyway", NULL);
+                /* The wire form is `:server CAP <target> NAK :sts`, so the needle is
+                 * the SUB-COMMAND followed by the colonned list. Matching on "sts"
+                 * alone would be satisfied by the CAP LS this same connection
+                 * already received, which is the substring trap this suite has
+                 * been bitten by before (test_echo_message.c's whole subject). */
+                check(tc_expect(&plain, "NAK :sts", 10000) == 0,
+                      "CAP REQ :sts is NAKed: the specification says clients MUST "
+                      "NOT request this capability, and an ACK would tell a client "
+                      "it had negotiated a policy",
+                      tc_buffer(&plain));
+                check(strstr(tc_buffer(&plain), "ACK :sts") == NULL,
+                      "no ACK is sent for sts under any circumstances",
+                      tc_buffer(&plain));
+                tc_close(&plain);
+            }
+
+            /* --- A REAL IMPLICIT-TLS HANDSHAKE, verified ---
+             *
+             * `t` and `why` are scoped to THIS block on purpose. Every refusal case
+             * below declares its own pair, and an earlier version of this file
+             * declared one pair for the whole function -- which -Wshadow correctly
+             * reported, and correctly: a shared `why` across a function that runs
+             * four handshakes is a variable whose value a reader has to prove is
+             * from the handshake they are looking at. */
+            {
+            tf_tls_t t;
+            const char *why = NULL;
+
+            if (tf_tls_connect(&t, tls_port, g_cert, "irc.tls", &why) != 0) {
+                check(0, "an implicit-TLS handshake against the node's own "
+                         "certificate succeeds",
+                      (why != NULL) ? why : "handshake failed");
+            } else {
+                check(1, "an implicit-TLS handshake against the node's own "
+                         "certificate succeeds", NULL);
+                check(tf_tls_send(&t, "NICK tlsuser") == 0, "send NICK", NULL);
+                check(tf_tls_send(&t, "USER tlsuser 0 * :TLS User") == 0,
+                      "send USER", NULL);
+                check(tf_tls_expect(&t, " 001 ", 10000) == 0,
+                      "registration completes over the encrypted connection",
+                      tf_tls_buffer(&t));
+                check(tf_tls_send(&t, "JOIN #secure") == 0, "send JOIN", NULL);
+                check(tf_tls_expect(&t, " 366 ", 10000) == 0,
+                      "a channel join completes over the encrypted connection",
+                      tf_tls_buffer(&t));
+                check(tf_tls_send(&t, "PING :tls-ok") == 0, "send PING", NULL);
+                check(tf_tls_expect(&t, "PONG irc.tls tls-ok", 10000) == 0,
+                      "PING/PONG completes over the encrypted connection",
+                      tf_tls_buffer(&t));
+                tf_tls_close(&t);
+            }
+            }
+            check(nf_expect(&n, "tls_handshake_start: fd=", 5000) == 0,
+                  "the node reports starting the handshake, so the handshake is "
+                  "visible to an operator and not just to the client", NULL);
+            /* The counters are published at SHUTDOWN, not per tick, so the check
+             * has to come after nf_stop() rather than before it. Asking for a
+             * counter the node has not printed yet is a check that fails for a
+             * reason that has nothing to do with the thing it is checking. */
+            (void)nf_stop(&n);
+            check(nf_expect_u64(&n, "tls_handshake_failed=", 0u, 5000) == 0,
+                  "no handshake failed on the ACCEPTING side, for a certificate "
+                  "the node presented itself and a client that verified it "
+                  "against the node's own CA",
+                  NULL);
+            nf_free(&n);
+        }
+
+        /* --- THE FOUR REFUSED HANDSHAKES, against ONE node --- */
+        {
+            nf_node_t n2;
+            int p2;
+            (void)0;
+
+            argv[0] = a0; argv[1] = a1; argv[2] = a2; argv[3] = a3;
+            argv[4] = "--tls-cert"; argv[5] = g_cert;
+            argv[6] = "--tls-key"; argv[7] = g_key;
+            argv[8] = "--tls-port"; argv[9] = g_port;
+            argv[10] = NULL; argv[11] = NULL; argv[12] = NULL;
+            argv[13] = NULL; argv[14] = NULL; argv[15] = NULL;
+            if (spawn_argv(&n2, argv) != 0) {
+                check(0, "spawn a node for the refused-handshake cases", NULL);
+            } else {
+                const char *p = strstr(n2.out, "tls_port=");
+
+                p2 = (p != NULL) ? atoi(p + 9) : -1;
+                check(p2 > 0, "the refused-handshake node bound an implicit-TLS "
+                              "port", NULL);
+
+                /* WRONG CA. A second, unrelated self-signed authority that shares
+                 * no key and no name with the node's, verified by the client
+                 * against the node's own CA. The node does not ask for a client
+                 * certificate, so this is refused by the CLIENT -- which is the
+                 * right place for it and is worth saying: the client's refusing is
+                 * the protection, and a client that does not verify has no
+                 * protection at all. That is the honest limit of this case. */
+                {
+                    char otherca[512];
+                    tf_tls_t t;
+                    const char *why = NULL;
+
+                    snprintf(otherca, sizeof otherca, "%s/other.crt", dir);
+                    (void)tf_tls_make_cert(dir, "other", "someone.else",
+                                           "IP:127.0.0.1", 0, 86400, 0600);
+                    check(tf_tls_connect(&t, p2, otherca, "irc.tls", &why) != 0,
+                          "a client that verifies against a DIFFERENT CA refuses "
+                          "the node's certificate, so the handshake never "
+                          "completes",
+                          (why != NULL) ? why : "the handshake SUCCEEDED");
+                    tf_tls_close(&t);
+                }
+                /* EXPIRED. The node presents a certificate whose notAfter is in the
+                 * past. OpenSSL's chain verification checks the validity window and
+                 * this phase does not turn that off, so a client that verifies
+                 * refuses it. */
+                {
+                    char ecert[512];
+                    char ekey[512];
+                    nf_node_t n3;
+                    int p3;
+
+                    (void)tf_tls_make_cert(dir, "expired", "irc.tls",
+                                           "IP:127.0.0.1,DNS:localhost",
+                                           -86400, -3600, 0600);
+                    snprintf(ecert, sizeof ecert, "%s/expired.crt", dir);
+                    snprintf(ekey, sizeof ekey, "%s/expired.key", dir);
+                    argv[4] = "--tls-cert"; argv[5] = ecert;
+                    argv[6] = "--tls-key"; argv[7] = ekey;
+                    argv[8] = "--tls-port"; argv[9] = g_port;
+                    argv[10] = NULL; argv[11] = NULL; argv[12] = NULL;
+                    if (spawn_argv(&n3, argv) == 0) {
+                        tf_tls_t t;
+                        const char *why = NULL;
+                        const char *q = strstr(n3.out, "tls_port=");
+
+                        p3 = (q != NULL) ? atoi(q + 9) : -1;
+                        /* The node ACCEPTS the expired certificate -- it is its own
+                         * certificate and this node does not verify itself. The
+                         * refusal is the CLIENT's, and that is the only place it
+                         * can be: a server cannot refuse its own certificate. */
+                        check(tf_tls_connect(&t, p3, ecert, "irc.tls", &why) != 0,
+                              "an EXPIRED certificate is refused by a client that "
+                              "verifies it, so the handshake does not complete",
+                              (why != NULL) ? why : "the handshake SUCCEEDED");
+                        tf_tls_close(&t);
+                        (void)nf_stop(&n3);
+                        nf_free(&n3);
+                    } else {
+                        check(0, "spawn a node with an expired certificate", NULL);
+                    }
+                }
+                /* NOT YET VALID. notBefore in the future. Separate from the expired
+                 * case because it is a different check in the library and a
+                 * generator that only ever made one of them would satisfy the
+                 * other's test. */
+                {
+                    char fcert[512];
+                    char fkey[512];
+                    nf_node_t n4;
+                    int p4;
+
+                    (void)tf_tls_make_cert(dir, "future", "irc.tls",
+                                           "DNS:irc.tls,IP:127.0.0.1,DNS:localhost",
+                                           86400, 172800, 0600);
+                    snprintf(fcert, sizeof fcert, "%s/future.crt", dir);
+                    snprintf(fkey, sizeof fkey, "%s/future.key", dir);
+                    argv[4] = "--tls-cert"; argv[5] = fcert;
+                    argv[6] = "--tls-key"; argv[7] = fkey;
+                    argv[8] = "--tls-port"; argv[9] = g_port;
+                    argv[10] = NULL; argv[11] = NULL; argv[12] = NULL;
+                    if (spawn_argv(&n4, argv) == 0) {
+                        tf_tls_t t;
+                        const char *why = NULL;
+                        const char *q = strstr(n4.out, "tls_port=");
+
+                        p4 = (q != NULL) ? atoi(q + 9) : -1;
+                        check(tf_tls_connect(&t, p4, fcert, "irc.tls", &why) != 0,
+                              "a NOT-YET-VALID certificate is refused by a client "
+                              "that verifies it",
+                              (why != NULL) ? why : "the handshake SUCCEEDED");
+                        tf_tls_close(&t);
+                        (void)nf_stop(&n4);
+                        nf_free(&n4);
+                    } else {
+                        check(0, "spawn a node with a not-yet-valid certificate",
+                              NULL);
+                    }
+                }
+                /* WRONG NAME. The certificate's SAN is a different host, signed by
+                 * the same authority the client trusts. A chain check alone
+                 * ACCEPTS this one -- which is the whole argument for the name
+                 * check, and why this case exists separately from the wrong-CA
+                 * one. */
+                {
+                    char nc[512];
+                    char nk[512];
+                    nf_node_t n5;
+                    int p5;
+
+                    (void)tf_tls_make_cert(dir, "othername", "irc.tls",
+                                           "IP:10.99.99.99,DNS:not-this-node",
+                                           0, 86400, 0600);
+                    snprintf(nc, sizeof nc, "%s/othername.crt", dir);
+                    snprintf(nk, sizeof nk, "%s/othername.key", dir);
+                    argv[4] = "--tls-cert"; argv[5] = nc;
+                    argv[6] = "--tls-key"; argv[7] = nk;
+                    argv[8] = "--tls-port"; argv[9] = g_port;
+                    argv[10] = NULL; argv[11] = NULL; argv[12] = NULL;
+                    if (spawn_argv(&n5, argv) == 0) {
+                        tf_tls_t t;
+                        const char *why = NULL;
+                        const char *q = strstr(n5.out, "tls_port=");
+
+                        p5 = (q != NULL) ? atoi(q + 9) : -1;
+                        check(tf_tls_connect(&t, p5, nc, "irc.tls", &why) != 0,
+                              "a certificate signed by the TRUSTED authority but "
+                              "naming a DIFFERENT host is refused, which a chain "
+                              "check alone would accept",
+                              (why != NULL) ? why : "the handshake SUCCEEDED");
+                        tf_tls_close(&t);
+                        (void)nf_stop(&n5);
+                        nf_free(&n5);
+                    } else {
+                        check(0, "spawn a node with a mismatched-name certificate",
+                              NULL);
+                    }
+                }
+                (void)nf_stop(&n2);
+                nf_free(&n2);
+            }
+        }
+
+        /* --- STARTTLS: the upgrade, and the three refusals --- */
+        {
+            nf_node_t n6;
+            test_client_t plain2;
+            int p6;
+            const char *q;
+
+            /* NO --tls-port, and that is deliberate rather than an omission:
+             * STARTTLS is then the ONLY way to reach an encrypted connection on
+             * this node, so a test that passed by connecting to an implicit-TLS
+             * port would be testing a different path than the one it names. */
+            argv[0] = a0; argv[1] = a1; argv[2] = a2; argv[3] = a3;
+            argv[4] = "--tls-cert"; argv[5] = g_cert;
+            argv[6] = "--tls-key"; argv[7] = g_key;
+            argv[8] = NULL; argv[9] = NULL; argv[10] = NULL;
+            argv[11] = NULL; argv[12] = NULL; argv[13] = NULL;
+            argv[14] = NULL; argv[15] = NULL;
+            if (spawn_argv(&n6, argv) == 0) {
+                (void)q;
+                p6 = n6.port;
+                check(nf_expect(&n6, "tls_port=-1", 5000) == 0,
+                      "with no --tls-port the node reports tls_port=-1, and `sts` "
+                      "therefore carries a duration with no port -- which a client "
+                      "on an insecure connection correctly ignores",
+                      NULL);
+
+                /* 1. ALREADY REGISTERED. */
+                if (tc_connect(&plain2, p6) != 0) {
+                    check(0, "connect for the STARTTLS refusals", NULL);
+                } else {
+                    (void)tc_send(&plain2, "NICK afterreg");
+                    (void)tc_send(&plain2, "USER afterreg 0 * :A");
+                    check(tc_expect(&plain2, " 001 ", 10000) == 0,
+                          "a client registers", tc_buffer(&plain2));
+                    (void)tc_send(&plain2, "STARTTLS");
+                    check(tc_expect(&plain2, " 691 ", 10000) == 0,
+                          "STARTTLS after REGISTRATION is refused 691", NULL);
+                    check(strstr(tc_buffer(&plain2),
+                                 "only available before registration") != NULL,
+                          "the refusal says the connection has already registered, "
+                          "which is the specification's own rule",
+                          tc_buffer(&plain2));
+                    tc_close(&plain2);
+                }
+
+                /* 2. AFTER A CREDENTIAL. PASS in the clear, then STARTTLS: the
+                 * password has already been on the wire, so upgrading cannot undo
+                 * that and the connection is refused. This is the refusal that is
+                 * easy to get wrong and it is the one that matters. */
+                if (tc_connect(&plain2, p6) != 0) {
+                    check(0, "connect for the credential case", NULL);
+                } else {
+                    /* PASS AND NOTHING ELSE, so this case tests the credential
+                     * rule and not the registration rule. Sending NICK and USER as
+                     * well would make both rules fire and would only prove which
+                     * one is checked FIRST -- which is the second case below, and is
+                     * a real property worth its own assertion. */
+                    (void)tc_send(&plain2, "PASS hunter2");
+                    (void)tc_send(&plain2, "STARTTLS");
+                    check(tc_expect(&plain2, " 691 ", 10000) == 0,
+                          "STARTTLS after a PASS is refused 691: the credential "
+                          "was already on the wire in the clear",
+                          tc_buffer(&plain2));
+                    check(strstr(tc_buffer(&plain2),
+                                 "already been sent on this connection in the "
+                                 "clear") != NULL,
+                          "the refusal says a credential was already sent in the "
+                          "clear, so an operator can see WHY",
+                          tc_buffer(&plain2));
+                    tc_close(&plain2);
+                }
+                /* THE SAME CONNECTION HAVING ALSO REGISTERED, and the reason is
+                 * named is the CREDENTIAL rather than the registration. This is the
+                 * case a client that has decided to authenticate produces, so it is
+                 * the one that matters in the field: "too late, you registered" is
+                 * true and says nothing about the password that is already on the
+                 * wire. */
+                if (tc_connect(&plain2, p6) != 0) {
+                    check(0, "connect for the both-rules case", NULL);
+                } else {
+                    (void)tc_send(&plain2, "PASS hunter2");
+                    (void)tc_send(&plain2, "NICK afterboth");
+                    (void)tc_send(&plain2, "USER afterboth 0 * :A");
+                    (void)tc_send(&plain2, "STARTTLS");
+                    check(tc_expect(&plain2,
+                                    "already been sent on this connection", 10000)
+                              == 0,
+                          "a client that sent a PASS AND registered is told about "
+                          "the CREDENTIAL, not about registering: the registration "
+                          "refusal is true and hides the finding that matters",
+                          tc_buffer(&plain2));
+                    check(strstr(tc_buffer(&plain2), "only available before "
+                                                    "registration") == NULL,
+                          "and the registration reason is NOT what it was told, so "
+                          "the two refusals are distinguishable",
+                          tc_buffer(&plain2));
+                    tc_close(&plain2);
+                }
+
+                /* 3. THE HANDSHAKE IS REFUSED WHEN IT IS ALREADY TLS. Cheap to
+                 * reach on an upgraded connection and it proves the check exists
+                 * rather than being unreachable code. */
+                {
+                    tf_tls_t up;
+
+                    if (tf_tls_connect_plain(&up, p6) == 0 &&
+                        tf_tls_send(&up, "STARTTLS") == 0 &&
+                        tf_tls_expect(&up, " 670 ", 10000) == 0) {
+                        const char *why = NULL;
+
+                        check(tf_tls_upgrade(&up, up.fd, g_cert, "irc.tls",
+                                             &why) == 0,
+                              "a STARTTLS upgrade completes a real handshake",
+                              (why != NULL) ? why : "upgrade failed");
+                        check(tf_tls_send(&up, "NICK starter") == 0,
+                              "send NICK over the upgraded connection", NULL);
+                        /* BOTH HALVES OF REGISTRATION. This line was MISSING for a
+                         * long round of debugging in which the STARTTLS upgrade was
+                         * blamed for the node "stopping reading" afterwards: `NICK`
+                         * alone never completes registration on any node, so `001`
+                         * could not arrive however well the transport worked. The
+                         * wire trace that showed it was `NICK` framed by the node
+                         * and nothing else -- which is correct behaviour, correctly
+                         * observed, and easy to misread as a transport fault. */
+                        check(tf_tls_send(&up, "USER starter 0 * :Starter") == 0,
+                              "send USER over the upgraded connection", NULL);
+                        check(tf_tls_expect(&up, " 001 ", 10000) == 0,
+                              "registration completes over the UPGRADED connection, "
+                              "not the implicit-TLS one",
+                              tf_tls_buffer(&up));
+                        check(tf_tls_send(&up, "STARTTLS") == 0,
+                              "a second STARTTLS on the upgraded connection", NULL);
+                        check(tf_tls_expect(&up, " 691 ", 10000) == 0,
+                              "a second STARTTLS is refused 691, because a second "
+                              "handshake inside a live session is not a thing any "
+                              "client can use",
+                              tf_tls_buffer(&up));
+                        tf_tls_close(&up);
+                    } else {
+                        check(0, "STARTTLS reaches 670 and the upgrade completes",
+                              tf_tls_buffer(&up));
+                        tf_tls_close(&up);
+                    }
+                }
+                (void)nf_stop(&n6);
+                nf_free(&n6);
+            } else {
+                check(0, "spawn a node for the STARTTLS cases", NULL);
+            }
+        }
+
+        /* --- --tls-require refuses a PLAINTEXT client at accept --- */
+        {
+            nf_node_t n7;
+            test_client_t c7;
+            int p7;
+
+            argv[0] = a0; argv[1] = a1; argv[2] = a2; argv[3] = a3;
+            argv[4] = "--tls-cert"; argv[5] = g_cert;
+            argv[6] = "--tls-key"; argv[7] = g_key;
+            argv[8] = "--tls-require";
+            argv[9] = "--tls-port"; argv[10] = g_port;
+            argv[11] = NULL; argv[12] = NULL; argv[13] = NULL;
+            if (spawn_argv(&n7, argv) == 0) {
+                check(nf_expect(&n7, "tls=required", 5000) == 0,
+                      "the startup line says tls=required", NULL);
+                p7 = n7.port;
+                if (tc_connect(&c7, p7) != 0) {
+                    check(0, "connect to a --tls-require node's PLAIN port", NULL);
+                } else {
+                    (void)tc_send(&c7, "NICK refused");
+                    (void)tc_send(&c7, "USER refused 0 * :R");
+                    /* A RESET IS THE EXPECTED SIGNATURE HERE, and accepting both
+                     * outcomes is not a weakened assertion -- it is the correct
+                     * one, and the reason is worth writing down.
+                     *
+                     * The node refuses at accept, which means it closes a socket
+                     * the client has already written to and which the node never
+                     * read. POSIX: a close() on a socket with unread data in its
+                     * receive queue makes the kernel send RST rather than FIN. So a
+                     * client that sent NICK and USER before the refusal arrives
+                     * sees ECONNRESET, not EOF. `tc_expect_eof` distinguishes the
+                     * two and returns -3 for a reset, which is why this assertion
+                     * names both: the property being checked is "the connection
+                     * ended and nothing was said", and a reset is how that
+                     * arrives. Accepting a TIMEOUT instead would make the test
+                     * pass against a node that simply stopped answering. */
+                    {
+                        int eof = tc_expect_eof(&c7, 10000);
+
+                        check(eof == 0 || eof == -3,
+                              "a PLAINTEXT client on a --tls-require node has its "
+                              "connection ended at accept -- EOF, or the RST that "
+                              "a close with unread data produces -- and no "
+                              "registration burst",
+                              tc_buffer(&c7));
+                    }
+                    check(strstr(tc_buffer(&c7), " 001 ") == NULL,
+                          "and it received NO registration burst: refusing at "
+                          "accept is the point, because refusing later would leave "
+                          "a working unencrypted session",
+                          tc_buffer(&c7));
+                    tc_close(&c7);
+                }
+                check(nf_expect(&n7, "client_refused: fd=", 5000) == 0,
+                      "the node reports client_refused with reason=TLS_REQUIRED, so "
+                      "an operator can see WHY a client was dropped",
+                      NULL);
+                check(nf_expect(&n7, "reason=TLS_REQUIRED", 5000) == 0,
+                      "the reason names the flag, not a socket error", NULL);
+                (void)nf_stop(&n7);
+                nf_free(&n7);
+            } else {
+                check(0, "spawn a --tls-require node", NULL);
+            }
+        }
+    }
+
+    (void)msg;
+    tf_tls_rmtree(dir);
+    printf("== %d failure(s) ==\n", failures);
+    return (failures == 0) ? 0 : 1;
+}

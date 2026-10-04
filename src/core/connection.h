@@ -112,6 +112,21 @@ struct chan; /* opaque until Phase 4 (2.2) */
  * written down. The relationship runs transport.h -> connection.h, never back. */
 struct transport_ops;
 
+/* PHASE 12: the node this connection belongs to.
+ *
+ * It exists because the TLS backend needs the node's SSL_CTX and the call site
+ * cannot supply it. conn_pump() starts a STARTTLS handshake from inside the
+ * CONNECTION layer -- that is where the ordering guarantee lives, that the 670 has
+ * to reach the client in the clear before the handshake begins -- and the
+ * connection layer has a conn_t and no server_t.
+ *
+ * It is set by server_add_conn() and by nothing else, which is the same rule
+ * server.h's by_fd table follows one field over: a connection is registered exactly
+ * once, so it acquires its node exactly once, and a conn_t that was never
+ * registered has owner == NULL -- which the backend treats as "not configured"
+ * rather than dereferencing. */
+struct server;
+
 /* conn_t::kind */
 #define CONN_CLIENT 0
 #define CONN_SERVER 1
@@ -573,6 +588,7 @@ typedef struct conn {
      * needs the answer. */
     const struct transport_ops *t_ops;
     void       *t_ctx;
+    struct server *owner;        /* the node this conn is registered with */
     /* 1 once this connection's transport is TLS, and 1 while a STARTTLS has been
      * agreed and the 670 is queued but the handshake has not been started. The
      * second is the ordering guarantee that the upgrade's confirmation is sent in
@@ -580,6 +596,27 @@ typedef struct conn {
      * conn_pump(). */
     int         tls_active;
     int         starttls_pending;
+    /* 1 once this connection has carried a CREDENTIAL in the clear: a PASS value
+     * or an AUTHENTICATE payload, offered or not.
+     *
+     * IT IS A FIELD RATHER THAN A QUESTION ABOUT c->sasl, and the reason is that
+     * `c->sasl != SASL_ABORTED` does NOT answer it. An AUTHENTICATE that was
+     * REFUSED -- a mechanism this node does not implement, a payload that would
+     * not decode, a credential with no store behind it -- has still put a
+     * credential on the wire, and a STARTTLS after it is exactly the downgrade
+     * the field exists to prevent. `c->sasl` records whether the exchange reached
+     * a verdict; this records whether there was one to reach.
+     *
+     * TWO WRITERS, handle_pass() and handle_authenticate(), and they are set at
+     * the TOP of each handler -- before any parsing, before any refusal -- because
+     * the interesting case is precisely the one that failed. It is written in two
+     * places rather than through a helper because both are one line and a helper
+     * called from two handlers would be a function whose only job is to make the
+     * rule less visible at the sites where the rule matters.
+     *
+     * IT GRANTS NOTHING and revokes nothing; it is a fact about the connection's
+     * history and nothing reads it except STARTTLS's refusal. */
+    int         credential_seen;
     char       *rbuf;              /* read buffer */
     size_t      rlen;
     size_t      rcap;

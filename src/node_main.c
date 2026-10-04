@@ -88,6 +88,7 @@
 #include <netdb.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -106,6 +107,10 @@
  * blocking call inside it). Two files, two questions -- see account_store.h. */
 #include "account_store.h"
 #include "sasl_framework.h"
+/* Phase 12: the TLS backend seam. The only two things this file asks of it are
+ * "load a certificate" and nothing else; everything about TLS itself is behind
+ * it, which is what keeps the zero-dependency build the default one. */
+#include "tls_backend.h"
 
 /* The node's own name, when --name is not given. It must satisfy the 2.4 tag
  * grammar, because it is stamped on every outbound irc-serve-origin tag, and a
@@ -203,7 +208,9 @@ static void usage(FILE *out, const char *argv0)
 {
     fprintf(out, "usage: %s [port] [--name NAME] [--secret S]\n", argv0);
     fprintf(out, "            [--sasl-store PATH] [--account-store PATH]\n");
-    fprintf(out, "            [--peer NAME,HOST,PORT]...\n");
+
+    fprintf(out, "            [--tls-port PORT] [--tls-require] [--tls-insecure]\n");
+    fprintf(out, "            [--tls-sts-duration SECONDS]\n");
     fprintf(out, "\n");
     fprintf(out, "  port   TCP port to listen on, 0-%d; 0 asks the kernel for\n"
                  "         an ephemeral port and reports which one it chose\n",
@@ -246,6 +253,54 @@ static void usage(FILE *out, const char *argv0)
                  "         BOTH files agree on its name and password, so a node\n"
                  "         with neither keeps exactly the behaviour it has today.\n"
                  "         Same secret-file rules, same refusals.\n");
+    fprintf(out, "\n");
+    fprintf(out, "  --tls-cert PATH, --tls-key PATH\n"
+                 "         the server certificate and its private key, PEM. BOTH\n"
+                 "         are required to enable TLS, and both are refused\n"
+                 "         unless they load and the key MATCHES the certificate.\n"
+                 "         The key must not be readable by group or other: a\n"
+                 "         private key a group account can read has been shared,\n"
+                 "         and that is the whole defeat of a server certificate.\n"
+                 "         Without both, this node has no TLS at all: no `tls` and\n"
+                 "         no `sts` capability, and STARTTLS is answered 691.\n");
+    fprintf(out, "\n");
+    fprintf(out, "  --tls-ca PATH\n"
+                 "         the CA store used to verify PEER certificates. Without\n"
+                 "         it, a peer link that requires TLS is REFUSED rather than\n"
+                 "         verified against system roots -- an operator who has\n"
+                 "         configured no trust anchor has configured no peer\n"
+                 "         authentication. It is not used to verify CLIENT\n"
+                 "         certificates: this node asks clients for none.\n");
+    fprintf(out, "\n");
+    fprintf(out, "  --tls-insecure\n"
+                 "         accept a peer certificate this node cannot verify. An\n"
+                 "         EXPLICIT opt-in for exactly that: the default is a\n"
+                 "         refusal with a named reason, and this flag is the thing\n"
+                 "         an operator types when they mean it. Every link it\n"
+                 "         affects prints mode=INSECURE when it is established.\n");
+    fprintf(out, "\n");
+    fprintf(out, "  --tls-port PORT\n"
+                 "         bind a SECOND listener on which every byte is TLS from\n"
+                 "         the first -- implicit TLS, RFC 7194's 6697 in practice.\n"
+                 "         IRCv3's `sts` requires it: `sts` is incompatible with a\n"
+                 "         node that offers TLS only via STARTTLS on an insecure\n"
+                 "         port. Refused if TLS is not configured. 0 asks the\n"
+                 "         kernel for a port, like the plain port's 0.\n");
+    fprintf(out, "\n");
+    fprintf(out, "  --tls-require\n"
+                 "         refuse PLAINTEXT client connections. The plain listener\n"
+                 "         is still bound -- so the startup line still reports a\n"
+                 "         port -- and each connection to it is closed at accept\n"
+                 "         with reason=TLS_REQUIRED. Refusing at accept rather\n"
+                 "         than after registration is the point: a client refused\n"
+                 "         late would have a working, unencrypted session.\n");
+    fprintf(out, "\n");
+    fprintf(out, "  --tls-sts-duration SECONDS\n"
+                 "         the `sts=duration=` persistence policy. Default 0, which\n"
+                 "         the specification recommends as a shipped default so an\n"
+                 "         administrator DELIBERATELY chooses an expiry rather than\n"
+                 "         inheriting one. 0 advertises no persistence policy; it\n"
+                 "         does not disable TLS or STARTTLS.\n");
     fprintf(out, "\n");
     fprintf(out, "  --help  print this text and exit\n");
     fprintf(out, "\n");
@@ -311,6 +366,33 @@ typedef struct {
     int         have_port;
     node_peer_t peers[NODE_MAX_PEERS];
     int         npeers;
+    /* PHASE 12. Six TLS options and one extra list, and the shape is the same as
+     * --sasl-store's: every one is a POINTER or a flag with a defined zero state,
+     * so `opts_defaults()` produces a struct in which every field is either a
+     * default or something the operator typed. There is no "unset" value to
+     * interpret, which is what keeps the backward-compatibility argument
+     * checkable: with no TLS options at all this struct is exactly what the node
+     * had before the phase existed, and the node builds and runs exactly as it
+     * did.
+     *
+     * tls_cert and tls_key are a PAIR and are refused unless both are given. Half a
+     * certificate configuration is not a state this binary can be in: a node with a
+     * certificate and no key, or the reverse, would advertise nothing and would
+     * refuse every STARTTLS for a reason the operator could not read off the
+     * startup line. */
+    const char *tls_cert;
+    const char *tls_key;
+    const char *tls_ca;
+    int         tls_port;
+    int         have_tls_port;
+    int         tls_require;
+    /* --tls-insecure. The ONLY way this node accepts a peer certificate it cannot
+     * verify, and it is a flag rather than an inference from "no --tls-ca" for the
+     * reason the usage text gives: a default that silently accepts anything is the
+     * failure mode a security option exists to prevent, so the insecure mode has
+     * to be written down. */
+    int         tls_insecure;
+    uint32_t    tls_sts_duration;
 } node_opts_t;
 
 static void opts_defaults(node_opts_t *o)
@@ -406,12 +488,43 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
         }
         if (strcmp(arg, "--name") == 0 || strcmp(arg, "--secret") == 0 ||
             strcmp(arg, "--peer") == 0 || strcmp(arg, "--sasl-store") == 0 ||
-            strcmp(arg, "--account-store") == 0) {
+            strcmp(arg, "--account-store") == 0 ||
+
+            strcmp(arg, "--tls-key") == 0 || strcmp(arg, "--tls-ca") == 0 ||
+            strcmp(arg, "--tls-sts-duration") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "irc-serve: %s needs a value\n", arg);
                 return -1;
             }
             value = argv[++i];
+        } else if (strcmp(arg, "--tls-port") == 0) {
+            /* A PORT, and it is parsed by the port parser rather than taken as a
+             * string, so `--tls-port 6697x` is an error instead of a port the
+             * kernel was asked for and refused. */
+            if (i + 1 >= argc) {
+                fprintf(stderr, "irc-serve: %s needs a value\n", arg);
+                return -1;
+            }
+            value = argv[++i];
+            if (parse_port(value, &o->tls_port) != 0) {
+                fprintf(stderr, "irc-serve: bad --tls-port argument: %s\n", value);
+                return -1;
+            }
+            o->have_tls_port = 1;
+            continue;
+        } else if (strcmp(arg, "--tls-require") == 0 ||
+                   strcmp(arg, "--tls-insecure") == 0) {
+            /* FLAGS, and they take no value. Accepting one as `--tls-require=0`
+             * is not a thing this parser does for anything else either, and a
+             * silently-ignored value on a security flag is the worst outcome
+             * available: an operator who typed `--tls-require=no` would get a node
+             * that requires TLS and believes it does not. */
+            if (strcmp(arg, "--tls-require") == 0) {
+                o->tls_require = 1;
+            } else {
+                o->tls_insecure = 1;
+            }
+            continue;
         } else if (arg[0] == '-') {
             fprintf(stderr, "irc-serve: unknown option: %s\n", arg);
             return -1;
@@ -433,6 +546,26 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
             o->sasl_store = value;
         } else if (strcmp(arg, "--account-store") == 0) {
             o->account_store = value;
+        } else if (strcmp(arg, "--tls-cert") == 0) {
+            o->tls_cert = value;
+        } else if (strcmp(arg, "--tls-key") == 0) {
+            o->tls_key = value;
+        } else if (strcmp(arg, "--tls-ca") == 0) {
+            o->tls_ca = value;
+        } else if (strcmp(arg, "--tls-sts-duration") == 0) {
+            char *end = NULL;
+            long seconds;
+
+            errno = 0;
+            seconds = strtol(value, &end, 10);
+            if (errno != 0 || end == value || *end != '\0' || seconds < 0 ||
+                seconds > 2147483647L) {
+                fprintf(stderr, "irc-serve: bad --tls-sts-duration: %s\n", value);
+                fprintf(stderr, "  expected a whole number of seconds, 0-%ld\n",
+                        2147483647L);
+                return -1;
+            }
+            o->tls_sts_duration = (uint32_t)seconds;
         } else {
             if (o->npeers >= NODE_MAX_PEERS) {
                 fprintf(stderr, "irc-serve: at most %d --peer options\n",
@@ -629,6 +762,72 @@ int main(int argc, char **argv)
         }
     }
 
+    /* ------------------------------------------------------------------------
+     * PHASE 12: TLS, and WHERE it is configured matters more than it looks
+     * ------------------------------------------------------------------------
+     * Here, before the loop is armed, for the reason the credential store and the
+     * account registry are loaded here: 3.4 forbids a blocking call inside the
+     * event loop, and reading a certificate is as blocking as reading a file.
+     *
+     * THE ORDER inside this block is load-bearing and each step refuses rather
+     * than degrades:
+     *
+     *   1. The cert/key PAIR is checked before either is opened. Half a
+     *      configuration is not a state this binary can be in.
+     *   2. tls_backend_node_init() checks the KEY'S PERMISSIONS before loading
+     *      anything, so a world-readable key refuses the whole configuration
+     *      rather than producing a node that offers a certificate whose private
+     *      half is on a shared filesystem.
+     *   3. --peer-tls is applied only after the peers exist and only if TLS
+     *      exists, and a name that matches no peer is a STARTUP ERROR: a flag that
+     *      quietly does nothing on a security option is worse than no flag.
+     */
+    if ((opts.tls_cert == NULL) != (opts.tls_key == NULL)) {
+        fprintf(stderr, "irc-serve: --tls-cert and --tls-key are a pair; "
+                        "supplying one is not a configuration this node has\n");
+        server_shutdown(&srv);
+        return 1;
+    }
+    if (opts.tls_cert != NULL) {
+        if (tls_backend_node_init(&srv.tls, opts.tls_cert, opts.tls_key,
+                                  opts.tls_ca, opts.tls_insecure) != 0) {
+            /* A CERTIFICATE THAT DID NOT LOAD IS A STARTUP FAILURE, and this is
+             * the one configuration error in the phase that is. The reasoning is
+             * cap.h's rule applied to the node rather than to a capability: a node
+             * that was told to serve TLS and cannot must NOT come up as a node
+             * that does not, because "my node has no `sts` in CAP LS" is a thing
+             * an operator has to go looking for and "TLS is on and broken" is
+             * worse than either. Compare --sasl-store, whose failure is NOT
+             * fatal: there, a node without a store refuses every AUTHENTICATE and
+             * says so, which is a correct node. Here, a node without a
+             * certificate would serve plaintext on the port the operator believes
+             * is encrypted. */
+            fprintf(stderr, "irc-serve: TLS was configured and could not be "
+                            "loaded; refusing to start rather than serving "
+                            "plaintext\n");
+            server_shutdown(&srv);
+            return 1;
+        }
+        srv.tls_require = opts.tls_require;
+        srv.sts_duration = opts.tls_sts_duration;
+    } else {
+        /* Every TLS option without a certificate pair is an ERROR rather than a
+         * silent no-op, for the same reason: `--tls-port 6697 --tls-require` on a
+         * node with no certificate is a command line that says "this node is
+         * encrypted" and is not. --tls-insecure is included in the test because
+         * it says the same thing: "accept unverifiable peers" on a node that can
+         * have no peers is a configuration an operator believes in and does not
+         * have. */
+        if (opts.have_tls_port || opts.tls_require != 0 ||
+            opts.tls_ca != NULL || opts.tls_sts_duration != 0u ||
+            opts.tls_insecure != 0) {
+            fprintf(stderr, "irc-serve: TLS options were given without "
+                            "--tls-cert and --tls-key\n");
+            server_shutdown(&srv);
+            return 1;
+        }
+    }
+
     /* Resolve and configure the peers, still before the loop. */
     for (i = 0; i < opts.npeers; i++) {
         if (resolve_peer(&srv, &opts.peers[i]) != 0) {
@@ -642,6 +841,24 @@ int main(int argc, char **argv)
                opts.port, strerror(errno));
         server_shutdown(&srv);
         return 1;
+    }
+
+    /* THE IMPLICIT-TLS LISTENER, second and after the plain one. Its failure is
+     * FATAL rather than a warning, and that is a different decision from the
+     * certificate's: an operator who asked for --tls-port has said clients will be
+     * encrypted from the first byte, and a node that could not bind that port and
+     * said nothing would leave those clients on a plaintext port they were told
+     * not to use. A REFUSAL here is the honest answer. */
+    if (opts.have_tls_port) {
+        if (server_listen_tls(&srv, opts.tls_port) != 0) {
+            printf("[observable] server startup failed: tls_port=%d reason=%s\n",
+                   opts.tls_port,
+                   (srv.tls == NULL) ? "no_tls_configured" : strerror(errno));
+            server_shutdown(&srv);
+            return 1;
+        }
+        printf("[observable] tls_bind: port=%d fd=%d state=LISTENING\n",
+               server_tls_port(&srv), srv.tls_listen_fd);
     }
 
     /* Read the port back rather than echoing the argument: with port 0 the
@@ -658,13 +875,47 @@ int main(int argc, char **argv)
     /* `sasl=` is the startup line's half of "advertise only what you have": a
      * reader comparing two nodes' startup output can tell which one offers
      * authentication without opening either one's credential file. */
-    printf("[observable] server initialized: name=%s epoch=%llu peers=%d "
-           "secret=%s sasl=%s accounts=%s\n",
-           opts.name, (unsigned long long)srv.epoch,
-           (int)server_link_count(&srv),
-           (opts.secret[0] == '\0') ? "none" : "set",
-           sasl_store_count(srv.sasl_store) > 0u ? "loaded" : "none",
-           account_store_count(srv.account_store) > 0u ? "loaded" : "none");
+    /* `tls=` is four states and not two, because a node that cannot encrypt and a
+     * node that will encrypt but has not been told to require it are different
+     * nodes and an operator reading two startup lines must be able to tell them
+     * apart:
+     *
+     *   absent     this build or this node has no certificate. No `tls`, no `sts`,
+     *              and STARTTLS is answered 691.
+     *   configured a certificate and key loaded and the key MATCHED the
+     *              certificate. `tls` and `sts` are advertised.
+     *   insecure   as above, AND --tls-insecure: an unverifiable peer certificate
+     *              is accepted. Named here as well as on each link, because this is
+     *              the line an operator reads once.
+     *   required   as above, and PLAINTEXT client connections are refused at
+     *              accept.
+     *
+     * `tls_port` and `sts_duration` are the two halves of the advertised `sts`
+     * value, printed so a reader can check what clients will be told without having
+     * to know the formatting rule. A negative tls_port means there is no
+     * implicit-TLS listener, which is also when the `sts` value carries no `port`
+     * key -- the specification makes that key REQUIRED on an insecure connection,
+     * so without a secure port `sts` is advertised with a duration only and an
+     * insecure client correctly ignores it. */
+    {
+        const char *tls_state = "absent";
+
+        if (srv.tls != NULL) {
+            tls_state = opts.tls_insecure ? "insecure"
+                                          : (srv.tls_require ? "required"
+                                                             : "configured");
+        }
+        printf("[observable] server initialized: name=%s epoch=%llu peers=%d "
+               "secret=%s sasl=%s accounts=%s tls=%s tls_port=%d "
+               "sts_duration=%u\n",
+               opts.name, (unsigned long long)srv.epoch,
+               (int)server_link_count(&srv),
+               (opts.secret[0] == '\0') ? "none" : "set",
+               sasl_store_count(srv.sasl_store) > 0u ? "loaded" : "none",
+               account_store_count(srv.account_store) > 0u ? "loaded" : "none",
+               tls_state, server_tls_port(&srv),
+               (unsigned)srv.sts_duration);
+    }
 
     /* Readiness: emitted after the listener is up and immediately before the
      * loop is armed, so anything waiting on this line is talking to a serving
@@ -684,10 +935,29 @@ int main(int argc, char **argv)
      * still open. */
     server_shutdown(&srv);
 
+    /* `dial_connected` AND `dial_failed` ARE HERE BECAUSE PHASE 12 ADDED A WAY FOR A
+     * DIAL TO FAIL, and this line is the only place the shipped binary reports
+     * anything.
+     *
+     * They were here before this phase and were REMOVED at the same time, because
+     * the harness's inline children were the only thing that ever printed them and
+     * the shipped binary had no peer to dial. Phase 12 gave it one -- and gave the
+     * counter a second failure mode, since a TCP connect can now succeed and the
+     * CERTIFICATE still be refused. A node whose peer links are all failing on
+     * certificates produces `dial_failed=0`, `fed_dead=0` and no established links,
+     * and without these two numbers that combination is indistinguishable from a
+     * node with no peers configured.
+     *
+     * THE PAIR IS DISTINGUISHABLE AND THAT IS WHY BOTH ARE HERE. `dial_connected=1`
+     * with `dial_failed=0` and no link established says the socket worked and the
+     * handshake did not, which is a certificate problem with a completely
+     * different fix from a refused port. test_peer_tls.c asserts exactly that
+     * reading, and it could not before these two numbers were published. */
     printf("[observable] loop_stats: ticks=%llu eintr=%llu accepted=%llu "
            "closed=%llu lines=%llu parse_reject=%llu frame_error=%llu "
            "writeq_overflow=%llu write_error=%llu partial_writes=%llu "
-           "rejected_fd=%llu pass_seen=%llu reply_refused=%llu "
+           "rejected_fd=%llu dial_connected=%llu dial_failed=%llu "
+           "pass_seen=%llu reply_refused=%llu "
            "fed_rejected=%llu fed_duplicate=%llu fed_hs_timeout=%llu "
            "fed_dead=%llu fed_retry_exhausted=%llu "
            "fed_preauth_drop=%llu fed_hop_drop=%llu "
@@ -699,7 +969,8 @@ int main(int argc, char **argv)
            "resume_rejected=%llu resume_evicted=%llu resume_swept=%llu "
            "resume_chan_gone=%llu resume_chan_taken=%llu resume_held=%zu "
            "burst_refused=%llu burst_abandoned=%llu burst_truncated=%llu "
-           "topic_cache_full=%llu sasl_ok=%llu sasl_fail=%llu\n",
+           "topic_cache_full=%llu sasl_ok=%llu sasl_fail=%llu "
+           "tls_handshake_failed=%llu tls_client_refused=%llu\n",
            (unsigned long long)srv.n_ticks, (unsigned long long)srv.n_eintr,
            (unsigned long long)srv.n_accepted, (unsigned long long)srv.n_closed,
            (unsigned long long)srv.n_lines,
@@ -709,6 +980,8 @@ int main(int argc, char **argv)
            (unsigned long long)srv.n_write_error,
            (unsigned long long)srv.n_partial_writes,
            (unsigned long long)srv.n_rejected_fd,
+           (unsigned long long)srv.n_dial_connected,
+           (unsigned long long)srv.n_dial_failed,
            (unsigned long long)srv.n_pass_seen,
            (unsigned long long)srv.n_reply_refused,
            (unsigned long long)srv.n_link_rejected,
@@ -742,7 +1015,9 @@ int main(int argc, char **argv)
            (unsigned long long)srv.n_burst_truncated,
            (unsigned long long)srv.n_topic_cache_full,
            (unsigned long long)srv.n_sasl_ok,
-           (unsigned long long)srv.n_sasl_fail);
+           (unsigned long long)srv.n_sasl_fail,
+           (unsigned long long)srv.n_tls_handshake_failed,
+           (unsigned long long)srv.n_tls_client_refused);
 
     /* The link table itself, and last, after the counters: 8 asks for "a way to
      * dump peers and their FSM states" and the state is what the counters are

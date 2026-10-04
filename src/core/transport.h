@@ -154,4 +154,11 @@ void transport_init_plaintext(conn_t *c);
  * implicit-TLS listener hands the socket over exactly once at accept. */
 int transport_starttls(conn_t *c, int as_server);
 
+/* As transport_starttls(), for an OUTBOUND peer link, naming the host that was
+ * dialled. The name is what lets the backend check the peer's certificate against
+ * the address this node reached it at rather than against the chain alone: a
+ * certificate for a different name, signed by the same CA, passes a chain check
+ * and is the wrong node. See tls_backend.h's tls_backend_starttls_peer(). */
+int transport_starttls_peer(conn_t *c, int as_server, const char *peer_host);
+
 #endif /* IRC_CORE_TRANSPORT_H */

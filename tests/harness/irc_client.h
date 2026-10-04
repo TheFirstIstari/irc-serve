@@ -142,6 +142,35 @@ void tc_close(test_client_t *c);
  */
 typedef void (*tc_pump_fn)(void);
 
+/* Run the installed pump hook ONCE, now.
+ *
+ * It exists for a wait that is not one of this file's own loops. Every wait in
+ * irc_client.c calls pump_hook() itself, but a wait over an SSL object cannot use
+ * them -- see the block above, which explains why after a handshake the decrypted
+ * bytes are inside OpenSSL rather than in the socket. tests/harness/tls_fixture.c's
+ * tf_tls_expect() is that wait, and without this it would stop draining the child
+ * nodes' stdout, so a node that fills its 64 KiB pipe would wedge inside its own
+ * event loop while the test waited for it to answer. */
+void tc_pump(void);
+
+/* Run the installed pump hook ONCE, now.
+ *
+ * It exists because a wait that is not one of this file's own loops still has to
+ * keep the parent reading, and irc_client.h's own block above says why that is not
+ * a tidiness matter: a child's stdout is a 64 KiB pipe, a child that fills it
+ * blocks INSIDE its event loop, and then it serves nobody. A test that waits on a
+ * socket of its OWN -- rather than through tc_expect() -- has no way to keep that
+ * true, and tests/harness/tls_fixture.c's tf_tls_expect() is exactly that: it waits
+ * on an SSL object with its own select() loop because after a handshake the
+ * decrypted bytes are inside OpenSSL and reading the descriptor would return the
+ * NEXT record rather than the one being waited for.
+ *
+ * So it calls this once per iteration. The alternative -- letting each fixture grow
+ * its own reference to the harness's internals -- is worse, because the hook is
+ * installed by node_fixture.c and the two would have to agree about it by
+ * convention. */
+void tc_pump(void);
+
 /* Install the callback every deadline loop calls to keep unrelated readers
  * moving. NULL removes it. tc_init()/tc_connect() do NOT clear it: it belongs to
  * the process, not to a connection. */

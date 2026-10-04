@@ -274,6 +274,39 @@ typedef struct server_link {
      * it without first having seen anything wrong from the peer. */
     int      initiator;
 
+    /* ------------------------------------------------------------------------
+     * PHASE 12: WHETHER THIS LINK MUST CARRY TLS, and it is STICKY
+     * ------------------------------------------------------------------------
+     * Set from the operator's --peer-tls NAME at configure time and NEVER CLEARED
+     * for the life of the link. That is the whole of the downgrade answer, and it
+     * is worth stating in one sentence because "we reconnect with TLS" is not a
+     * property a mesh has by default: if a link that was TLS could come back
+     * plaintext, then compromising the plaintext path once would be enough to
+     * downgrade it permanently, because the attacker would simply answer the next
+     * dial. Nothing in this codebase ever clears this field -- not a tick, not a
+     * retry arm, not fed_link_reset() -- so a link configured for TLS re-dials with
+     * TLS or does not come back.
+     *
+     * A link with require_tls == 0 on a node that HAS TLS is a PLAINTEXT link, and
+     * that is permitted: a mixed mesh is allowed and link.c's header gives the
+     * argument. What is NOT permitted is a link silently changing mode, and this
+     * field is what makes that structural rather than a rule somebody has to
+     * remember.
+     *
+     * THE COST: one int per link, 16 bytes on the 16-link vector, and one place
+     * (`fed_tick`'s dial arm) that has to consult it.
+     */
+    int      require_tls;
+
+    /* Whether this link's CURRENT socket is carrying TLS. 0 until the handshake
+     * completes, and it is a REPORT rather than a decision: the sticky field above
+     * is what the next dial reads. It exists because "this link was established
+     * in the clear" is the single fact an operator most needs when reading a mesh,
+     * and because a link that was TLS and is now not is a finding worth a line of
+     * its own. A link with require_tls == 1 that finds this 0 has FAILED -- the
+     * handshake aborts and the link is retried; it never continues in the clear. */
+    int      tls_active;
+
     uint64_t created_ms;
     uint64_t last_sent_ms;
     uint64_t last_recv_ms;
@@ -964,6 +997,61 @@ struct server {
     uint64_t  n_fed_shutdown_relayed;
     uint64_t  n_fed_shutdown_refused;
     uint64_t  n_fed_shutdown_announced;
+
+    /* ------------------------------------------------------------------------
+     * PHASE 12: TLS, AND THE FIVE FACTS A NODE HAS TO BE ABLE TO ANSWER
+     * ------------------------------------------------------------------------
+     * The layout is opaque pointers for the same reason every other store on this
+     * struct is: tls_backend.h owns `struct tls_node`, and a reader of server_t
+     * should not also have to understand two SSL_CTX and a verify policy.
+     *
+     *   tls              the node's TLS configuration, or NULL on a build without
+     *                    TLS and on a node that was not given a certificate. NULL
+     *                    is the honest "this node cannot encrypt anything" state
+     *                    and it is what cap_available() asks, so a node with no
+     *                    `tls` advertises neither `tls` nor `sts`.
+     *
+     *   tls_listen_fd    the IMPLICIT-TLS listener (RFC 7194's port 6697), or -1.
+     *                    It is a SECOND listener rather than a mode of the first
+     *                    because IRCv3's `sts` specification requires it:
+     *                    "STS expects that servers instead offer a port that
+     *                    directly services secure connections and it is
+     *                    incompatible with servers that offer secure connections
+     *                    only via STARTTLS on an insecure port." A STARTTLS-only
+     *                    node cannot advertise `sts` at all.
+     *
+     *   tls_require      refuse PLAINTEXT client connections. The listener is
+     *                    still bound, so the startup line, the port readback and
+     *                    every fixture that waits on readiness keep working, and
+     *                    an accepted plaintext connection is closed immediately
+     *                    with a named reason. Binding it and refusing the
+     *                    connections is a better shape than not binding it: a
+     *                    client gets a definite RST/FIN rather than a timeout, and
+     *                    an operator gets a line in the log naming the reason.
+     *
+     *   sts_duration     the `sts=duration=` value in SECONDS, or 0 for no
+     *                    persistence policy. It is an operator figure rather than
+     *                    a constant because the specification's own server notes
+     *                    say a default would let an administrator rely on an expiry
+     *                    nobody chose: "Server implementations should consider
+     *                    using a default value of duration=0 ... which will require
+     *                    server administrators to deliberately choose an expiry
+     *                    according to their specific needs." So 0 is the shipped
+     *                    default and an operator who wants a policy has to type a
+     *                    number.
+     */
+    struct tls_node *tls;
+    int      tls_listen_fd;
+    int      tls_listen_port;
+    int      tls_require;
+    uint32_t sts_duration;
+
+    /* A handshake that FAILED. The reason is named rather than counted, because
+     * the four reasons an operator can act on (wrong CA, expired certificate, name
+     * mismatch, no trust anchor configured) have completely different fixes and a
+     * single counter would be the least useful number in the log. */
+    uint64_t  n_tls_handshake_failed;
+    uint64_t  n_tls_client_refused;  /* plaintext client on a --tls-require node */
     /* A PEER REPORTED AS SHEDDING, counted once per threshold CROSSING rather than
      * once per tick -- the latch is server_link_t::shed_reported and server.h's
      * shed_pct block gives the whole argument for why the count is of crossings.
@@ -1091,6 +1179,50 @@ void server_shutdown(server_t *s);
  * what the kernel chose. Returns 0 on success, -1 on failure with errno set
  * from the failing call. */
 int server_listen(server_t *s, int port);
+
+/* ---------------------------------------------------------------------------
+ * THE IMPLICIT-TLS LISTENER (Phase 12), and the two facts about it that are
+ * policy rather than plumbing
+ * ---------------------------------------------------------------------------
+ * server_listen_tls() binds a SECOND listening socket on which every byte is TLS
+ * from the first one -- RFC 7194's port 6697 in practice. It is a second listener
+ * rather than a mode of the first because IRCv3's `sts` specification requires one:
+ * "STS expects that servers instead offer a port that directly services secure
+ * connections and it is incompatible with servers that offer secure connections
+ * only via STARTTLS on an insecure port."
+ *
+ * IT REFUSES WHEN THERE IS NO TLS CONFIGURED, and that refusal is the safety
+ * property: there is no configuration in which this function binds a port it cannot
+ * encrypt. An operator who types --tls-port on a node with no certificate gets a
+ * refusal and a named reason, never a plaintext service on a port clients will
+ * expect a handshake on.
+ *
+ * server_accept_tls_one() accepts ONE connection from it and starts the handshake;
+ * it does not COMPLETE it, because this is a nonblocking node and a TLS handshake is
+ * several round trips. The handshake finishes on the loop's own schedule through
+ * conn_t::want_read and conn_pump()'s empty pass -- the case a data-derived poll
+ * mask cannot express. */
+int server_listen_tls(server_t *s, int port);
+
+/* The port the implicit-TLS listener bound, or -1. Read rather than assumed,
+ * because `--tls-port 0` is meaningful (the kernel picks an ephemeral one) exactly
+ * as the plain port's 0 is, and a caller that cannot learn the real one cannot
+ * connect. */
+int server_tls_port(const server_t *s);
+
+/* Accept ONE connection on the implicit-TLS listener and hand the socket straight
+ * to the TLS transport. Returns 1 on success, 0 when nothing is pending, -1 on a
+ * fatal accept error, or SERVER_ACCEPT_REJECTED for the FD_SETSIZE rejection --
+ * the same vocabulary server_accept_one() uses, so the loop's drain loop over the
+ * TLS listener is character-for-character the drain loop over the plain one.
+ *
+ * THE HANDSHAKE IS STARTED, NOT COMPLETED. This is a nonblocking node and a TLS
+ * handshake is several round trips, so the connection is registered with a TLS
+ * transport whose handshake has begun and the loop carries it to completion on its
+ * own schedule. That is the case conn_t::want_read and conn_pump()'s empty pass
+ * exist for, and a loop that derived its poll mask from data could not express it
+ * at all. */
+int server_accept_tls_one(server_t *s);
 
 /* The port actually bound, via getsockname(). Returns -1 if the listener is
  * not bound. This is the readback that makes port 0 usable. */

@@ -260,3 +260,18 @@ int transport_starttls(conn_t *c, int as_server)
     return -1;
 #endif
 }
+
+int transport_starttls_peer(conn_t *c, int as_server, const char *peer_host)
+{
+    if (c == NULL) {
+        return -1;
+    }
+#if defined(IRC_WITH_TLS)
+    return tls_backend_starttls_peer(c, as_server, peer_host);
+#else
+    (void)as_server;
+    (void)peer_host;
+    printf("[observable] tls_unavailable: fd=%d reason=NOT_COMPILED_IN\n", c->fd);
+    return -1;
+#endif
+}

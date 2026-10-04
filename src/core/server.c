@@ -16,6 +16,8 @@
 
 #include "core/channel.h"
 #include "core/message.h"
+/* Phase 12: the transport interface, for server_accept_tls_one()'s handoff. */
+#include "core/transport.h"
 /* Phase 10.1's account registry. Included for the same reason sasl_framework.h
  * below is: it is a teardown arm on a table this struct holds, so the pointer
  * belongs to the node and the layout belongs to the module that owns it. */
@@ -47,6 +49,12 @@
  * pointer belongs to the node. */
 #include "federation/nickreg.h"
 #include "sasl_framework.h"
+/* Phase 12: the TLS backend seam, and the ONE include that makes server_t's
+ * `struct tls_node *tls` meaningful. Nothing else in this file names a TLS type:
+ * the layout is the backend's, and the two things this file asks of it are "is
+ * there one" (tls_listen_fd's accept arm) and "release it" (the shutdown arm
+ * above). */
+#include "tls_backend.h"
 
 /* ---------------------------------------------------------------------------
  * A small open-addressed string -> pointer map
@@ -603,6 +611,11 @@ int server_init(server_t *s, const char *name)
     }
     memset(s, 0, sizeof *s);
     s->listen_fd = -1;
+    /* Phase 12: there is NO second listener until an operator asks for one with
+     * --tls-port. -1 rather than 0, because 0 is a legal descriptor and the
+     * loop's step 3 tests this field against >= 0. */
+    s->tls_listen_fd = -1;
+    s->tls_listen_port = -1;
 
     /* A name this node cannot stamp on its own irc-serve-origin tag would
      * break the never-forward-own-origin rule at the first relay, so it is
@@ -668,6 +681,43 @@ void server_shutdown(server_t *s)
         close(s->listen_fd);
         s->listen_fd = -1;
     }
+    /* PHASE 12: THE IMPLICIT-TLS LISTENER, closed HERE and not by the reaper.
+     *
+     * It is not a connection and no conn_t ever rides it: an accepted implicit-TLS
+     * socket becomes an ordinary conn_t at accept, with its own SSL* owned by
+     * conn_free(). So this descriptor has no conn to be reaped along with, and
+     * leaving it to the walk above -- which only sees by_fd -- would leak a
+     * listening socket for the life of the process. It sits with the other listener
+     * because it IS one, and because both must be closed before the contexts are:
+     * SSL_CTX_free() below does not touch any socket.
+     *
+     * SAFE HERE AND AT ANY POINT ABOVE, and the argument is the one every
+     * allocation arm in this function gives: the connection walk has already closed
+     * every conn_t, so nothing can be holding an SSL* that references these
+     * contexts. And it is safe on a node that never configured TLS, which is every
+     * node in the default build -- the field is -1 until server_listen_tls(). */
+    if (s->tls_listen_fd >= 0) {
+        close(s->tls_listen_fd);
+        s->tls_listen_fd = -1;
+    }
+    /* THE NODE'S TLS CONTEXTS, released LAST among the network state and for the
+     * same reason the dedup table and the topic cache are released by this
+     * function rather than by their owners: a teardown that could not see an
+     * allocation would not be a teardown of everything on this struct.
+     *
+     * ASSERTED, NOT VERIFIED, ON THIS PLATFORM, and it is worth saying so plainly:
+     * **LeakSanitizer does not run on Darwin.** The top-level CMakeLists.txt's
+     * IRC_SANITIZE block records that an ASan binary with detect_leaks=1 HANGS on
+     * macOS rather than reporting, so a missing free here is invisible locally and
+     * caught only by the Linux CI job. The arm PRINTS whether TLS was open, so it
+     * is at least ASSERTED on every platform -- a test can require the line -- and
+     * Linux CI reads the same line next to its LSan run. See the arm for the
+     * account registry, which does this and says why. */
+    printf("[observable] tls_node_close: tls=%s insecure_conns=%llu\n",
+           (s->tls != NULL) ? "OPEN" : "NONE",
+           (unsigned long long)s->n_tls_handshake_failed);
+    tls_backend_node_free(s->tls);
+    s->tls = NULL;
     if (s->dials != NULL) {
         for (i = 0; i < s->ndials; i++) {
             if (s->dials[i].state == DIAL_CONNECTING ||
@@ -910,6 +960,189 @@ int server_port(const server_t *s)
     return (int)ntohs(addr.sin_port);
 }
 
+int server_tls_port(const server_t *s)
+{
+    struct sockaddr_in addr;
+    socklen_t len = sizeof addr;
+
+    if (s == NULL || s->tls_listen_fd < 0) {
+        return -1;
+    }
+    if (getsockname(s->tls_listen_fd, (struct sockaddr *)&addr, &len) != 0) {
+        return -1;
+    }
+    return (int)ntohs(addr.sin_port);
+}
+
+/* ---------------------------------------------------------------------------
+ * THE IMPLICIT-TLS LISTENER (Phase 12), and why it is a SECOND LISTENER
+ * ---------------------------------------------------------------------------
+ * server_listen_tls() is server_listen() again with two differences, and both of
+ * them are load-bearing rather than incidental.
+ *
+ * THE SECOND LISTENER. IRCv3's `sts` specification is explicit that it does not
+ * work over a STARTTLS-only port: "STS expects that servers instead offer a port
+ * that directly services secure connections and it is incompatible with servers
+ * that offer secure connections only via STARTTLS on an insecure port." So a node
+ * that wants to advertise `sts` -- which is the mechanism that stops a client
+ * being downgraded after the first connection, and therefore the only part of this
+ * phase that protects a return visit -- needs a port a client can connect to and be
+ * encrypted from the first byte. That is this listener, on RFC 7194's 6697.
+ *
+ * THE REFUSAL WHEN THERE IS NO TLS. Refused rather than started, because a node
+ * whose --tls-port is bound and which then serves PLAINTEXT on it is the worst
+ * possible outcome: the operator typed a TLS port, a client sees 6697 and expects
+ * a handshake, and gets IRC in the clear instead. There is no configuration in
+ * which this function binds a port it cannot encrypt, and that is the whole of
+ * the safety property here.
+ *
+ * THE CODE IS server_listen()'S AND NOT A REFACTOR OF IT. Duplicating twenty lines
+ * of bind/listen/nonblocking is cheaper than a `int is_tls` parameter on
+ * server_listen(), because a parameter would make every existing caller think about
+ * a mode it does not have, and this codebase's own convention (set_nonblocking()'s
+ * comment) is that a descriptor must be nonblocking BEFORE it is reachable from the
+ * loop -- which is a sequence worth reading in one piece at each site rather than
+ * branching inside. */
+int server_listen_tls(server_t *s, int port)
+{
+    struct sockaddr_in addr;
+    int fd;
+    int one = 1;
+
+    if (s == NULL || port < 0 || port > 65535) {
+        return -1;
+    }
+    /* THE REFUSAL, and it is checked BEFORE socket(). There is no point creating a
+     * descriptor this node is not going to be able to use, and on a build without
+     * TLS there is no point at all. */
+    if (s->tls == NULL) {
+        printf("[observable] tls_listen: state=REFUSED port=%d "
+               "reason=NO_TLS_CONFIGURED\n", port);
+        return -1;
+    }
+    if (s->tls_listen_fd >= 0) {
+        /* One implicit-TLS listener. A second one would be a second place an
+         * operator's intent about this node's TLS surface is recorded, and this
+         * struct already has one (`tls_listen_port`). */
+        return -1;
+    }
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0) {
+        close(fd);
+        return -1;
+    }
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, SOMAXCONN) != 0) {
+        close(fd);
+        return -1;
+    }
+    if (set_nonblocking(fd) != 0) {
+        close(fd);
+        return -1;
+    }
+    s->tls_listen_fd = fd;
+    s->tls_listen_port = port;
+    return 0;
+}
+
+/* Accept ONE connection on the implicit-TLS listener and hand the socket straight
+ * to the TLS transport. Returns 1 on success, 0 when nothing is pending, -1 on a
+ * fatal accept error, or SERVER_ACCEPT_REJECTED for the FD_SETSIZE rejection --
+ * the same vocabulary server_accept_one() uses, so the loop's drain loop over the
+ * TLS listener is character-for-character the drain loop over the plain one.
+ *
+ * THE HANDSHAKE IS NOT DONE HERE, and the difference matters: this is a nonblocking
+ * node and a TLS handshake is several round trips. So the connection is registered
+ * with a TLS transport whose handshake has only been STARTED, and the loop carries
+ * it to completion on its own schedule -- which is exactly the case conn_t::want_read
+ * and the empty pass in conn_pump() exist for, and which could not be expressed at
+ * all in a loop that derived its poll mask from data.
+ *
+ * THE ORDER IS: accept, nonblocking, conn_new, ADD THE CONNECTION, and only then
+ * start TLS. server_add_conn() sets conn_t::owner, which the backend needs to find
+ * the node's SSL_CTX, so starting TLS first would find a conn with no node. That is
+ * why the two steps are not swapped, and why transport_starttls() reports
+ * NOT_CONFIGURED rather than dereferencing NULL. */
+int server_accept_tls_one(server_t *s)
+{
+    struct sockaddr_storage peer;
+    socklen_t peerlen = sizeof peer;
+    conn_t *c;
+    int fd;
+
+    if (s == NULL || s->tls_listen_fd < 0) {
+        return -1;
+    }
+    for (;;) {
+        fd = accept(s->tls_listen_fd, (struct sockaddr *)&peer, &peerlen);
+        if (fd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return 0;
+            }
+#if defined(EMFILE) || defined(ENFILE)
+            if (errno == EMFILE || errno == ENFILE) {
+                return 0;
+            }
+#endif
+            return -1;
+        }
+        break;
+    }
+    /* 3.4's explicit FD_SETSIZE check, for the same reason and with the same
+     * consequence as at the plaintext accept site: poll() would silently drop it. */
+    if (fd >= FD_SETSIZE) {
+        close(fd);
+        s->n_rejected_fd++;
+        printf("[observable] accept_rejected: fd=%d reason=fd_ge_fdsize limit=%d "
+               "transport=tls\n", fd, FD_SETSIZE);
+        return SERVER_ACCEPT_REJECTED;
+    }
+    if (set_nonblocking(fd) != 0) {
+        close(fd);
+        return -1;
+    }
+    c = conn_new(fd, CONN_CLIENT);
+    if (c == NULL) {
+        close(fd);
+        return -1;
+    }
+    describe_peer(c, (const struct sockaddr *)&peer);
+    if (server_add_conn(s, c) != 0) {
+        conn_free(c);
+        close(fd);
+        return -1;
+    }
+    if (transport_starttls(c, 1) != 0) {
+        /* The handshake could not even be STARTED, which on this build means the
+         * node's TLS state went away between the listener being bound and this
+         * accept. The connection is closed rather than left in the clear, and the
+         * reason is counted and printed: a node that silently served a plaintext
+         * connection on its TLS port is exactly the failure this whole phase
+         * exists to prevent. */
+        s->n_tls_handshake_failed++;
+        printf("[observable] tls_handshake_failed: fd=%d reason=START_FAILED "
+               "transport=implicit action=CLOSE\n", fd);
+        conn_mark_closing(c);
+        return 1;
+    }
+    printf("[observable] client_connect: fd=%d host=%s state=REG_PASS "
+           "transport=tls\n", fd, c->host);
+    return 1;
+}
+
 uint64_t server_now_ms(void)
 {
     struct timespec ts;
@@ -998,6 +1231,12 @@ int server_add_conn(server_t *s, conn_t *c)
     if (s->by_fd[c->fd] != NULL) {
         return -1;
     }
+    /* Phase 12: the conn acquires its NODE here, which is the only writer. The TLS
+     * backend needs the node's SSL_CTX and the call site that starts a handshake
+     * -- conn_pump(), from inside the connection layer -- has no server_t. See
+     * conn_t::owner's own comment. A conn_t that is never registered keeps NULL,
+     * and the backend treats that as "not configured" rather than dereferencing. */
+    c->owner = s;
     s->by_fd[c->fd] = c;
     s->nconns++;
     s->n_accepted++;
@@ -1049,6 +1288,35 @@ int server_accept_one(server_t *s)
         return SERVER_ACCEPT_REJECTED;
     }
 
+    /* ------------------------------------------------------------------------
+     * PHASE 12: --tls-require, AND IT IS CHECKED BEFORE ANYTHING IS BUILT
+     * ------------------------------------------------------------------------
+     * A node told to require TLS refuses a PLAINTEXT client connection, and it
+     * refuses it HERE -- at accept, before a conn_t exists -- rather than after
+     * registration or on the first command.
+     *
+     * THE ORDER IS THE PROPERTY. Refusing late would mean the connection had been
+     * registered, could be handed a nickname, could JOIN a channel and RECEIVE
+     * messages before anything noticed it was in the clear; a client on a
+     * --tls-require node would see a working IRC session that is secretly
+     * unauthenticated and unencrypted, which is worse than a refusal because it
+     * looks like success. Closing at accept means the client gets a FIN and no
+     * bytes at all: no 001, no MOTD, no channel, nothing to mistake for a session.
+     *
+     * AND THE LISTENER IS STILL BOUND, which is the other half of the decision and
+     * is deliberate. Not binding it would mean an operator's `--port` silently
+     * became a no-op, the startup line would have no port to report, and every
+     * fixture that waits on readiness would time out instead of learning why.
+     * Binding it and closing each connection says the same thing to a client (it
+     * gets nothing) and says it to an operator as a named line in the log.
+     */
+    if (s->tls_require != 0) {
+        close(fd);
+        s->n_tls_client_refused++;
+        printf("[observable] client_refused: fd=%d reason=TLS_REQUIRED "
+               "hint=use_the_tls_port_or_STARTTLS\n", fd);
+        return 1;
+    }
     if (set_nonblocking(fd) != 0) {
         close(fd);
         return -1;
@@ -1861,6 +2129,7 @@ int server_dial_progress(server_t *s, const struct pollfd *pfds, size_t nfds)
                strlen(s->dials[i].peer_name) + 1u);
         s->dials[i].state = DIAL_CONNECTED;
         s->n_dial_connected++;
+
     }
     return 0;
 }
