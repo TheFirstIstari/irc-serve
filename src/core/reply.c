@@ -263,14 +263,36 @@ static const char *reply_target(const conn_t *src)
  * reply
  * ------------------------------------------------------------------------ */
 
-int reply(server_t *s, conn_t *src, const char *code, const char *const *mid,
-          size_t nmid, const char *fmt, ...)
+/* The body reply() and reply_colon() share, and the reason they are two thin
+ * wrappers rather than two copies: every refusal, every bound and the whole
+ * parameter assembly live here exactly once, so "reply() refuses a bad_param and
+ * reply_colon() does not" is not a state this file can be in. `force` reaches
+ * emit_built_ex() and nothing else, which is the same one-bit difference
+ * send_line_colon() makes.
+ *
+ * IT TAKES A va_list AND NOT THE `...` ITSELF, because C has no way to forward
+ * one variadic function's arguments to another. Each wrapper owns its va_start
+ * and va_end, which is also what lets both keep reply()'s printf format
+ * attribute: the attribute checks a caller's arguments against the literal at
+ * the CALL SITE of reply(), and this function never sees that call site. */
+#if defined(__GNUC__)
+/* The `0` is what says the arguments arrive through `ap` rather than through a
+ * `...`, which is the only form of the attribute that fits a va_list parameter.
+ * It is also what keeps -Wformat-nonliteral quiet about the vsnprintf() below:
+ * this function is itself format-attributed, so a non-literal `fmt` here is the
+ * documented shape rather than a defect. Both compilers honour it, and reply()
+ * and reply_colon() keep the CHECKED form because a caller of those is handing
+ * over real arguments -- see reply.h. */
+__attribute__((format(printf, 7, 0)))
+#endif
+static int reply_va(server_t *s, conn_t *src, const char *code,
+                    const char *const *mid, size_t nmid, int force,
+                    const char *fmt, va_list ap)
 {
     const char *params[IRC_MAX_PARAMS];
     char text[REPLY_TEXT_MAX];
     size_t n = 0;
     int want;
-    va_list ap;
     int written;
 
     /* A NULL src is NOT handled here: it reaches emit_to_client(), which
@@ -285,12 +307,10 @@ int reply(server_t *s, conn_t *src, const char *code, const char *const *mid,
         return refuse(s, src, code, "too_many_params");
     }
 
-    va_start(ap, fmt);
     written = vsnprintf(text, sizeof text, fmt, ap);
-    va_end(ap);
     /* vsnprintf returns what it WOULD have written, so a non-negative result
      * at or above the buffer size means it was cut. 3.2 forbids delivering a
-     * silently truncated parameter, so this is refused rather than sent. */
+     * silently shortened parameter, so this is refused rather than sent. */
     if (written < 0 || (size_t)written >= sizeof text) {
         return refuse(s, src, code, "text_too_long");
     }
@@ -305,7 +325,31 @@ int reply(server_t *s, conn_t *src, const char *code, const char *const *mid,
     }
     params[n++] = text;
 
-    return emit_built(s, src, code, NULL, params, want);
+    return emit_built_ex(s, src, code, NULL, params, want, force, NULL);
+}
+
+int reply(server_t *s, conn_t *src, const char *code, const char *const *mid,
+          size_t nmid, const char *fmt, ...)
+{
+    va_list ap;
+    int rc;
+
+    va_start(ap, fmt);
+    rc = reply_va(s, src, code, mid, nmid, 0, fmt, ap);
+    va_end(ap);
+    return rc;
+}
+
+int reply_colon(server_t *s, conn_t *src, const char *code,
+                const char *const *mid, size_t nmid, const char *fmt, ...)
+{
+    va_list ap;
+    int rc;
+
+    va_start(ap, fmt);
+    rc = reply_va(s, src, code, mid, nmid, 1, fmt, ap);
+    va_end(ap);
+    return rc;
 }
 
 int send_line(server_t *s, conn_t *dst, const char *prefix,

@@ -318,7 +318,7 @@ int main(void)
      * node that folded here would list `bob` for a client that registered as
      * `Bob`, with no way for the client to tell the two apart. The query is a
      * third spelling on purpose: the resolution folds and the answer does not. */
-    send_expect(&alice, "ISON BoB", ":irc.test 303 alice Bob :are online\r\n");
+    send_expect(&alice, "ISON BoB", ":irc.test 303 alice :Bob\r\n");
 
     /* "Bob" joins a channel alice created, so the roster holds both a capitalised
      * and a lowercase name and a node that rendered the folded form would be
@@ -486,7 +486,7 @@ int main(void)
      * `ISON BOB` resolves every holder of that name and renders each one in its
      * own case, so on a node that let both through this answers with two names
      * and the needle -- which reaches the closing CRLF -- does not match. */
-    send_expect(&alice, "ISON BOB", ":irc.test 303 alice bob :are online\r\n");
+    send_expect(&alice, "ISON BOB", ":irc.test 303 alice :bob\r\n");
 
     /* The refused client is not wedged: a 433 must leave it able to register. */
     TF_CHECK_MSG(tc_send(&dave.c, "NICK dave") == 0, "tc_send failed");
@@ -551,7 +551,7 @@ int main(void)
      * rename to `BOB` would satisfy the silence above and fail both of these. */
     send_expect(&alice, "WHOIS bob",
                 ":irc.test 311 alice bob bob 127.0.0.1 * :Real bob\r\n");
-    send_expect(&alice, "ISON BOB", ":irc.test 303 alice bob :are online\r\n");
+    send_expect(&alice, "ISON BOB", ":irc.test 303 alice :bob\r\n");
 
     /* =======================================================================
      * 6. A HELD NAME IS RELEASED AND THE UPPERCASE SPELLING TAKES IT -- AND
@@ -595,7 +595,7 @@ int main(void)
      * display value and the username is untouched by any of this. */
     send_expect(&alice, "WHOIS bob",
                 ":irc.test 311 alice BOB carol 127.0.0.1 * :Real carol\r\n");
-    send_expect(&alice, "ISON bob", ":irc.test 303 alice BOB :are online\r\n");
+    send_expect(&alice, "ISON bob", ":irc.test 303 alice :BOB\r\n");
 
     /* And bob cannot have his own spelling back, even though nobody holds it
      * byte-for-byte. This is the reverse half of section 4: between them the two
