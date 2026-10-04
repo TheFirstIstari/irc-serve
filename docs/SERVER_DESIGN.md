@@ -2671,6 +2671,77 @@ walks in three handlers unless the routing module expresses it once. §3.1.1 is 
 expression: a per-destination **GATE** beside the existing per-destination shape
 choice, both asked inside the one walk `fanout.c` already owns.
 
+**Phase 12 — TLS (OpenSSL, optional). COMPLETE.** `-DWITH_TLS=ON`, default OFF, so
+the zero-dependency build stays the one this project has always shipped and the one
+every CI runner compiles. `src/tls_openssl.c` is compiled **whole** in a TLS build
+and compiled out entirely otherwise; `src/tls_none.c` is the other half. The seam is
+`tls_backend.h`, and it exists to keep "does the plaintext build still compile" a
+question about ONE file.
+
+**What is enforced on an outbound peer link.** The chain must verify against the
+operator's `--tls-ca` — no system roots, no fallback, and no `--tls-ca` on a
+`--peer-tls` link is a refusal rather than a silent downgrade. The certificate's
+**name** must match the link's server name, and an IP literal is matched against
+`iPAddress` SANs instead of `dNSName`s. A name that can be configured as neither is a
+**refusal**: the link never starts a handshake rather than starting one with an empty
+verify parameter. That last sentence is a fix, not a design choice — a first-character
+discriminator between "address" and "hostname" sent every digit-leading peer name down
+the address path, where it was rejected, leaving **no name check configured at all**,
+and verification then passed on the chain alone. Since the federation secret is
+mesh-wide, that degraded every digit-named peer to "chains to our mesh CA", so any node
+holding any CA-issued certificate could impersonate any digit-named peer.
+
+**§9's known gaps, named here because the audit requires them visible, not fixed:**
+
+- **REVOCATION IS NOT IMPLEMENTED. `revocation=none`.** No CRL and no OCSP are
+  consulted, so a revoked certificate that chains to the configured CA is **accepted
+  until it expires**. This is the largest gap in the boundary and it is stated three
+  ways so it cannot be missed: this paragraph, `tls_openssl.c`'s "WHAT IS NOT
+  ENFORCED" list, and the `revocation=none` field on the `tls_init` startup line, so
+  one line of node output shows the whole policy. Deferring it is the right call for
+  this phase — a CRL distribution point is an operational dependency this project does
+  not have — but **deferring is not the same as not saying so**.
+- **`sts` HAS NO SNI / HOSTNAME GATING.** The persistence policy is advertised on
+  every connection to the plaintext port regardless of which hostname the client
+  arrived with, because **this node does not know a hostname for itself**: there is no
+  option that names it. The specification says a persistence policy SHOULD NOT be
+  advertised when no hostname is known, and the consequence is visible rather than
+  theoretical — a client that reached this node by an unintended name of a wildcard
+  certificate pins that unintended name. Known gap; not fixed.
+- **`--peer-tls` PROTECTS ONLY THE DIRECTION THIS NODE DIALS.** Verified: with
+  `--peer-tls irc.c`, a peer dialling the **plaintext** port still establishes a
+  cleartext link. The flag is sticky — a link configured for TLS re-dials with TLS or
+  does not come back, and there is no code path that clears it — but stickiness is
+  about *not changing mode*, not about *both directions being encrypted*. The
+  accepting direction is closed by `--tls-require`, which refuses every plaintext
+  connection at accept. It is not closed by sniffing the plain port for a
+  `ClientHello`: a port that must serve plaintext clients and auto-detect TLS has no
+  correct discriminator, because any client that sends something other than a
+  `ClientHello` first defeats one, and a detector that guesses is a downgrade waiting
+  to be asked for.
+- **NO CLIENT-CERTIFICATE AUTHENTICATION.** A client on the implicit-TLS port is not
+  asked for a certificate at all. SASL PLAIN over TLS is what a client has here.
+- **NO CIPHER OR PROTOCOL PINNING, NO RESUMPTION CONTROL, NO 0-RTT** beyond OpenSSL's
+  compiled-in defaults.
+
+**Memory: the read buffer is 8 KB, and on a TLS build that is no longer the whole
+story.** `CONN_RBUF_MAX` is `IRC_MAX_LINE` (8192) and a plaintext connection's total
+receive memory is bounded by it. A TLS connection's is **not**: OpenSSL holds a
+per-connection receive buffer that can hold **up to one TLS record — about 18 KB at
+TLS 1.3's maximum plaintext record size — IN ADDITION TO** `conn_t`'s buffer. So the
+worst case per TLS connection is roughly 26 KB of receive memory rather than 8 KB.
+This is inherent to the library's interface rather than a defect here, and it is
+**bounded**: one record, not a stream. It is documented rather than fixed, because
+"fixing" it would mean either handing OpenSSL a smaller read than it asked for (which
+costs a syscall per record) or not using its buffered interface at all.
+
+**`sts` is advertised only where it can be honoured.** `port` is REQUIRED on an
+insecure connection and "if any required part is missing, clients MUST continue as if
+no STS policy was advertised", so a node with a certificate and no `--tls-port`
+withholds the `sts` **name** rather than rendering a duration with no port. Plain
+`tls` is still advertised, because it is true. `duration=0` **with** a port is
+correct and is the specification's recommended shipped default.
+
 **There is no official IRCv3 conformance suite.** `ircv3/ircv3-test-suite` and
 `ircv3/chathistory-test-suite` do not exist. Compliance here is hand-written tests
 against spec text, which is a weaker guarantee than a green third-party runner and

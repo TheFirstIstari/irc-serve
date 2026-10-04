@@ -651,10 +651,17 @@ int tls_backend_node_init(tls_node_t **out, const char *cert, const char *key,
     }
 
     *out = node;
-    printf("[observable] tls_init: state=READY ca=%s insecure=%d verify=%s\n",
+    /* ONE LINE, THE WHOLE POLICY. `verify=` is the peer-certificate policy this
+     * node will apply, `ca=` is whether a trust anchor was configured, and
+     * `revocation=none` is the largest gap in it -- no CRL and no OCSP are
+     * consulted, so a revoked certificate is accepted until it EXPIRES. It is on
+     * this line rather than only in a comment because an operator who greps the
+     * startup output should not have to read the source to learn that. */
+    printf("[observable] tls_init: state=READY ca=%s insecure=%d verify=%s "
+           "revocation=none\n",
            node->have_ca ? "configured" : "none", node->insecure,
            (node->have_ca && node->insecure == 0) ? "PEER_CHAIN_AND_NAME"
-                                                   : "NONE_WITHOUT_CA");
+                                                  : "NONE_WITHOUT_CA");
     return 0;
 }
 

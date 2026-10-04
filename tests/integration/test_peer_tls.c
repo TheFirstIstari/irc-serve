@@ -354,6 +354,20 @@ int main(void)
               "chain verification alone accepts a certificate for a different host "
               "signed by the same authority, so both are stated",
               nb.out);
+        /* REVOCATION, ASSERTED RATHER THAN ONLY DOCUMENTED. `revocation=none` is on
+         * the same startup line as `verify=`, so an operator who greps one line of
+         * node output gets the whole policy -- including the part this project does
+         * NOT implement. It is the only reason to put it there: the comment at
+         * tls_openssl.c documents the same fact and cannot be seen from a terminal.
+         * Nothing about any handshake depends on this field, which is exactly why it
+         * needs an assertion: a change that dropped it would leave every other
+         * assertion in this file green and silently remove the one line an operator
+         * reads. */
+        check(nf_expect(&nb, "revocation=none", 5000) == 0,
+              "and the same line carries revocation=none, so the LARGEST gap in peer "
+              "authentication -- no CRL, no OCSP, a revoked certificate is accepted "
+              "until it EXPIRES -- is visible at runtime and not only in the source",
+              nb.out);
 
         /* A. Note the order: --peer, THEN --peer-tls. The dial hint is irc.b's
          * IMPLICIT-TLS port, so an inbound peer link from irc.b arrives where every
