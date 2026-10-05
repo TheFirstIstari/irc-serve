@@ -10,7 +10,7 @@ BUILD_DIR := build-testing
 BENCH_BUILD_DIR := build-benchmark
 CTEST_TIMEOUT := 60
 
-.PHONY: all build test benchmark local-ci clean help docs-check
+.PHONY: all build test benchmark local-ci gate clean help docs-check
 .DEFAULT_GOAL := help
 
 help:
@@ -19,6 +19,9 @@ help:
 	@echo "  test         Run unit tests via ctest, then the skip ratchet"
 	@echo "  benchmark    Configure + build + run benchmarks"
 	@echo "  local-ci     Run ./local-ci.sh (mirrors .github/workflows/ci.yml)"
+	@echo "  gate         Run ./scripts/gate.sh — 3 compilers x Release/Debug x"
+	@echo "               WITH_TLS ON/OFF, plus an ASan+UBSan cell. SLOW: 13"
+	@echo "               fresh builds. Pass extra args, e.g. 'make gate GATE_ARGS=-j2'"
 	@echo "  clean        Remove build directories"
 
 # `build` mirrors `local-ci.sh` lines 1-2 and CI job `ci_test`.
@@ -57,8 +60,29 @@ local-ci:
 	fi
 	./local-ci.sh
 
+# `gate` runs the project's own definition of green: 3 compilers x Release/Debug
+# x WITH_TLS ON/OFF (12 cells), plus an ASan+UBSan cell at WITH_TLS=ON. Every
+# cell is configured into a FRESH directory and every cell runs ctest, because a
+# reused build directory reports success for a file it did not recompile.
+#
+# It is NOT `local-ci` and does not overlap it: local-ci mirrors ci_test, ONE
+# compiler and ONE configuration. The gate is the breadth ci_test deliberately
+# does not have. It lives in scripts/gate.sh rather than here because it needs
+# per-cell log handling, a compiler probe and a skip ratchet per cell, and a make
+# recipe is the wrong place for that.
+#
+# GATE_ARGS is forwarded verbatim, so `make gate GATE_ARGS=-j2` and
+# `make gate GATE_ARGS="--no-asan"` both work.
+GATE_ARGS ?=
+gate:
+	@if [ ! -x ./scripts/gate.sh ]; then \
+		echo "[Makefile] scripts/gate.sh missing or not executable"; \
+		exit 1; \
+	fi
+	./scripts/gate.sh $(GATE_ARGS)
+
 clean:
-	rm -rf $(BUILD_DIR) $(BENCH_BUILD_DIR)
+	rm -rf $(BUILD_DIR) $(BENCH_BUILD_DIR) build-gate
 
 docs-check:
 	@test -f docs/SPEC_TRACKING.md || (echo "docs/SPEC_TRACKING.md missing"; exit 1)
