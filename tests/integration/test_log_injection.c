@@ -462,6 +462,30 @@ static void case_no_client_byte_reaches_the_log(void)
                  "withheld value diagnosable rather than mysterious.\n  log: %s",
                  node.out);
 
+    /* AND THE PER-LINE CONFINEMENT IS LOAD-BEARING, asserted rather than assumed.
+     *
+     * The two cases above produce DIFFERENT lines -- one carrying the verbatim word,
+     * one carrying `-` with a length and a bad-byte count -- and confining the search
+     * to the line that carries the prefix is the only thing keeping each assertion
+     * pointed at its own. Without it, a tail can be satisfied by another line's
+     * fields, and that failure is invisible: the assertion still passes, for the
+     * wrong line.
+     *
+     * So this is the negative of it, and it exists because the confinement was
+     * removed under fault injection and NOTHING WENT RED. That is the useful shape of
+     * this bug: a helper that quietly stopped doing what its name says, caught by no
+     * assertion, in a suite where a strip that stopped stripping also went unnoticed
+     * once. Here is the assertion that would have caught it. */
+    TF_CHECK_MSG(log_line_has_tail(node.out, "cmd_unimplemented: fd=",
+                                  "command=- command_len=9 "
+                                  "command_bad_bytes=2") == 0,
+                 "the WITHHELD case's fields were found on the VERBATIM case's line, "
+                 "which means the helper is no longer confining its search to the line "
+                 "that carries the prefix. Both lines exist in this log and carry "
+                 "different values, so a helper ranging over the whole buffer would "
+                 "satisfy either assertion from either line -- and every check here "
+                 "would go on passing for the wrong reason.\n  log: %s", node.out);
+
     /* AND THE WITHHELD-BECAUSE-TOO-LONG CASE, the other `-`. Same verb, same
      * absence of a control byte, and a different reason -- so the two `-`s are only
      * distinguishable by the length beside them, which is the whole reason every
