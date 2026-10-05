@@ -119,6 +119,105 @@ int main(void)
         assert(valid_nick(nul_mid) == 1);
     }
 
+    /* --- UTF-8 that is WELL FORMED: kept ---
+     *
+     * This block exists because the obvious way to refuse a raw 0x80-0x9F byte is to
+     * refuse the RANGE, and `ā` is `0xC4 0x81`: its second byte is inside that very
+     * range. A byte-range refusal eats every accented Latin character, Cyrillic and
+     * Greek character on the network, so `ā` is asserted here BY NAME and in
+     * isolation. It is the single input a "simplified" refusal gets wrong, and the
+     * fault evidence for that lives in tests/integration/test_nick_utf8.c, where the
+     * same nicks go out on the wire to a second client. */
+    static const char *const utf8_ok[] = {
+        "\xc4\x81",              /* a-macron: the 2-byte case, lead 0xC4 + 0x81 */
+        "\xc3\xa9",              /* e-acute: the same in 3 bytes as C3 A9 */
+        "caf\xc3\xa9",           /* and inside an ASCII nick, as clients write it */
+        "\xe6\x97\xa5\xe6\x9c\xac", /* nihon: two 3-byte sequences back to back */
+        "a\xe4\xb8\xad" "b",     /* a 3-byte sequence with ASCII on BOTH sides */
+        "\xd0\x96",              /* Cyrillic zhe: lead 0xD0, a second 2-byte range */
+        "\xd1\x80",              /* Cyrillic be, one step further up */
+        "\xf0\x9f\x98\x80",      /* U+1F600: the 4-byte case, lead 0xF0 */
+        "\xc4\x81" "1",             /* a multibyte nick may still end in a digit */
+    };
+    for (size_t i = 0; i < sizeof utf8_ok / sizeof utf8_ok[0]; i++) {
+        assert_valid(utf8_ok[i]);
+    }
+    /* The one that matters most, asserted on its own so a narrowing fault cannot be
+     * masked by a longer case that happens to pass. */
+    assert_valid("\xc4\x81");
+
+    /* --- UTF-8 that is NOT well formed: refused ---
+     *
+     * A nickname is STORED and re-rendered into every prefix this node emits, so
+     * bytes that do not decode are refused at the door rather than copied around the
+     * mesh forever with no way to tell what they were meant to be. Four shapes, each
+     * built explicitly so the source is unambiguous:
+     *
+     *   1. A RAW C1 byte, 0x80-0x9F, with nothing expecting a continuation.
+     *   2. An ENCODED C1, 0xC2 followed by 0x80-0x9F. This is U+0080-U+009F written
+     *      the way a modern client writes it, and U+009B is CSI in Unicode -- a
+     *      nickname carrying it is carrying an escape sequence whatever the encoding.
+     *      It is the shape a raw-range refusal does NOT catch, which is why it is
+     *      here as its own case.
+     *   3. A TRUNCATED or INTERRUPTED sequence: a lead byte that never gets its
+     *      continuations, or gets ASCII where one was required.
+     *   4. A byte that can never appear in UTF-8 at all: 0xC0/0xC1 (which could only
+     *      ever encode an overlong NUL) and 0xF5-0xFF. */
+    {
+        char buf[8];
+        size_t kept = 0;
+
+        for (unsigned b = 0x80u; b <= 0x9fu; b++) {
+            /* shape 1: bare, on its own and inside a nick */
+            buf[0] = (char)b;
+            buf[1] = '\0';
+            assert_invalid(buf);
+            buf[0] = 'a';
+            buf[1] = (char)b;
+            buf[2] = 'b';
+            buf[3] = '\0';
+            assert_invalid(buf);
+            /* shape 2: the same code point, properly encoded */
+            buf[0] = 'a';
+            buf[1] = '\xc2';
+            buf[2] = (char)b;
+            buf[3] = 'b';
+            buf[4] = '\0';
+            assert_invalid(buf);
+            kept += 3u;
+        }
+        /* The loop really did run over all 32 code points, so the pair of blocks
+         * above is testing the range rather than passing on one input. */
+        assert(kept == 96u);
+    }
+    {
+        /* shape 3 */
+        static const char *const truncated[] = {
+            "a\xc3",        /* lead, then the string ends */
+            "a\xe6\x97",    /* 3-byte lead with one continuation */
+            "a\xf0\x9f\x98", /* 4-byte lead with two */
+            "a\xc3" "b",       /* lead where ASCII arrived instead */
+            "a\xe6\x97" "b",   /* same, three bytes in */
+            "\xc3",         /* and a lead byte as the entire nickname */
+        };
+        for (size_t i = 0; i < sizeof truncated / sizeof truncated[0]; i++) {
+            assert_invalid(truncated[i]);
+        }
+    }
+    {
+        /* shape 4 */
+        static const char *const impossible[] = {
+            "a\xc0\xaf",    /* overlong solidus, the classic path-traversal shape */
+            "a\xc1\xbf",    /* the other of the two overlong-NUL leads */
+            "a\xf5\x80\x80\x80",
+            "a\xfe",
+            "a\xff",
+        };
+        for (size_t i = 0; i < sizeof impossible / sizeof impossible[0]; i++) {
+            assert_invalid(impossible[i]);
+        }
+    }
+
     /* --- empty, NULL, and length --- */
     assert_invalid("");
     assert_invalid(NULL);
