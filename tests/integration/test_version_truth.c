@@ -64,6 +64,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+/* waitpid()/WNOHANG. macOS pulls this in transitively through another header, so
+ * its absence is invisible to a macOS-only build and only a Linux GCC build
+ * reports it -- the same platform blindness as the glibc __wur class, in the
+ * shape of a missing declaration rather than an unchecked return value. */
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "core/server.h"
