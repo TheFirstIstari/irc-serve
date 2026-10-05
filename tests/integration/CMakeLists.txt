@@ -727,3 +727,12 @@ irc_add_integration_test(test_control_bytes test_control_bytes.c)
 # surviving bytes was exactly this one, so committing it is what stops the finding
 # from having to be rediscovered.
 irc_add_integration_test(test_log_injection test_log_injection.c)
+
+# The relay SHAPE behind four #121 bugs: an emission carrying `m->params` instead of
+# the value the node stored. A source test, because the defect leaves every runtime
+# invariant intact -- a field and its announcement can be two different values and
+# nothing on the wire says so -- which is the same situation test_close_sites.c
+# checks by looking rather than by running. It counts what it expects to FIND as
+# well as what it expects not to, so deleting the emissions turns it red instead of
+# vacuous.
+irc_add_integration_test(test_relay_shape test_relay_shape.c)
