@@ -50,6 +50,42 @@ jobs:
   # A real 4-way matrix, executed CONCURRENTLY because the machine runs six
   # runner instances. A runner process handles one job at a time, so the
   # instance count is what sets the parallelism.
+  #
+  # THIS JOB IS NOT DEAD, and that was worth checking rather than assuming. The
+  # GitHub API reports all four combinations as `success` on each of the last
+  # four merges to main (30c2aac, 118c617, 358db40, ab84b80), and each one ran
+  # the gcc and clang Release/Debug cells to completion. What looks like a dead
+  # job on a pull request is the `if:` below: `github.event_name == 'push'` is
+  # false for a pull_request, so the job is skipped by design, and a
+  # job-level `if` that evaluates false ALSO SUPPRESSES MATRIX EXPANSION --
+  # which is why the skipped run shows ONE job with the literal text
+  #   ci_linux ${{ matrix.compiler }} ${{ matrix.build_type }}
+  # rather than four named ones. That artifact is cosmetic in the UI and is a
+  # reliable signal of the cause; it is not a runner-matching failure. The
+  # distinction matters, because the two have opposite fixes: "no runner
+  # matched" means register a runner, and "skipped by if" means change nothing
+  # about the runner at all.
+  #
+  # SO IT STAYS SELF-HOSTED. Moving it to ubuntu-22.04 would be a one-line
+  # change that would also quietly delete the only reason this job exists:
+  # cachyos is a rolling distribution carrying a newer glibc than the pinned
+  # ubuntu-22.04 image, and a newer glibc declares more
+  # __attribute__((warn_unused_result)) and fortify paths than the older one.
+  # That is precisely the class that reached main history as a red PR --
+  # `(void)read(...)`, which glibc marks __wur and the macOS SDK does not
+  # declare at all. (The exact glibc release on the runner is not asserted
+  # here; it was not read from the machine. The claim that ubuntu-22.04's glibc
+  # already catches THAT one is not a claim about versions: it is read off the
+  # ci_test log at run 37242557613, which is ubuntu-22.04's own GCC reporting
+  # the diagnostic. The argument for keeping cachyos is about the NEXT one, in a
+  # function nobody thought to check.) Stating that plainly: the distro breadth
+  # IS preserved by keeping it, and WOULD NOT BE by moving it, and anyone
+  # reading a future commit that moves this to a hosted runner should treat that
+  # as a coverage regression rather than a cleanup.
+  #
+  # The availability cost is real and is paid on purpose: if the machine is off,
+  # a push to main waits. It does NOT affect pull requests, because the `if:`
+  # excludes them, so the PR-time gate -- ci_test, hosted -- is unaffected.
   ci_linux_cachyos:
     name: ci_linux ${{ matrix.compiler }} ${{ matrix.build_type }}
     runs-on: [self-hosted, Linux, X64, cachyos-x8664]
@@ -57,7 +93,20 @@ jobs:
     environment:
       name: ${{ github.actor == 'TheFirstIstari' && 'self-hosted-auto' || 'self-hosted' }}
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    continue-on-error: true
+    # continue-on-error IS GONE, deliberately, and the argument is short.
+    #
+    # This job CANNOT gate a merge: it is push-to-main only, so by the time it
+    # runs the merge has already happened. There is therefore no merge to
+    # protect by tolerating its failures, and continue-on-error bought nothing
+    # -- while costing the one thing a post-merge job exists to provide, which
+    # is a truthful result. Under it, a Linux-only build break found only on
+    # cachyos was reported as a GREEN TICK on main. A red push to main is
+    # information and blocks nothing; a fake green is worse than either.
+    #
+    # It is also now the only job whose result can distinguish "cachyos is
+    # healthy" from "cachyos never ran", since the job that used to be the
+    # merge gate for Linux is post-merge by construction.
+    #
     # Six runner instances are registered (cachyos-x8664-1..6), so this matrix
     # runs CONCURRENTLY rather than queueing behind a single runner.
     # Measured: `gcc Release` and `clang Debug` completed in 19s each, at the
@@ -81,6 +130,16 @@ jobs:
       - name: Build and test
         run: |
           set -euo pipefail
+          # WHAT GATES A PULL REQUEST, stated here so the two are not confused:
+          # ci_test, on ubuntu-22.04, with GCC against glibc, is the pre-merge
+          # Linux gate and is a required check. It is what reported the
+          # `(void)read(...)` __wur defect at run 37242557613, before the branch
+          # was merged. THIS job cannot gate a pull request -- the `if:` above
+          # excludes pull_request events -- so what it adds is a second Linux
+          # distribution on a newer glibc, confirming after the fact what ci_test
+          # could not reach. It is not a replacement for ci_test, and it is not
+          # the only Linux evidence; it is the only Linux evidence from a
+          # distro other than Ubuntu's.
           cmake -B build -S . -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=${{ matrix.compiler }}
           # NOT $(nproc). Four matrix jobs land on this box at once, so asking each
