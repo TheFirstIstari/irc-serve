@@ -125,6 +125,10 @@ struct ps_shape {
      * discovered. See `ps_expect_withheld()`. */
     const char *field;
     const char *measure;
+    /* Set when the node must REPORT a refusal of the marker, which is the only
+     * way a shape whose marker is stripped before the product logic sees it can
+     * still assert anything about that logic. See `ps_expect_verdict()`. */
+    int report_refusal;
 };
 
 static const struct ps_shape k_shapes[] = {
@@ -146,7 +150,7 @@ static const struct ps_shape k_shapes[] = {
      * would make these rows tests of the ownership rules, which are covered where
      * they belong, and would fail on correct behaviour. */
     { ":" PEER " SPRIVMSG \x02 :marker \x01 text",
-      "fed_message: channel=", NULL, NULL },
+      "fed_message: channel=", NULL, NULL, 0 },
     /* THE CHANNEL NAME, from a peer. The channel does not exist -- the name carries
      * the marker, so it could not be the one that was created -- so this is a
      * refusal, and the refusal is what is swept: `fed_malformed:` prints the target
@@ -157,7 +161,7 @@ static const struct ps_shape k_shapes[] = {
      * the target itself and the line proves it: `target=-` with a `reason=` beside
      * it. That is the shape `ps_expect_withheld()` was written for. */
     { ":" PEER " SPRIVMSG #P\x01 :in the channel name",
-      "fed_malformed:", "target=-", "reason=" },
+      "fed_malformed:", "target=-", "reason=", 0 },
     /* A MODE STRING.
      *
      * THE STATE VERBS NAME THE CHANNEL IN THE SECOND PARAMETER and the first is the
@@ -172,7 +176,7 @@ static const struct ps_shape k_shapes[] = {
      * is NOT a trailing one -- `SMODES o #c :+m nick` has three, because the `:`
      * makes everything after it one. */
     { ":" PEER " SMODES " NAME_A " \x02 +\x01 " NICK_C, "fed_modes:",
-      "modes=-", "modes_bad_bytes=" },
+      "modes=-", "modes_bad_bytes=", 1 },
     /* Origin first, channel second, for the reason the SMODES row gives. */
     /* `fed_topic_ignored:` and NOT `fed_topic:`, because the channel this probe
      * uses was created by a CLIENT on this node and its origin is therefore this
@@ -180,14 +184,14 @@ static const struct ps_shape k_shapes[] = {
      * still meaningful: the node took the topic, refused it for a REASON that is
      * about ownership rather than about the bytes, and printed the channel. */
     { ":" PEER " STOPIC " NAME_A " \x02 :topic with \x01 in it",
-      "fed_topic", NULL, NULL },
+      "fed_topic", NULL, NULL, 0 },
     { ":" PEER " SKICK " NAME_A " \x02 " NICK_C " :reason \x01 here",
-      "fed_skick", NULL, NULL },
+      "fed_skick", NULL, NULL, 0 },
     /* THE SERVER NAME IN A PREFIX, which is a peer-chosen string this node cannot
      * validate beyond its own name table: `irc.b` is the configured name and
      * `irc.<marker>` is not, so the line is refused as an untagged relay and the
      * refusal is printed. */
-    { ":irc.\x01 SPRIVMSG \x02 :from a prefix", "fed_untagged:", NULL, NULL },
+    { ":irc.\x01 SPRIVMSG \x02 :from a prefix", "fed_untagged:", NULL, NULL, 0 },
     /* An ADVERTISE whose NAME is the marker: the store holds it and
      * `fed_advertise:` prints it. */
     /* An ADVERTISE whose NAME is the marker. The store HOLDS the name and the
@@ -203,10 +207,10 @@ static const struct ps_shape k_shapes[] = {
      * The row had been written from the shape one would guess rather than the shape
      * the code reads, which is the same mistake as the parameter index. */
     { ":" PEER " ADVERTISE 10 irc.\x01 127.0.0.1 1234",
-      "fed_advertise_refused:", "name=-", "peer=" },
+      "fed_advertise_refused:", "name=-", "peer=", 0 },
     /* A SHUTDOWN naming a peer that is not this one, so the node reports it and
      * refuses rather than leaving -- which keeps the link for the probes after it. */
-    { ":" PEER " SHUTDOWN irc.\x01 :going away", "fed_shutdown", NULL, NULL },
+    { ":" PEER " SHUTDOWN irc.\x01 :going away", "fed_shutdown", NULL, NULL, 0 },
     /* 0x00, AND IT IS HERE RATHER THAN IN THE LOOP BELOW, because it is the one
      * marker byte this framing layer cannot deliver at all: 3.2 refuses an embedded
      * NUL, so a line containing one is never a line. The client sweep has the same
@@ -218,7 +222,7 @@ static const struct ps_shape k_shapes[] = {
      * DID act, by refusing, and a probe that waited for a `fed_` line here would
      * time out on correct behaviour. */
     { ":" PEER " SPRIVMSG \x02 :marker \x01 text", "parse_reject=",
-      NULL, NULL },
+      NULL, NULL, 0 },
 };
 #define SH_COUNT ((int)(sizeof k_shapes / sizeof k_shapes[0]))
 #define SH_CHAN_FMT "#P%02u"
@@ -589,16 +593,93 @@ static void ps_assert_no_inverted_assertions(void)
     }
 }
 
-/* THE LAST LINE OF THE NODE'S OUTPUT THAT CONTAINS `needle`, or NULL.
+/* THE NODE'S OWN STDOUT IS A PIPE, AND A FULL ONE STOPS THE NODE.
+ *
+ * The harness reads that pipe only when a caller waits on it. A sweep that sends
+ * thousands of lines and waits on a PEER socket instead leaves the node blocked in
+ * write() -- which is what this pair of helpers exists to prevent, and what the
+ * first version of this file did: the node had 3009 bytes queued, was parked inside
+ * write(), and never answered the PING that the liveness probe sent it.
+ *
+ * They are duplicated from `test_terminal_sweep.c` rather than shared because they
+ * are nine lines each and the sharing would have to export the node type and the
+ * pump hook into a header that the marker instrument does not otherwise need --
+ * a header whose name says "terminal-injection scan" and which turns out to own
+ * the event loop would be worse than the duplication. */
+static void drain_node_pipe(nf_node_t *node)
+{
+    for (;;) {
+        int pending = 0;
+
+        if (nf_pending_bytes(node, &pending) != 0) {
+            return; /* the descriptor cannot be asked; the buffer is what we have */
+        }
+        if (pending == 0) {
+            return;
+        }
+        tc_pump();
+    }
+}
+
+/* ps_wait_new(): WAIT FOR A LINE IN THE OUTPUT THE NODE HAS PRODUCED SINCE `from`.
+ *
+ * `nf_expect()` searches the node's ACCUMULATED output, so after the first probe
+ * every needle in this file is already in the buffer and a wait returns instantly on
+ * an earlier probe's line. That is generator mistake 1 again, and it hid the SMODES
+ * allowlist completely: `refused=01` from marker `0x01` satisfied marker `0x02`'s
+ * wait, and with `chan_mode_implemented()` reverted the sweep was green.
+ *
+ * SO EVERY WAIT HERE IS SCOPED TO WHAT IS NEW, by remembering `node.out_len` before
+ * the probe and searching only past it. There is no per-shape way to do this that
+ * does not also have to be right about which field is unique, and the offset is
+ * unique by construction.
+ *
+ * Returns the output length just after the needle was seen, or `(size_t)-1` on the
+ * deadline. The deadline is a deadline and not a sleep: the loop waits for
+ * READABILITY on the node's own pipe, capped at the poll interval.
+ */
+static size_t ps_wait_new(nf_node_t *node, size_t from, const char *needle,
+                          int timeout_ms)
+{
+    unsigned long long deadline = pf_now_ms() + (unsigned long long)timeout_ms;
+    size_t nlen = strlen(needle);
+
+    for (;;) {
+        drain_node_pipe(node);
+        if (node->out_len > from && nlen > 0u &&
+            memmem(node->out + from, node->out_len - from, needle, nlen) != NULL) {
+            return node->out_len;
+        }
+        if (pf_now_ms() >= deadline) {
+            return (size_t)-1;
+        }
+        {
+            struct timeval tv;
+            fd_set rfds;
+
+            FD_ZERO(&rfds);
+            FD_SET(node->out_fd, &rfds);
+            tv.tv_sec = 0;
+            tv.tv_usec = (suseconds_t)(SW_POLL_MS * 1000);
+            (void)select(node->out_fd + 1, &rfds, NULL, NULL, &tv);
+        }
+    }
+}
+
+/* THE LAST LINE OF THE NODE'S OUTPUT **SINCE `from`** THAT CONTAINS `needle`, or
+ * NULL. Scoped for the same reason `ps_wait_new()` is: the finding has to belong to
+ * the probe in hand, and an earlier probe's line is the easiest wrong answer to
+ * reach for.
  *
  * The LAST rather than the first because `nf_expect()` searches the whole
  * accumulated buffer: after a few hundred probes the first matching line is from
  * the first probe, and checking a field there would prove nothing about the probe
  * in hand. */
-static const char *ps_last_line_with(const char *out, size_t len, const char *needle)
+static const char *ps_last_line_with(const char *out, size_t from, size_t len,
+                                     const char *needle)
 {
     const char *found = NULL;
-    const char *p = out;
+    const char *p = out + from;
     const char *end = out + len;
 
     while (p < end) {
@@ -637,8 +718,9 @@ static const char *ps_last_line_with(const char *out, size_t len, const char *ne
  * quietly. Those rows are covered by the CLIENT sweep for the same fields, and by
  * the byte count below -- which is the claim that keeps them from being decorative.
  */
-static void ps_expect_withheld(const nf_node_t *node, const struct ps_shape *sh,
-                               unsigned char mark, size_t idx)
+static void ps_expect_withheld(const nf_node_t *node, size_t from,
+                               const struct ps_shape *sh, unsigned char mark,
+                               size_t idx)
 {
     const char *line;
     size_t n;
@@ -646,7 +728,7 @@ static void ps_expect_withheld(const nf_node_t *node, const struct ps_shape *sh,
     if (sh->field == NULL) {
         return;
     }
-    line = ps_last_line_with(node->out, node->out_len, sh->needle);
+    line = ps_last_line_with(node->out, from, node->out_len, sh->needle);
     TF_CHECK_MSG(line != NULL, "marker 0x%02x on shape %zu: no `%s` line to "
                  "check the withheld field on", (unsigned)mark, idx, sh->needle);
     if (line == NULL) {
@@ -669,32 +751,60 @@ static void ps_expect_withheld(const nf_node_t *node, const struct ps_shape *sh,
                  (int)n, line);
 }
 
-/* THE NODE'S OWN STDOUT IS A PIPE, AND A FULL ONE STOPS THE NODE.
+/* ps_expect_verdict(): A SHAPE WHOSE MARKER IS STRIPPED BEFORE THE PRODUCT LOGIC
+ * SEES IT MUST STILL BE ABLE TO ASSERT THAT LOGIC.
  *
- * The harness reads that pipe only when a caller waits on it. A sweep that sends
- * thousands of lines and waits on a PEER socket instead leaves the node blocked in
- * write() -- which is what this pair of helpers exists to prevent, and what the
- * first version of this file did: the node had 3009 bytes queued, was parked inside
- * write(), and never answered the PING that the liveness probe sent it.
+ * THE SMODES ROW IS THE CASE, and it is the most useful thing this pass learned
+ * about its own instrument. The row's marker goes into a mode string, and
+ * `fed_relay_clean()` now removes it before the mode string is rendered -- so the
+ * byte never reaches `chan_mode_implemented()`, and the sweep's own filter has made
+ * the allowlist **unobservable**. With `chan_mode_implemented()` reverted the peer
+ * sweep stayed GREEN: the fault was real, the byte was refused for a different
+ * reason, and the sweep reported clean.
  *
- * They are duplicated from `test_terminal_sweep.c` rather than shared because they
- * are nine lines each and the sharing would have to export the node type and the
- * pump hook into a header that the marker instrument does not otherwise need --
- * a header whose name says "terminal-injection scan" and which turns out to own
- * the event loop would be worse than the duplication. */
-static void drain_node_pipe(nf_node_t *node)
+ * That is the SAME class as the withheld-field bug one level up: a filter standing
+ * between the probe and the thing under test. The fix is the same shape -- assert on
+ * the node's own REPORT rather than on the byte -- and it only works because
+ * `fed_modes:` prints the verdict: `applied=` names the letters it applied and
+ * `refused=` names the ones it declined, both by BYTE IN HEX. So this check requires
+ * `refused=` to name THIS probe's marker, which is exactly the claim "this node
+ * declined that mode letter" and is false the moment the allowlist is removed.
+ *
+ * WHY IT IS A FLAG AND NOT A PER-SHAPE STRING: the expected value contains the
+ * marker, so it is built per probe from the byte rather than written out in the
+ * table once. A table entry that said `refused=01` would be wrong for 61 of the 62
+ * markers, which is the decorative kind of entry.
+ */
+static void ps_expect_verdict(const nf_node_t *node, size_t from,
+                              const struct ps_shape *sh, unsigned char mark,
+                              size_t idx)
 {
-    for (;;) {
-        int pending = 0;
+    char want[24];
+    const char *line;
+    size_t n;
+    int w;
 
-        if (nf_pending_bytes(node, &pending) != 0) {
-            return; /* the descriptor cannot be asked; the buffer is what we have */
-        }
-        if (pending == 0) {
-            return;
-        }
-        tc_pump();
+    if (sh->report_refusal == 0) {
+        return;
     }
+    line = ps_last_line_with(node->out, from, node->out_len, sh->needle);
+    TF_CHECK_MSG(line != NULL, "marker 0x%02x on shape %zu: no `%s` line to read "
+                 "a verdict from", (unsigned)mark, idx, sh->needle);
+    if (line == NULL) {
+        return;
+    }
+    n = strcspn(line, "\n");
+    w = snprintf(want, sizeof want, "refused=%02x", (unsigned)mark);
+    TF_CHECK_MSG(w > 0 && (size_t)w < sizeof want,
+                 "the verdict needle could not be built");
+    TF_CHECK_MSG(memmem(line, n, want, strlen(want)) != NULL,
+                 "marker 0x%02x on shape %zu: the `%s` line does not carry `%s`. "
+                 "The sweep's own filter removed this marker before the mode string "
+                 "was rendered, so the byte cannot witness what the node did with "
+                 "it -- the node's REPORT is the only thing that can, and this is "
+                 "the check that keeps a real product regression from hiding behind "
+                 "a correct filter: %.*s",
+                 (unsigned)mark, idx, sh->needle, want, (int)n, line);
 }
 
 /* WAIT FOR THE NODE TO ANSWER THE CLIENT'S PING, pumping the node's stdout while
@@ -803,6 +913,7 @@ int main(void)
     int listen_fd;
     unsigned probes = 0;
     int found_surfaces = 0;
+    size_t from = 0u;
     const char *const claim[] = {
         ":" NAME_A " FEDERATE " NAME_A " ",
         " " SECRET " " IRC_SERVE_VERSION ""
@@ -928,12 +1039,22 @@ int main(void)
              * node has printed, which is what `nf_expect()` does over its buffer.
              * A probe whose needle never appears is a FAILURE, because it means the
              * node did nothing with the line and the probe proved nothing. */
-            TF_CHECK_MSG(nf_expect(&node, k_shapes[i].needle, T_IO_MS) == 0,
+            /* FROM BEFORE THE PROBE IS SENT, because everything after this point is
+             * a claim about THIS probe and nothing else. */
+            from = node.out_len;
+            TF_CHECK_MSG(send_shape(peer.fd, k_shapes[i].tmpl, (unsigned char)b,
+                                    (unsigned)probes) == 0,
+                         "the test could not send shape %d with marker 0x%02x",
+                         i, (unsigned)b);
+            TF_CHECK_MSG(ps_wait_new(&node, from, k_shapes[i].needle, T_IO_MS) !=
+                         (size_t)-1,
                          "marker 0x%02x on shape %d produced no `%s`, so this "
                          "probe tested a line the node never acted on",
                          (unsigned)b, i, k_shapes[i].needle);
-            ps_expect_withheld(&node, &k_shapes[i], (unsigned char)b,
+            ps_expect_withheld(&node, from, &k_shapes[i], (unsigned char)b,
                                (size_t)i);
+            ps_expect_verdict(&node, from, &k_shapes[i], (unsigned char)b,
+                              (size_t)i);
             probes++;
 
             /* Drain the peer's socket, non-blocking. A peer socket nobody reads
