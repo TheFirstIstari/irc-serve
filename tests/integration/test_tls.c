@@ -1229,6 +1229,34 @@ int main(void)
                 } else {
                     (void)tc_send(&c7, "NICK refused");
                     (void)tc_send(&c7, "USER refused 0 * :R");
+                    /* THE REFUSAL IS WAITED FOR HERE, BEFORE THE NEXT WRITE, and
+                     * that ordering is the point of the whole case.
+                     *
+                     * This node refuses at accept, so it closes a socket the
+                     * client has already written to -- and the original version of
+                     * this case then went straight on writing to it. Whether the
+                     * client's writes landed before or after that close(fd) is a
+                     * sub-millisecond race that loopback usually wins for the
+                     * client, which is why it stayed green locally and killed
+                     * test_tls on a loaded macOS Release runner: the write found
+                     * the socket reset, and the harness's send had no
+                     * MSG_NOSIGNAL, so EPIPE arrived as a SIGPIPE and took the
+                     * test process down with it.
+                     *
+                     * Forcing the order removes the race rather than describing
+                     * it. server.c closes the accepted fd BEFORE printing
+                     * client_refused, so returning from the wait below proves the
+                     * node has already refused and closed. Nothing here sleeps:
+                     * both waits are for an observable event -- one line of the
+                     * node's own output, and one end of the connection -- and the
+                     * checks are the same two the case already made, moved to
+                     * where they establish the ordering they are read in. */
+                    check(nf_expect(&n7, "client_refused: fd=", 5000) == 0,
+                          "the node reports client_refused with reason=TLS_REQUIRED, so "
+                          "an operator can see WHY a client was dropped",
+                          NULL);
+                    check(nf_expect(&n7, "reason=TLS_REQUIRED", 5000) == 0,
+                          "the reason names the flag, not a socket error", NULL);
                     /* A RESET IS THE EXPECTED SIGNATURE HERE, and accepting both
                      * outcomes is not a weakened assertion -- it is the correct
                      * one, and the reason is worth writing down.
@@ -1259,14 +1287,79 @@ int main(void)
                           "accept is the point, because refusing later would leave "
                           "a working unencrypted session",
                           tc_buffer(&c7));
+
+                    /* AND NOW THE WRITE THAT MUST BE REPORTED RATHER THAN FATAL.
+                     *
+                     * Everything above has established that the node refused and
+                     * that this connection ENDED -- tc_expect_eof() returned 0 or
+                     * -3, so the socket has seen the end and not merely been
+                     * promised one. A write from here is therefore a write into a
+                     * peer that is gone, which is the condition that killed this
+                     * test in CI, and the harness has to REPORT it.
+                     *
+                     * This is the assertion the fix exists to keep honest. With
+                     * MSG_NOSIGNAL on tc_send_raw()'s send(2) the write comes back
+                     * as EPIPE and tc_send() returns non-zero. Take the flag back
+                     * off and this line is never reached: the process has already
+                     * taken a SIGPIPE and died, so the suite is red by crashing
+                     * rather than by this check -- which is the same defect with
+                     * the same evidence, and it is why the ordering above is
+                     * forced instead of raced. Without the forced ordering this
+                     * check would be a coin flip that passes by accident.
+                     *
+                     * The node closes with NICK and USER still unread in its
+                     * receive queue -- the refusal happens before any conn_t
+                     * exists, so nothing is ever read -- which is what makes the
+                     * kernel answer RST rather than FIN, and an RST is what makes
+                     * the next write report EPIPE instead of being accepted. */
+                    check(tc_send(&c7, "PING :after-the-refusal") != 0,
+                          "a write into the connection the node refused is REPORTED "
+                          "as a failed write by the harness, so the test learns it "
+                          "happened instead of the process being killed by it",
+                          NULL);
+                    /* AND SIGPIPE IS STILL ARMED IN THE TEST PROCESS, which is the
+                     * other half of that sentence and the half with no wire to
+                     * assert on.
+                     *
+                     * `signal(SIGPIPE, SIG_IGN)` in a test's main() would also stop
+                     * the death, and it is the shape this fix is required NOT to
+                     * take: it is permanent and process-wide, so it disarms the
+                     * signal for every write in every test -- the harness's, a
+                     * test's own write(2), OpenSSL's -- and a test that then writes
+                     * into a socket nobody is serving carries on to its next
+                     * assertion and reports success. No assertion about any single
+                     * write can tell that apart from the real fix, because
+                     * send(2) returns the same EPIPE either way; the only thing
+                     * that differs is whether the signal is still armed. So the
+                     * test says so.
+                     *
+                     * This is an assertion about the TEST's own environment and not
+                     * a wire line, which is worth naming rather than glossing: it
+                     * cannot tell a reader anything about the node, and it is here
+                     * because the decision it protects -- suppress the signal per
+                     * send, do not disarm it per process -- is invisible from the
+                     * outside otherwise. node_fixture.c's SIG_IGN is the deliberate
+                     * counter-example and it lives in the other process: nf_child_run()
+                     * runs in the FORKED CHILD node, where the shipped binary's own
+                     * node_main.c would have disarmed it anyway, and never in a test.
+                     *
+                     * Cost: one sigaction(2) with a NULL first argument, which only
+                     * reads the current disposition and changes nothing. */
+                    {
+                        struct sigaction sa;
+
+                        memset(&sa, 0, sizeof sa);
+                        check(sigaction(SIGPIPE, NULL, &sa) == 0 &&
+                                  sa.sa_handler == SIG_DFL,
+                              "SIGPIPE is still at its default disposition in a test "
+                              "process, so a write that raises it is still fatal "
+                              "here -- which is what makes MSG_NOSIGNAL on the send "
+                              "the whole of the fix rather than a global ignore that "
+                              "would hide every other write like it",
+                              NULL);
+                    }
                     tc_close(&c7);
                 }
-                check(nf_expect(&n7, "client_refused: fd=", 5000) == 0,
-                      "the node reports client_refused with reason=TLS_REQUIRED, so "
-                      "an operator can see WHY a client was dropped",
-                      NULL);
-                check(nf_expect(&n7, "reason=TLS_REQUIRED", 5000) == 0,
-                      "the reason names the flag, not a socket error", NULL);
                 (void)nf_stop(&n7);
                 nf_free(&n7);
             } else {

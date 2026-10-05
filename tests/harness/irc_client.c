@@ -239,7 +239,34 @@ int tc_send_raw(test_client_t *c, const char *bytes, size_t n)
         return -1;
     }
     while (off < n) {
-        ssize_t w = send(c->fd, bytes + off, n - off, 0);
+        /* MSG_NOSIGNAL, and this is the harness's version of a rule the product
+         * already keeps. transport.c sends with MSG_NOSIGNAL so that an EPIPE is
+         * RETURNED and never becomes a process-killing SIGPIPE, and node_main.c
+         * additionally disarms SIGPIPE in the shipped binary; a test that does
+         * neither writes into a peer that has gone, gets SIGPIPE, and dies --
+         * taking every assertion after this line with it and reporting nothing
+         * about which write did it.
+         *
+         * That is not hypothetical here. A closed peer is an EXPECTED outcome in
+         * this suite rather than a fault: test_tls's --tls-require case has a
+         * node that refuses a connection at accept and closes a socket the client
+         * has already written to and still writes to. Whether the client's write
+         * lands before or after that close is a sub-millisecond race, which is
+         * why this killed test_tls on a macOS Release runner and on no cell
+         * anywhere else.
+         *
+         * WHY IT GOES ON THE SEND AND NOT ON THE PROCESS. `signal(SIGPIPE,
+         * SIG_IGN)` also stops the death, and it was rejected deliberately: it is
+         * permanent and process-wide, so it would disarm the signal for every
+         * write in every test -- including the ones this harness does not own,
+         * such as a test's own write(2) and OpenSSL's -- and it would convert a
+         * loud, immediate, attributable crash into a silent continuation past a
+         * broken assumption. MSG_NOSIGNAL suppresses the signal for THIS send(2)
+         * and leaves the disposition alone, so a SIGPIPE raised by anything else
+         * in a test still kills that test. Nothing is weakened: EPIPE still comes
+         * back as a failed return and tc_send_raw() still returns -1. Cost is one
+         * flag word per send. */
+        ssize_t w = send(c->fd, bytes + off, n - off, MSG_NOSIGNAL);
 
         if (w > 0) {
             off += (size_t)w;
