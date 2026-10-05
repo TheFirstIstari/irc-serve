@@ -31,27 +31,38 @@ into a temporary one that clears on the next resync.
 
 ## Status
 
-**v1.0.0 — the nine-phase plan plus an IRCv3 phase is complete. 89 tests, 0
-skipped, 0 code-scanning alerts, 0 required third-party dependencies.**
+**A working server. 92 tests, 0 skipped, 0 code-scanning alerts, 0 required
+third-party dependencies.**
+
+There is no release. `irc-serve --help` prints the version — one definition, in
+`src/core/server.h`, which CMake, the packaging and every report of it read; the
+tree's newest tag is `v0.7.0-messaging`, a **per-phase** tag rather than a release.
 
 | | |
 |---|---|
-| Tests | **89 passing, 0 skipped**, 0 failing |
+| Tests | **92 passing, 0 skipped**, 0 failing |
 | Warnings | **0**, on gcc-16, upstream Clang 23 and Apple clang 21 (`-Weverything`), Release **and** Debug |
 | Fortify cell | `-D_FORTIFY_SOURCE=2` (`IRC_FORTIFY=1 ./local-ci.sh`) — a **no-op on macOS**, see below |
 | Sanitizers | ASan + UBSan clean locally; **LeakSanitizer clean** on the Linux CI job |
 | Code scanning | **0 open alerts** (CodeQL) |
 | Language | strict C11, **no required third-party libraries**; TLS (`-DWITH_TLS=ON`) adds the optional one |
-| Size | ~36,700 lines of C |
+| Size | ~43,800 lines of C |
 
-All ten phases shipped. Every test that was ever a CTest skip is now a real test
-and `tests/known_skips.txt` is **empty** — so a green suite means the whole
+Every test that was ever a CTest skip is now a real test and
+`tests/known_skips.txt` is **empty** — so a green suite means the whole
 implemented surface is covered, which was true at no earlier version.
 
-**What 1.0 means here, precisely.** The wire contract is frozen and documented,
-the suite covers all of it, and the tree is clean under three compilers and three
-sanitizers. It does **not** mean hardened for the open internet — see the limits
-below and [SECURITY.md](SECURITY.md).
+**What this status does and does not mean, precisely.** The wire contract is
+frozen and documented, the suite covers all of it, and the tree is clean under
+three compilers and three sanitizers. It does **not** mean hardened for the open
+internet — see the limits below and [SECURITY.md](SECURITY.md).
+
+**And it used to claim `v1.0.0`, which was not true.** That claim was deliberate
+when it was written — it was a *maturity* milestone, not a release, and it was
+bounded at the time by the paragraph above — but it was still a version number a
+reader would take as a release, in a project with no 1.x history, no `v1.0.0` tag,
+and TLS landing in its final weeks. The bounded sentence was worth keeping; the
+number was not, so the number is gone and the sentence stays.
 
 ### Verified behaviour
 
@@ -152,7 +163,7 @@ off by default for three reasons that are each a real cost avoided:
 - the default build stays buildable and testable on any machine, including a CI
   runner with no OpenSSL development package;
 - "plaintext is byte-identical" stays a claim about the configuration this project
-  actually ships, so the 85-test regression suite means what it says;
+  actually ships, so the regression suite means what it says;
 - a deployment that does not want TLS does not link a TLS stack.
 
 The cost, stated plainly: **a node built with the default options cannot encrypt
