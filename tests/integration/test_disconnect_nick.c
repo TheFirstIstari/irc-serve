@@ -269,8 +269,12 @@ int main(void)
     TF_CHECK_MSG(count_352(&held, from, end) == 2,
                  "the baseline WHO listed %zu clients, expected 2",
                  count_352(&held, from, end));
+    /* The mask columns are part of the needle and not incidental: since #121 this
+     * line names a value the client chose, so it carries `mask_len` and
+     * `mask_bad_bytes` beside it, and asserting only `mask=*` would pass on a node
+     * that had started measuring a different mask. */
     TF_CHECK_MSG(nf_expect(&node, "[observable] who: nick=" NICK_HELD
-                                  " mask=* nicks=2",
+                                  " mask=* mask_len=1 mask_bad_bytes=0 nicks=2",
                            T_IO_MS) == 0,
                  "the node reported the wrong enumeration size with two "
                  "registered clients: expected nicks=2 on the mask=* line");
@@ -302,7 +306,7 @@ int main(void)
     expect_absent_in_window(&held, from, end, "the WHO after the disconnect",
                             NICK_GONE);
     TF_CHECK_MSG(nf_expect(&node, "[observable] who: nick=" NICK_HELD
-                                  " mask=* nicks=1",
+                                  " mask=* mask_len=1 mask_bad_bytes=0 nicks=1",
                            T_IO_MS) == 0,
                  "WHO reported the wrong enumeration size after the disconnect: "
                  "expected nicks=1 on the mask=* line, because the connection "
@@ -348,7 +352,7 @@ int main(void)
     expect_352_for(&held, from, end, NICK_HELD, "Held On Purpose");
     expect_352_for(&held, from, end, NICK_GONE, "Took The Name Back");
     TF_CHECK_MSG(nf_expect(&node, "[observable] who: nick=" NICK_HELD
-                                  " mask=* nicks=2",
+                                  " mask=* mask_len=1 mask_bad_bytes=0 nicks=2",
                            T_IO_MS) == 0,
                  "the enumeration did not come back to two after the departed "
                  "connection's name was claimed by somebody else");

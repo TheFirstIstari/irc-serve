@@ -475,8 +475,22 @@ void handle_who(server_t *s, conn_t *c, const message_t *m)
         return;
     }
 
-    printf("[observable] who: nick=%s mask=%s nicks=%zu\n", c->nick, mask,
-           server_nick_count(s));
+    /* MEASURED, AND THE POINT IS WHICH BRANCH THIS IS. The channel branch above is
+     * gated by `chan_name_valid()`, so a channel name never prints from a raw
+     * argument -- but a mask that is NOT a channel falls through here, and this line
+     * named whatever the client sent. A WHO mask is one of the least constrained
+     * parameters in the protocol: RFC 2812 3.3.4 lets it be a nickname, a channel, a
+     * host mask or `0`, so almost everything a client sends lands on this branch and
+     * almost nothing about it has been validated. Log-only, so measured. */
+    {
+        char shown[CONN_LOG_FIELD_MAX + 1u];
+
+        (void)conn_text_logsafe(shown, sizeof shown, mask);
+        printf("[observable] who: nick=%s mask=%s mask_len=%zu mask_bad_bytes=%zu "
+               "nicks=%zu\n",
+               c->nick, shown, strlen(mask), conn_text_bad_count(mask),
+               server_nick_count(s));
+    }
     for (size_t i = 0; i < server_nick_count(s); i++) {
         conn_t *who = server_nick_at(s, i);
 

@@ -2312,20 +2312,43 @@ static void handle_authenticate(server_t *s, conn_t *c, const message_t *m)
     s->n_sasl_ok++;
     if (account_set(s, c, authcid, passwd) != 0) {
         s->n_account_refused++;
-        printf("[observable] account: fd=%d authcid=%s outcome=REFUSED reason=%s "
-               "registry=%s\n",
-               c->fd, authcid,
-               (s->account_store == NULL) ? "NO_REGISTRY" : "NOT_IN_REGISTRY",
-               (s->account_store != NULL) ? "loaded" : "none");
+        /* The same measurement as the rejection line above, for the same reason:
+         * `account_set()` refused, which is the path where its
+         * `account_name_wire_safe()` check is what said no, so nothing upstream
+         * validated this name. The credential DID verify -- so this is an
+         * identification failure and not an authentication one -- which is exactly
+         * why the login name matters to whoever reads the log. */
+        {
+            char shown[CONN_LOG_FIELD_MAX + 1u];
+
+            (void)conn_text_logsafe(shown, sizeof shown, authcid);
+            printf("[observable] account: fd=%d authcid=%s authcid_len=%zu "
+                   "authcid_bad_bytes=%zu outcome=REFUSED reason=%s registry=%s\n",
+                   c->fd, shown, strlen(authcid), conn_text_bad_count(authcid),
+                   (s->account_store == NULL) ? "NO_REGISTRY" : "NOT_IN_REGISTRY",
+                   (s->account_store != NULL) ? "loaded" : "none");
+        }
     }
     /* TWO KEYS AND NOT ONE, and the split is deliberate: `logged_in` is the
      * BOOLEAN and `account=` on account_set()'s line is a NAME. Rendering both
      * as `account=` would put a name and a 0/1 behind one key on two different
      * lines, and a reader (or a grep, or a test) asking "what is this user's
      * account" would have to know which of the two it had found. */
-    printf("[observable] sasl: fd=%d authcid=%s outcome=COMPLETED granted=0 "
-           "logged_in=%d\n",
-           c->fd, authcid, account_logged_in(c));
+    /* Measured, and here `account_name_wire_safe()` DID run -- inside
+     * `account_set()` -- so this value is one of the few client strings on the node
+     * that is already known safe. It is measured anyway rather than trusted,
+     * because the two facts are different: the CHECK runs on the success path, and
+     * this line prints on both. One `conn_text_logsafe()` costs a pass over 63 bytes
+     * once per login, and it removes the need to know which path this was. */
+    {
+        char shown[CONN_LOG_FIELD_MAX + 1u];
+
+        (void)conn_text_logsafe(shown, sizeof shown, authcid);
+        printf("[observable] sasl: fd=%d authcid=%s authcid_len=%zu "
+               "authcid_bad_bytes=%zu outcome=COMPLETED granted=0 logged_in=%d\n",
+               c->fd, shown, strlen(authcid), conn_text_bad_count(authcid),
+               account_logged_in(c));
+    }
     /* Registration is not forced here. A client that sent NICK and USER before
      * its AUTHENTICATE has already satisfied the state machine, and if it was
      * held for CAP it is still held -- so the gate is re-evaluated rather than

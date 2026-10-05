@@ -46,6 +46,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "core/connection.h"
 #include "harness/irc_client.h"
 #include "harness/node_fixture.h"
 #include "harness/test_util.h"
@@ -149,6 +150,8 @@ static void case_no_client_byte_reaches_the_log(void)
     nf_node_t node;
     test_client_t c;
     char line[1024];
+    char long_verb[96];
+    size_t long_verb_len;
 
     TF_CHECK_MSG(nf_spawn_binary(&node) == 0, "could not spawn the node");
     tc_init(&c);
@@ -229,6 +232,13 @@ static void case_no_client_byte_reaches_the_log(void)
     poke(&c, "BATCH +" X);
     poke(&c, "BATCH -" X);
     poke(&c, "BATCH -nosuch");
+    /* AND THE REFERENCE-TAG FORM, which is a DIFFERENT SITE. `BATCH +ref` is an
+     * argument and reaches `batch_refused: reason=INVALID_REFTAG`; the `+ref` that
+     * `note_reference()` looks at is a CLIENT PREFIX INSIDE A TAG KEY, so the wire
+     * form is `@+ref` on an ordinary command line. An earlier version of this battery
+     * sent only the `BATCH` forms and so never reached `batch_ref_refused:` at all --
+     * which is how a site survived a sweep that reported itself as complete. */
+    poke(&c, "@+" X " WHOIS vic");
 
     /* The capability grammar, on all three of its log lines: an unknown
      * SUBCOMMAND, a refused REQ name and a refused DEL name. `sub` is
@@ -249,6 +259,25 @@ static void case_no_client_byte_reaches_the_log(void)
     poke(&c, "KILL " X);
     poke(&c, "NOSUCHVERB");
 
+    /* A COMMAND WORD LONGER THAN THE PRINT FIELD. `conn_text_logsafe()` withholds
+     * rather than shortens -- a log line that cut a value in half would name
+     * something the client did not send -- so this arrives as `-` with its true
+     * length beside it. `CONN_LOG_FIELD_MAX` is 64 and this word is 80, which is the
+     * only way that branch is reachable at all: every real verb in the tree is under
+     * twenty bytes, so without this the withholding-on-length behaviour would be
+     * code no test could reach and therefore code no fault could be found in. */
+    {
+        (void)snprintf(long_verb, sizeof long_verb,
+                       "NOSUCHVERB%s", "0123456789012345678901234567890123456789"
+                                      "0123456789012345678901234");
+        long_verb_len = strlen(long_verb);
+        TF_CHECK_MSG(long_verb_len > (size_t)CONN_LOG_FIELD_MAX,
+                     "the long verb is %lu bytes and the print field is %d, so this "
+                     "case cannot reach the withholding-on-length branch",
+                     (unsigned long)long_verb_len, CONN_LOG_FIELD_MAX);
+        poke(&c, long_verb);
+    }
+
     /* THE SAME VERB WITH THE BYTES IN THE WORD. `KILL ` + X has a space, so the
      * verb is the printable word `KILL` and the hostile bytes are a parameter.
      * `KILL` + X has no space, so the verb itself is unprintable -- which is the
@@ -262,6 +291,27 @@ static void case_no_client_byte_reaches_the_log(void)
      * It is in the battery as a POSITIVE CONTROL for "resolved means validated",
      * and the case below asserts what it prints. */
     poke(&c, "INVITE #T #T");
+
+    /* TWO MORE SITES THE FIRST SWEEP MISSED, both found by re-running the
+     * enumeration over the FIXED tree rather than by re-reading the original list.
+     * Both are named here so the next sweep does not have to rediscover them.
+     *
+     * WHO's MASK. `chan_name_valid()` gates the channel branch above it, so a
+     * channel mask never reaches the line -- but a mask that is NOT a channel falls
+     * through to the fall-through print, which names the client's own argument.
+     * My first battery sent `WHO <ESC>` and the log stayed clean, which I read as
+     * "validated". It was not: the validation is on the OTHER branch. A clean log
+     * from a battery is evidence about the branches the battery reached, and this
+     * one had not reached this line.
+     *
+     * THE AUTHCID. `authcid` is decoded from a base64 payload into a stack buffer
+     * and is therefore entirely client bytes -- and it is printed on the REJECTED
+     * path, which is by definition a path where `account_name_wire_safe()` never
+     * ran. The first battery sent `AUTHENTICATE <ESC>`, which reaches the mechanism
+     * line and says nothing about the authcid. */
+    poke(&c, "WHO " X);
+    poke(&c, "AUTHENTICATE PLAIN "
+             "AGFzAGwAaQBjAGwAaQBlAG4AYwB0AAAtAGIAeQBiAHUA");
 
     /* PRIVMSG to an unknown target and to a known one: `msg_refused: target=%s`
      * names `m->params[0]` on the unrenderable-source branch, which is documented
@@ -314,6 +364,25 @@ static void case_no_client_byte_reaches_the_log(void)
                  "and 2 bad bytes -- the length and the count are what make a "
                  "withheld value diagnosable rather than mysterious.\n  log: %s",
                  node.out);
+
+    /* AND THE WITHHELD-BECAUSE-TOO-LONG CASE, the other `-`. Same verb, same
+     * absence of a control byte, and a different reason -- so the two `-`s are only
+     * distinguishable by the length beside them, which is the whole reason every
+     * caller prints it. */
+    {
+        char needle[160];
+
+        (void)snprintf(needle, sizeof needle,
+                       "cmd_unknown: fd=4 command=- command_len=%zu "
+                       "command_bad_bytes=0", long_verb_len);
+        TF_CHECK_MSG(strstr(node.out, needle) != NULL,
+                     "an over-long but PRINTABLE command word was not withheld with "
+                     "its length; expected \"%s\". The zero count is what distinguishes "
+                     "this from the unprintable case above, which has the same `-` and "
+                     "a non-zero count -- so the two withholding reasons are only "
+                     "separable because the length is printed.\n  log: %s", needle,
+                     node.out);
+    }
 
     /* THE INVITE POSITIVE CONTROL, spelled out because it is the one site in the
      * battery that was ALREADY SAFE. `chan_invite_refused: ... target=%s` prints
