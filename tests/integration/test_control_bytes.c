@@ -24,10 +24,10 @@
  *   | channel TOPIC             | other members' terminals     | strip   |
  *   | realname                  | every member of every channel| refuse  |
  *
- * THIS STAGE (#121, commit 2 of 4) ADDS THE SERVERNAME CASE: the value is gone from
- * the log and what replaces it is a measurement, so the claim is an absence with a
- * number attached, plus the positive arm that says the well-formedness column is a
- * verdict rather than a constant.
+ * THIS STAGE (#121, commit 3 of 4) ADDS THE TWO AWAY CASES: what a member receives on
+ * the wire, what the operator log records, the state divergence a strip creates when
+ * NOTHING survives it, and -- the second case -- the bytes the strip must NOT eat,
+ * because a strip that mangles UTF-8 silently is worse than the injection it removes.
  *
  * A reader who wants to know whether this is one predicate with three answers, or
  * three predicates, needs only to read the one function and then this file's four
@@ -157,6 +157,22 @@ static void register_as(test_client_t *c, int port, const char *nick,
     drain(c);
 }
 
+static void join(test_client_t *c, const char *chan)
+{
+    char line[128];
+    char want[64];
+
+    (void)snprintf(line, sizeof line, "JOIN %s", chan);
+    TF_CHECK_MSG(tc_send(c, line) == 0, "JOIN %s send failed", chan);
+    (void)snprintf(want, sizeof want, " JOIN %s\r\n", chan);
+    TF_CHECK_MSG(tc_expect(c, want, T_IO_MS) == 0,
+                 "the JOIN %s echo never arrived, so the roster below is not the "
+                 "one under test", chan);
+    /* The numerics a JOIN produces (331/332/333/353/366/329) are drained here so a
+     * window opened below holds only what its own claim put there. */
+    drain(c);
+}
+
 /* ---------------------------------------------------------------------------
  * THE NEGATIVE HELPER, and why it scans rather than searching for two needles
  * ---------------------------------------------------------------------------
@@ -175,6 +191,28 @@ static void register_as(test_client_t *c, int port, const char *nick,
  * that would be asserting about text this file did not put there. `mark` is taken
  * after registration, so the window is exactly what the command under test caused.
  */
+static void assert_no_controls(test_client_t *c, size_t mark, const char *what)
+{
+    const char *win = tc_buffer(c) + mark;
+    size_t win_len = tc_received(c) - mark;
+    size_t i;
+
+    for (i = 0; i < win_len; i++) {
+        const unsigned char ch = (unsigned char)win[i];
+
+        if (ch == '\r' || ch == '\n') {
+            continue;
+        }
+        TF_CHECK_MSG(ch > 0x1fu && ch != 0x7fu,
+                     "%s: a byte from the log-injection set (0x%02x) reached the "
+                     "client's socket. This node's output is the only place a "
+                     "control byte can come from, and 0x07 rings a terminal's bell "
+                     "while ESC followed by `[` is a CSI sequence any terminal "
+                     "executes -- so this is one user rewriting another user's "
+                     "screen, or ringing it.\n  window: %s", what, ch, win);
+    }
+}
+
 /* The same scan over the child's own stdout, for the field whose only consumer was
  * the log. */
 static void assert_no_controls_in_log(const nf_node_t *node, size_t mark,
@@ -310,6 +348,138 @@ static void case_servername_is_summarised(void)
  * The 306 above is on the SENDER's socket and the announcement is on the MEMBER's,
  * so the two claims cannot be satisfied by one line.
  */
+static void case_away_stripped_for_member(void)
+{
+    nf_node_t node;
+    test_client_t setter;
+    test_client_t member;
+    char want[128];
+    size_t mark;
+
+    TF_CHECK_MSG(nf_spawn_binary(&node) == 0, "could not spawn the node");
+    tc_init(&setter);
+    register_as(&setter, node.port, "vic", "*spoofed", CAP_AWAY_NOTIFY);
+    tc_init(&member);
+    register_as(&member, node.port, "bob", "*spoofed", CAP_AWAY_NOTIFY);
+    join(&setter, CHAN);
+    join(&member, CHAN);
+
+    mark = tc_received(&member);
+    TF_CHECK_MSG(tc_send(&setter, "AWAY :" CSI) == 0, "AWAY send failed");
+
+    /* 1. The set edge, on the setter's own socket. */
+    TF_CHECK_MSG(tc_expect(&setter, " 306 ", T_IO_MS) == 0,
+                 "the setter was refused instead of stripped. An away message is "
+                 "free text real clients send, so the answer for a control byte in "
+                 "one is to remove the byte and keep the command -- a 417 here would "
+                 "break a working feature and the user would see \"message too "
+                 "long\" for a short sentence.");
+
+    /* 2. The exact line the member receives, at the start of a line rather than as
+     * the tail of a longer one. */
+    (void)snprintf(want, sizeof want,
+                   ":vic!vic@" OBSERVED_HOST " AWAY " CHAN " :" CSI_STRIPPED "\r\n");
+    TF_CHECK_MSG(tc_expect(&member, want, T_IO_MS) == 0,
+                 "the member did not receive the exact stripped line \"%s\". The "
+                 "expected line is written out in full rather than searched for as a "
+                 "substring, so a strip that removed the wrong bytes fails here "
+                 "instead of passing.\n  member saw: %s",
+                 want, tc_buffer(&member) + mark);
+
+    /* 3. The whole window. */
+    assert_no_controls(&member, mark, "the away-notify announcement");
+
+    /* 4. The log, with the count, so the mutation is a record and not a surprise. */
+    {
+        char log_want[160];
+
+        /* The counts come from strlen() of the two literals above rather than from
+         * numbers typed in, because a hand-arithmetic byte count that is wrong by
+         * one turns a real assertion into a permanently red test -- which is the
+         * same failure as an assertion that cannot fail. `removed=3` IS written
+         * out: it is the number of bytes in the payload that the set contains --
+         * two ESCs and a DEL -- and it is what says the count is a measurement
+         * rather than a constant. */
+        (void)snprintf(log_want, sizeof log_want,
+                       "away_stripped: nick=vic removed=3 in_len=%zu kept_len=%zu "
+                       "reason=CONTROL_BYTES", strlen(CSI), strlen(CSI_STRIPPED));
+        TF_CHECK_MSG(nf_expect(&node, log_want, T_IO_MS) == 0,
+                     "the operator log did not record the strip, or recorded the "
+                     "wrong counts; expected \"%s\". The payload carries two ESCs and "
+                     "a DEL, so it must be announced as 3 removed, %zu in, %zu kept -- "
+                     "silent "
+                     "mutation is its own defect, and without this line a member and "
+                     "the setter simply disagree about what was said with no record "
+                     "of why.\n  node said: %s", log_want, strlen(CSI),
+                     strlen(CSI_STRIPPED), node.out);
+    }
+
+    /* And the announcement reached EXACTLY ONE member, so the strip is not the
+     * reason a second copy could appear -- the count is here to catch a fault that
+     * delivers twice, which a substring assertion would pass. */
+    drain(&member);
+    TF_CHECK_MSG(tf_count(tc_buffer(&member) + mark, " AWAY " CHAN " ") == 1u,
+                 "the away announcement did not reach the member exactly once.\n"
+                 "  member saw: %s", tc_buffer(&member) + mark);
+
+    /* ------------------------------------------------------------------------
+     * A MESSAGE THAT WAS NOTHING BUT A REFUSED BYTE IS NOT AN AWAY MESSAGE
+     * ------------------------------------------------------------------------
+     * This is the one place where the strip changed what the command MEANS rather
+     * than what it said, so it is asserted separately rather than folded into the
+     * case above.
+     *
+     * `AWAY :<DEL>` is non-empty on the wire, so it passes the empty-parameter test
+     * at the top of handle_away(), and it strips to nothing. Storing that would mark
+     * the user away with an empty message -- and an empty trailing parameter IS the
+     * parameterless `AWAY` line, which means "no longer away". So the user would be
+     * away and every member who negotiated `away-notify` would be told they were
+     * not. That is the mirror of the defect test_away_notify.c spends a case on.
+     *
+     * Three claims, and the third is the one that distinguishes the fix from a
+     * numeric that merely keeps the byte off the wire:
+     *
+     *   1. The setter gets `305`, NOT `306`. `306` plus an empty message is the lie;
+     *      `417` would tell a client its three-byte message was 258 characters.
+     *   2. The member gets the PARAMETERLESS line, which is what actually happened.
+     *      Asserted as an exact line, so the assertion fails both if nothing is sent
+     *      and if a trailing `:` appears.
+     *   3. The log says `kept_len=0 reason=ALL_BYTES_REFUSED state=NOT_SET`, so the
+     *      `305` is distinguishable from a client that genuinely came back.
+     */
+    mark = tc_received(&member);
+    (void)tc_send(&setter, "AWAY :away");   /* away first, so the clear edge has work */
+    TF_CHECK_MSG(tc_expect(&setter, " 306 ", T_IO_MS) == 0, "could not set an away state");
+    drain(&member);
+    mark = tc_received(&member);
+    TF_CHECK_MSG(tc_send(&setter, "AWAY :" DEL) == 0, "AWAY :<DEL> send failed");
+    TF_CHECK_MSG(tc_expect(&setter, " 305 ", T_IO_MS) == 0,
+                 "an away message made only of a refused byte was answered 306, which "
+                 "asserts the user is away while the notification the same command "
+                 "produces asserts they are not. A message this node cannot carry is "
+                 "not an away message.");
+    (void)snprintf(want, sizeof want,
+                   ":vic!vic@" OBSERVED_HOST " AWAY " CHAN "\r\n");
+    TF_CHECK_MSG(tc_expect(&member, want, T_IO_MS) == 0,
+                 "the member was not told the user is back. Expected the "
+                 "PARAMETERLESS line \"%s\" -- written out exactly, so it fails both "
+                 "when nothing arrives and when a trailing colon does.\n  member saw: %s",
+                 want, tc_buffer(&member) + mark);
+    TF_CHECK_MSG(nf_expect(&node, "away_stripped: nick=vic removed=1 in_len=1 "
+                           "kept_len=0 reason=ALL_BYTES_REFUSED state=NOT_SET",
+                           T_IO_MS) == 0,
+                 "the log did not record the all-refused away message distinctly. "
+                 "Without `reason=ALL_BYTES_REFUSED state=NOT_SET` the 305 above is "
+                 "indistinguishable in the log from a client that genuinely came "
+                 "back.\n  node said: %s", node.out);
+    assert_no_controls(&member, mark, "the clear-edge notification");
+
+    tc_close(&setter);
+    tc_close(&member);
+    TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
+    nf_free(&node);
+}
+
 /* ---------------------------------------------------------------------------
  * CASE 3 -- TOPIC: STRIPPED FOR THE MEMBERS, AND NOT STORED STRIPPED-ONLY
  * ---------------------------------------------------------------------------
@@ -379,7 +549,115 @@ static void case_servername_is_summarised(void)
  * directly, because `"literal" + 4u` is not pointer arithmetic to a compiler that
  * thinks in strings -- -Wstring-plus-int objects to it, and rightly: this returns an
  * offset into a buffer, not a pointer into a string constant. */
+static size_t build_split_away(char *out, size_t cap, const char *esc,
+                               size_t *total_out)
+{
+    /* A named array rather than the literal: `UTF8_TEXT + 4` is arithmetic on a
+     * string constant, and a compiler that models string constants as objects
+     * rejects it (-Wstring-plus-int). Copying it once is also what makes the two
+     * memcpy() calls below obviously the same bytes. */
+    char text[64];
+    size_t text_len;
+    size_t esc_len = strlen(esc);
+    size_t n;
+
+    (void)snprintf(text, sizeof text, "%s", UTF8_TEXT);
+    text_len = strlen(text);
+    if (cap < strlen("AWAY :") + esc_len + text_len + 3u) {
+        TF_CHECK_MSG(0, "the buffer handed to build_split_away() is too small for "
+                     "the line plus its CRLF");
+    }
+    (void)snprintf(out, cap, "AWAY :%s", esc);
+    n = strlen(out);
+    (void)memcpy(out + n, text, 4u);
+    n += 4u;
+    if (total_out != NULL) {
+        *total_out = n + (text_len - 4u) + 2u; /* the rest of the text, then CRLF */
+    }
+    (void)memcpy(out + n, text + 4, text_len - 4u);
+    n += text_len - 4u;
+    out[n] = '\r';
+    n++;
+    out[n] = '\n';
+    n++;
+    out[n] = '\0';
+    /* The cut: everything before it is a whole number of characters. */
+    return strlen("AWAY :") + esc_len + 4u;
+}
+
 /* AWAY: the text a member receives when the strip kept everything it should. */
+static void case_away_strip_keeps_good_bytes(void)
+{
+    nf_node_t node;
+    test_client_t setter;
+    test_client_t member;
+    char line[512];
+    char want[512];
+    size_t mark;
+
+    TF_CHECK_MSG(nf_spawn_binary(&node) == 0, "could not spawn the node");
+    tc_init(&setter);
+    register_as(&setter, node.port, "vic", "*spoofed", CAP_AWAY_NOTIFY);
+    tc_init(&member);
+    register_as(&member, node.port, "bob", "*spoofed", CAP_AWAY_NOTIFY);
+    join(&setter, CHAN);
+    join(&member, CHAN);
+
+    /* 4a. Spaces and UTF-8, in one line, with a control byte in front of them so
+     * the strip is exercised on the same input that has bytes to keep. */
+    (void)snprintf(line, sizeof line, "AWAY :" ESC UTF8_TEXT);
+    mark = tc_received(&member);
+    TF_CHECK_MSG(tc_send(&setter, line) == 0, "AWAY send failed");
+    TF_CHECK_MSG(tc_expect(&setter, " 306 ", T_IO_MS) == 0,
+                 "the AWAY with spaces and UTF-8 was refused");
+    (void)snprintf(want, sizeof want,
+                   ":vic!vic@" OBSERVED_HOST " AWAY " CHAN " :" UTF8_TEXT "\r\n");
+    TF_CHECK_MSG(tc_expect(&member, want, T_IO_MS) == 0,
+                 "the member did not receive \"%s\" byte for byte. Every byte of it "
+                 "is either a space, printable ASCII, or part of a UTF-8 sequence "
+                 "whose bytes are all >= 0x80, and none of those is in the "
+                 "log-injection set -- a strip that removed any of them would "
+                 "corrupt every non-ASCII user's away message SILENTLY, which is a "
+                 "worse failure than the injection it prevents.\n  member saw: %s",
+                 want, tc_buffer(&member) + mark);
+    assert_no_controls(&member, mark, "an away message with spaces and UTF-8");
+
+    /* And nothing was announced as stripped beyond the one ESC: 4b below counts
+     * lines, and the log's kept_len is the arithmetic. */
+    TF_CHECK_MSG(nf_expect(&node, "away_stripped: nick=vic removed=1", T_IO_MS) == 0,
+                 "the log did not report removing exactly the one ESC.\n  node "
+                 "said: %s", node.out);
+
+    /* 4b. THE SPLIT CHARACTER. Same text, cut in the middle of a two-byte
+     * character and sent in two writes. */
+    {
+        char buf[512];
+        size_t total = 0;
+        size_t cut = build_split_away(buf, sizeof buf, ESC, &total);
+
+        mark = tc_received(&member);
+        TF_CHECK_MSG(tc_send_raw(&setter, buf, cut) == 0, "first half send failed");
+        TF_CHECK_MSG(tc_send_raw(&setter, buf + cut, total - cut) == 0,
+                     "second half send failed");
+        (void)snprintf(want, sizeof want,
+                       ":vic!vic@" OBSERVED_HOST " AWAY " CHAN " :" UTF8_TEXT "\r\n");
+        TF_CHECK_MSG(tc_expect(&member, want, T_IO_MS) == 0,
+                     "the member did not receive the full text when the wire was "
+                     "cut in the MIDDLE of a two-byte UTF-8 character (\"%s\" was "
+                     "split after its lead byte). The strip runs on an assembled "
+                     "parameter and cannot see a read boundary, so this cannot "
+                     "depend on how the reads were scheduled -- and a strip that "
+                     "removed bytes >= 0x80 fails here no matter what the schedule "
+                     "was.\n  member saw: %s", UTF8_TEXT, tc_buffer(&member) + mark);
+        assert_no_controls(&member, mark, "an away message split mid-character");
+    }
+
+    tc_close(&setter);
+    tc_close(&member);
+    TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
+    nf_free(&node);
+}
+
 /* TOPIC: the same constraint, on the field whose exposure is larger. */
 /* ---------------------------------------------------------------------------
  * CASE 6 -- THE REALNAME IS STILL REFUSED (Rule 3's regression guard)
@@ -480,6 +758,8 @@ int main(void)
 {
     case_realname_still_refused();
     case_servername_is_summarised();
+    case_away_stripped_for_member();
+    case_away_strip_keeps_good_bytes();
 
     tf_done("control-bytes");
     return 0;

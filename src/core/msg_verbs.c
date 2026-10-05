@@ -13,6 +13,11 @@
 #include "core/account.h"
 #include "core/cap.h"
 #include "core/channel.h"
+/* For conn_text_strip() -- the log-injection set, and the strip `handle_away()`
+ * applies. Named rather than reached through channel.h's include of it, because a
+ * transitive include is what lets a module keep using a symbol after the module
+ * that happened to pull it in stops. */
+#include "core/connection.h"
 #include "core/fanout.h"
 #include "core/reply.h"
 
@@ -1073,6 +1078,7 @@ void handle_away(server_t *s, conn_t *c, const message_t *m)
 {
     const char *message;
     size_t len;
+    size_t kept;
 
     if (m->nparams > 1) {
         (void)reply_refused(s, c, "AWAY", "TOO_MANY_PARAMS", "461", NULL, 0,
@@ -1101,6 +1107,67 @@ void handle_away(server_t *s, conn_t *c, const message_t *m)
 
     message = m->params[0];
     len = strlen(message);
+    /* ---------------------------------------------------------------------------
+ * AWAY: THE STRIP, AND WHY IT IS A STRIP (#121)
+ * ---------------------------------------------------------------------------
+ * The bound above is a LENGTH bound. It says the message fits `conn_t::away`; it
+ * says nothing about WHICH BYTES are in it, and `message_parse_n()` only refuses
+ * CR, LF and NUL. So `AWAY :<ESC>[2J<ESC>[31mbrb` passed it and reached two other
+ * terminals -- every member of a shared channel through the away-notify
+ * announcement, and anyone who ran WHOIS through 301 -- as
+ *
+ *     :irc.zz 301 bob vic <ESC>[2J<ESC>[31mbrb
+ *
+ * and 0x07 would ring their bell. That is the §9 class, on a field the length
+ * check made look closed.
+ *
+ * WHY STRIP AND NOT REFUSE, which is the whole content of this fix:
+ *
+ *   - AN AWAY MESSAGE IS LEGITIMATE USER CONTENT THAT REAL CLIENTS SEND. It is a
+ *     sentence a person typed. Refusing the whole command with 417 for a byte in
+ *     it would break a working feature for every client whose terminal, clipboard
+ *     or input method ever let a control byte through, and the fix would be
+ *     invisible in the sense that matters: the user would see "message too long"
+ *     for a 30-character sentence.
+ *   - THE CONSUMER IS ANOTHER USER'S TERMINAL, and a terminal has no business
+ *     executing bytes a stranger chose. Stripping is the answer that keeps the
+ *     feature.
+ *   - THE REALNAME GOES THE OTHER WAY, and the difference is the consumer and not
+ *     the string: a realname is refused because it is reported to every member of
+ *     every channel as though they wrote it (handle_user(), SETNAME, both). An away
+ *     message is already known to be text the setter typed, and text is expected to
+ *     arrive modified or not at all.
+ *
+ * WHY NOT ESCAPE. `conn_text_strip()` drops the bytes rather than rewriting them
+ * as `^[[` or `\x1b`. Nothing in this node escapes, so an escaped value would be
+ * unreadable to every reader of every one of these surfaces -- the channel, 301,
+ * the node's own log -- and a reader would have to know which of them to
+ * un-escape. Stripping costs the sender those bytes and costs the reader nothing.
+ *
+ * WHAT A STRIP COSTS, and it is a real cost rather than a rounding error:
+ *
+ *   - The setter's message is not what other members see. A member and the setter
+ *     can disagree about what was said, and the only record of the difference is
+ *     the log line below. Silent mutation is its own defect, which is why this is
+ *     announced.
+ *   - A TAB (0x09) is inside the log-injection set and goes with the rest, which
+ *     JOINS the words around it. connection.h's set block says why TAB is in and
+ *     space is out; this is what being in costs here.
+ *   - Space, printable ASCII and every byte >= 0x80 survive untouched, so UTF-8 is
+ *     intact. A strip that mangled a multi-byte sequence would be worse than the
+ *     bug: it would be silent, and the user could not see the damage.
+ *
+ * THE ORDER, and why the bound is checked before the strip rather than after: the
+ * bound is a property of what the CLIENT SENT, and 417 is a fact about the message
+ * the node could not accept. Checking it first means an over-long message is
+ * refused for being over-long even when it also carries a control byte, so the
+ * numeric and the log line each name one cause. Checking it afterwards would make
+ * a 9000-byte message of control bytes report a length it no longer had.
+ *
+ * THE STRIP CANNOT FAIL, and the reason is that the set contains no byte that
+ * would need escaping to be dropped: `0x00` cannot arrive at all (the parser
+ * refuses it) and is in the set anyway, so what comes out is a well-formed C
+ * string of at most the length that was just bounded. */
     if (len > (size_t)CONN_MAX_AWAY) {
         (void)reply_refused(s, c, "AWAY", NULL, "417", NULL, 0,
                             "Away message is too long");
@@ -1110,10 +1177,68 @@ void handle_away(server_t *s, conn_t *c, const message_t *m)
         return;
     }
 
-    memcpy(c->away, message, len + 1u);
+    kept = conn_text_strip(c->away, sizeof c->away, message);
+    /* ------------------------------------------------------------------------
+     * A MESSAGE THAT WAS NOTHING BUT BAD BYTES IS NOT AN AWAY MESSAGE (#121)
+     * ------------------------------------------------------------------------
+     * This arm exists because of the strip above, and it is the one place where
+     * removing bytes changed what the command MEANS rather than what it said.
+     *
+     * `AWAY :<DEL>` -- or any message made only of bytes this node refuses -- is
+     * non-empty on the wire, so it passes the empty test at the top of this
+     * function, and it strips to nothing. Storing that would mark the user away
+     * with an EMPTY message, and `notify_away()` would then have an empty string
+     * to send, which is the parameterless `AWAY` line that means "no longer away".
+     * The result is a state divergence in both directions at once: the user is
+     * away, and every member who negotiated `away-notify` is told they are not.
+     * That is the mirror image of the defect test_away_notify.c spends a case on
+     * -- a member who is never told the user went away believes they are present
+     * for ever.
+     *
+     * SO THE CLEAR EDGE IS TAKEN INSTEAD, and it is the honest answer rather than a
+     * convenient one: a client that sent nothing this node will carry has not said
+     * anything away-worthy, so the user is not marked away, `305` says so, and the
+     * parameterless notification tells the members what actually happened. Every
+     * alternative is worse and the reasons are worth naming:
+     *
+     *   - `306` plus an empty message: a lie in two places at once, because the
+     *     notification it produces asserts the opposite of the state it creates.
+     *   - `417`: the message is not too long, and a client whose away message was
+     *     three control bytes would be told it was 258 characters.
+     *   - refusing with no numeric: this node has no numeric for "your message
+     *     contained nothing I will carry", and inventing one would be a lie about
+     *     the protocol.
+     *
+     * THE COST, stated: a client that sent only control bytes as its away message
+     * gets `305 RPL_UNAWAY` rather than `306 RPL_NOWAYAY`, which reads as though
+     * it had asked to come back. It is not being marked away, so that is the truth,
+     * and the log line below names the cause so the two are distinguishable from
+     * outside. This is the same class of trade as the strip itself -- a legitimate
+     * command answered in a shape the client did not ask for -- and it is the price
+     * of not carrying bytes a terminal would execute. */
+    if (kept == 0u) {
+        c->away[0] = '\0';
+        (void)reply(s, c, "305", NULL, 0, "You are no longer marked as being away");
+        notify_away(s, c, NULL);
+        printf("[observable] away: nick=%s state=clear\n", c->nick);
+        printf("[observable] away_stripped: nick=%s removed=%zu in_len=%zu "
+               "kept_len=0 reason=ALL_BYTES_REFUSED state=NOT_SET\n",
+               c->nick, len, len);
+        return;
+    }
     (void)reply(s, c, "306", NULL, 0, "You have been marked as being away");
     notify_away(s, c, c->away);
-    printf("[observable] away: nick=%s state=set len=%zu\n", c->nick, len);
+    printf("[observable] away: nick=%s state=set len=%zu\n", c->nick, kept);
+    /* THE STRIP IS ANNOUNCED, on its own line and only when it happened. The line
+     * above reports the length actually stored, which a reader can compare with
+     * `AWAYLEN` and cannot compare with what the client sent; this is the record
+     * that the two differ, and it carries the count so "one stray byte" and "four
+     * hundred" are distinguishable to somebody reading the log afterwards. */
+    if (kept != len) {
+        printf("[observable] away_stripped: nick=%s removed=%zu in_len=%zu "
+               "kept_len=%zu reason=CONTROL_BYTES\n",
+               c->nick, len - kept, len, kept);
+    }
 }
 
 /* ---------------------------------------------------------------------------
