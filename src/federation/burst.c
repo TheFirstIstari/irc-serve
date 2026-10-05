@@ -117,10 +117,29 @@ typedef struct {
     char            topic_who[CHAN_MAX_TOPIC_WHO + 1];
     uint64_t        topic_when; /* the ORIGIN's clock, which is what 333 wants */
     char            modes[CHAN_MAX_MODES + 1];
+    /* WHICH FIELDS OF THIS RECORD DID NOT FIT (#122), as a bitmask rather than a
+     * boolean, because the three have different widths and a reader asking "what
+     * did this node lose" needs to be told which one.
+     *
+     * IT IS NOT "the record was refused". The record is KEPT, counted in nchans,
+     * and installed -- its roster is the origin's and a topic the receiver could
+     * not store says nothing about who is on the channel. What is withheld is the
+     * origin's PRESENTATION of the channel: the topic and the modes. See
+     * apply_chan() for why those two travel together, and apply_end() for what
+     * does with this. */
+    unsigned        refused;
     burst_member_t *members;
     size_t          nmembers;
     size_t          mcap;
 } burst_chan_t;
+
+/* The three fields of a SBURSTC this node may not be able to store, named as a
+ * bitmask so the refusal is reported as a list rather than as "something". */
+enum {
+    BURST_CHAN_REFUSED_TOPIC     = 1u << 0,
+    BURST_CHAN_REFUSED_TOPIC_WHO = 1u << 1,
+    BURST_CHAN_REFUSED_MODES     = 1u << 2
+};
 
 typedef struct {
     int             open;  /* a BEGIN has arrived and no COMMIT has           */
@@ -1075,6 +1094,18 @@ static int apply_chan(server_t *s, server_link_t *link, const message_t *m)
                       wire_size(link->name, "SBURSTC", m->params, 6)) != 0) {
         return -1;
     }
+    /* THE EXPLICIT CEILING (#122), and it is checked BEFORE the realloc rather
+     * than after it so that the refusal costs no allocation. See
+     * IRC_BURST_MAX_CHANS for why this is not the bound: the charge above already
+     * caps the count at 642 at the shipped budget, and this arm exists so that
+     * the day that arithmetic moves, the count this node will allocate for is a
+     * number somebody wrote down rather than a quotient. */
+    if (g_shadow.nchan_used >= IRC_BURST_MAX_CHANS) {
+        s->n_fed_malformed++;
+        shadow_discard(s, "TOO_MANY_CHANS", g_shadow.origin, g_shadow.nnicks,
+                       g_shadow.nchans, g_shadow.nmembers);
+        return -1;
+    }
     if (g_shadow.nchan_used == g_shadow.nchan_cap) {
         size_t want = (g_shadow.nchan_cap == 0u) ? 8u : g_shadow.nchan_cap * 2u;
         burst_chan_t *grown =
@@ -1093,13 +1124,91 @@ static int apply_chan(server_t *s, server_link_t *link, const message_t *m)
     }
     sc = &g_shadow.chans[g_shadow.nchan_used++];
     (void)chan_name_upper(canonical, sizeof canonical, m->params[0]);
-    (void)burst_copy(sc->name, sizeof sc->name, canonical);
-    (void)burst_copy(sc->origin, sizeof sc->origin, m->params[1]);
-    (void)burst_copy(sc->topic, sizeof sc->topic, m->params[5]);
-    (void)burst_copy(sc->topic_who, sizeof sc->topic_who,
-                     ((m->params[2][0] == '-') ? "" : m->params[2]));
-    (void)burst_copy(sc->modes, sizeof sc->modes,
-                     ((m->params[4][0] == '-') ? "" : m->params[4]));
+    /* THE TWO FIELDS THAT CANNOT FAIL ARE NOT `(void)`-ED (#122). Both are
+     * validated above -- chan_name_valid() against the width chan_name_upper()
+     * writes, irc_serve_server_name_valid() against the width burst_copy() is
+     * given -- so a refusal here would mean one of those two predicates had
+     * started accepting something the other rejects. That is a divergence between
+     * two rules rather than a peer input, and it is reported here for the reason
+     * account_store.c's note about this same helper gives: a discarded result on a
+     * copy whose source is already validated is a way for the field to keep
+     * whatever the realloc left in it, with nothing on the wire or in the log to
+     * say so. */
+    if (!burst_copy(sc->name, sizeof sc->name, canonical) ||
+        !burst_copy(sc->origin, sizeof sc->origin, m->params[1])) {
+        shadow_discard(s, "BAD_CHAN_RECORD", g_shadow.origin, g_shadow.nnicks,
+                       g_shadow.nchans, g_shadow.nmembers);
+        return -1;
+    }
+    /* ------------------------------------------------------------------------
+     * THE THREE FIELDS THAT CAN, AND NOW THAT THE RESULT IS READ (#122).
+     *
+     * REFUSE THE FIELD, KEEP THE RECORD. The two alternatives were both wrong and
+     * it is worth saying why, because the choice is the whole of this fix:
+     *
+     *   TRUNCATE. Excluded by this tree's own rule for this exact field.
+     *   chan_set_topic() refuses rather than truncates, and the reason it gives is
+     *   that "a topic cut mid-word is a different topic, and a client would have
+     *   no way to tell" -- with 331/332/333 named as where it shows. A truncated
+     *   topic in the shadow would be stored, and send_topic() hands ch->topic to
+     *   every member on the next 332 and 333, so the cut sentence would be shown
+     *   to the channel and replayed to every member who joined afterwards. That is
+     *   the failure the existing refusal exists to prevent, and 3.2's "never
+     *   deliver a silently shortened parameter" is the rule it cites.
+     *
+     *   REFUSE THE RECORD. Excluded on blast radius, and this is the part that is
+     *   not obvious. A record refusal here is not a local drop: the terminator
+     *   asserts nchans, so refusing the record without counting it makes the
+     *   COMMIT mismatch, which discards the WHOLE transaction. One over-long topic
+     *   on one channel out of five hundred would then leave this node stale about
+     *   four hundred and ninety-nine healthy channels -- trading a cosmetic loss
+     *   that is visible on one numeric for a total loss that is visible only as
+     *   fed_burst_truncated. The header's "there is no partial burst" rule is
+     *   about not losing records WITHOUT SAYING SO, and a counted refusal says so.
+     *
+     * So the record installs: the roster is the origin's and is unaffected by a
+     * topic this node could not store, and the transaction commits with the
+     * channel counted. What is withheld is the topic AND the modes, together,
+     * because replace_modes() clears through the old value before setting the new
+     * one -- handing it the zeroed field a refusal leaves behind would strip the
+     * channel of every mode letter it has on the strength of a record whose modes
+     * this node refused to store. apply_end() reads this mask, and the loss is
+     * counted in dropped= and named on the wire.
+     *
+     * THE MASK, NOT A BOOLEAN, because the three widths are different and a reader
+     * asking what was lost needs the answer to name it. The `[observable]` line
+     * below prints the three as separate numbers rather than the mask for the
+     * same reason: a mask on the wire is a number only this file can decode. */
+    if (!burst_copy(sc->topic, sizeof sc->topic, m->params[5])) {
+        sc->refused |= BURST_CHAN_REFUSED_TOPIC;
+    }
+    if (!burst_copy(sc->topic_who, sizeof sc->topic_who,
+                    ((m->params[2][0] == '-') ? "" : m->params[2]))) {
+        sc->refused |= BURST_CHAN_REFUSED_TOPIC_WHO;
+    }
+    if (!burst_copy(sc->modes, sizeof sc->modes,
+                    ((m->params[4][0] == '-') ? "" : m->params[4]))) {
+        sc->refused |= BURST_CHAN_REFUSED_MODES;
+    }
+    if (sc->refused != 0u) {
+        /* THE MASK AS THREE NUMBERS RATHER THAN ONE, and the reason is that a
+         * reader of a log is not reading this file: `refused=3` needs a decoder and
+         * `refused_topic=1` does not. The three INDEPENDENT lengths are printed
+         * beside them because the interesting fact is not only that a field was
+         * too wide but HOW wide, and a peer sending a 300-byte topic on a node
+         * with a 255-byte cache is a peer whose sender does not check its own
+         * bound -- which is a thing an operator can act on and a bare flag is
+         * not. */
+        printf("[observable] fed_burst_chan_refused: fd=%d channel=%s "
+               "refused_topic=%d refused_topic_who=%d refused_modes=%d "
+               "topic_len=%zu topic_who_len=%zu modes_len=%zu "
+               "reason=FIELD_TOO_WIDE\n",
+               link->fd, sc->name,
+               (sc->refused & BURST_CHAN_REFUSED_TOPIC) != 0u ? 1 : 0,
+               (sc->refused & BURST_CHAN_REFUSED_TOPIC_WHO) != 0u ? 1 : 0,
+               (sc->refused & BURST_CHAN_REFUSED_MODES) != 0u ? 1 : 0,
+               strlen(m->params[5]), strlen(m->params[2]), strlen(m->params[4]));
+    }
     sc->topic_when = when;
     g_shadow.cur = sc;
     g_shadow.nchans++;
@@ -1387,7 +1496,25 @@ static chan_t *resolve_shadow_chan(server_t *s, const burst_chan_t *sc,
  * federation/verbs.h forward-references when it says the receiver "reads
  * topic_when from the origin's own record" -- before a burst existed there was no
  * such record on the wire, so that sentence described an intention rather than
- * the code. It is the code now. */
+ * the code. It is the code now.
+ *
+ * THE `too_long` ARM BELOW CANNOT BE REACHED FROM THE BURST PATH, and the reason
+ * is worth recording because it is not the one it looks like (#122). It is not
+ * that a refused copy left the field empty -- that WAS true until apply_chan()
+ * started reading burst_copy()'s result, and it is why this function's arm was
+ * thought to be the reporting point for a field the receiver could not store. It
+ * is that `sc->topic` is char[CHAN_MAX_TOPIC + 1] and burst_copy() enforces
+ * strlen(src) < sizeof dst, so the value handed to chan_set_topic() can never
+ * exceed what chan_set_topic() accepts. The shadow field and the setter's bound
+ * are the same width BY CONSTRUCTION, which is the right relationship for a cache
+ * and is also what makes the refusal invisible here: there is nothing for this
+ * function to catch, because the node never holds an over-long topic -- it holds
+ * either the origin's topic or no record of one at all.
+ *
+ * So the refusal is reported where it is detected, in apply_chan(), and the arm
+ * stays because chan_set_topic() is not this file's to change: if that width ever
+ * diverged from CHAN_MAX_TOPIC this is where it would show, and an arm that
+ * cannot fire is cheaper than a behaviour with no reporting at all. */
 static void apply_topic(chan_t *ch, const burst_chan_t *sc)
 {
     if (chan_set_topic(ch, sc->topic, sc->topic_who) != 0) {
@@ -1564,15 +1691,66 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
          * removed it. */
         (void)chan_server_add(ch, origin);
         if (chan_same_name(sc->origin, origin)) {
-            /* The topic and the modes are the ORIGIN's authority and nothing
+            /* THE ORIGIN'S PRESENTATION FIELDS, AND WHEN THEY ARE WITHHELD (#122).
+             *
+             * The topic and the modes are the ORIGIN's authority and nothing
              * else's, which is 2.2's single-writer rule read from the other side:
-             * on a mesh of three, node A reports channels it does not own, and
-             * its copy of their topic is a cache exactly as it is for a relayed
+             * on a mesh of three, node A reports channels it does not own, and its
+             * copy of their topic is a cache exactly as it is for a relayed
              * STOPIC. Taking it from a line that merely passed through would make
-             * every relay an authority. */
-            apply_topic(ch, sc);
-            replace_modes(ch, sc->modes);
+             * every relay an authority.
+             *
+             * AND THEY ARE SKIPPED TOGETHER WHEN THE RECORD DECLARED EITHER ONE
+             * UNSTORABLE, which is the other half of apply_chan()'s argument and
+             * the reason the mask covers both. Two separate reasons, one rule:
+             *   - the topic is refused, so there is nothing truthful to set. Left
+             *     alone, this node keeps the topic it already had, which is a
+             *     cache of the origin's last statement rather than a new one --
+             *     the honest answer to a record this node could not read.
+             *   - apply_topic() with the zeroed field a refusal leaves behind would
+             *     CLEAR the topic, and replace_modes() with the zeroed modes would
+             *     CLEAR every mode letter. A record whose topic this node could not
+             *     store would strip the channel of its presentation, which is a
+             *     worse and less honest outcome than not updating it.
+             *
+             * The roster below still installs either way: it is the origin's, and a
+             * topic the receiver could not keep says nothing about who is on the
+             * channel. `dropped` counts the record so the loss is in the number an
+             * operator reads rather than only in the log line above. */
+            if (sc->refused == 0u) {
+                apply_topic(ch, sc);
+                replace_modes(ch, sc->modes);
+            } else {
+                dropped++;
+                /* THE WITHHELD LINE, AND THE TWO LENGTHS ARE THE NUMBERS THAT
+                 * MATTER. Nothing else in this file reports what the channel's
+                 * topic or modes ended up as after a burst, which is why a defect
+                 * that CLEARED either of them, or cut the topic to CHAN_MAX_TOPIC,
+                 * was invisible: the record still applied, the counts still
+                 * matched, and the only symptom was a client asking 332 for a topic
+                 * it had already been shown. So the report names what the node is
+                 * LEFT holding -- 31 if it kept the topic it had, 0 if something
+                 * cleared it, 255 if something truncated the peer's -- which is the
+                 * difference between the three outcomes and the only thing an
+                 * operator reading this log can act on.
+                 *
+                 * THE MODES ARE REPORTED FOR THE SAME REASON AND BECAUSE OF THE RULE
+                 * ABOVE: `kept_modes_len` is 0 on a channel that had no modes even
+                 * when the record's <modes> FIT, because a fitting field is withheld
+                 * when a different field was refused. That is the half of the rule
+                 * with no other evidence, and it is the half worth making visible --
+                 * a node that applied the modes of a record whose topic it could not
+                 * read would be reporting half a channel from half a record. */
+                printf("[observable] fed_burst_chan_withheld: channel=%s "
+                       "kept_topic_len=%zu kept_modes_len=%zu refused_topic=%d "
+                       "refused_topic_who=%d refused_modes=%d reason=FIELD_TOO_WIDE\n",
+                       ch->name, strlen(ch->topic), strlen(ch->modes),
+                       (sc->refused & BURST_CHAN_REFUSED_TOPIC) != 0u ? 1 : 0,
+                       (sc->refused & BURST_CHAN_REFUSED_TOPIC_WHO) != 0u ? 1 : 0,
+                       (sc->refused & BURST_CHAN_REFUSED_MODES) != 0u ? 1 : 0);
+            }
         }
+
         for (size_t k = 0; k < sc->nmembers; k++) {
             const char *host;
 

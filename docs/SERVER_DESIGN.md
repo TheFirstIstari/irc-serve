@@ -1408,6 +1408,57 @@ bound, because the shadow is memory made out of what a peer *said*.
 channel name and a 64-byte hostmask) against `IRC_MAX_RELAY_LINE`, and a
 `SBURST*` line is neither.
 
+**A `SBURSTC` field wider than the channel cache is refused, and the record is
+kept.** The volume budget is about volume, so it says nothing about one field of
+one record being too wide — and the field that bites on a receiver is
+`CHAN_MAX_TOPIC`, which `§2.2` names as *the one field whose loss a client can
+see*, because `331`/`332`/`333` render it verbatim. Three outcomes were available
+and two of them are wrong for reasons worth stating, because the arithmetic here
+prices the *sender*'s line and not the *receiver*'s cache:
+
+*Truncate the field* is excluded by this node's own rule for this exact field.
+`chan_set_topic()` refuses rather than truncates because a topic cut mid-word is a
+different topic and a client has no way to tell — and the storage a truncated copy
+would land in is handed to every member on the next `332`, including every member
+who joins afterwards, for as long as the channel lives. 3.2's "never deliver a
+silently shortened parameter" is the rule it cites, and a second, shorter path to
+the same field would be a place that rule did not reach.
+
+*Refuse the record* is excluded on blast radius, which is the half that is not
+obvious. `SBURSTE` asserts `nchans`, so refusing a record without counting it
+makes the terminator disagree, which discards the **whole** transaction: one
+over-long topic on one channel out of five hundred would leave this node stale
+about four hundred and ninety-nine healthy channels. That trades a cosmetic loss
+visible on one numeric for a total loss visible only as `fed_burst_truncated`.
+"There is no partial burst" is a rule about not losing records *without saying
+so*, and a counted refusal says so.
+
+So the record installs — its roster is the origin's, and a topic the receiver
+could not store says nothing about who is on the channel — the topic **and the
+modes** are withheld together, and the loss is counted: `dropped=` in
+`fed_burst_applied` counts the record, and `fed_burst_chan_refused:` names the
+fields with their arriving lengths so an operator can tell a peer that ignores its
+own bound from one that is three bytes over. `fed_burst_chan_withheld:` then
+reports what the channel was **left** holding, because that number is the only
+evidence that the right thing happened and nothing else in the tree prints it.
+The modes travel with the topic because `replace_modes()` clears through the old
+value before setting the new one, so handing it the zeroed field a refusal leaves
+behind would strip the channel of every mode letter on the strength of a record
+whose presentation this node declined to store.
+
+**The channel count is bounded twice, and only one of the two is the budget.** The
+byte budget does bound it — at the shipped `IRC_BURST_MAX_BYTES` the cheapest
+legal `SBURSTC` charges 204 bytes, so at most 642 channel records fit — but that is
+arithmetic about a charge calculation in another function, not a number the code
+states, and it holds only while `IRC_MAX_TAG_OVERHEAD` stays frozen, `wire_size()`
+keeps adding it unconditionally, and `shadow_charge()` keeps running before each
+record. `IRC_BURST_MAX_CHANS` (1024, 1.59× the 642) is the bound the code states,
+and it is defence in depth rather than the bound: at the shipped budget it cannot
+bind, and when it does — a raised budget, a narrower charge, a moved charge — it
+refuses through the same abandon path every other refusal uses, because a
+transaction cut short by a local ceiling and one cut short by a peer's volume are
+the same event from this node's point of view.
+
 **A truncated transaction is counted twice, under two names, and the second name
 is the one that says why.** `n_burst_abandoned` counts an inbound burst discarded
 before its terminator — a count mismatch, an over-large transaction, a malformed
