@@ -106,10 +106,20 @@ static void report(const char *file, int line, const char *msg)
     fprintf(stderr, "%s:%d: %s\n", file, line, msg);
 }
 
+/* THE MESSAGE BUFFER IS 1024 AND NOT 512, and the reason is gcc-16's
+ * -Wformat-truncation, which is an ERROR in this tree and is right: the longest
+ * message literal here is about 250 characters of prose and the string it quotes
+ * is bounded at 400, so a 512-byte destination has 249 bytes of room for 400
+ * bytes of value and the compiler can see the overflow. 1024 gives it 760, which
+ * satisfies the analysis honestly rather than by shortening the diagnostic until
+ * it stops complaining.
+ *
+ * It is a stack buffer in a loop that runs at most SWEEP_MAX times, so the cost is
+ * a frame rather than an allocation, and it lives only inside the CHECK arm. */
 #define CHECK(cond, ...)                                                      \
     do {                                                                      \
         if (!(cond)) {                                                        \
-            char tf_msg_[512];                                                \
+            char tf_msg_[1024];                                               \
                                                                               \
             (void)snprintf(tf_msg_, sizeof tf_msg_, __VA_ARGS__);             \
             report(__FILE__, __LINE__, tf_msg_);                              \
