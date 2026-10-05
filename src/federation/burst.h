@@ -257,6 +257,45 @@
  * the day somebody raises CONN_WQ_MAX for a client-facing reason. */
 #define IRC_BURST_MAX_BYTES (CONN_WQ_MAX / 2u)
 
+/* THE SHADOW'S CHANNEL COUNT, CEILINGED EXPLICITLY (#122), and it is defence in
+ * depth rather than the bound.
+ *
+ * WHY THERE IS A CEILING AT ALL WHEN THE BYTE BUDGET ALREADY BOUNDS IT. The
+ * budget is real and it does hold: shadow_charge() runs before every record and
+ * IRC_BURST_MAX_BYTES is 131072, while the SMALLEST possible SBURSTC charges 204
+ * bytes -- IRC_MAX_TAG_OVERHEAD (179, frozen) + a one-byte origin + the seven-byte
+ * verb + six parameters of one byte each with their six separators + the four the
+ * accounting adds for CRLF and colons. So at the shipped budget the byte
+ * arithmetic caps the channel count at 131072/204 = 642, and the staging array
+ * cannot exceed 642 entries however many records a peer sends.
+ *
+ * BUT THAT BOUND IS ARITHMETIC ABOUT A CHARGE, NOT SOMETHING THE CODE STATES, and
+ * that is a different kind of thing to rely on. It holds only as long as three
+ * separate decisions hold at once -- that IRC_MAX_TAG_OVERHEAD stays frozen, that
+ * wire_size() keeps adding it unconditionally, and that shadow_charge() keeps
+ * running before the record rather than after it. Any of the three moving, in
+ * either direction, silently changes the ceiling on a peer's control over this
+ * node's allocation, and the change would be invisible: no refusal, no counter,
+ * no log line, just a larger array.
+ *
+ * SO THIS IS THE BOUND THE CODE STATES, and the byte budget is the one that does
+ * the work. 1024 is 1.59x the 642 the charge arithmetic allows at the shipped
+ * budget, so the ceiling cannot bind there; the cost of that headroom is at most
+ * 382 unused burst_chan_t slots, about 196 KiB on a 64-bit build and nothing at
+ * all, since the array only grows to what a transaction actually sends.
+ *
+ * WHAT IT IS FOR is the day the arithmetic moves. A burst record is a per-record
+ * heap allocation made out of what a peer said, which is what CHAN_MAX_REMOTE_MEMBERS
+ * and CHAN_MAX_MEMBER_SERVERS exist for one level up; a node that has one bound
+ * whose number comes from a subtraction in another file has one bound, and this is
+ * the second one so that it has two. When the ceiling does bind -- which at the
+ * shipped budget it cannot -- it binds LOUDLY, through the same abandon path and
+ * the same n_burst_abandoned every other refusal uses, because a transaction cut
+ * short by a local ceiling and a transaction cut short by a peer's volume are the
+ * same event from this node's point of view: this node did not take the whole
+ * thing, so it applies none of it. */
+#define IRC_BURST_MAX_CHANS ((size_t)1024u)
+
 /* The shipped bound for THIS PROCESS, and a per-process override of it. 0 keeps
  * the built-in. Call it before the burst runs; the value is read on every
  * comparison, so calling it later is legal but would apply mid-flight.

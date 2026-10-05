@@ -92,6 +92,70 @@ int tc_send_raw(test_client_t *c, const char *bytes, size_t n);
  * prefix of a longer one. */
 int tc_expect(test_client_t *c, const char *needle, int timeout_ms);
 
+/* Read ONE COMPLETE LINE and hand back its payload.
+ *
+ * Wait until a line arrives whose text begins with `prefix`, copy that line's
+ * text -- the whole line, without the CRLF -- into `out` (NUL-terminated), set
+ * `*len` to its length, and return 0. -1 on timeout.
+ *
+ * WHY THIS EXISTS, and it is a bug class rather than a convenience. It is now the
+ * THIRD time in this suite that a test has needed "the reply, as a string, with
+ * the line boundary proved" and written it by hand, and the two hand-rolled
+ * versions were both wrong in different ways:
+ *
+ *   tc_expect() with the CRLF inside the needle proves the line is TERMINATED but
+ *   says nothing about where it STARTS, so it can be satisfied by a longer line
+ *   that happens to contain the text. Hand-rolling the other half -- finding the
+ *   needle with strstr() and then checking the byte before it -- is what
+ *   tests/integration/test_cap_negotiation.c did, and it got the offset wrong
+ *   twice before it was right.
+ *
+ *   Copying the payload into a caller buffer with snprintf() and then walking it
+ *   with str*() is what that case did next, and it read one byte PAST the end of
+ *   what it wrote: the buffer was 2048 bytes, the payload was 180, and the token
+ *   walk stepped off the end of the string onto an uninitialised byte. On the
+ *   author's machine that byte was zero; on a GitHub runner it was not, and
+ *   `CAPNegotiation` failed in all four ci_macos cells with a capability count
+ *   one too high. Passing `*len` back is the fix: a caller that walks a COUNTED
+ *   string cannot read past it, and one that walks it with str*() has been handed
+ *   the length for a reason.
+ *
+ * So the three properties this buys, each of which a hand-rolled version got
+ * wrong at least once:
+ *
+ *   1. THE LINE MUST BE TERMINATED. A partial line is not a match, however much
+ *      of the prefix has arrived. This is what makes the answer independent of how
+ *      the reply was split across TCP segments -- a question that never needed
+ *      asking once the terminator is required.
+ *   2. THE PREFIX MUST BE AT A LINE BOUNDARY. The bytes before it must be the
+ *      start of the buffer or the LF of the previous line's CRLF, so a reply that
+ *      merely CONTAINS the text cannot satisfy it.
+ *   3. THE CALLER GETS A LENGTH. See above.
+ *
+ * `prefix` is matched case-SENSITIVELY and against the line's text as it arrived,
+ * which for this tree's formatter is the wire spelling. An empty prefix matches
+ * the next complete line, which is occasionally what a test wants.
+ *
+ * This does NOT consume the line: the accumulated buffer is unchanged, so a test
+ * can still `strstr()` the whole stream afterwards, exactly as before. */
+int tc_read_line(test_client_t *c, const char *prefix, char *out, size_t cap,
+                 size_t *len, int timeout_ms);
+
+/* As tc_read_line(), but the scan starts at `from` rather than at the beginning
+ * of the buffer, so a caller can walk SUCCESSIVE matching lines.
+ *
+ * WHY IT IS A SEPARATE ENTRY POINT rather than a flag on the first one: a test that
+ * wants the first match writes `tc_read_line()`, and a test that wants the third
+ * writes `tc_read_line_from(2 * CAP_LS_MAX, ...)` or whatever the offset is -- the
+ * offset is something the CALLER computes and owns, and a function that hid it
+ * behind a "skip the first N" argument would be asking the caller to do the same
+ * arithmetic with less information.
+ *
+ * `from` past the end of the buffer is not an error: it simply finds nothing and
+ * times out, which is what a caller that has consumed everything should see. */
+int tc_read_line_from(test_client_t *c, size_t from, const char *prefix, char *out,
+                      size_t cap, size_t *len, int timeout_ms);
+
 /* Wait for the server to close its half. Returns 0 when a clean EOF was
  * observed (recv() returned 0), -1 on timeout, -2 on a timeout where data had
  * arrived but the close never did, and -3 if the connection was reset.

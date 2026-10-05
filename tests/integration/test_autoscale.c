@@ -108,20 +108,36 @@
  * (fed_set_timeouts(), fed_set_retry(), fed_set_advertise_interval(), each of which
  * is a function rather than a rule edit), and nothing else:
  *
- *   DEAD_MS / RETRY_BASE_MS / RETRY_MAX_MS  the shipped ladder starts at
- *       IRC_FED_DEAD_MS (90 s), so a case that waited out even the first rung would
- *       take minutes. What the test preserves is the ladder's SHAPE -- base x 2 per
- *       attempt, capped, bounded by a budget of 3 -- and the single T7 condition
- *       that refuses a diallable link. That condition is the claim; the scale is
- *       not. Stated as a cost, because a test that sets a 60 ms base proves the
- *       policy's shape and says nothing about how 90 s behaves in a field.
+ *   RETRY_BASE_MS / RETRY_MAX_MS  the shipped ladder starts at IRC_FED_DEAD_MS
+ *       (90 s), so a case that waited out even the first rung would take minutes.
+ *       What the test preserves is the ladder's SHAPE -- base x 2 per attempt,
+ *       capped, bounded by a budget of 3 -- and the single T7 condition that refuses
+ *       a diallable link. That condition is the claim; the scale is not. Stated as a
+ *       cost, because a test that sets a 60 ms base proves the policy's shape and
+ *       says nothing about how 90 s behaves in a field.
+ *   DEAD_MS  WAS in that list and IS NOT ANY MORE, and it was there on a false
+ *       premise: this file claimed the ladder is armed by T4 firing inside the dead
+ *       threshold, and scaling the threshold is what made that happen. It is not what
+ *       happens -- the clean-leave path arms the ladder at `silent_ms=0`, so a 90 s
+ *       threshold changes nothing about the arm -- and leaving it scaled was not
+ *       harmless, because a 150 ms threshold is one poll tick above the cadence of
+ *       the inbound traffic the absence window is measured on, which is the 1-in-20
+ *       flake this file had for months. It is now the shipped value and the reason
+ *       is written out at the constant.
  *   ADVERTISE_MS  the shipped advertisement interval is derived equal to the
  *       keepalive (30 s), and the test needs a second advertisement inside its own
  *       deadline so it can watch a figure CHANGE and see the edge latch work. The
  *       interval is a knob for that reason (link.h says so), and the refresh being
  *       on a clock at all is what the test checks.
  *   KEEPALIVE_MS on the two nodes that are only there to be clocks, so the absence
- *       windows are hundreds of milliseconds rather than tens of seconds.
+ *       windows are hundreds of milliseconds rather than tens of seconds. It was
+ *       shortened for SPEED rather than safety once DEAD_MS stopped being 150 ms, and
+ *       the reason is at the constant: at the shipped 30 s these nodes would speak
+ *       once in half a minute and the case would get much slower to prove the same
+ *       thing.
+ *   SPEAK_MS on the departing node, for the same reason and with the same caveat: it
+ *       is a speed knob now, not a safety one, and a node talking every 50 ms is not
+ *       what a deployment looks like.
  *
  * NOT SHORTENED, and these are the claims: the ORDER of the guard chain, the shape
  * of the ADVERTISE verb, the latch semantics of the shed report (once per crossing,
@@ -202,24 +218,32 @@
 #define SHED_PCT_FMT "30%"  /* the NEEDLE spelling; see LOAD_PUB_FMT above */
 #define SHED_PCT_ESC "30%%" /* the printf-FORMAT spelling; see LOAD_PUB_ESC above */
 
-/* The clean-leave case's ladder, and the four numbers are ONE calculation rather
- * than four choices. The shipped base is IRC_FED_DEAD_MS (90 s); 60 ms with a 240 ms
- * ceiling keeps the ladder's SHAPE (base x 2^attempt, capped, budget 3) and changes
- * only its scale.
+/* The clean-leave case's ladder. The shipped base is IRC_FED_DEAD_MS (90 s); 60 ms with
+ * a 240 ms ceiling keeps the ladder's SHAPE (base x 2^attempt, capped, budget 3) and
+ * changes only its scale.
  *
- * WITH the dead threshold at DEAD_MS, an UNSUPPRESSED clean leave would be re-dialled
- * at
+ * AN UNSUPPRESSED CLEAN LEAVE WOULD BE RE-DIALLED AT
  *
- *      150 +  60 = 210 ms     first rung
- *      210 + 120 = 330 ms     second
- *      330 + 240 = 570 ms     third, at the ceiling
+ *      60 ms     first rung, from the arm the clean-leave path makes
+ *      180 ms    second
+ *      420 ms    third, at the ceiling
  *
  * and the observation window is " WINDOW_LINES " inbound lines at KEEPALIVE_MS, which is
- * " WINDOW_MS ". That is past EVERY rung above by a wide margin, so an unsuppressed
- * leave would have dialled three times inside a window in which the assertion requires
- * none. The margin is not decoration: a window that closes before the fault's first
- * dial is a window that cannot catch it, and that is exactly the failure mode an
- * earlier set of these numbers had.
+ * " WINDOW_MS ". That is past every rung above by a wide margin, so an unsuppressed leave
+ * would have dialled three times inside a window in which the assertion requires none.
+ *
+ * The dead threshold is NOT in that arithmetic, and the two comments above used to say
+ * it was. It was not: the arm that makes `arms == 1` below is made by the CLEAN-LEAVE
+ * PATH, which declares the departed link dead at `silent_ms=0` -- the socket is already
+ * closed when the SHUTDOWN is processed, so there is no silence to wait out. Measured,
+ * on a node whose dead threshold was raised from 150 ms to 5000 ms:
+ *
+ *      [observable] link_dead: peer=irc.stay silent_ms=0
+ *      [observable] link_retry: peer=irc.stay attempt=1/3 delay_ms=60 after=DEAD
+ *
+ * ...and the case still passed, `arms == 1` still held. So the ladder was already armed
+ * at zero silence and DEAD_MS was governing something else entirely. See the constant
+ * below.
  *
  * The boundary is INBOUND LINES ON THE NODE UNDER TEST -- the fourth node's keepalive
  * PINGs, which arrive as inbound lines and move `lines=` on a real timer. Two things
@@ -235,10 +259,56 @@
  *   onto inbound traffic, where it caught it in 8 out of 8. */
 #define RETRY_BASE_MS 60
 #define RETRY_MAX_MS  240
-#define DEAD_MS 150
 #define KEEPALIVE_MS 60
 #define WINDOW_LINES 16
 #define WINDOW_MS (WINDOW_LINES * KEEPALIVE_MS)
+
+/* THE DEAD THRESHOLD ON THE NODE UNDER TEST, AND WHY IT IS NOT SET (#122's neighbour --
+ * this is the 1-in-20 flake, and the mechanism is T4 rather than anything in this file).
+ *
+ * THE MECHANISM, in full, because the number above it is the whole of the fix and
+ * nothing about the number says why:
+ *
+ *   1. The window's boundary is `lines=` on " NAME_THIRD ", and after " NAME_STAY "
+ *      departs the ONLY remaining source of inbound lines is " NAME_FOURTH "'s
+ *      keepalive.
+ *   2. " NAME_FOURTH "'s keepalive is KEEPALIVE_MS (60 ms) and T3 fires it on the
+ *      POLL_TICK_MS (50 ms) tick, so the real cadence is quantised UP to two ticks.
+ *      Measured over 14 runs with a probe on the tick: a maximum gap between inbound
+ *      lines of **104-107 ms**, and a tick delta of 51-55 ms even under 28x CPU
+ *      oversubscription.
+ *   3. T4 declares a link dead at `now - last_recv_ms > g_dead_ms`. With this node's
+ *      threshold at 150 ms and a real cadence of ~104 ms, the margin is ONE TICK.
+ *   4. " NAME_FOURTH " DIALS " NAME_THIRD ", so on " NAME_THIRD " the link is
+ *      `initiator=0` -- ACCEPTED -- and T7's guard is `initiator != 0 && addrlen != 0`.
+ *      **A link this node did not dial is never re-dialled**, so the one T4 hiccup
+ *      does not cost the window a delay, it costs it the rest of the run.
+ *   5. `lines=` then freezes, `nf_expect_u64_ge()` waits out its full T_IO_MS, and the
+ *      failure names the WINDOW rather than the dead link. Reproduced deliberately by
+ *      raising the clock's keepalive until the cadence crossed the threshold:
+ *
+ *          [observable] link_dead: peer=irc.fourth silent_ms=156
+ *          [observable] link_retry: peer=irc.fourth attempt=1/3 delay_ms=60 after=DEAD
+ *          [observable] link: peer=irc.fourth state=INIT fd=-1 initiator=0 ...
+ *          nf_expect_u64_ge: TIMEOUT after 15000 ms waiting for lines=>=25;
+ *              last seen was 9
+ *
+ *      `last seen was 9` against a requirement of 25, from a node whose deadline was
+ *      fifteen seconds: the counter did not run slowly, it STOPPED. Which is why
+ *      widening the window cannot help and did not when it was tried.
+ *
+ * SO THE FIX IS NOT A WIDER WINDOW AND NOT A BIGGER THRESHOLD ON THE CLOCK. It is to
+ * leave the node under test's dead threshold at the SHIPPED IRC_FED_DEAD_MS (90 s), by
+ * passing 0, for the reason established above: nothing this case asserts depends on
+ * that threshold, because the ladder is armed at zero silence by the clean-leave path.
+ * With the shipped threshold the clock link cannot be declared dead inside any deadline
+ * this test has, so the window's clock cannot be switched off by a scheduler.
+ *
+ * THE COST, and it is the honest one: this case no longer exercises T4's expiry at all
+ * on the departed link. It did not exercise it -- the expiry never happened, the clean
+ * leave beat it -- so nothing is lost. What the case now proves is the claim it was
+ * written for, which is about `clean_leave` and not about a timer. */
+#define DEAD_MS 0 /* the shipped IRC_FED_DEAD_MS: see the comment above */
 
 /* HOW OFTEN THE DEPARTING NODE SPEAKS, and the reason this is a separate number from
  * KEEPALIVE_MS is that the two roles are opposite and confusing them breaks the
@@ -248,14 +318,26 @@
  *                 what open the observation window, and nothing depends on them being
  *                 answered -- a peer link does not answer PINGs at all in this build,
  *                 which is why n_fed_unknown_verb counts them on the far side.
- *   SPEAK_MS      the DEPARTING node's own cadence, and it is a FIXTURE CONSTRAINT
- *                 rather than a choice: the node that receives the departure has a
- *                 150 ms dead threshold (scaled so T4 arms the ladder, which is what
- *                 makes "no retry" a decision rather than an accident), so the peer it
- *                 is watching has to speak well inside 150 ms or the receiver declares
- *                 it dead before the case ever sends SIGTERM. 50 against 150 is the
- *                 same three-to-one shape the shipped 30 s keepalive has to the
- *                 shipped 90 s dead threshold. */
+ *   SPEAK_MS      the DEPARTING node's own cadence. It was a FIXTURE CONSTRAINT rather
+ *                 than a choice, for a reason that has since turned out to be FALSE:
+ *                 the node receiving the departure had a 150 ms dead threshold, so
+ *                 the peer it was watching had to speak well inside 150 ms or the
+ *                 receiver would declare it dead before the case sent SIGTERM. The
+ *                 dead threshold is now the shipped 90 s (see DEAD_MS), so the
+ *                 constraint is gone.
+ *
+ *                 IT IS LEFT AT 50 ANYWAY, and the reason is that removing it would
+ *                 change what the case is for. At the shipped keepalive this node
+ *                 would speak once in thirty seconds, so the assertions that read
+ *                 "lines=" on it before the departure would have to wait out half a
+ *                 minute for no additional information, and the case would get
+ *                 slower to prove exactly the same thing. 50 against the shipped 30 s
+ *                 keepalive and the shipped 90 s dead threshold is a proportion far
+ *                 wider than three to one, so the relationship is no longer under
+ *                 any pressure at all -- the number is now a SPEED knob rather than a
+ *                 SAFETY one, and the cost of that is stated in the header's "what is
+ *                 shortened": a node talking every 50 ms is not what a deployment
+ *                 looks like. */
 #define SPEAK_MS 50
 
 /* THE SHED LATCH'S WINDOW: how many advertisements must reach the observer before the
@@ -697,24 +779,24 @@ static void peer_answer_claim(peer_t *p)
     g_cfg.dial_ms = 1000;
     g_cfg.hs_ms = 5000;
     /* THE KEEPALIVE IS THE ONE INTERVAL SHORTENED HERE, and it is not an
-     * optimisation -- it is what keeps the fixture honest.
+     * optimisation -- it is what keeps the case quick.
      *
-     * The node that receives the departure has a SHORT dead threshold (DEAD_MS,
-     * scaled with the ladder, and the reason why is at that spawn). A dead threshold
-     * of 150 ms with this node's keepalive at the shipped 30 s means the receiver
-     * declares this peer DEAD 150 ms after the last thing it heard -- which is long
-     * before the case gets to send SIGTERM. T4 would then tear the link down,
-     * announce this node's own departure, arm the ladder and redial, and the
-     * assertions below would be measuring a link that had already failed for an
-     * unrelated reason. The first run of this file did exactly that and failed with
-     * a self-SQUIT naming the wrong server.
+     * It USED to be a safety constraint rather than a speed one, and the difference
+     * is worth recording because the constraint was never real. This node's
+     * keepalive had to speak well inside the receiver's 150 ms dead threshold, or T4
+     * would tear the link down, announce this node's own departure, arm the ladder
+     * and redial -- and the assertions below would be measuring a link that had
+     * already failed for an unrelated reason. The first run of this file did exactly
+     * that and failed with a self-SQUIT naming the wrong server.
      *
-     * So the two numbers have to agree, and the way they agree is that this node
-     * speaks well inside the receiver's dead threshold. 50 ms against 150 ms is the
-     * same three-to-one relationship the shipped 30 s keepalive has to the shipped
-     * 90 s dead threshold, so the SHAPE of the shipped pairing is preserved and only
-     * its scale changes -- which is the whole trade every one of these knobs exists
-     * to make.
+     * But the receiver's dead threshold is now the SHIPPED 90 s (see DEAD_MS), and at
+     * the shipped 30 s keepalive this node would speak once in thirty seconds -- so
+     * the assertions that read `lines=` on it before the departure would wait out half
+     * a minute for no additional information. 50 ms is kept for that reason and no
+     * other: it is what makes the case prove the same thing in 1.6 s rather than in
+     * 30 s. The shipped pairing's SHAPE is not being preserved any more, and the
+     * header says so at SPEAK_MS rather than claiming a three-to-one relationship
+     * that DEAD_MS has just made 1800-to-one.
      *
      * The cost is traffic this node would not otherwise send, and it is worth
      * stating: at 50 ms it emits about twenty PINGs a second on each of its two
@@ -743,22 +825,30 @@ static void peer_answer_claim(peer_t *p)
      * timer rather than a sleep. See the file header on why the boundary must be
      * inbound traffic and not something the fault under test produces. */
     g_cfg.keepalive_ms = KEEPALIVE_MS;
-    /* THE LADDER, AND THIS IS THE MOST LOAD-BEARING SHORTENING IN THE FILE. The
-     * dead threshold and the retry base are both scaled down so that T4 FIRES inside
-     * this case and therefore ARMS the retry schedule.
+    /* THE LADDER, AND THE DEAD THRESHOLD IS NOT PART OF IT. Only the retry base,
+     * ceiling and budget are scaled; the dead threshold is left at the shipped
+     * IRC_FED_DEAD_MS by DEAD_MS == 0, for the reason the constant's own comment
+     * gives in full. The short version, because the comment above used to claim the
+     * opposite and that claim is what this flake was:
      *
-     * WHY IT MATTERS SO MUCH: claim 2 is that a clean leave arms no retry. Asserted
-     * alone, that claim is VACUOUS -- with the shipped 90 s dead threshold the ladder
-     * is never armed at all, so a node with no clean-leave suppression whatsoever
-     * would also dial zero times and pass. The only thing that makes the zero redials
-     * a DECISION is that the schedule is live and expiring, and T7's
-     * `clean_leave == 0` is the single thing standing between it and a socket. So
-     * this is why the assertion below is a PAIR: one `link_retry:` (the schedule was
-     * armed) and one `link_dial:` (no socket came of it).
+     *   THE LADDER IS ARMED BY THE CLEAN-LEAVE PATH AT `silent_ms=0`, not by T4's
+     *   expiry. The departing node has already closed the socket by the time the
+     *   SHUTDOWN is processed, so there is no silence to wait out and no threshold to
+     *   out-wait. Measured with the threshold raised from 150 ms to 5000 ms: the arm
+     *   still happened, still printed `link_retry: … after=DEAD`, and the case still
+     *   passed.
      *
-     * What the scaling preserves is the ladder's SHAPE -- base x 2 per attempt,
-     * capped, bounded by a budget of three -- and what it costs is stated in the
-     * header: a 60 ms base proves the policy's shape and termination, and says
+     * So the claim this case makes -- a clean leave arms no retry -- is NOT vacuous
+     * without a short dead threshold, which is what the old comment here asserted,
+     * and the ladder being armed is established by the `arms == 1` assertion below
+     * rather than by a timer being short. T7's `clean_leave == 0` is still the single
+     * thing standing between an armed schedule and a socket, and the assertion is
+     * still a PAIR for the same reason: one `link_retry:` (the schedule was armed)
+     * and one `link_dial:` (no socket came of it).
+     *
+     * What the scaling of the base preserves is the ladder's SHAPE -- base x 2 per
+     * attempt, capped, bounded by a budget of three -- and what it costs is stated in
+     * the header: a 60 ms base proves the policy's shape and termination, and says
      * nothing about how 90 s behaves in a field.
      *
      * Its KEEPALIVE is the shipped 30 s, deliberately: nothing here needs this node's
@@ -1046,11 +1136,53 @@ static void peer_answer_claim(peer_t *p)
      * running. Whatever the counter reads now is the floor, and only lines that arrive
      * AFTER it can open the window.
      *
+     * AND `base` IS TYPICALLY SMALL, which is worth knowing when reading the failure
+     * this case used to produce: after " NAME_STAY " leaves, " NAME_THIRD "'s only
+     * remaining source of inbound lines is " NAME_FOURTH "'s keepalive at two poll
+     * ticks, so `base` lands at 9 on most runs and the window needs 16 more. "lines=11
+     * against a requirement of 25" is therefore two lines in fifteen seconds, which is
+     * not a slow counter -- it is a counter whose source had stopped, and the two are
+     * indistinguishable from the number alone. That is what the clock-is-alive check
+     * above is for.
+     *
      * The node is " NAME_THIRD " and not " NAME_STAY " because that is the node the
      * absence is asserted on. */
     TF_CHECK_MSG(nf_find_u64(&third, "lines=", &base) == 0,
                  NAME_THIRD " never published its inbound line count, so the "
                  "observation window below has no lower bound to grow from: %s",
+                 third.out);
+
+    /* THE WINDOW'S CLOCK WAS ALIVE WHEN THE WINDOW OPENED, which is the precondition
+     * the window below does not check and cannot.
+     *
+     * THE FLAKE THIS FILE HAD, in one line: the window's boundary is inbound lines
+     * from " NAME_FOURTH ", and if T4 declares that link dead then the counter stops
+     * for ever, because " NAME_FOURTH " DIALS " NAME_THIRD " and a link this node did
+     * not dial is never re-dialled (T7's `initiator != 0 && addrlen != 0`). The
+     * mechanism is at DEAD_MS; the reason the link cannot die is that this node's
+     * dead threshold is the shipped 90 s.
+     *
+     * WHAT THIS ASSERTION IS WORTH, and the limit is worth as much as the claim. It
+     * catches a clock that was ALREADY dead when the window opened. It does NOT catch
+     * a clock that dies DURING the window -- and that is the case the flake actually
+     * was, because the clock was healthy until T4 fired inside the wait. The teeth run
+     * established this by making the failure deterministic (150 ms threshold, 120 ms
+     * clock) and observing that the window assertion is the one that fires, with
+     * `last seen was 9` against a requirement of 25 -- the reported symptom exactly.
+     *
+     * So this is not the fix and it is not claimed to be. It is a precondition made
+     * explicit, and its value is the direction it fails in: a clock dead before the
+     * window opens is reported here, at the point where the cause is still knowable,
+     * rather than fifteen seconds later by an assertion about a counter that had
+     * nothing left to count. */
+    TF_CHECK_MSG(strstr(third.out, "link_dead: peer=" NAME_FOURTH) == NULL,
+                 NAME_THIRD " had already declared " NAME_FOURTH
+                 " DEAD before its observation window opened, so `lines=` cannot "
+                 "climb, the window can never open, and the failure would be "
+                 "reported as a window that stayed shut rather than as the dead link "
+                 "that shut it. " NAME_FOURTH " DIALS " NAME_THIRD
+                 ", so T7 can never re-establish an ACCEPTED link and this is "
+                 "permanent for the run -- see DEAD_MS for the whole mechanism: %s",
                  third.out);
 
     /* THE WINDOW, and its arithmetic is at WINDOW_LINES: " WINDOW_LINES " inbound lines
@@ -1059,11 +1191,32 @@ static void peer_answer_claim(peer_t *p)
      * traffic, which no dial produces -- a boundary on `link_dial:` or `accepted=`
      * would be satisfied BY the fault under test and would stop before the fault
      * fired. */
+
+    /* THE WINDOW, and its failure message names the cause this file spent months not
+     * naming -- because a counter that stops is not a counter that is slow, and the
+     * two produce the same TIMEOUT. "lines=11 against 16" from a fifteen-second
+     * deadline is not a slow machine; it is a source that stopped, and the way to
+     * tell is one strstr away. Naming it costs a sentence and turns the next
+     * occurrence from a bisect into a reading.
+     *
+     * THE THREE POSSIBILITIES, in the order they are worth checking: the clock link
+     * was declared dead (permanent, because the link was accepted and T7 cannot
+     * re-dial it); this node stopped ticking (a hang, and nothing above would have
+     * arrived either); or the cadence really was slower than the arithmetic at
+     * WINDOW_LINES says -- the only one of the three a longer window would fix. */
     TF_CHECK_MSG(nf_expect_u64_ge(&third, "lines=", base + (uint64_t)WINDOW_LINES,
                                   T_IO_MS) == 0,
                  NAME_THIRD " received too few inbound lines and the observation "
                  "window never opened, so the absence asserted below would be "
-                 "vacuous: %s",
+                 "vacuous. THE USUAL CAUSE IS NOT A SLOW COUNTER: this window is "
+                  "measured on " NAME_FOURTH
+                  "'s keepalive, and if T4 declared that link dead the counter cannot "
+                  "climb again -- the link was ACCEPTED on this node, so T7 cannot "
+                  "re-dial it and the freeze is permanent. Look for \"link_dead: "
+                  "peer=" NAME_FOURTH
+                  "\" in this node's output above; if it is there, no longer window "
+                  "will open. If it is not there, this node stopped ticking. See "
+                 "DEAD_MS for the whole mechanism: %s",
                  third.out);
 
     /* THE ASSERTION WITH TEETH. Exactly one dial to " NAME_STAY " in the surviving

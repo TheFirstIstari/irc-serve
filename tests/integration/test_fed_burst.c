@@ -254,6 +254,27 @@ static int g_stage;
 static int g_tiny_send;
 static int g_tiny_recv;
 
+/* RAISE the RECEIVER's byte budget, for the second half of
+ * case_channel_count_bound() (#122). Pre-fork state, like the rest.
+ *
+ * WHY A CASE RAISES A BOUND RATHER THAN SHRINKING IT, and this is the only place
+ * in the suite that does: the claim is that IRC_BURST_MAX_CHANS is a bound that
+ * EXISTS, and the only way to see a ceiling do anything is to remove the budget
+ * that would otherwise get there first. Shrinking cannot demonstrate it -- a
+ * smaller budget makes the arithmetic bind harder, which is the other case.
+ *
+ * THE FIGURE IS DERIVED FROM THE TWO BOUNDS rather than picked, so that moving
+ * either moves it: 2 KiB is IRC_BURST_MAX_CHANS (1024) times twice the 204-byte
+ * minimum charge, which is what leaves a factor of two between this budget and the
+ * number of records the ceiling stops at. The charge is a floor, not an estimate --
+ * IRC_MAX_TAG_OVERHEAD is frozen at 179 and every record pays it plus its origin,
+ * its verb and six parameters -- so a budget of 2 KiB per channel cannot be
+ * exhausted by 1024 records on any input, and the case cannot sit on the
+ * boundary. The cost of the headroom is memory in the RECEIVER under test: 1024
+ * burst_chan_t is about 524 KiB, allocated only by this case. */
+#define BURST_TEST_CEIL_BUDGET (IRC_BURST_MAX_CHANS * 512u)
+static int g_raised_recv;
+
 /* SEND A DELIBERATELY TRUNCATED TRANSACTION INSTEAD OF A RESYNC, for
  * case_truncated_burst_changes_nothing(). Pre-fork state, like the rest. */
 static int g_truncate;
@@ -263,11 +284,31 @@ static int g_truncate;
  * the tick hook cannot see anything the parent sets after the fork. */
 static int g_open_burst;
 
+/* SEND A HAND-BUILT TRANSACTION WHOSE <topic> IS WIDER THAN CHAN_MAX_TOPIC, for
+ * case_over_long_topic_is_refused(). Pre-fork state, like the rest.
+ *
+ * A MODE RATHER THAN A BOOLEAN, because the transaction this produces is only
+ * meaningful on a node whose channel already has a topic to keep: the claim is that
+ * the receiver refuses the field and leaves what it had, and a receiver that had
+ * nothing to keep would pass the same assertion for the wrong reason. */
+static int g_overlong;
+
+/* SEND `count` MINIMAL SBURSTC RECORDS AND NOTHING ELSE, for the two halves of
+ * case_channel_count_bound(). `count` is a size_t rather than a mode because the
+ * two halves need different numbers: the byte-budget half has to send enough to
+ * exhaust the shipped budget, and the ceiling half has to send exactly one more
+ * than IRC_BURST_MAX_CHANS. Pre-fork state, like the rest; 0 sends nothing, which
+ * is what every other case wants. */
+static size_t g_flood_count;
+
 /* Defined below, with the wire format written out. Forward-declared rather than
  * moved so the RESYNC DRIVER -- the thing every case in this file is about -- reads
  * first and the one case that bypasses it reads as the exception it is. */
 static void send_truncated_burst(server_t *s, server_link_t *link);
 static void send_open_burst(server_t *s, server_link_t *link);
+static void send_overlong_topic_burst(server_t *s, server_link_t *link);
+static size_t send_channel_flood_burst(server_t *s, server_link_t *link,
+                                     size_t count);
 
 /* ---------------------------------------------------------------------------
  * THE RESYNC DRIVER
@@ -281,6 +322,24 @@ static void offer_resync(server_t *s)
 {
     chan_t *ch;
 
+    /* THE FLOOD IS ABOVE EVERY GATE, including the `ch == NULL` return below, and
+     * that placement is the case's whole arrangement rather than an ordering
+     * convenience: a transaction of a thousand empty channel records is about
+     * VOLUME, so it must not need a channel to exist, a member to have joined or a
+     * nick to have registered first. Every other mode here is gated on state the
+     * case has to build, and this one deliberately is not -- which is also what
+     * makes the flood's receiver a node with nothing of its own to interleave, so
+     * the records that land are the records the case sent. */
+    if (g_flood_count > 0u && g_is_b == 0 && g_stage == 0) {
+        /* ONCE, and only once it has actually gone out -- see the return value at
+         * send_channel_flood_burst(). The stage-1 branch below would put a second
+         * transaction on the wire behind this one. */
+        if (send_channel_flood_burst(s, server_find_link(s, NAME_B),
+                                     g_flood_count) > 0u) {
+            g_stage = 3;
+        }
+        return;
+    }
     if (g_is_b != 0) {
         /* NODE B DRIVES EXACTLY ONE, AND THAT IS A DIFFERENT CLAIM FROM A's THREE.
          * A's three are about what a burst does to the RECEIVER's roster. This one
@@ -330,6 +389,24 @@ static void offer_resync(server_t *s)
              * would be holding a shadow the case cannot account for. */
             g_stage = 3;
             send_open_burst(s, server_find_link(s, NAME_B));
+            return;
+        }
+        if (g_overlong != 0) {
+            /* Straight to 3 for the same reason as the open transaction above: one
+             * hand-built transaction, once, and the stage-1 branch would put a
+             * second one on the wire behind it. TWO gates and the second is the
+             * load-bearing one: `nick_count >= 2` alone would fire the burst as soon
+             * as ann registered, which is before alice has set the topic, and the
+             * case's final assertion is that the receiver KEPT the topic it already
+             * had. A receiver that had not been sent one would satisfy that without
+             * this node refusing anything. Both lines travel the one link in the
+             * order they are queued, so waiting for node A to hold a topic is what
+             * makes the arrival order on the far side a fact rather than a race. */
+            if (server_nick_count(s) < 2u || ch->topic[0] == '\0') {
+                return;
+            }
+            g_stage = 3;
+            send_overlong_topic_burst(s, server_find_link(s, NAME_B));
             return;
         }
         if (g_truncate != 0) {
@@ -577,6 +654,176 @@ static void child_tick(server_t *s, uint64_t now_ms)
     offer_resync(s);
 }
 
+/* ---------------------------------------------------------------------------
+ * #122: A TRANSACTION CARRYING A FIELD THE RECEIVER CANNOT STORE
+ * ---------------------------------------------------------------------------
+ * The third place in the tree where a test writes the wire format, and for the
+ * third distinct reason: the thing under test is a record whose topic is WIDER than
+ * CHAN_MAX_TOPIC, and no correctly behaving sender produces one. 4.3.1 prices the
+ * <topic> parameter at CHAN_MAX_TOPIC + 1 on the wire, so this node's own
+ * federation_resync() cannot emit it however it is configured -- which is exactly
+ * why the bug this case exists for was invisible: burst_copy() REFUSES rather than
+ * truncates, the refusal left the field empty, the empty field fitted, and the
+ * transaction counted as applied with dropped=0.
+ *
+ * THE PARAMETERS ARE DELIBERATELY LEGAL IN EVERY OTHER RESPECT. The channel name
+ * passes chan_name_valid(), the origin passes irc_serve_server_name_valid(), the
+ * topic_when is a legal 2.4 decimal and the terminator's counts are all correct --
+ * so the ONLY thing wrong with the record is the width of one field, and a receiver
+ * that discarded the transaction would be discarding a well-formed burst over a
+ * cosmetic violation. That distinction is the claim: the case measures a node that
+ * KEPT the record and refused the field, against a node that either truncated it or
+ * threw the whole resync away.
+ */
+#define OVERLONG_TOPIC_LEN 300u
+
+static char g_overlong_topic[OVERLONG_TOPIC_LEN + 1];
+
+static void send_overlong_topic_burst(server_t *s, server_link_t *link)
+{
+    conn_t *peer = server_link_conn(s, link);
+    const char *n0[2];
+    const char *n1[6];
+    const char *c1[6];
+    const char *m1[5];
+    const char *e1[4];
+    char signon[24];
+    char epoch[24];
+    int ok = 0;
+
+    if (peer == NULL) {
+        return;
+    }
+    burst_render_u64(epoch, sizeof epoch, s->epoch);
+    burst_render_u64(signon, sizeof signon, 0u);
+
+    n0[0] = epoch;
+    n0[1] = "1"; /* one nick follows */
+    n1[0] = NICK_E;
+    n1[1] = NICK_E;
+    n1[2] = "127.0.0.1";
+    n1[3] = "-";
+    n1[4] = signon;
+    n1[5] = "";
+    c1[0] = CHAN_T;
+    c1[1] = NAME_A;
+    c1[2] = NICK_A; /* a topic setter that FITS: 63 bytes is the bound and this is 5 */
+    c1[3] = "1700000000";
+    /* <modes> FITS -- 2 bytes against CHAN_MAX_MODES (31) -- and that is the whole
+     * point of it. The record has exactly one fault in it, the topic, and the modes
+     * are here so that the case can assert the consequence of the rule apply_chan()
+     * states: a field that DID fit is still withheld, because the origin's
+     * presentation of a channel is one record rather than three fields. A case whose
+     * <modes> were also refused would pass against a node that applied the modes of
+     * a record it had refused the topic of, because both refusals would look the
+     * same. */
+    c1[4] = "nt";
+    c1[5] = g_overlong_topic;
+    m1[0] = CHAN_T;
+    m1[1] = NAME_A;
+    m1[2] = NICK_E;
+    m1[3] = "-";
+    m1[4] = "*";
+    e1[0] = epoch;
+    e1[1] = "1"; /* nicks: correct */
+    e1[2] = "1"; /* chans: correct -- the record WAS accepted, which is the claim */
+    e1[3] = "1"; /* members: correct */
+
+    if (fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURST", n0, 2,
+                       NULL) == 0 &&
+        fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURSTN", n1, 6,
+                       NULL) == 0 &&
+        fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURSTC", c1, 6,
+                       NULL) == 0 &&
+        fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURSTM", m1, 5,
+                       NULL) == 0 &&
+        fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURSTE", e1, 4,
+                       NULL) == 0) {
+        ok = 1;
+    }
+    printf("[fixture] overlong_sent: ok=%d topic_len=%u\n", ok, OVERLONG_TOPIC_LEN);
+    fflush(stdout);
+}
+
+/* ---------------------------------------------------------------------------
+ * #122, THE OTHER HALF: HOW MANY CHANNEL RECORDS THE SHADOW WILL HOLD
+ * ---------------------------------------------------------------------------
+ * The channel count is bounded twice over. The byte budget bounds it ARITHMETICALLY
+ * -- every record is charged before it is stored, and at the shipped budget the
+ * cheapest possible SBURSTC costs 204 bytes against 131072, so at most 642 fit --
+ * and IRC_BURST_MAX_CHANS bounds it by a number somebody wrote down. Two
+ * senders below, one per bound, and the pair is the point: the first proves the
+ * arithmetic is what does the work, and the second proves the stated ceiling is
+ * real code rather than a comment.
+ *
+ * `count` records go out, one per tick-batch, each naming a DIFFERENT channel, so
+ * the receiver's shadow really does grow by `count` and nothing dedups them. The
+ * topic is one byte and the topic_who is one byte, which is what makes the charge
+ * the 204 the arithmetic above is built on.
+ */
+static size_t send_channel_flood_burst(server_t *s, server_link_t *link, size_t count)
+{
+    conn_t *peer = server_link_conn(s, link);
+    char epoch[24];
+    char count_s[24];
+    char name[CHAN_MAX_NAME + 1];
+    size_t sent = 0u;
+
+    /* RETURNS WHAT IT SENT, AND THAT IS THE POINT OF THE RETURN VALUE: the tick
+     * hook that calls this advances its own stage on a non-zero answer, so a tick
+     * that arrives before the link is up -- which is the first tick on this node --
+     * does not consume the one attempt the case has. A fixture that advanced its
+     * stage first and sent second would report "sent 0 of 1024" on the tick before
+     * the handshake and then never try again. */
+    if (peer == NULL) {
+        return 0u;
+    }
+    burst_render_u64(epoch, sizeof epoch, s->epoch);
+    {
+        const char *n0[2];
+
+        n0[0] = epoch;
+        n0[1] = "0"; /* no nicks */
+        if (fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURST", n0, 2,
+                           NULL) != 0) {
+            return 0u;
+        }
+    }
+    for (size_t i = 0; i < count; i++) {
+        const char *c1[6];
+
+        /* A DISTINCT LEGAL NAME PER RECORD, and the width matters as much as the
+         * distinctness: chan_name_valid() has to accept it or the record is
+         * refused as malformed and the case would be measuring the wrong refusal. */
+        (void)snprintf(name, sizeof name, "#f%05zu", i);
+        c1[0] = name;
+        c1[1] = NAME_A;
+        c1[2] = "-"; /* no topic setter: the SHORTEST legal form */
+        c1[3] = "0"; /* topic_when */
+        c1[4] = "-"; /* no modes */
+        c1[5] = "x"; /* a one-byte topic */
+        if (fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURSTC", c1,
+                           6, NULL) != 0) {
+            break;
+        }
+        sent++;
+    }
+    burst_render_u64(count_s, sizeof count_s, (uint64_t)sent);
+    {
+        const char *e1[4];
+
+        e1[0] = epoch;
+        e1[1] = "0";
+        e1[2] = count_s;
+        e1[3] = "0";
+        (void)fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURSTE", e1,
+                             4, NULL);
+    }
+    printf("[fixture] flood_sent: sent=%zu of %zu\n", sent, count);
+    fflush(stdout);
+    return sent;
+}
+
 /* Runs in the CHILD, before anything may connect. */
 static void child_setup(server_t *s)
 {
@@ -647,6 +894,13 @@ static void child_setup(server_t *s)
          * tag block plus the prefix, the verb and the parameters, not the bytes
          * actually rendered -- and the case below states both numbers. */
         fed_burst_set_max_bytes(BURST_TEST_RECV_BUDGET);
+    }
+    if (g_raised_recv != 0 && g_is_b != 0) {
+        /* THE RECEIVER WITH ITS BYTE BOUND RAISED (#122), and the comment at the
+         * constant says why this is the only case in the suite that raises one: the
+         * claim is about the SECOND bound existing, and a ceiling nobody has ever
+         * seen refuse anything is a comment. */
+        fed_burst_set_max_bytes(BURST_TEST_CEIL_BUDGET);
     }
 
     if (g_peer_port <= 0) {
@@ -1972,6 +2226,497 @@ static void case_open_transaction_released_at_shutdown(void)
     g_open_burst = 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * #122: A TOPIC WIDER THAN CHAN_MAX_TOPIC IS REFUSED, COUNTED, AND KEPT FROM
+ * BECOMING A DIFFERENT TOPIC
+ * ---------------------------------------------------------------------------
+ * What used to happen: apply_chan() discarded burst_copy()'s result, so a 300-byte
+ * topic left `sc->topic` empty, the empty string fitted chan_set_topic() without
+ * complaint, and the terminator's counts matched -- so the transaction committed and
+ * reported `dropped=0`. The node had silently discarded a field a client can read
+ * on 332 and 333, and reported success to everyone. The proof that the result was
+ * being lost is that apply_topic()'s `fed_burst_topic_ignored: reason=too_long` arm
+ * could never fire, which is not asserted here because that arm is unreachable for
+ * a DIFFERENT and better reason -- see the comment on apply_topic() in burst.c,
+ * where the shadow field and the setter's bound are the same width by
+ * construction -- so the refusal is reported where it is detected instead.
+ *
+ * WHAT IS ASSERTED, and the order is the argument:
+ *   1. the refusal is REPORTED, with the arriving length beside the flag, so an
+ *      operator can tell a peer that ignores its own bound from one that is off by
+ *      a byte;
+ *   2. the transaction still APPLIED -- chans=1 and the member installed -- which
+ *      is what separates "refused the field" from "threw the resync away";
+ *   3. dropped=1, so the loss is in the number rather than only in the log;
+ *   4. the node's topic is UNCHANGED, which is the half a truncating fix would
+ *      fail: a cut sentence is stored, and send_topic() hands it to every member on
+ *      the next 332, including every member who joins later.
+ *
+ * AND THE NEGATIVE, which is what makes assertions 1 and 3 worth having: put the
+ * `(void)` back on burst_copy() in apply_chan() and the mask stays zero, so no
+ * `fed_burst_chan_refused` line is printed and dropped=0, and this case fails on
+ * both counts. Nothing else in the file notices: the record still installs and the
+ * terminator's counts still match, which is exactly why the defect survived.
+ */
+static void case_over_long_topic_is_refused(void)
+{
+    nf_node_t a;
+    nf_node_t b;
+    test_client_t alice;
+    test_client_t ann;
+    const char *const both[] = { "@" NICK_A };
+    char needle[256];
+
+    memset(g_overlong_topic, 'T', sizeof g_overlong_topic - 1u);
+    g_overlong_topic[sizeof g_overlong_topic - 1u] = '\0';
+
+    g_peer_port = 0;
+    g_trace = 0;
+    g_is_b = 0;
+    g_stage = 0;
+    g_tiny_send = 0;
+    g_tiny_recv = 0;
+    g_raised_recv = 0;
+    g_flood_count = 0u;
+    g_open_burst = 0;
+    g_overlong = 1;
+    TF_CHECK_MSG(nf_spawn_inline_named(&a, NAME_A, child_setup) == 0,
+                 "could not spawn node A");
+    g_peer_port = a.port;
+    g_is_b = 1;
+    TF_CHECK_MSG(nf_spawn_inline_named(&b, NAME_B, child_setup) == 0,
+                 "could not spawn node B");
+
+    TF_CHECK_MSG(nf_expect(&b, "fed_burst_applied: peer=" NAME_A, T_IO_MS) == 0,
+                 "node B never applied the empty establishment transaction, so the "
+                 "shadow machinery this case drives is not the one under test: %s",
+                 b.out);
+
+    register_client(&alice, a.port, NICK_A);
+    TF_CHECK_MSG(tc_send(&alice, "JOIN " CHAN_T) == 0, "alice's JOIN send failed");
+    TF_CHECK_MSG(tc_expect(&alice, " 366 ", T_IO_MS) == 0,
+                 "alice's JOIN never completed on the node that owns the channel");
+
+    /* A TOPIC ON THE RECEIVER BEFORE ANYTHING UNDER TEST HAPPENS, and it is not
+     * decoration: it is what the final assertion reads. A receiver that had no topic
+     * would pass "the topic is unchanged" without this node doing anything right,
+     * and a receiver that had never been sent one would pass "no truncated topic was
+     * stored" without this node having refused anything.
+     *
+     * THE ORDER IS LOAD-BEARING AND IT IS WHY ann IS REGISTERED LATER. The tick
+     * hook's gate is `nick_count >= 2`, so registering ann before this TOPIC would
+     * put the burst on the wire first, and then "the topic on B is unchanged" would
+     * be a statement about a receiver that had nothing to keep. Both lines travel
+     * the one link in the order they are queued, so setting the topic before ann
+     * exists is what makes the arrival order a fact rather than a race.
+     *
+     * The 31 is `strlen("the topic that was already here")`, and it is what makes
+     * the final assertion falsifiable: a receiver that TRUNCATED the 300-byte topic
+     * would hold 255 bytes, and one that cleared it would hold 0. */
+    TF_CHECK_MSG(tc_send(&alice, "TOPIC " CHAN_T " :the topic that was already here")
+                     == 0,
+                 "alice's TOPIC send failed");
+    TF_CHECK_MSG(nf_expect(&a, "chan_topic: channel=" CHAN_T " nick=" NICK_A " len=31",
+                           T_IO_MS) == 0,
+                 "node A never applied alice's topic, so the receiver was never sent "
+                 "one and the assertions about it would be vacuous: %s",
+                 a.out);
+    /* AND IT REACHED THE RECEIVER, over a relayed STOPIC rather than a burst -- which
+     * is what gives the final assertion its baseline. `fed_topic:` is verbs.c's own
+     * report of a topic this node applied, and it carries the STORED LENGTH, so this
+     * line is the measurement the final assertion compares against. */
+    TF_CHECK_MSG(nf_expect(&b, "fed_topic: channel=" CHAN_T " member=" NICK_A
+                                   " len=31",
+                           T_IO_MS) == 0,
+                 "node B never applied the relayed topic, so asserting that it did not "
+                 "CHANGE it afterwards would be asserting nothing: %s",
+                 b.out);
+
+    /* ann LAST, and registering her is what fires the transaction: the tick hook's
+     * gate is `nick_count >= 2`. */
+    register_client(&ann, a.port, NICK_E);
+
+    /* THE TRANSACTION. The tick hook fires it once ann has registered and node A
+     * holds a topic, and the `[fixture]` line is what makes the rest of the case
+     * non-vacuous: it says the lines were queued, so a later failure is about what
+     * the receiver did. */
+    TF_CHECK_MSG(nf_expect(&a, "overlong_sent: ok=1 topic_len=300", T_IO_MS) == 0,
+                 "node A never sent the over-long-topic transaction: %s", a.out);
+
+    /* 1. THE REFUSAL IS REPORTED, with the ARRIVING LENGTH in the line. The length
+     * is the half that matters operationally: a peer whose sender does not check
+     * CHAN_MAX_TOPIC against its own output is a different problem from one that is
+     * three bytes over, and the flag alone cannot tell them apart.
+     *
+     * THE NEEDLE STARTS AT `channel=` AND NOT AT `fd=`, and that is the rule this
+     * suite adopted when it stopped pinning descriptor numbers: the descriptor is
+     * allocated by the receiver and its value is not a property of the behaviour
+     * under test, so a needle that included it would fail for a reason that has
+     * nothing to do with the refusal. */
+    (void)snprintf(needle, sizeof needle,
+                   "channel=" CHAN_T
+                   " refused_topic=1 refused_topic_who=0 refused_modes=0 "
+                   "topic_len=300 topic_who_len=5 modes_len=2 "
+                   "reason=FIELD_TOO_WIDE");
+    TF_CHECK_MSG(nf_expect(&b, needle, T_IO_MS) == 0,
+                 "node B did not report the field it could not store, so the loss is "
+                 "silent -- which is the whole of the defect this case was filed for. "
+                 "The lengths matter as much as the flag: a 300-byte topic on a "
+                 "255-byte cache is a peer whose sender does not check its own bound: "
+                 "%s",
+                 b.out);
+    /* AND ONLY THE TOPIC WAS REFUSED, which the needle above already pins by saying
+     * topic_who=0 and modes=0. Asserted again on the counter the alternative design
+     * would have used: if the whole record had been refused the transaction would
+     * not have committed at all, which is assertion 2. */
+
+    /* 2. THE TRANSACTION APPLIED. chans=1 is the load-bearing field and it is the
+     * direct opposite of the alternative: a receiver that discarded the record would
+     * have reported a count mismatch at the terminator, abandoned the whole
+     * transaction, and left this node stale about a channel whose roster was
+     * perfectly good. The epoch is not in the needle because it is this node's own
+     * boot stamp and asserting it would be asserting the fixture. */
+    TF_CHECK_MSG(nf_expect(&b, "nicks=1 chans=1 members=1 installed=1", T_IO_MS) == 0,
+                 "node B did not apply a transaction whose only fault was one field "
+                 "being too wide, so it threw away a good roster over a cosmetic "
+                 "violation: %s",
+                 b.out);
+    /* AND THE MEMBER CAME ACROSS, which is what says the record was KEPT rather than
+     * merely counted. ann exists only on node A, so B cannot already hold her. */
+    expect_names(&alice, "alice after the over-long-topic burst", NICK_A, CHAN_T, both,
+                 1u, NULL);
+
+    /* 3. THE LOSS IS IN THE NUMBER. dropped=1 is the count an operator reads, and
+     * the value it had was 0 -- which is the silent half of the defect: the record
+     * counted as fully applied. */
+    TF_CHECK_MSG(nf_expect(&b, "dropped=1", T_IO_MS) == 0,
+                 "node B reported dropped=0 for a transaction it could not fully "
+                 "apply, so the field it discarded is invisible in the number an "
+                 "operator reads: %s",
+                 b.out);
+    /* AND THE TRANSACTION WAS NOT ABANDONED, which is what separates "refused the
+     * field" from "threw the resync away" on the counters as well as on the log. */
+    TF_CHECK_MSG(nf_expect_u64(&b, "burst_abandoned=", 0, 1000) == 0,
+                 "node B abandoned the transaction, so it did not keep the record and "
+                 "refuse the field -- it discarded five hundred good channels' worth "
+                 "of peer state over one wide topic: %s",
+                 b.out);
+    TF_CHECK_MSG(nf_expect_u64(&b, "fed_malformed=", 0, 1000) == 0,
+                 "node B refused the record as malformed, so this case is measuring "
+                 "the malformed arm rather than the width one: %s",
+                 b.out);
+
+    /* 4. THE TOPIC ON THE RECEIVER IS UNCHANGED, and this is the assertion a
+     * truncating fix fails. A cut topic is stored and then handed to every member by
+     * send_topic() on the next 332 and 333 -- including every member who joins
+     * later, for as long as the channel lives.
+     *
+     * `kept_topic_len=31` IS THE MEASUREMENT, and the needle says why: 31 is what
+     * the baseline above established, 0 would mean something cleared the topic on
+     * the strength of a record it could not read, and 255 would mean something
+     * truncated the peer's 300 bytes. Nothing else in the tree reports what a
+     * channel's topic ended up as after a burst, so this line and this number are
+     * the whole of the evidence that the right thing happened -- and the teeth run
+     * is what found that out: a fault which applied the topic anyway, from the
+     * zeroed field a refusal leaves behind, cleared it to 0 and every other
+     * assertion in this case still passed. */
+    TF_CHECK_MSG(nf_expect(&b, "fed_burst_chan_withheld: channel=" CHAN_T
+                                   " kept_topic_len=31 kept_modes_len=0 "
+                                   "refused_topic=1 refused_topic_who=0 "
+                                   "refused_modes=0 reason=FIELD_TOO_WIDE",
+                           T_IO_MS) == 0,
+                 "node B did not report the topic and the modes it was left holding. "
+                 "kept_topic_len must be the 31 bytes it already had -- a 0 means the "
+                 "record cleared the topic on the strength of a field it could not "
+                 "read, and a 255 means it truncated the origin's 300-byte topic into "
+                 "a different one that would be replayed to every member who joins "
+                 "later. kept_modes_len must be 0 even though the record's <modes> "
+                 "was \"nt\" and FIT, because the origin's presentation of a channel "
+                 "is one record rather than three fields, and a node that applied half "
+                 "of a record it had refused the other half of is reporting half a "
+                 "channel: %s",
+                 b.out);
+    /* COUNTED rather than asserted as an absence, for the reason this file states
+     * everywhere else: `fed_topic:` is printed once per topic this node APPLIES from
+     * a relayed STOPIC, so a count of exactly one says both "it applied the relayed
+     * one" and "it applied nothing since". An absence on the string alone would be
+     * satisfied by a node that never applied the topic in the first place, which the
+     * baseline assertion above rules out -- and this count re-checks it here rather
+     * than trusting a check made forty lines earlier. */
+    TF_CHECK_MSG(tf_count(b.out, "fed_topic: channel=" CHAN_T) == 1u,
+                 "node B applied %zu topics on " CHAN_T " and should have applied "
+                 "exactly one -- the relayed one from before the burst. A second one "
+                 "means it either truncated the origin's 300-byte topic into a "
+                 "different one or cleared the topic it already had, and "
+                 "chan_set_topic() refuses rather than truncates for exactly this "
+                 "reason: 3.2's \"never deliver a silently shortened parameter\" is "
+                 "the rule it cites: %s",
+                 tf_count(b.out, "fed_topic: channel=" CHAN_T), b.out);
+    /* AND THE CLIENT PATH NEVER RAN ON THE RECEIVER AT ALL, which is the other half
+     * of the same fact: `chan_topic:` is printed only by handle_topic(), so its
+     * absence on a node that has no client of its own is what says the topic was
+     * never rewritten by any route. */
+    TF_CHECK_MSG(strstr(b.out, "chan_topic:") == NULL,
+                 "node B wrote a topic through the client path, and node B has no "
+                 "client: something other than a relayed STOPIC or a burst set that "
+                 "channel's topic: %s",
+                 b.out);
+    /* THE COMPLEMENT, and it is the same fact read from the other side: not one byte
+     * of the peer's over-long topic is anywhere in the receiver's log, so nothing
+     * anywhere can have cut it down to CHAN_MAX_TOPIC bytes. */
+    TF_CHECK_MSG(strstr(b.out, "TTTTTT") == NULL,
+                 "node B logged a run of the over-long topic, so some part of the "
+                 "peer's bytes was stored rather than refused whole: %s",
+                 b.out);
+
+    TF_CHECK_MSG(nf_stop(&a) == 0, "node A did not exit cleanly");
+    TF_CHECK_MSG(nf_stop(&b) == 0, "node B did not exit cleanly");
+    TF_CHECK_MSG(nf_expect_u64(&a, "burst_abandoned=", 0, 1000) == 0,
+                 "node A abandoned a transaction of its own: %s", a.out);
+    TF_CHECK_MSG(nf_expect(&b, "fed_burst_close: shadow=NONE", 1000) == 0,
+                 "node B reported an open shadow at shutdown: %s", b.out);
+
+    tc_close(&alice);
+    tc_close(&ann);
+    nf_free(&a);
+    nf_free(&b);
+    g_overlong = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * #122: THE CHANNEL COUNT IS BOUNDED BY THE BYTE BUDGET, NOT BY THE CEILING
+ * ---------------------------------------------------------------------------
+ * IRC_BURST_MAX_CHANS is defence in depth, and this case is what makes that a
+ * measurement rather than a claim: it drives channel records at the SHIPPED budget
+ * until the transaction is refused, and asserts that the refusal is the byte budget
+ * and that the count stopped well short of the ceiling.
+ *
+ * IT PASSES WHETHER OR NOT THE CEILING EXISTS. That is the property that makes the
+ * ceiling defence in depth rather than the bound, and it is asserted here rather
+ * than left to be true by inspection: with `IRC_BURST_MAX_CHANS` deleted from
+ * burst.c this case is still green, because nothing about it depends on the number
+ * 1024. The case that goes red if the ceiling is deleted is
+ * case_channel_ceiling_refuses_what_the_budget_would_allow(), and the two are one
+ * claim split so that neither can be satisfied by the other.
+ *
+ * HOW MANY RECORDS IT SENDS, and the arithmetic. The cheapest legal SBURSTC charges
+ * IRC_MAX_TAG_OVERHEAD (179, frozen) + a one-byte origin + the seven-byte verb +
+ * six one-byte parameters with their six separators + the four wire_size() adds =
+ * 204. The shipped budget is IRC_BURST_MAX_BYTES = CONN_WQ_MAX/2 = 131072, so the
+ * byte arithmetic stops the count at 131072/204 = 642. The case sends
+ * IRC_BURST_MAX_CHANS (1024) records -- comfortably more than the budget can take,
+ * and comfortably more than the ceiling -- and asserts the refusal came from the
+ * budget with chans= under the ceiling.
+ *
+ * 1024 records is about 87 KiB on the wire against a 256 KiB link queue, so the
+ * transaction fits the sender's queue as well as being over the receiver's budget:
+ * a case that saturated the link instead would be refused at the queue and would
+ * learn nothing about either bound.
+ */
+static void case_channel_count_bound(void)
+{
+    nf_node_t a;
+    nf_node_t b;
+    char needle[128];
+    uint64_t chans;
+
+    g_peer_port = 0;
+    g_trace = 0;
+    g_is_b = 0;
+    g_stage = 0;
+    g_tiny_send = 0;
+    g_tiny_recv = 0;
+    g_raised_recv = 0;
+    g_open_burst = 0;
+    g_overlong = 0;
+    g_flood_count = IRC_BURST_MAX_CHANS;
+    TF_CHECK_MSG(nf_spawn_inline_named(&a, NAME_A, child_setup) == 0,
+                 "could not spawn node A");
+    g_peer_port = a.port;
+    g_is_b = 1;
+    TF_CHECK_MSG(nf_spawn_inline_named(&b, NAME_B, child_setup) == 0,
+                 "could not spawn node B");
+
+    TF_CHECK_MSG(nf_expect(&b, "fed_burst_applied: peer=" NAME_A, T_IO_MS) == 0,
+                 "node B never applied the empty establishment transaction: %s",
+                 b.out);
+    TF_CHECK_MSG(nf_expect(&a, "flood_sent: sent=1024 of 1024", T_IO_MS) == 0,
+                 "node A did not queue the whole flood, so the receiver was not given "
+                 "the chance to run out of budget and the assertion below is not "
+                 "about a transaction that stopped early: %s",
+                 a.out);
+
+    /* THE REFUSAL IS THE BYTE BUDGET. `reason=TOO_LARGE` is shadow_charge()'s, and
+     * it is the load-bearing needle of this case: TOO_MANY_CHANS would mean the
+     * ceiling got there first, which is the whole thing being ruled out. */
+    TF_CHECK_MSG(nf_expect(&b, "fed_burst_abandon: origin=" NAME_A
+                                   " reason=TOO_LARGE",
+                           T_IO_MS) == 0,
+                 "node B did not refuse the flood on its byte budget, so the bound on "
+                 "the channel count is not the byte arithmetic the header claims it "
+                 "is: %s",
+                 b.out);
+    /* AND THE CEILING WAS NOT WHAT REFUSED IT, asserted as an absence so a run in
+     * which both bounds could have fired still has to name the one that did. */
+    TF_CHECK_MSG(strstr(b.out, "TOO_MANY_CHANS") == NULL,
+                 "node B refused the flood on its channel CEILING rather than on its "
+                 "byte budget, so the ceiling is load-bearing at the shipped bound "
+                 "and the arithmetic in IRC_BURST_MAX_CHANS's comment is wrong: %s",
+                 b.out);
+
+    /* AND THE COUNT STOPPED SHORT OF THE CEILING, with the two figures adjacent so
+     * the relationship is legible in the log rather than computed by the reader. The
+     * budget allows 642 and the ceiling is 1024, so a count at or above the ceiling
+     * would mean the two bounds had traded places. */
+    TF_CHECK_MSG(nf_find_u64(&b, "chans=", &chans) == 0,
+                 "node B never reported how many channel records it had staged, so "
+                 "the count cannot be placed against the ceiling: %s",
+                 b.out);
+    (void)snprintf(needle, sizeof needle, "chans=%llu ", (unsigned long long)chans);
+    TF_CHECK_MSG(chans > 0u && chans < (uint64_t)IRC_BURST_MAX_CHANS,
+                 "node B staged %llu channel records against a ceiling of %llu, so "
+                 "the byte budget did not stop the count below the ceiling and the "
+                 "headroom IRC_BURST_MAX_CHANS claims to have is not there: %s",
+                 (unsigned long long)chans,
+                 (unsigned long long)IRC_BURST_MAX_CHANS, b.out);
+    /* AND THE BUDGET IS THE ONE THAT BOUNDED IT, restated as arithmetic so the case
+     * says what it measured rather than only that it refused: the budget is what the
+     * records were charged against, so the count cannot exceed it by more than one
+     * record's charge. 131072/204 is 642, and the margin is two whole records. */
+    TF_CHECK_MSG(chans <= (uint64_t)(IRC_BURST_MAX_BYTES / 204u) + 2u,
+                 "node B staged %llu channel records, which is more than the %llu the "
+                 "shipped byte budget can pay for at the 204-byte minimum charge -- so "
+                 "the budget is not the bound and something else is: %s",
+                 (unsigned long long)chans,
+                 (unsigned long long)(IRC_BURST_MAX_BYTES / 204u), b.out);
+
+    /* AND NOTHING WAS INSTALLED, because a transaction cut short by the budget
+     * leaves the receiver exactly as it was. burst_abandoned=1 is that fact on a
+     * counter, and a receiver that had applied the first few hundred channels
+     * before running out of budget would be a partial burst. */
+    TF_CHECK_MSG(nf_expect_u64(&b, "burst_abandoned=", 1, 1000) == 0,
+                 "node B did not count the refusal, so the case cannot tell a "
+                 "transaction that was thrown away from one that was applied and "
+                 "then reported: %s",
+                 b.out);
+    /* COUNTED RATHER THAN ABSENT, because there IS one `fed_burst_applied` in this
+     * node's output before the flood: the empty establishment transaction every node
+     * sends on a link coming up, which the case waits for above. An absence on the
+     * string would therefore be false from the moment the link was established, so
+     * the claim has to be "the flood added no second one", and the baseline is
+     * asserted rather than assumed. */
+    TF_CHECK_MSG(tf_count(b.out, "fed_burst_applied:") == 1u,
+                 "node B applied %zu transactions and one of them is the empty "
+                 "establishment one this case waited for -- so the flood was applied "
+                 "after the byte budget had abandoned it, which is the partial burst "
+                 "4.3 forbids: %s",
+                 tf_count(b.out, "fed_burst_applied:"), b.out);
+
+    TF_CHECK_MSG(nf_stop(&a) == 0, "node A did not exit cleanly");
+    TF_CHECK_MSG(nf_stop(&b) == 0, "node B did not exit cleanly");
+    TF_CHECK_MSG(nf_expect(&b, "fed_burst_close: shadow=NONE", 1000) == 0,
+                 "node B reported an open shadow at shutdown: %s", b.out);
+
+    nf_free(&a);
+    nf_free(&b);
+    g_flood_count = 0u;
+}
+
+/* ---------------------------------------------------------------------------
+ * #122: AND THE CEILING IS REAL CODE, NOT A COMMENT
+ * ---------------------------------------------------------------------------
+ * The other half of the pair, and the one with the negative in it. IRC_BURST_MAX_CHANS
+ * is unreachable at the shipped budget -- case_channel_count_bound() is what proves
+ * that -- and a bound nobody has ever seen refuse anything is a comment with a cost.
+ * So this case removes the budget that would otherwise get there first: the
+ * receiver's byte budget is raised to twice what 1024 records charge, the ceiling
+ * is the only bound left, and the transaction is refused by it.
+ *
+ * DELETE `IRC_BURST_MAX_CHANS` FROM burst.c AND THIS CASE GOES RED: with no ceiling
+ * the 1024 records all fit the raised budget, the transaction commits, and
+ * `reason=TOO_MANY_CHANS` is never printed. Nothing else in the suite notices,
+ * because nothing else ever sends a thousand channel records -- which is precisely
+ * the class of defect that survives to a release, and why this case exists as a
+ * separate one rather than as an assertion inside the previous case.
+ */
+static void case_channel_ceiling_refuses_what_the_budget_would_allow(void)
+{
+    nf_node_t a;
+    nf_node_t b;
+
+    g_peer_port = 0;
+    g_trace = 0;
+    g_is_b = 0;
+    g_stage = 0;
+    g_tiny_send = 0;
+    g_tiny_recv = 0;
+    g_raised_recv = 1;
+    g_open_burst = 0;
+    g_overlong = 0;
+    g_flood_count = IRC_BURST_MAX_CHANS + 1u;
+    TF_CHECK_MSG(nf_spawn_inline_named(&a, NAME_A, child_setup) == 0,
+                 "could not spawn node A");
+    g_peer_port = a.port;
+    g_is_b = 1;
+    TF_CHECK_MSG(nf_spawn_inline_named(&b, NAME_B, child_setup) == 0,
+                 "could not spawn node B");
+
+    TF_CHECK_MSG(nf_expect(&b, "fed_burst_applied: peer=" NAME_A, T_IO_MS) == 0,
+                 "node B never applied the empty establishment transaction: %s",
+                 b.out);
+    TF_CHECK_MSG(nf_expect(&a, "flood_sent: sent=1025 of 1025", T_IO_MS) == 0,
+                 "node A did not queue one record more than the ceiling allows, so "
+                 "the ceiling was never approached: %s",
+                 a.out);
+
+    /* THE CEILING REFUSED IT. The budget could not have: 1025 records at the
+     * 204-byte minimum charge is 209100 bytes, and BURST_TEST_CEIL_BUDGET is
+     * IRC_BURST_MAX_CHANS * 512 = 524288 -- a factor of 2.5 of headroom, so this
+     * case cannot sit on the boundary between the two bounds. */
+    TF_CHECK_MSG(nf_expect(&b, "reason=TOO_MANY_CHANS", T_IO_MS) == 0,
+                 "node B did not refuse a thousand and twenty-five channel records on "
+                 "IRC_BURST_MAX_CHANS with its byte budget raised out of the way, so "
+                 "the ceiling is a comment rather than a bound: %s",
+                 b.out);
+    /* AND IT NAMED THE RIGHT REASON, because a ceiling and a budget failing together
+     * is the arrangement this case has to rule out and the reason string is what
+     * rules it out. */
+    TF_CHECK_MSG(strstr(b.out, "reason=TOO_LARGE") == NULL,
+                 "node B reported the byte budget as well as the ceiling, so the case "
+                 "cannot say which bound did the refusing: %s",
+                 b.out);
+    /* AND IT STOPPED AT THE CEILING, not before it. A ceiling that fired early
+     * would pass every assertion above and still be wrong, because its job is to be
+     * the LAST line rather than the only one. */
+    TF_CHECK_MSG(nf_expect(&b, "chans=1024", T_IO_MS) == 0,
+                 "node B did not stage exactly IRC_BURST_MAX_CHANS channel records "
+                 "before refusing, so it stopped for some other reason than the "
+                 "ceiling's count: %s",
+                 b.out);
+
+    /* AND IT IS ALL OR NOTHING, so the ceiling did not become a way to apply most of
+     * a transaction: the whole shadow went, and this node's view of the peer is
+     * exactly what it was. */
+    TF_CHECK_MSG(nf_expect_u64(&b, "burst_abandoned=", 1, 1000) == 0,
+                 "node B did not count the ceiling's refusal: %s", b.out);
+    TF_CHECK_MSG(tf_count(b.out, "fed_burst_applied:") == 1u,
+                 "node B applied %zu transactions and one of them is the empty "
+                 "establishment one -- so the flood was applied after the ceiling had "
+                 "already abandoned it, and the ceiling has become a way to apply most "
+                 "of a transaction: %s",
+                 tf_count(b.out, "fed_burst_applied:"), b.out);
+
+    TF_CHECK_MSG(nf_stop(&a) == 0, "node A did not exit cleanly");
+    TF_CHECK_MSG(nf_stop(&b) == 0, "node B did not exit cleanly");
+    TF_CHECK_MSG(nf_expect(&b, "fed_burst_close: shadow=NONE", 1000) == 0,
+                 "node B reported an open shadow at shutdown: %s", b.out);
+
+    nf_free(&a);
+    nf_free(&b);
+    g_flood_count = 0u;
+    g_raised_recv = 0;
+}
+
 int main(void)
 {
     case_resync_replaces();
@@ -1979,6 +2724,9 @@ int main(void)
     case_over_budget_changes_nothing();
     case_truncated_burst_changes_nothing();
     case_open_transaction_released_at_shutdown();
+    case_over_long_topic_is_refused();
+    case_channel_count_bound();
+    case_channel_ceiling_refuses_what_the_budget_would_allow();
     tf_done("fed_burst");
     return 0;
 }

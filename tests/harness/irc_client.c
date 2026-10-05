@@ -348,6 +348,159 @@ int tc_expect(test_client_t *c, const char *needle, int timeout_ms)
     return -1;
 }
 
+/* The body of tc_read_line(), factored out so the wait loop and the scan cannot
+ * disagree about what "a complete line at a boundary matching `prefix`" means.
+ * Returns 1 and fills the out-params on a match, 0 on "not yet".
+ *
+ * THE SCAN, and the two boundary conditions are the whole of it:
+ *
+ *   the line must be TERMINATED -- a run of bytes ending in CRLF -- because a
+ *   prefix that has arrived so far is not a reply;
+ *   and the prefix must START the line -- the character before it must be the
+ *   start of the buffer or an LF -- because a reply that CONTAINS the text is not
+ *   the reply.
+ *
+ * LF rather than CR is the byte tested for the boundary, and deliberately: the
+ * stream is CRLF, so the LF of the previous line is the last byte before this
+ * line begins, and testing for CR would accept a stream whose lines end in a bare
+ * CR. */
+static int line_payload(const test_client_t *c, size_t from, const char *prefix,
+                        char *out, size_t cap, size_t *len)
+{
+    size_t plen;
+    size_t at = from;
+
+    if (c == NULL || c->buf == NULL || prefix == NULL || out == NULL ||
+        cap == 0u) {
+        return 0;
+    }
+    plen = strlen(prefix);
+    if (plen >= cap) {
+        return 0; /* the prefix alone cannot fit; the caller's buffer is too small */
+    }
+    /* THE SCAN NEVER STARTS MID-LINE, and that is what makes `from` usable: a caller
+     * advancing by `len + 2` lands on the first byte after a CRLF, and a caller that
+     * does not is asking for a match somewhere inside a line, which is the substring
+     * hazard this function exists to remove. So an offset in the middle of a line is
+     * advanced to the start of the NEXT one rather than silently accepted. */
+    if (at < c->len && at > 0u && c->buf[at - 1u] != '\n') {
+        const char *nl = strchr(c->buf + at, '\n');
+
+        if (nl == NULL) {
+            return 0;
+        }
+        at = (size_t)(nl - c->buf) + 1u;
+    }
+    while (at < c->len) {
+        const char *line = c->buf + at;
+        const char *crlf = strstr(line, "\r\n");
+        size_t llen;
+
+        if (crlf == NULL) {
+            /* The last line in the buffer has no terminator yet. It is either the
+             * line being waited for arriving in pieces, or a line the node has not
+             * finished sending; either way it is not a match yet. */
+            return 0;
+        }
+        llen = (size_t)(crlf - line);
+        if (llen >= plen && strncmp(line, prefix, plen) == 0) {
+            /* IT MUST FIT WHOLE, and refusing is the only honest answer. snprintf()
+             * would truncate and report `*len` as the FULL length, so the caller
+             * would be handed a length that does not describe the string it has --
+             * which is precisely the bug this primitive exists to remove, in a new
+             * place. A caller whose buffer is too small for a reply it has actually
+             * received has a bug in the test, and it should hear about it here
+             * rather than diagnose a miscount later. */
+            if (llen + 1u > cap) {
+                return -1;
+            }
+            memcpy(out, line, llen);
+            out[llen] = '\0';
+            if (len != NULL) {
+                *len = llen;
+            }
+            return 1;
+        }
+        at += llen + 2u; /* past this line's CRLF */
+    }
+    return 0;
+}
+
+int tc_read_line_from(test_client_t *c, size_t from, const char *prefix, char *out,
+                      size_t cap, size_t *len, int timeout_ms)
+{
+    uint64_t deadline;
+
+    if (c == NULL || prefix == NULL || out == NULL || cap == 0u || c->fd < 0) {
+        return -1;
+    }
+    deadline = now_ms() + (uint64_t)timeout_ms;
+    for (;;) {
+        int eof = 0;
+        int rc;
+        int found = line_payload(c, from, prefix, out, cap, len);
+
+        if (found > 0) {
+            return 0;
+        }
+        if (found < 0) {
+            fprintf(stderr, "tc_read_line: the line starting \"%s\" is longer than "
+                            "the %zu-byte buffer this test gave it, so it is REFUSED "
+                            "rather than truncated -- a truncated payload with a full "
+                            "length beside it is the bug tc_read_line() exists to "
+                            "remove\n",
+                    prefix, cap);
+            return -1;
+        }
+        rc = read_once(c, deadline, &eof);
+        if (rc < 0) {
+            break;
+        }
+        if (eof) {
+            /* One last scan: a close can land in the same select() as the last
+             * bytes, so what we wanted may be in hand and the socket already gone. */
+            found = line_payload(c, from, prefix, out, cap, len);
+            if (found != 0) {
+                return (found > 0) ? 0 : -1;
+            }
+            break;
+        }
+        if (now_ms() >= deadline) {
+            break;
+        }
+    }
+    fprintf(stderr, "tc_read_line: TIMEOUT after %d ms waiting for a complete line "
+                    "starting \"%s\"\n",
+            timeout_ms, prefix);
+    fprintf(stderr, "tc_read_line: received %zu bytes: \"", c->len);
+    {
+        size_t i;
+        size_t show = (c->len < 512u) ? c->len : 512u;
+
+        for (i = 0; i < show; i++) {
+            unsigned char ch = (unsigned char)c->buf[i];
+
+            if (ch == '\r') {
+                fputs("\\r", stderr);
+            } else if (ch == '\n') {
+                fputs("\\n", stderr);
+            } else if (ch < 0x20u || ch > 0x7eu) {
+                fprintf(stderr, "\\x%02x", ch);
+            } else {
+                fputc((int)ch, stderr);
+            }
+        }
+    }
+    fprintf(stderr, "\"\n");
+    return -1;
+}
+
+int tc_read_line(test_client_t *c, const char *prefix, char *out, size_t cap,
+                 size_t *len, int timeout_ms)
+{
+    return tc_read_line_from(c, 0u, prefix, out, cap, len, timeout_ms);
+}
+
 /* Wait for the server to close its half. Returns 0 when a clean EOF was
  * observed (recv() returned 0), -1 on timeout, -2 on a timeout where data had
  * arrived but the close never did, and -3 if the connection was reset.
