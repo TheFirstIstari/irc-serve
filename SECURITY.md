@@ -52,10 +52,18 @@ each field's **consumer** decides what happens to it.
 `test_control_bytes.c` pins the wire lines a member receives, per field.
 `test_log_injection.c` puts a control byte into every position a client can put
 one and requires that **none** of them reaches this node's own stdout. And
-`test_terminal_sweep.c` is the **reachability** property: it derives the verb
-list from `commands.c`'s `k_commands[]`, generates every marker byte in every
-argument position of every verb, and requires that none of them reaches this
-node's stdout **or any client socket**.
+`test_terminal_sweep.c` is the **reachability** property on the **client** path: it
+derives the verb list from `commands.c`'s `k_commands[]`, generates every marker
+byte in every argument position of every verb, and requires that none of them
+reaches this node's stdout **or any client socket**.
+`test_peer_terminal_sweep.c` is the same property on the **peer** path, on the
+**same instrument** — the marker predicate, the byte masks and the walk are one
+implementation in `tests/harness/sweep_scan.h`, because two copies of "what counts
+as a marker byte" is a copy that can drift, and drift there is invisible from the
+outside: one surface would quietly stop being swept while the sweep still printed
+its coverage line. It derives its shapes from the frozen 4.3 S-verb shapes rather
+than from `k_commands[]`, and it scans three surfaces: this node's stdout, the
+peer link, and a client socket after peer-originated lines.
 
 The third one exists because the first two did not hold. An earlier pass counted
 347 `printf` sites and reported zero survivors; a site is only a leak if it is
@@ -175,24 +183,58 @@ can open a socket to this node's port. `federation/verbs.c` already has a
 `HOST_UNPRINTABLE` check, which is the shape of the right answer; extending it to
 the peer-side roster is unstarted work.
 
-**`src/federation/verbs.c` has NO terminal-injection coverage at all** — no
-sweep, no battery, no case — and this is stated here rather than left to be
-discovered. One site writes control bytes into `ch->modes`, which then propagates
-through `324`, the `SBURST` shadow and the whole mesh, so the exposure is
-longer-lived and wider than anything on the client path: a peer that is trusted
-once keeps injecting. `test_terminal_sweep.c` covers the **client** path only, and
-its header says so in as many words.
+**`src/federation/verbs.c` HAD no terminal-injection coverage at all** — no sweep,
+no battery, no case — and it was this file that wrote control bytes into
+`ch->modes`, which then propagate through `324`, the `SBURST` shadow and the whole
+mesh. The exposure is longer-lived and wider than anything on the client path: a
+peer that is trusted once keeps injecting.
 
-It is worth being precise about why, because "the fixture made it impossible" and
-"out of scope" are different answers. The peer path **is** reachable from a single
-spawned node: `tests/integration/test_fed_guards.c` owns one end of a link as a
-raw socket, lets the node dial it, answers `FEDERATE` with a real claim, and from
-that moment can put any line on that socket — so no two-node mesh fixture is
-needed. What is needed is a second verb table (the `INBOUND[]` S-verbs, not
-`k_commands[]`), a second shape generator, and the `ch->modes` fix above. That is
-a larger piece of work than the client-path sweep and is **routed separately**;
-shipping a sweep that is red, or one that quietly does not cover this, would be
-worse than saying so.
+**Both halves of that are now closed**, and the section that used to route the work
+is gone because the work is done. `test_peer_terminal_sweep.c` sweeps the peer path
+on the shared instrument (see **WHAT IS DEFENDED ON EACH PATH** above), and
+`fed_obs()` is the single instrument for every `[observable]` line this file prints:
+a `%s` argument goes through `conn_text_logsafe()` before it reaches stdout, and
+every other conversion is this node's own number and is passed through, because
+filtering a count would make the line lie.
+
+The reason `fed_obs()` is a FUNCTION and not a strip at each site is the reason the
+two sweeps share an instrument: a policy with fifty-six enforcement points is a
+policy with fifty-five chances to be forgotten, and this file has shipped two
+divergences from exactly that cause. It is also why the function has **no
+`vfprintf()`** — an earlier version read the `%s` conversions with `va_arg()` and
+handed the rest to `vfprintf()`, which mixes two consumers of one `va_list` and at
+`-O2` left `vfprintf()` consuming nothing, so every `%s` after a `%d` on the same
+line read the previous argument. It surfaced as a segfault, which is the luckiest
+possible symptom; fourteen tests went red and nine of them were federation tests
+whose guards all print that line. Every conversion is now pulled off the list by
+hand over a closed set.
+
+### THE ECHO POLICY, STATED ONCE
+
+**A value this node echoes back to the socket that sent it is FILTERED: the bytes
+are removed and the FIELD IS KEPT.** `emit_numeric_ex()` in `core/reply.c` is the
+one place a numeric's parameters are rendered, and `send_pong()` goes through it
+like every other numeric — `PONG` included, because RFC 2812 2.4 requires the token
+to be echoed and says nothing about a client putting control bytes inside one. A
+parameter that becomes empty is **still a parameter**: `needs_colon()` puts the `:`
+marker on an empty final parameter, so a positional parser finds the field exactly
+where the RFC says it is. Dropping the field instead would shift every field after
+it, which is a protocol divergence rather than a filter.
+
+**The decisive argument is not "there is no second reader".** That argument was
+written into `commands.c` to justify the `421` case and it is **wrong as stated**: a
+client that logs numerics to a file, or a bouncer relaying them to a human's
+terminal, **is** the second reader, and it is downstream of the client rather than
+of this node. The argument that does hold is narrower and is the one this policy
+rests on: **the echo carries no information the sender does not already have.** The
+sender chose every byte in it a moment earlier and had it in hand. That is a
+property of the SENDER, not of the reader, which is why it does not depend on
+whoever reads the echo afterwards — and it is why this is a filter and not a
+refusal: refusing would turn a rendering hazard into a delivery hazard.
+
+Everything else in this section that says "echo", "reported back to the client" or
+"reaches the client that sent it" is an instance of this paragraph and is not
+argued again.
 
 **3. The node's log is still untrusted input for anything that renders it**, and so
 is the wire. Two reasons survive the list above. A `printf("%s", ...)` added
@@ -200,40 +242,138 @@ tomorrow over a client value is not covered by any per-field policy, and
 `test_terminal_sweep.c` is what catches that: it fails the first time anybody
 exercises the command that reaches it, because it generates the
 (verb × argument position × marker byte) space rather than listing it. The
-second reason is the sweep's own **exception list**, which has thirteen entries,
-each with a per-entry justification, a byte set and the site that produces it. A
-green sweep means *no marker byte reaches a scanned surface except at those
-thirteen sites* — so the list is part of the boundary, not a footnote to it, and
-three of its entries are live findings rather than features:
+second reason is the sweep's own **exception list**, which now has **ONE** entry on
+each sweep, each with a per-entry justification, a byte set and the site that
+produces it. A green sweep means *no marker byte reaches a scanned surface except
+at those sites* — so the list is part of the boundary, not a footnote to it.
 
-- **A nickname may hold a bare C1 byte (`0x80`–`0x9F`), and a nickname is not
-  log-only.** `nick_char_illegal()` in `core/message.c` accepts every byte
-  `>= 0x80` ("UTF-8 nicknames are ordinary and are not control characters") and
-  this node's own byte predicate does not treat `0x80`–`0x9F` as control either.
-  A nickname is the **source** of every line its owner sends and the `<client>`
-  field of every numeric it receives, and it appears in `353` NAMES lists — so
-  `NICK a<0x9F>z` puts a C1 byte in front of everything that client then says
-  to every other channel member's terminal. This is a live **cross-client**
-  terminal injection. It is not fixed because the fix is a policy decision about
-  which nicknames this node accepts (refusing bare `0x80`–`0x9F` also refuses
-  `U+0080`–`U+009F`, which are C1 controls in Unicode), and because it reaches
-  the peer path's `SBURST` shadow. **Routed, not defended.**
-- **Eleven numerics echo a client-supplied value back to the client that sent
-  it**: `421` (the command word, verbatim), `461` (the verb), `403`/`401`/`432`
-  (the name), `402` (the server mask), `410` (the CAP subcommand), `315`/`318`
-  (the queried name), `302` (the token), and `PONG` (the token, which RFC 2812
-  2.4 **requires**). `commands.c` argues for the `421` case explicitly — "the
-  verb is going to the client that sent it, so there is no second reader and no
-  hazard" — and the other ten are not argued anywhere. The argument does not
-  hold as stated: a client that logs numerics to a file, or a bouncer relaying
-  them to a human's terminal, **is** the second reader, and it is downstream of
-  the client rather than of this node. **Reported, not defended.**
+It was **thirteen** on the client sweep, and the eleven that were numerics echoing
+a client value back, plus the nickname and `PONG`, are all gone now — because all
+thirteen were **bugs rather than decisions**, and the honest response to "this
+sweep needs an exception here" is to ask why. What is left is the eight mIRC
+formatting bytes in **relayed message text**, which is a specification rather than
+an exception: `relay_byte_kept()` keeps exactly those eight and drops every other
+C0 byte including ESC and BEL.
+
+THE TWO CHECKS THAT KEEP A LIST HONEST are what made it shrink, and they are the
+part worth copying: an occurrence is excused only when its byte is in the entry's
+set **AND** its line carries the entry's site, so an entry can never become a
+blanket amnesty for a byte; and a listed entry whose site never appears anywhere in
+the run **fails**, so the list cannot accumulate entries nobody exercises. When the
+eleven echo entries stopped matching because the echoes stopped happening, the
+check said so and the entries had to be **deleted** rather than left looking
+reasonable.
+
+### WHAT IS DEFENDED ON EACH PATH, AND WHAT IS NOT
+
+- **A nickname may hold a bare C1 byte** — **no longer**. `valid_nick()` asks
+  `conn_text_display_check()`, which **refuses** a raw `0x80`–`0x9F`, the encoded
+  `0xC2 0x80`–`0xC2 0x9F` pair, a **truncated or interrupted** sequence, a lead byte
+  outside UTF-8 (`0xC0`, `0xC1`, `0xF5`–`0xFF`), an **overlong** sequence
+  (`0xE0 0x80 0xAF` and `0xF0 0x80 0x80 0xAF`) and a **surrogate half**
+  (`0xED 0xA0 0x80`). It **accepts** every well-formed 2-, 3- and 4-byte sequence,
+  including `ā` (`C4 81`), `café`, `日本` and U+1F600 — and the accepting half is
+  asserted as carefully as the refusing half, because the check is written as four
+  exclusions from three ranges and a check written as `u <= 0xDF || u >= 0xF5`
+  instead would refuse every accented character on the network.
+
+  It is a **refusal** and not a strip because there is no copy to sanitise: a
+  nickname **is** every copy. It is the `<client>` field of every numeric its owner
+  receives and the source of every line it sends.
+
+  WHY THE C1 RANGE IS NOT A RANGE TEST, which is the mistake this rule is most
+  likely to be "simplified" into: `ā` is `C4 81` and its **second byte is inside
+  `0x80`–`0x9F`**. A byte-range refusal eats the Cyrillic, the Greek and every
+  accented character on the node. What separates them is *how many continuation
+  bytes the sequence in progress still expects*, and nothing else.
+
+  WHY OVERLONG AND SURROGATE ARE IN SCOPE rather than pedantry: an overlong
+  encoding decodes to the same code point as a shorter one, so a filter that
+  **decodes** before it compares and a filter that compares **bytes** disagree about
+  one value — and `C0 AF` is the case where they do. Two filters disagreeing about
+  one value is the whole of that attack. The four excluded leads are checked
+  against their own first-continuation bound, which is the tightest rule UTF-8 has.
+
+  `test_valid_nick.c` asserts both directions in one block;
+  `test_nick_utf8.c` asserts what a **second client** receives — the `PRIVMSG`
+  prefix byte for byte, including `C4 81`, so a Latin-1 fallback fails as well as a
+  dropped nickname — and that all 32 raw and all 32 encoded C1 bytes are refused on
+  the wire with the field kept.
+- **Numerics echo a client-supplied value** — **no longer**. See **THE ECHO
+  POLICY** above; all eleven are filtered at the one place a numeric's parameters
+  are rendered. `PONG`'s token is kept and filtered, which is not a contradiction
+  of RFC 2812 2.4: the specification requires the token be **echoed** and says
+  nothing about a client sending control bytes inside one, and a client demanding a
+  byte-exact echo of such a token is a client whose liveness check is a string
+  comparison against bytes it chose to put on the wire in the first place.
 - **`PRIVMSG`/`NOTICE` text relays the eight mIRC formatting bytes** (`0x01` CTCP,
   `0x02` bold, `0x03` colour, `0x0F` plain, `0x11` mono, `0x16` reverse, `0x1D`
   italic, `0x1F` underline). That is the feature, not an oversight:
   `relay_byte_kept()` keeps exactly those eight and drops every other C0 byte
   including ESC and BEL, because a range test would swallow the hazard and would
   corrupt every CTCP. **Defended, deliberately.**
+
+  **AND NOW IT IS THE SAME CODE ON BOTH SURFACES.** `fed_relay_clean()` in
+  `federation/verbs.c` filters the peer-bound copy through those same two
+  functions, at `fed_queue_line()` — the only place a peer-bound line is built. The
+  peer sweep found the gap: 64 marker bytes were reaching a peer socket on one run,
+  because the peer relay path had **no filter at all** rather than a different one.
+  The fix routes it; adding a second filter at the second site would have produced
+  two implementations of one rule, which is how this tree produced the `SMODES`
+  divergence and the `vfprintf` one. Stripping is announced
+  (`fed_relay_stripped: kept= removed=`) and **only when something came off**, so
+  this node's log rate does not become the mesh's message rate.
+- **The peer's mode string reaches `ch->modes`** — **no longer**.
+  `chan_mode_implemented()` is the **one** predicate asked by the client's `MODE`,
+  by `chan_mode_set()` itself and by the peer's `SMODES` handler. Before it, the
+  client path refused a mode letter this node does not evaluate and the peer path
+  applied all of them, so a peer could put a control byte into `ch->modes[]` and
+  have it reach `324`, the `SBURST` shadow and the whole mesh. Two paths disagreeing
+  is not fixed by describing it.
+- **The peer path has no terminal-injection coverage** — **no longer**, and the
+  routing note that used to sit here is gone because the thing it routed is done.
+  The reachability answer was the one `SECURITY.md` already named: the peer path is
+  reachable from a single spawned node, because `tests/harness/peer_fixture.c` owns
+  one end of a link as a raw socket, lets the node dial it and answers `FEDERATE`
+  with a real claim. What was needed beyond that was a second verb table — the
+  `INBOUND[]` S-verbs, not `k_commands[]` — and a second shape generator, and both
+  are now in the tree.
+
+  **THE THREE THINGS THE PEER SWEEP TAUGHT, and every one of them was found by a red
+  run rather than by reading**, which is why they are here rather than in a comment
+  on the generator:
+
+  1. **A filter's withholding can disguise a wrong field.** `conn_text_logsafe()`
+     renders a value with a byte in the strip set as `-`, so a field that is
+     **wrong** and a field that has been **correctly filtered** both print as
+     `name=-`. A sweep row written with the channel in the wrong parameter reported
+     itself clean for exactly that reason. Rows now assert that the expected field
+     is **present-and-withheld** rather than absent entirely.
+  2. **A needle that does not name the probe is satisfied by an earlier probe's
+     answer.** `tc_expect(client, " 366 ")` searches the accumulated buffer, so
+     after the first probe the wait returned on the *previous* channel's answer, the
+     probe went out before the node had created this probe's channel, and the node
+     reported a lookup failure for a channel that did not exist — which reads
+     exactly like a product bug. Every wait names its probe now.
+  3. **Nothing at all is the easiest thing for a sweep to get wrong**, because a
+     node that never received the line produces no findings. Every probe waits for
+     the line the node prints for that shape, and once per marker the sweep waits
+     for a PONG proving the node is still serving.
+
+  AND THE INVERTED-ASSERTION HAZARD is checked mechanically where it can be: an
+  assertion whose condition asserts a value is **absent** must have a message that
+  reads as an absence. It does not attempt the general case, because
+  `count == 3` is correct with "expected 3" and inverted with "no replies were
+  seen", and telling those apart means reading English — a check that guesses fails
+  in the direction that hides a defect.
+
+  THE PEER PATH HAS NO `PING`, and that is **a gap, not a design choice**: the
+  federation verb map has no entry for it, so a `PING` down a peer link is counted
+  as an unknown verb and never answered. A peer cannot be liveness-probed through
+  its own link. The sweeps work around it by probing the client socket, which asks
+  the same question because one event loop serves both surfaces. **Not fixed in this
+  pass** — it is more than one line, and a link that cannot be pinged is a real
+  operational gap worth its own entry.
 
 The file paths and process names in the startup and store-loading lines also come
 from argv and the filesystem rather than from a client, and are outside the
