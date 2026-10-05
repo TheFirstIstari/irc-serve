@@ -221,11 +221,14 @@ static void run_case(const char *label, const char *a_crt,
         return;
     }
 
+    /* The two directions of the link assertion, and the DEADLINE is what carries the
+     * difference: 20s waiting for a line that must arrive, against 4s waiting for one
+     * that must not. There is no sleep anywhere in this file, and no way to assert an
+     * absence without one of these two. */
+    (void)snprintf(line, sizeof line, "link_established: peer=irc.b");
     if (establish != 0) {
-        (void)snprintf(line, sizeof line, "link_established: peer=irc.b");
         check(nf_expect(&na, line, 20000) == 0, explain, na.out);
     } else {
-        (void)snprintf(line, sizeof line, "link_established: peer=irc.b");
         check(nf_expect(&na, line, 4000) != 0,
               "and the link NEVER ESTABLISHES", na.out);
     }
@@ -246,21 +249,18 @@ static void run_case(const char *label, const char *a_crt,
     (void)snprintf(line, sizeof line, "peer=irc.b status=%s policy=%s action=%s",
                    verdict, (a_permissive != 0) ? "permissive" : "strict",
                    (establish != 0) ? "ACCEPT" : "REFUSE");
-    {
-        char needle[256];
-
-        (void)snprintf(needle, sizeof needle, "tls_peer_revocation: fd=%%d %s", line);
-        /* The fd is a wildcard because it is unknowable, so the expectation is the
-         * FIXED part of the line after it. Two nf_expect() calls rather than one
-         * because the needle above is built with a literal %%d and nf_expect() does
-         * not glob: the first matches the line's prefix and the second the fields
-         * that carry the decision. */
-        check(nf_expect(&na, "tls_peer_revocation: fd=", 20000) == 0 &&
-                  nf_expect(&na, line, 5000) == 0,
-              "and the revocation line reports that status, that policy, and what "
-              "this node did about it",
-              na.out);
-    }
+    /* TWO nf_expect() CALLS, and the first one exists because `line` starts at
+     * `peer=` rather than at `tls_peer_revocation:`. The descriptor number is the
+     * CHILD's and this process has no way to learn it -- nf_node_t has no fd field --
+     * so the expectation is the fixed part of the line after it, and the prefix call
+     * is what proves the two halves belong to the SAME line rather than to two
+     * different ones. A single call containing the prefix and a wildcard would need
+     * a glob, which nf_expect() does not have. */
+    check(nf_expect(&na, "tls_peer_revocation: fd=", 20000) == 0 &&
+              nf_expect(&na, line, 5000) == 0,
+          "and the revocation line reports that status, that policy, and what this "
+          "node did about it",
+          na.out);
     /* THE EXPOSURE WINDOW. Asserted once, on the good case, because that is where
      * it is load-bearing: an operator reading a log has to be able to answer "when
      * does my exposure window close" and the answer has to be ON THE WIRE. The

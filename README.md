@@ -101,7 +101,9 @@ socket** — not inferred from the source:
 - **TLS** — optional, off by default, and the build has **no required third-party
   dependency** without it. With `-DWITH_TLS=ON`: implicit TLS on its own port
   (RFC 7194's 6697), `STARTTLS` on the plaintext port with the IRCv3 refusal rules,
-  peer links that can require TLS, and an `sts` policy a client acts on
+  peer links that can require TLS, an `sts` policy a client acts on, and — on the
+  outbound peer-link path — a revocation check against the peer's **stapled** OCSP
+  response, which fails closed by default
 
 ### Not implemented, and why
 
@@ -119,6 +121,10 @@ Each is documented where it is excluded.
 | WebSocket transport | a second transport for the `core/transport.h` interface, which now has two implementations |
 | `sasl-3.2` (SCRAM/EXTERNAL) | a crypto surface for *authentication*, which is a different problem from *transport* encryption and is not solved by TLS |
 | epoll | the `FD_SETSIZE` ceiling of 1024 is accepted and documented; every accept and dial site rejects above it rather than truncating |
+| Certificate revocation **inbound** | moot rather than missing: this program never asks a client for a certificate, so there is no client certificate to revoke. Inbound mTLS is not built |
+| Certificate revocation **by CRL** | a CRL is a distribution point, and an unreachable one must be treated as revoked or the check is decorative — which means fetching it, and the event loop may not block. OCSP stapling is the alternative: the peer already has the bytes |
+| Refreshing an OCSP staple | a refresh inside the event loop is the thing stapling exists to avoid. A stale staple stays stale until an operator replaces the file and restarts, at which point a waiting peer refuses with `STALE` |
+| Revocation for a **self-signed** peer certificate | there is no issuer, so nobody could have issued a status for it. The link is refused with `NO_ISSUER`, which is a true statement about the configuration: a mesh that wants revocation checking needs a CA in `--tls-ca` |
 
 Client-only IRCv3 specs (`react`, `typing`, `channel-context`, `batch/react`) are
 **N/A for a server** and recorded as such.
@@ -153,6 +159,31 @@ The cost, stated plainly: **a node built with the default options cannot encrypt
 anything.** No `tls` and no `sts` capability, and `STARTTLS` is answered `691`. The
 startup line says `tls=absent`, so that state is visible rather than inferred.
 
+### Revocation, and what failing closed costs
+
+A peer link over TLS is checked against the peer's **stapled** OCSP response. The
+policy is one boolean and it **fails closed**: missing, stale, unverifiable and
+revoked are all refusals, and `--tls-staple-permissive` is the explicit weakening.
+The startup line says which, on the same line as the rest of the policy:
+
+```
+[observable] tls_init: state=READY ca=configured insecure=0 verify=PEER_CHAIN_AND_NAME ocsp_staple=configured revocation=staple-strict
+[observable] tls_peer_revocation: fd=6 peer=irc.b status=GOOD policy=strict action=ACCEPT this_update=… next_update=… detail="in force"
+[observable] tls_peer_cert: fd=6 peer=irc.b not_after=2026-10-06T15:27:45Z not_after_in=86335s ocsp=GOOD
+```
+
+`not_after` is the second half of the finding: even a certificate that is never
+revoked is good until it expires, and an operator who cannot read that from a log
+cannot answer "how long is my exposure".
+
+**The cost, stated rather than discovered later:** both sides of a mesh need
+`--tls-ocsp-staple`, so **upgrading one side of a running mesh stops peer links**
+until both are configured — the refusal is named (`MISSING_STAPLE`) and the
+`ocsp_staple=` field says which side is unconfigured. A staple is never refreshed.
+And nothing is fetched: no HTTP, no DNS, no blocking call anywhere in the event
+loop, which a test asserts by reading the source rather than by trusting this
+paragraph.
+
 ```sh
 # implicit TLS on 6697, STARTTLS on 6667, an `sts` policy clients will act on
 ./build/src/irc-serve 6667 --name irc.example   --tls-cert /etc/irc/cert.pem --tls-key /etc/irc/key.pem   --tls-port 6697 --tls-sts-duration 15552000
@@ -170,6 +201,8 @@ startup line says `tls=absent`, so that state is visible rather than inferred.
 | `--tls-require` | Refuse plaintext client connections, at accept. |
 | `--tls-sts-duration N` | The `sts` persistence policy, in seconds. Default `0` — no policy. |
 | `--peer-tls NAME` | Require that the link to peer `NAME` carries TLS. Sticky for the life of the link. |
+| `--tls-ocsp-staple PATH` | An OCSP response for this node's own certificate, DER or PEM, **stapled on every handshake it performs**. Read once at startup, never refreshed, never fetched. |
+| `--tls-staple-permissive` | Do **not** refuse a peer link whose stapled revocation status is missing, stale or unverifiable: log the reason and continue. A revoked certificate is then accepted, which is why the default is the strict policy and this is the flag that turns it off. |
 
 ```sh
 git clone https://github.com/TheFirstIstari/irc-serve.git

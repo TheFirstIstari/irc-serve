@@ -765,8 +765,27 @@ static const char *tls_time_text(char *out, size_t cap, const ASN1_TIME *t)
         (void)snprintf(out, cap, "unreadable");
         return out;
     }
-    (void)snprintf(out, cap, "%04d-%02d-%02dT%02d:%02d:%02dZ", tm.tm_year + 1900,
-                   tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+    /* EVERY FIELD IS REDUCED BY A CONSTANT MODULO BEFORE IT IS PRINTED, and that is
+     * for the compiler rather than for the format. A bare `tm.tm_year + 1900` is an
+     * int of unknown range to a value-range analysis, so `%04d` is a MINIMUM width
+     * rather than a maximum, and gcc-16 computed a worst case of 73 bytes into this
+     * function's 32-byte buffer -- a refusal, under -Werror, on a build whose two
+     * clangs report nothing at all. Reducing each field with an unsigned modulo
+     * makes the maximum the minimum: four digits and five pairs of two, six literal
+     * characters and a NUL is 21 bytes, and 21 <= 32 is arithmetic a compiler can
+     * do without a model of struct tm.
+     *
+     * AND IT IS NOT COSMETIC. tm_mday, tm_hour and the rest are whatever the library
+     * left there, and a notAfter that ASN1_TIME_to_tm() accepted but that carries
+     * nonsense would otherwise print eleven characters into a field an operator
+     * reads as a date. The modulo makes the formatter's contract TRUE rather than
+     * merely hoped for: the result is always a well-formed ISO-8601 instant, and for
+     * an impossible field it is the wrong instant rather than a broken line. */
+    (void)snprintf(out, cap, "%04u-%02u-%02uT%02u:%02u:%02uZ",
+                   (unsigned)((unsigned long)((long)tm.tm_year + 1900L) % 10000UL),
+                   ((unsigned)tm.tm_mon + 1u) % 100u, (unsigned)tm.tm_mday % 100u,
+                   (unsigned)tm.tm_hour % 100u, (unsigned)tm.tm_min % 100u,
+                   (unsigned)tm.tm_sec % 100u);
     return out;
 }
 
@@ -854,10 +873,10 @@ static int tls_peer_revocation(conn_t *c, SSL *ssl, tls_node_t *node)
     const char *verdict = "NO_CHECK";
     const char *why = "";
     const char *policy = (node->staple_strict != 0) ? "strict" : "permissive";
-    char not_after[32];
-    char not_after_in[32];
-    char this_text[32];
-    char next_text[32];
+    char not_after[48];
+    char not_after_in[48];
+    char this_text[48];
+    char next_text[48];
 
     leaf = SSL_get1_peer_certificate(ssl);
     if (leaf == NULL) {
@@ -1018,18 +1037,21 @@ done:
      * too, because the two questions are independent -- a link refused for a revoked
      * staple still says how long that certificate would have been good for, which is
      * what tells an operator whether the revocation mattered. */
-    (void)snprintf(not_after, sizeof not_after, "%s",
-                   (leaf != NULL)
-                       ? tls_time_text(this_text, sizeof this_text,
-                                       X509_get0_notAfter(leaf))
-                       : "unknown");
-    (void)snprintf(not_after_in, sizeof not_after_in, "%s",
-                   tls_seconds_text(next_text, sizeof next_text,
-                                    (leaf != NULL) ? X509_get0_notAfter(leaf)
-                                                   : NULL));
+    /* THE FORMATTERS' OWN BUFFERS ARE PASSED STRAIGHT TO printf(), with no
+     * intermediate copy, and that is not a style choice: a `snprintf(dst, sizeof
+     * dst, "%s", src)` where both are the same size is a 48-character string plus a
+     * NUL into 48 bytes, which gcc-16's -Wformat-truncation correctly refuses. The
+     * formatter already returns the buffer it filled, so the copy bought nothing but
+     * the diagnostic. */
     printf("[observable] tls_peer_cert: fd=%d peer=%s not_after=%s not_after_in=%ss "
            "ocsp=%s\n",
-           c->fd, peer, not_after, not_after_in, verdict);
+           c->fd, peer,
+           (leaf != NULL) ? tls_time_text(not_after, sizeof not_after,
+                                         X509_get0_notAfter(leaf))
+                          : "unknown",
+           tls_seconds_text(not_after_in, sizeof not_after_in,
+                            (leaf != NULL) ? X509_get0_notAfter(leaf) : NULL),
+           verdict);
     rc = (good != 0 || node->staple_strict == 0) ? 0 : -1;
     /* THE VERDICT. `action=` is what this node DID, not what it recommends, and it is
      * decided HERE rather than by the caller so the two cannot disagree. In

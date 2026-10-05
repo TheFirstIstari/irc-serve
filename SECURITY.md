@@ -202,9 +202,30 @@ secret.
 - **There is no client-certificate authentication.** A client is never asked for a
   certificate and one it offers is not verified against anything. SASL PLAIN over
   TLS is what a client has here.
-- **There is no revocation checking.** No CRL and no OCSP. A revoked certificate
-  that chains to the configured CA is accepted until it expires. This is the largest
-  gap in the boundary.
+- **Revocation is checked, from the peer's stapled OCSP response, and only on the
+  outbound peer-link path.** A peer link is refused unless the peer staples a status
+  this node can verify against `--tls-ca`, that is still inside its `nextUpdate`, and
+  that says GOOD; `--tls-staple-permissive` turns that refusal into a warning and must
+  be typed. What it does **not** cover, and this is the list that matters:
+  - **There is no CRL.** A CRL is a distribution point, and an unreachable one has to
+    be treated as revoked or the check is decorative — which means fetching, which the
+    event loop may not do. A staple is bytes the peer already had, so nothing is
+    fetched and nothing can be unreachable.
+  - **Nothing refreshes a staple.** It is read once at startup from
+    `--tls-ocsp-staple` and stapled from there. A stale staple stays stale until an
+    operator replaces the file and restarts, at which point peers whose links were
+    waiting on a fresh one refuse with `STALE`. That is a deliberate trade against a
+    refresh in the event loop, not an oversight.
+  - **A self-signed peer certificate cannot be checked at all.** There is no issuer,
+    so nobody could have issued a status for it, and the link is refused with
+    `NO_ISSUER`. A mesh that wants revocation checking needs a CA in `--tls-ca`.
+  - **Inbound is not covered, and is not claimable.** There is no inbound
+    client-certificate authentication in this program at all — the server never asks a
+    client for a certificate — so revocation is moot inbound rather than implemented
+    inbound. Inbound mTLS is not built.
+  - **`notAfter` is still the outer bound.** A certificate that is never revoked is
+    good until it expires, and every established peer link now logs its `not_after`
+    and the seconds remaining, so that window is answerable from a log.
 - **No cipher or protocol pinning beyond the linked OpenSSL's defaults.** There is no
   operator-facing cipher-suite list, so the policy is whatever the library ships.
 - **A peer link in the clear still carries the shared federation secret.** A mixed
