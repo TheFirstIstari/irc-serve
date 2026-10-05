@@ -181,34 +181,77 @@
  * and changes only its scale, which is the trade federation/link.h's
  * fed_set_retry() paragraph exists to make.
  *
- * WITH irc.a's dead threshold at 150 ms (DEAD_MS below), an unsuppressed clean
- * leave would be re-dialled at
+ * AN UNSUPPRESSED CLEAN LEAVE WOULD BE RE-DIALLED AT
  *
- *      150 +  60 = 210 ms     first rung
- *      210 + 120 = 330 ms     second
- *      330 + 240 = 570 ms     third, at the ceiling
- *      570 + 240 = 810 ms     fourth -- and the budget is 3, so this one does not
- *                             happen; irc.a would print link_retry_exhausted:
+ *      60 ms     first rung, from the arm the clean-leave path makes
+ *      180 ms    second
+ *      420 ms    third, at the ceiling
+ *      660 ms    fourth -- and the budget is 3, so this one does not happen;
+ *                 irc.a would print link_retry_exhausted:
  *
  * and the observation window is " WINDOW_LINES " of irc.d's 60 ms keepalives,
  * which is 960 ms. So the window is past EVERY rung including the budget's last,
- * by 150 ms, and the assertion is made over a span in which an unsuppressed leave
+ * by 300 ms, and the assertion is made over a span in which an unsuppressed leave
  * would have dialled three times. This margin is not decoration: the first
  * version of these numbers put the first rung at 420 ms and the window at
  * 800 ms, which sounds generous and was not, because `base` is read before the
  * SHUTDOWN and the inbound lines that open the window start arriving before it.
  * The teeth run found the fault un-caught 3 times out of 3, and the cause was
- * that margin, not the assertion. */
+ * that margin, not the assertion.
+ *
+ * The dead threshold is NOT in that arithmetic, and a comment here used to say it
+ * was -- it claimed T4 declared the departed peer dead "quickly" and that the
+ * ladder was scaled to match it. T4 does not declare it dead at all: the
+ * CLEAN-LEAVE PATH does, at `silent_ms=0`, because irc.b has already closed the
+ * socket by the time the SHUTDOWN is processed. Measured with the threshold raised
+ * from 150 ms to 5000 ms, the arm still happened, still printed
+ * `link_retry: ... after=DEAD`, and this case still passed with arms == 1. So the
+ * threshold was governing something else, and what it was governing was the
+ * window's own clock -- see DEAD_MS. */
 #define RETRY_BASE_MS 60
 #define RETRY_MAX_MS  240
 #define WINDOW_LINES  16
 
-/* irc.a's dead threshold in the clean-leave case. Short so T4 declares the
- * departed peer dead quickly; the retry ladder above is scaled to match it so the
- * first rung is 210 ms after the socket closes. This is the one link timer
- * fed_set_timeouts() takes separately precisely so a case can declare a liveness
- * threshold on its own terms. */
-#define DEAD_MS 150
+/* irc.a's dead threshold in the clean-leave case, and it is the SHIPPED value (0
+ * means "keep the built-in", which is IRC_FED_DEAD_MS = 90 s).
+ *
+ * IT WAS 150 MS, and that was the second, newer flake of the pair this branch
+ * fixes -- `test_peer_discovery` failed once on ci_macos (Debug) at the window
+ * assertion below, 25/25 locally, untouched by any branch. It has THE SAME
+ * MECHANISM as test_autoscale's, and the mechanism is stated in full there
+ * because it is measured there; the four steps that matter here:
+ *
+ *   1. The window's boundary is `lines=` on irc.a, and after irc.b departs the only
+ *      remaining source of inbound lines is irc.d's keepalive.
+ *   2. irc.d's keepalive is 60 ms on a 50 ms tick, so its real cadence is quantised
+ *      up to two ticks -- a measured 104-107 ms between inbound lines.
+ *   3. T4 fires at `now - last_recv_ms > g_dead_ms`, so a 150 ms threshold against a
+ *      ~104 ms cadence is a margin of ONE TICK.
+ *   4. **irc.d DIALS irc.a**, so on irc.a that link is `initiator=0` -- ACCEPTED --
+ *      and T7's guard is `initiator != 0 && addrlen != 0`. A link this node did not
+ *      dial is NEVER re-dialled, so one T4 hiccup does not delay the window, it
+ *      ends the window. Reproduced deliberately by moving irc.d's cadence across the
+ *      threshold:
+ *
+ *          [observable] link_dead: peer=irc.d silent_ms=155
+ *          nf_expect_u64_ge: TIMEOUT after 15000 ms waiting for lines=>=17;
+ *              last seen was 6
+ *
+ *      and `lines=6` frozen against a requirement of 17, from a fifteen-second
+ *      deadline: the counter did not run slowly, it stopped, and no longer window
+ *      would open.
+ *
+ * Nothing this case asserts depends on the threshold -- the ladder is armed at zero
+ * silence by the clean-leave path, as measured above -- so the scaled value was
+ * buying a claim that was never true at the price of a one-tick margin on the
+ * window's only clock. With the shipped 90 s the clock link cannot be declared dead
+ * inside any deadline this test has, which is removal by construction rather than a
+ * margin.
+ *
+ * WHAT THIS CASE NO LONGER EXERCISES: T4's expiry on the departed link. It did not
+ * exercise it -- the clean leave beat it every time -- so nothing is lost. The case
+ * is about `clean_leave`, not about a timer. */
+#define DEAD_MS 0 /* the shipped IRC_FED_DEAD_MS: see the comment above */
 
 /* ---------------------------------------------------------------------------
  * The child
@@ -853,16 +896,24 @@ static void case_a_hint_is_recorded_and_never_dialled(void)
  *           one: fed_send_shutdown() has no caller anywhere in src/ (see the file
  *           header), so a real peer here would only ever close a socket.
  *
- *   irc.d  a real node that DIALS irc.a and keeps a 100 ms keepalive. It exists
+ *   irc.d  a real node that DIALS irc.a and keeps a 60 ms keepalive. It exists
  *           to be a clock (see the file header) and it is also the mesh the
  *           departure must be told onward to: a two-node mesh has nobody to tell,
  *           which is the same reason tests/integration/test_fed_resync.c needs
  *           four nodes.
  *
- * irc.a's dead threshold is 300 ms so T4 declares the departed peer dead and arms
- * the ladder quickly, and its retry base is 120 ms so the FIRST rung is due
- * 420 ms after the socket closed. The observation window is 800 ms of irc.d's
- * keepalives, which is past the second rung (660 ms) with margin.
+ * EVERY NUMBER IN THE PARAGRAPH THIS REPLACED WAS WRONG, and had been for some
+ * time: it said irc.a's dead threshold was 300 ms (it was 150 ms, and is now the
+ * shipped 90 s), that its retry base was 120 ms (60 ms), that the first rung was due
+ * 420 ms after the socket closed (60 ms), and that the window was 800 ms of irc.d's
+ * keepalives past a second rung at 660 ms (16 lines, which at irc.d's measured
+ * two-tick cadence of ~104 ms is about 1.6 s, past a third rung at 420 ms). A
+ * comment whose arithmetic does not match the code is worse than none, because the
+ * next person reads it instead of the constants.
+ *
+ * WHY IT NO LONGER MATTERS WHICH OF THEM IS RIGHT: the ladder is armed by the
+ * clean-leave path at `silent_ms=0`, not by a threshold expiring, so the first rung
+ * does not depend on any of these numbers. See DEAD_MS for the measurement.
  */
 static void case_clean_leave_is_not_a_failure(void)
 {
@@ -1040,10 +1091,50 @@ static void case_clean_leave_is_not_a_failure(void)
      * " ms ladder and past the budget's last, so an unsuppressed clean leave
      * would have dialled three times inside it. The arithmetic is at
      * " WINDOW_LINES " and the margin is not decoration -- see the comment there. */
+    /* THE WINDOW'S CLOCK WAS ALIVE WHEN THE WINDOW OPENED, which is the precondition
+     * the window below does not check and cannot.
+     *
+     * THE FLAKE: this window's boundary is inbound lines from " NAME_D ", and if T4
+     * declares that link dead the counter stops for ever -- " NAME_D " DIALS
+     * " NAME_A ", so on " NAME_A " the link is ACCEPTED and T7 cannot re-dial it. The
+     * mechanism and the measurements are at DEAD_MS; the fix is that the threshold
+     * is now the shipped 90 s, so the link cannot die at all.
+     *
+     * WHAT THIS IS WORTH, and the limit is worth as much as the claim. It catches a
+     * clock that was ALREADY dead when the window opened. It does NOT catch one that
+     * dies DURING the window -- which is what the flake was, established by the teeth
+     * run, which made it deterministic and watched the window assertion fire with
+     * `last seen was 6` against a requirement of 17. So this is a precondition made
+     * explicit and NOT a fix; it reports a cause while the cause is still knowable
+     * rather than fifteen seconds later through an assertion about a counter that had
+     * nothing left to count. */
+    TF_CHECK_MSG(strstr(a.out, "link_dead: peer=" NAME_D) == NULL,
+                 NAME_A " had already declared " NAME_D
+                 " DEAD before its observation window opened, so `lines=` cannot "
+                 "climb, the window can never open, and the failure would be "
+                 "reported as a window that stayed shut rather than as the dead link "
+                 "that shut it. " NAME_D " DIALS " NAME_A
+                 ", so T7 can never re-establish an ACCEPTED link and this is "
+                 "permanent for the run -- see DEAD_MS for the whole mechanism: %s",
+                 a.out);
+
+    /* THE WINDOW, and its failure message names the cause rather than the symptom,
+     * because a counter that stops is not a counter that is slow and the two produce
+     * the same TIMEOUT. "lines=6 against 17" from a fifteen-second deadline is not a
+     * slow machine; it is a source that stopped, and the way to tell is one strstr
+     * away. */
     TF_CHECK_MSG(nf_expect_u64_ge(&a, "lines=", base + (uint64_t)WINDOW_LINES,
                                   T_IO_MS) == 0,
                  "irc.a received %llu inbound lines and the observation window "
-                 "never opened, so the absence below would be vacuous: %s",
+                 "never opened, so the absence below would be vacuous. THE USUAL "
+                 "CAUSE IS NOT A SLOW COUNTER: this window is measured on " NAME_D
+                 "'s keepalive, and if T4 declared that link dead the counter cannot "
+                 "climb again -- the link was ACCEPTED on this node, so T7 cannot "
+                 "re-dial it and the freeze is permanent. Look for \"link_dead: "
+                 "peer=" NAME_D
+                 "\" in this node's output above; if it is there, no longer window "
+                 "will open. If it is not there, this node stopped ticking. See "
+                 "DEAD_MS for the whole mechanism: %s",
                  (unsigned long long)base, a.out);
 
     /* THE ASSERTION WITH TEETH. Exactly one dial to " NAME_B " in irc.a's whole
