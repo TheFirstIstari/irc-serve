@@ -614,6 +614,29 @@ struct server {
      * whether or not tracing is on. */
     uint64_t  n_reply_refused;
 
+    /* Relayed PRIVMSG/NOTICE texts from which a terminal-controlling byte was
+     * removed: ESC, BEL, DEL, or the encoded C1 pair. msg_verbs.c's send_message()
+     * is the only writer.
+     *
+     * A COUNT AND NOT A LOG LINE, and the reason is volume. Every other strip in
+     * this tree happens on a STATE CHANGE -- an away message, a topic, a kick, a
+     * part -- so a few lines a minute, and each one is a fact somebody will want
+     * explained. This one happens on every message anyone sends, and the bytes it
+     * removes are ordinary enough that one client's input method could produce a
+     * line per message for ever. Announcing it would not be a diagnostic; it would
+     * be a flood, and a flood on a log is how a log becomes unreadable.
+     *
+     * SO IT IS HERE, on the same `loop_stats` line as `parse_reject` and
+     * `reply_refused`, rather than as a new line format nobody's scraper knows.
+     * Non-zero means somebody's terminal has been rewritten. Climbing means a
+     * client is emitting escapes in ordinary conversation.
+     *
+     * WHAT IT DOES NOT COUNT: bytes removed from a STORED field -- an away message,
+     * a topic, a kick reason -- because those are announced individually and
+     * individually are the right granularity. This one is the relay path, where
+     * individually would be a flood. */
+    uint64_t  n_msg_stripped;
+
     /* ------------------------------------------------------------------------
      * Phase 6 federation claims. All four are events the link module
      * (federation/link.c) records, and all four are here rather than in that

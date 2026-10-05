@@ -534,6 +534,95 @@ size_t conn_text_strip(char *dst, size_t cap, const char *src)
 }
 
 /* ---------------------------------------------------------------------------
+ * conn_text_strip_relay: the KEEP half of the split, as a switch
+ * ---------------------------------------------------------------------------
+ * EIGHT BYTES, NAMED, rather than a range test -- because a range test is the
+ * mistake waiting to happen here. `u >= 0x02 && u <= 0x1F` looks like the keep
+ * list and is not: it would swallow 0x07 BEL and 0x1B ESC, which is the whole
+ * hazard, and would return 0 for 0x01, which corrupts every CTCP. A reader who
+ * wants to add a code to the keep list has to add it HERE, in the switch, where
+ * the list is visible as a list.
+ *
+ * DEL is not here: it is a strip, handled by the caller below rather than here,
+ * because 0x7F is not C0 and belongs to neither C0 group.
+ */
+static int relay_byte_kept(unsigned char u)
+{
+    switch (u) {
+    case 0x01u: /* the CTCP delimiter -- removing it CORRUPTS rather than sanitises */
+    case 0x02u: /* mIRC bold */
+    case 0x03u: /* mIRC colour */
+    case 0x0fu: /* mIRC plain */
+    case 0x11u: /* mIRC mono */
+    case 0x16u: /* mIRC reverse */
+    case 0x1du: /* mIRC italic */
+    case 0x1fu: /* mIRC underline */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+size_t conn_text_strip_relay(char *dst, size_t cap, const char *src)
+{
+    size_t kept = 0;
+
+    if (dst == NULL || cap == 0u) {
+        return 0;
+    }
+    if (src == NULL) {
+        dst[0] = '\0';
+        return 0;
+    }
+    for (size_t i = 0; src[i] != '\0'; i++) {
+        unsigned char u = (unsigned char)src[i];
+
+        /* The deny half of the split: every C0 byte that is not one of the eight
+         * named above. ESC and BEL arrive here and do not leave. */
+        if (u < 0x20u && relay_byte_kept(u) == 0) {
+            continue;
+        }
+        /* DEL. Not a C0 byte and not in the keep list, so it is simply dropped. */
+        if (u == 0x7fu) {
+            continue;
+        }
+        /* C1, AS THE ENCODED PAIR AND NOT AS RAW BYTES. `0xC2` is the only lead byte
+         * that can begin a C1 control in UTF-8, and it is followed by 0x80-0x9F --
+         * the same range that carries the continuation byte of ordinary text. So the
+         * two bytes are consumed TOGETHER and only when the leading byte is present:
+         *
+         *     0xC2 0x9B  ->  CSI, removed
+         *     0xD0 0x90  ->  Cyrillic A, untouched
+         *     0xCE 0x91  ->  Greek capital alpha, untouched
+         *     0xC3 0xA9  ->  e-acute, untouched
+         *
+         * Stripping the trailing byte on its own would remove the C1 escape and every
+         * accented, Greek and Cyrillic character on the node along with it -- measured
+         * at 8128 code points below U+3000. A filter that cannot tell those apart is
+         * not a filter, it is a character-set downgrade.
+         *
+         * A trailing `0xC2` with nothing after it is not a control and is kept: the
+         * `i + 1u` read is the NUL terminator, which is outside every range tested
+         * above, so it cannot be mistaken for one. */
+        if (u == 0xc2u && (unsigned char)src[i + 1u] >= 0x80u &&
+            (unsigned char)src[i + 1u] <= 0x9fu) {
+            i++; /* both bytes go, as a pair */
+            continue;
+        }
+        /* The bound is a SAFETY net on the same terms as conn_text_strip()'s: the
+         * caller has applied 3.2's line cap, and this only removes bytes, so it
+         * cannot fire in practice. */
+        if (kept + 1u >= cap) {
+            break;
+        }
+        dst[kept] = (char)u;
+        kept++;
+    }
+    dst[kept] = '\0';
+    return kept;
+}
+
+/* ---------------------------------------------------------------------------
  * conn_text_logsafe, and the one decision it makes
  * ---------------------------------------------------------------------------
  * The test is `conn_byte_is_bad()` and nothing else, so this function and

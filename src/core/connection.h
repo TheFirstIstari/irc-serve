@@ -379,6 +379,87 @@ size_t conn_text_bad_count(const char *s);
 size_t conn_text_strip(char *dst, size_t cap, const char *src);
 
 /* ---------------------------------------------------------------------------
+ * conn_text_strip_relay(): THE SAME STRIP, FOR A FIELD THAT IS *MESSAGE TEXT*
+ * ---------------------------------------------------------------------------
+ * Strip what can CONTROL A TERMINAL. Keep what is IRC MESSAGE SEMANTICS.
+ *
+ * This is NOT conn_text_strip() and the difference is load-bearing, so it is a
+ * separate function rather than a flag. conn_text_strip() refuses every C0
+ * control and DEL, which is right for an away message, a topic, a kick reason or
+ * anything this node STORES. It would be wrong for a PRIVMSG, because two groups
+ * of C0 bytes are how IRC has carried meaning for thirty years and every ircd
+ * relays them:
+ *
+ *   | STRIP                                   | KEEP                            |
+ *   |-----------------------------------------|---------------------------------|
+ *   | 0x1B ESC -- moves the cursor, retitles | 0x01 -- the CTCP DELIMITER       |
+ *   |   the window, sets the clipboard, and   | 0x02 bold, 0x0F plain, 0x03     |
+ *   |   switches terminal modes               |   colour, 0x11 mono, 0x16       |
+ *   | 0x07 BEL -- rings the terminal's bell   |   reverse, 0x1D italic, 0x1F    |
+ *   | 0x7F DEL -- invisible in a log, an      |   underline: the mIRC codes     |
+ *   |   ordinary glyph in most fonts          |                                 |
+ *   | 0xC2 0x80-0x9F -- C1, the 8-bit        |                                 |
+ *   |   equivalent of the same escapes        |                                 |
+ *
+ * WHY THE SPLIT IS WHERE IT IS, group by group, because a reader who does not
+ * know this will "simplify" it back into a deny-list and silently break colour.
+ *
+ *   ESC IS THE INJECTION. It is what a CSI sequence, an OSC title-set, a DECSC
+ *     and a clipboard write are made of, so it is the byte that actually lets one
+ *     user rewrite another's screen. Stripping it removes the hazard entirely.
+ *
+ *   BEL IS NOISE, NOT CONTROL -- but it is stripped anyway. It cannot rewrite a
+ *     screen, and a client that wants an audible alert has one. It goes because it
+ *     is a byte no message text needs and it is the loudest thing a stranger can
+ *     put in your terminal.
+ *
+ *   THE mIRC CODES ARE NOT A TERMINAL HAZARD AND ARE NOT PROSE. They are how IRC
+ *     carries colour and emphasis, a client renders them and strips them before
+ *     display, and an operator reading a raw log has never seen them. STRIPPING
+ *     THEM WOULD BREAK COLOUR ON EVERY CLIENT THAT USES IT -- a functional
+ *     regression traded for a cosmetic one, and the reason this function exists
+ *     rather than being conn_text_strip().
+ *
+ *   CTCP IS `0x01`-DELIMITED AND THE DELIMITER IS THE MEANING. `ACTION
+ *     waves` is one message because of the two `0x01`s. Remove either and it
+ *     stops being a CTCP and becomes text that happens to start with the word
+ *     ACTION -- so stripping `0x01` does not sanitise, it CORRUPTS. This is also
+ *     why no reader may be placed inside the kept group.
+ *
+ *   C1 IS STRIPPED AS THE ENCODED PAIR, NEVER AS RAW BYTES, and this is the one
+ *     subtlety in the function. In UTF-8 a C1 control is `0xC2` followed by
+ *     `0x80-0x9F`, and those trailing bytes are ALSO the continuation bytes of
+ *     ordinary text: `0xC2 0x9B` is CSI, and `0xD0 0x90` is the Cyrillic letter
+ *     A, and `0xCE 0x91` is the Greek capital alpha. A byte-wise filter over
+ *     `0x80-0x9F` would therefore mangle **every** Cyrillic, Greek and Latin-
+ *     Extended message on the node -- measured: 8128 code points below U+3000
+ *     have a continuation byte in that range. So the pair is matched as a PAIR
+ *     and only the pair is removed, which strips the 8-bit escapes and leaves
+ *     every other UTF-8 sequence byte-for-byte intact.
+ *
+ * IT RUNS ON AN ASSEMBLED PARAMETER, NOT ON A READ, and that is what makes the
+ * read-boundary case a non-case. `message_parse_n()` hands `m->params[]` one
+ * complete NUL-terminated parameter per line, so a `0x01` at the end of one recv()
+ * and the word after it at the start of the next are already one string by the
+ * time anything here runs. A per-read filter would have to carry state across
+ * reads to avoid splitting a sequence; this one has nothing to carry because it
+ * never sees a fragment. That is the same argument as the UTF-8 case at
+ * conn_text_strip() and it is why there is no partial-sequence handling below.
+ *
+ * `cap` counts the terminator. `src` shorter than `cap` minus one is the only
+ * case that can arise: the caller has already applied 3.2's line cap, and this
+ * only ever removes bytes. Returns the number of bytes KEPT, which is what lets a
+ * caller count the difference without walking the string twice.
+ *
+ * WHAT IT COSTS, named: a message containing ESC, BEL, DEL or an encoded C1
+ * reaches the recipient with those bytes missing, SILENTLY -- the relay path does
+ * not announce, and msg_verbs.c says why at the call. A caller that needs to know
+ * whether anything was removed compares the return value against strlen() of the
+ * input, which is exact because this only ever removes bytes and never reorders
+ * them. */
+size_t conn_text_strip_relay(char *dst, size_t cap, const char *src);
+
+/* ---------------------------------------------------------------------------
  * conn_text_logsafe(): RENDERING A CLIENT STRING INTO A LOG LINE
  * ---------------------------------------------------------------------------
  * Rule 1's operation, and the one the log-only fields need. Where

@@ -537,6 +537,17 @@ static uint64_t g_last_fed_dup_drop = 0;
  * trigger list changed. */
 static uint64_t g_last_fed_squit_self = 0;
 static uint64_t g_last_fed_lines = 0;
+/* n_msg_stripped IS IN THE CHANGE SET BELOW, and being absent from it is why the
+ * first version of test_msg_text.c could not read the counter at all: this harness
+ * prints `[fixture] stats` only when something it tracks has MOVED, so a node that
+ * stripped a message and nothing else said nothing, and the test saw a node that
+ * had "said everything it had to say" with no stats line anywhere in its output.
+ *
+ * That is a harness gap wearing the costume of a product bug -- the counter was
+ * incrementing correctly and being published correctly, and was simply never
+ * printed. Worth stating plainly because the symptom (no output at all) reads like
+ * a missing counter, and the fix belongs here rather than in src/. */
+static uint64_t g_last_msg_stripped = 0;
 /* The 4.3 resync's three counters (Phase 6 C4, C5). They are republished for the
  * same reason the others are -- a test that has to stop the node before it can
  * read them cannot tell "settled at zero" from "never republished" -- and they
@@ -602,7 +613,8 @@ static void nf_child_tick(server_t *s, uint64_t now_ms)
         s->n_burst_abandoned != g_last_burst_abandoned ||
         s->n_burst_truncated != g_last_burst_truncated ||
         s->n_lines != g_last_fed_lines ||
-        s->n_dial_failed != g_last_dial_failed) {
+        s->n_dial_failed != g_last_dial_failed ||
+        s->n_msg_stripped != g_last_msg_stripped) {
         g_last_nconns = s->nconns;
         g_last_closed = s->n_closed;
         g_last_accepted = s->n_accepted;
@@ -617,6 +629,7 @@ static void nf_child_tick(server_t *s, uint64_t now_ms)
         g_last_burst_truncated = s->n_burst_truncated;
         g_last_fed_lines = s->n_lines;
         g_last_dial_failed = s->n_dial_failed;
+        g_last_msg_stripped = s->n_msg_stripped;
         nf_child_print_stats(s);
     }
 }
@@ -634,6 +647,7 @@ static void nf_child_print_stats(const server_t *s)
            "parse_reject=%llu frame_error=%llu writeq_overflow=%llu "
            "write_error=%llu partial_writes=%llu eintr=%llu rejected_fd=%llu "
            "nconns=%llu dial_connected=%llu dial_failed=%llu "
+           "msg_stripped=%llu "
            "fed_rejected=%llu fed_duplicate=%llu fed_hs_timeout=%llu "
            "fed_dead=%llu fed_retry_exhausted=%llu "
            "fed_preauth_drop=%llu fed_hop_drop=%llu "
@@ -658,6 +672,7 @@ static void nf_child_print_stats(const server_t *s)
            (unsigned long long)s->nconns,
            (unsigned long long)s->n_dial_connected,
            (unsigned long long)s->n_dial_failed,
+           (unsigned long long)s->n_msg_stripped,
            (unsigned long long)s->n_link_rejected,
            (unsigned long long)s->n_link_duplicate,
             (unsigned long long)s->n_fed_hs_timeout,

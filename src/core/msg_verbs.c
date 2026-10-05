@@ -45,6 +45,14 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
 {
     fanout_target_t t;
     char prefix[CONN_HOSTMASK_MAX];
+    /* The relayed text, and the STRIPPED copy of it. `clean` is IRC_MAX_LINE + 1
+     * bytes and not IRC_MAX_LINE, for the same reason `prefix` is sized by its own
+     * bound: 3.2's cap counts the terminator, so the buffer that receives a line of
+     * that length needs one byte more. It is ONE buffer rather than one per delivery
+     * arm because the arms are mutually exclusive -- a message reaches one or the
+     * other, never both -- so a second buffer would be a second 8 KiB frame on the
+     * stack for a path that runs one of them. */
+    char clean[IRC_MAX_LINE + 1u];
     const char *text;
     int is_channel;
     int member;
@@ -66,6 +74,56 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
         return;
     }
     text = m->params[1];
+
+    /* ------------------------------------------------------------------------
+     * THE RELAY STRIP, AND WHY IT IS NOT conn_text_strip()
+     * ------------------------------------------------------------------------
+     * conn_text_strip() refuses every C0 control and DEL, which is right for every
+     * field this node STORES -- an away message, a topic, a kick reason. It would be
+     * wrong here, because two groups of C0 bytes are IRC message semantics rather
+     * than terminal control, and stripping either group is a regression that buys
+     * nothing:
+     *
+     *   - `0x01` is the CTCP DELIMITER. `\001ACTION waves\001` is ONE message
+     *     because of the two `0x01`s, so removing either does not sanitise it, it
+     *     CORRUPTS it into text beginning with the word ACTION.
+     *   - `0x02 0x03 0x0F 0x11 0x16 0x1D 0x1F` are the mIRC formatting codes. A
+     *     client renders them and strips them itself before display, and an operator
+     *     reading a raw log has never seen them. Removing them breaks colour on
+     *     every client that uses it.
+     *
+     * What IS removed is ESC -- the byte a CSI sequence, an OSC title-set, a DECSC
+     * and a clipboard write are all made of, and the one that actually lets a
+     * sender rewrite a recipient's screen -- along with BEL, DEL, and the encoded
+     * C1 controls. connection.h carries the byte table and the reason each half of
+     * the split sits where it does.
+     *
+     * WHY IT IS HERE AND NOT IN fanout_deliver(): every client-originated field this
+     * node relays to another client passes through send_message() for PRIVMSG and
+     * NOTICE, so this is the ONE place the strip can be applied to message text. The
+     * alternative -- filtering inside the writer -- would filter the node's OWN lines
+     * too, including the mIRC and CTCP the node emits on purpose, and would make
+     * "does this node relay escapes" unanswerable as a question about the code.
+     *
+     * WHY IT IS SILENT, which is the announcement decision and a real cost: the
+     * strip is not announced per message. A sender and a recipient can disagree
+     * about what was sent, and neither can find the moment in the log -- you cannot
+     * grep for an escape that was removed. The node says so ONCE, through a counter
+     * in the summary line it already prints, rather than adding a log line per
+     * message: a node whose count is non-zero has had somebody's terminal
+     * rewritten, and a node whose count climbs has a client emitting escapes in
+     * ordinary conversation. The cost of the cheaper design is named here rather
+     * than glossed over.
+     */
+    {
+        size_t in_len = strlen(text);
+        size_t kept = conn_text_strip_relay(clean, sizeof clean, text);
+
+        if (kept != in_len) {
+            s->n_msg_stripped++;
+        }
+        text = clean;
+    }
 
     /* The source prefix, built BEFORE resolution because it is needed to render
      * the line and because it is a precondition of the delivery rather than of
@@ -318,7 +376,19 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
     {
         const char *sp[1];
 
-        sp[0] = m->params[1];
+        /* `text`, NOT `m->params[1]` -- and the first version of this was
+         * `m->params[1]`, which is the R-class shape a third time and the reason this
+         * comment exists. `text` IS the stripped copy; reaching past it to the parsed
+         * parameter bypassed the strip entirely, so every recipient got the raw bytes
+         * while `n_msg_stripped` counted them as removed.
+         *
+         * Nothing caught it from the code side. The strip ran, the counter moved, and
+         * the log looked exactly like a working fix. It was caught by the WIRE
+         * assertion in test_msg_text.c, which is the argument for asserting observable
+         * socket lines rather than a return value -- the return value said "4 bytes
+         * kept" and the socket said otherwise. An assertion of the form "did the strip
+         * run" would have passed. */
+        sp[0] = text;
         /* `carry` is NULL: a client sent this line, so this node is ORIGINATING
          * it and fanout_forward_sverb() mints the 2.4 identity at the forward. */
         delivered = fanout_deliver(s, &t, prefix, verb, sp, 1, exclude, NULL);

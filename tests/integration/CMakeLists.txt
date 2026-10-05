@@ -736,3 +736,11 @@ irc_add_integration_test(test_log_injection test_log_injection.c)
 # well as what it expects not to, so deleting the emissions turns it red instead of
 # vacuous.
 irc_add_integration_test(test_relay_shape test_relay_shape.c)
+
+# Relayed PRIVMSG/NOTICE text: the strip/keep split, end to end. Its own file
+# because the rule is two-sided and a test of only one half passes while the other
+# is broken -- a strip that removed ESC but also the mIRC codes passes every
+# "nothing dangerous arrived" assertion and silently breaks colour on every client.
+# test_msg_text.c asserts BOTH halves, the two C1 subtleties (the pair, and the
+# UTF-8 that collides with it), and the announcement decision.
+irc_add_integration_test(test_msg_text test_msg_text.c)

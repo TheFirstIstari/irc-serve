@@ -1148,7 +1148,7 @@ int main(int argc, char **argv)
            "closed=%llu lines=%llu parse_reject=%llu frame_error=%llu "
            "writeq_overflow=%llu write_error=%llu partial_writes=%llu "
            "rejected_fd=%llu dial_connected=%llu dial_failed=%llu "
-           "pass_seen=%llu reply_refused=%llu "
+           "pass_seen=%llu reply_refused=%llu msg_stripped=%llu "
            "fed_rejected=%llu fed_duplicate=%llu fed_hs_timeout=%llu "
            "fed_dead=%llu fed_retry_exhausted=%llu "
            "fed_preauth_drop=%llu fed_hop_drop=%llu "
@@ -1175,6 +1175,7 @@ int main(int argc, char **argv)
            (unsigned long long)srv.n_dial_failed,
            (unsigned long long)srv.n_pass_seen,
            (unsigned long long)srv.n_reply_refused,
+           (unsigned long long)srv.n_msg_stripped,
            (unsigned long long)srv.n_link_rejected,
            (unsigned long long)srv.n_link_duplicate,
            (unsigned long long)srv.n_fed_hs_timeout,
