@@ -21,6 +21,11 @@
  * channel is still HELD by a client that is coming back to it. See the guard there
  * for why the hold is short: 2.2's disposal rule is delayed, not exempted. */
 #include "account_store.h"
+/* For conn_text_strip() -- the log-injection set, applied by chan_set_topic() to
+ * the one field here that is relayed to other clients verbatim. Named rather than
+ * reached through channel.h's include of it: a transitive include is what lets a
+ * module keep using a symbol after the module that happened to pull it in stops. */
+#include "core/connection.h"
 #include "core/resume.h"
 #include "core/reply.h"
 
@@ -424,7 +429,47 @@ int chan_set_topic(chan_t *ch, const char *topic, const char *who)
     if (strlen(topic) > (size_t)CHAN_MAX_TOPIC) {
         return -1;
     }
-    (void)copy_bounded(ch->topic, sizeof ch->topic, topic);
+    /* ------------------------------------------------------------------------
+     * THE STRIP, and it is HERE rather than in handle_topic() because this is the
+     * topic's ONLY writer (#121).
+     *
+     * `copy_bounded()` above is what made the bound look complete: it checks the
+     * LENGTH of the text and then copies every byte of it. So `TOPIC #c :<ESC>[2J`
+     * satisfied CHAN_MAX_TOPIC comfortably and `ch->topic` held the ESC, from
+     * which send_topic() handed it to every member on the next 332 and 333 --
+     * including every member who joined afterwards, for as long as the channel
+     * lived. One command, one stored byte, and an injection that replays itself.
+     *
+     * WHY THE SINGLETON WRITER IS THE RIGHT PLACE, which is the whole argument for
+     * putting it here rather than in the handler: this function has three callers
+     * and all three carry bytes a client or a peer chose --
+     *
+     *   - handle_topic(), from a client's `TOPIC`;
+     *   - federation/verbs.c's STOPIC, from a peer's report of a channel this node
+     *     does not own;
+     *   - federation/burst.c's apply path, from a peer's SBURSTC.
+     *
+     * A strip in handle_topic() would close the first and leave the other two
+     * writing a raw value into the same field, which is the drift this tree keeps
+     * refusing in one function per field. A peer is not more trusted than a client
+     * for the purpose of what a MEMBER'S TERMINAL executes, so the strip belongs
+     * below all three.
+     *
+     * THE POLICY IS STRIP, not refuse, and the consumer is the argument: a topic is
+     * free text a real client sends (`TOPICLEN` is advertised from this bound, so
+     * clients are told to send up to 255 bytes of it), and its consumers are other
+     * members' terminals. Refusing would break a working feature for a byte inside
+     * a sentence; stripping keeps the feature and takes the byte. `handle_topic()`
+     * announces the strip, because a topic that arrives shortened is otherwise
+     * indistinguishable from one that was always that short.
+     *
+     * IT IS NOT TRUNCATION, so a topic with no bad byte in it is stored byte for
+     * byte. And because the strip only ever removes bytes, it cannot push a value
+     * that fitted over CHAN_MAX_TOPIC -- which is why the length refusal above
+     * still reads the RAW input and still happens first. Checking after the strip
+     * would accept a 400-byte topic whose stripped form was 250 bytes, and 3.2's
+     * refusal would have become a function of which bytes were in it. */
+    (void)conn_text_strip(ch->topic, sizeof ch->topic, topic);
     if (topic[0] == '\0') {
         /* A cleared topic has no setter and no time: 331 says "no topic is
          * set", and leaving a stale 333 behind would claim a topic that is not

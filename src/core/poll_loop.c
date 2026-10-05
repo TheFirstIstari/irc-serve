@@ -25,6 +25,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/socket.h>
 
 #include "core/connection.h"
@@ -99,8 +100,33 @@ static void conn_readable(server_t *s, conn_t *c)
 
         s->n_lines++;
         if (s->trace) {
-            printf("[observable] line: fd=%d len=%zu command=%s\n",
-                   c->fd, len, m.command);
+            /* THE COMMAND WORD IS AN IDENTIFIER, SO IT IS MEASURED, NOT FILTERED.
+             * Every word on this line came off a socket, including the one that
+             * says WHICH word it was, and a client chooses it: `\033[2JBO` is one
+             * line and one verb as far as the parser is concerned. Printing it
+             * raw put a control byte in an operator's terminal from a single
+             * unrecognised verb, before registration and without a credential.
+             *
+             * A STRIP WOULD BE WRONG HERE RATHER THAN MERELY UNSAFE. The value of
+             * `line:` is that it names the verb, and a verb with a byte removed is
+             * no longer the verb -- `NICK\033` printed as `NICK` would be a lie and
+             * printed as `NIC` would name something the client never sent. So the
+             * value is kept when every byte is printable ASCII and withheld when
+             * one is not, with the length and the count beside it.
+             *
+             * THIS IS THE TRACING HALF of the pair. commands.c prints
+             * `cmd_unknown:`/`cmd_unimplemented:`/`cmd_dropped:` for the same word
+             * and does the same thing, because a reader asking "what did this
+             * client send that I have never heard of" is served by either line and
+             * a node that filtered one and not the other would be filtering
+             * arbitrarily. */
+            char shown[CONN_LOG_FIELD_MAX + 1u];
+
+            (void)conn_text_logsafe(shown, sizeof shown, m.command);
+            printf("[observable] line: fd=%d len=%zu command=%s command_len=%zu "
+                   "command_bad_bytes=%zu\n",
+                   c->fd, len, shown, strlen(m.command),
+                   conn_text_bad_count(m.command));
         }
         /* NULL dispatch is the honest Phase 2 state: the loop still accepts,
          * frames and parses, it simply has no command surface to answer with

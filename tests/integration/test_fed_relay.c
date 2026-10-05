@@ -120,6 +120,19 @@
 
 #define T_IO_MS 15000
 
+/* The log-injection set's two named members, octal so the C grammar cannot extend
+ * the escape into the following `[` -- `\x1b[` would be one hex escape reading as
+ * U+1B3 and the case would send something else entirely. */
+#define ESC "\033"
+#define BEL "\007"
+
+/* The payload from #121's audit, and what it becomes once only the escapes go.
+ * Written out as two literals rather than one with a filter applied in the test,
+ * because a "stripped" expectation assembled by the same arithmetic that builds
+ * the payload would agree with a wrong implementation. */
+#define PAYLOAD       ESC "[2J" ESC "[31mbrb back in 5"
+#define PAYLOAD_STRIPPED "[2J[31mbrb back in 5"
+
 #define SECRET     "irc-serve-federation-secret-a"
 #define NAME_A     "irc.a"
 #define NAME_B     "irc.b"
@@ -610,11 +623,292 @@ static void case_owner_with_no_local_members_relays(void)
     nf_free(&b);
 }
 
+/* ---------------------------------------------------------------------------
+ * THE `TOPIC` FORWARD ARM, AND WHAT IT ACTUALLY REACHES (#121)
+ * ---------------------------------------------------------------------------
+ * `handle_topic()` has two arms. The owned one stores through `chan_set_topic()`
+ * and broadcasts `ch->topic`; the `CHAN_VERDICT_FORWARD` one stores nothing --
+ * 2.2 forbids writing a cache field on a client's say-so -- and put the client's
+ * own `m->params[1]` straight into the emission. So the one path this file exists
+ * to exercise was the one path a control byte still travelled on, and the fix is a
+ * strip there rather than "broadcast the stored field", because there is nothing
+ * stored to broadcast.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THE FIX COULD NOT BE, MEASURED RATHER THAN ASSUMED
+ * ---------------------------------------------------------------------------
+ * The obvious test for this arm is "the other local member of the cache receives
+ * the stripped line". That test cannot exist, and the reason is 3.1's table rather
+ * than anything about this bug: a non-owned channel's `state-change` emission is
+ *
+ *     FORWARD ONLY -- never a local write
+ *
+ * (`fanout.c`'s row for FANOUT_REMOTE_CHANNEL, and it is a local write that is
+ * FORBIDDEN there, not one that is merely insufficient). So `deliver_state_change()`
+ * on the non-owning node never reaches that node's own members at all, and the
+ * exposure this arm had was never a local member's terminal -- it was the LINK.
+ *
+ * The second thing measured rather than assumed: the ORIGIN DISCARDS a forwarded
+ * topic. `fed_stopic()` applies a topic only when the link's name is the channel's
+ * origin's, and a non-owner's link never bears it, so the origin logs
+ * `fed_topic_ignored:`. Which means the bytes that crossed are not observable at the
+ * far end either -- the origin records the SENDER's name and nothing else. There is
+ * no fixture here that reads the wire between two real nodes.
+ *
+ * SO THE CLAIM IS ABOUT B'S OWN RECORD, and it is a real claim: the strip happens
+ * before the emission, `forwarded=1` is printed only by the branch that put the
+ * STRIPPED value into the parameter list, and both counts are on that line. A revert
+ * of the strip makes `kept_len` equal `in_len`, which is what the second assertion
+ * below is for -- and which is why the record is inside each branch rather than
+ * summarised after both of them.
+ *
+ * AND THE LOCAL-MEMBER FACT IS ASSERTED AS A NEGATIVE, because it is the reason the
+ * arm needed no local test and it is worth pinning: if 3.1's FORWARD ONLY row were
+ * ever relaxed, this case would start failing, which is the moment someone would
+ * need to know that the arm's local exposure came back with it.
+ *
+ * dave JOINs as the second local member of B's cache specifically so that the
+ * negative below is about a member rather than about a node with nobody in it.
+ */
+static void case_topic_forward_strips(void)
+{
+    nf_node_t a;
+    nf_node_t b;
+    test_client_t bob;
+    test_client_t carol;
+    test_client_t dave;
+    size_t mark_d;
+
+    g_peer_name = NAME_B;
+    g_peer_port = 0;
+    g_trace = 0;
+    TF_CHECK_MSG(nf_spawn_inline_named(&b, NAME_B, child_setup) == 0,
+                 "could not spawn node B");
+    TF_CHECK_MSG(b.port > 0, "node B reported no port");
+    g_peer_port = b.port;
+    TF_CHECK_MSG(nf_spawn_inline_named(&a, NAME_A, child_setup) == 0,
+                 "could not spawn node A");
+
+    TF_CHECK_MSG(nf_expect(&a, "link_established: peer=" NAME_B, T_IO_MS) == 0,
+                 "node A never established its link to node B");
+    TF_CHECK_MSG(nf_expect(&b, "link_established: peer=" NAME_A, T_IO_MS) == 0,
+                 "node B never established its link to node A");
+
+    /* A OWNS #T, so carol's TOPIC on B is forwarded rather than applied. */
+    register_client(&bob, a.port, NICK_B);
+    TF_CHECK_MSG(tc_send(&bob, "JOIN " CHAN) == 0, "bob's JOIN send failed");
+    TF_CHECK_MSG(tc_expect(&bob, " 366 ", T_IO_MS) == 0,
+                 "bob's JOIN never completed on the node that owns the channel");
+
+    /* Two local members of B's CACHE. A JOIN on a non-owned channel does add a local
+     * member -- membership is a local fact while the channel's state is the origin's
+     * -- so carol may set the topic on B at all, and dave is a member rather than an
+     * empty channel. */
+    /* ------------------------------------------------------------------
+     * THE PRECONDITION, AND IT IS NOW A BARRIER RATHER THAN AN ABSENCE
+     * ------------------------------------------------------------------
+     * B MUST LEARN THAT #T IS A's BEFORE ANY CLIENT JOINS IT ON B, and this waits
+     * for exactly that. It is not a formality: without it the case has a race, and
+     * that race is what made this test red on Linux and green on macOS.
+     *
+     * WHAT THE RACE WAS, from the CI log rather than from theory. A owns #T, and
+     * bob's JOIN makes A announce it to its peer -- so B learns of #T over the link.
+     * Whether B has processed that SJOIN by the time carol's JOIN arrives is not
+     * ordered by anything the test does. On macOS the SJOIN won:
+     *
+     *     fed_sjoin: channel=#T member=bob server=irc.a ... origin=irc.a owned=0
+     *     chan_state_forward: channel=#T verb=JOIN origin=irc.a
+     *
+     * so B had a non-owned cache and carol's JOIN took the forward arm. On Linux
+     * carol's JOIN won, and B CREATED the channel itself:
+     *
+     *     chan_create: channel=#T origin=irc.b epoch=40449 creator=carol
+     *     chan_topic: channel=#T nick=carol len=20
+     *     chan_topic_stripped: channel=#T nick=carol in_len=22 kept_len=20
+     *
+     * B was now the origin, so `authority_ok()` took the LOCAL WRITE arm and
+     * `chan_state_forward:` was never printed at all. The assertion below then waited
+     * fifteen seconds for a line this topology can never produce.
+     *
+     * NOTE WHAT IS NOT IN THAT STORY, because two explanations were considered and
+     * rejected against the log: no earlier case forwarded a TOPIC into this buffer --
+     * every case spawns its own nodes, so `b.out` starts empty and only this case can
+     * write to it -- and no prior forward arrived late, because there was no prior
+     * forward. The line was absent because this case had put the node in the wrong
+     * topology, not because another case had got there first.
+     *
+     * WHY THE OLD FORM WAS WRONG IN ITS OWN RIGHT, separately from the race. It
+     * asserted the ABSENCE of a `verb=TOPIC` line, which is a claim about a log other
+     * activity is still appending to, and an absence claim over a growing log has to be
+     * made under a timeout -- here 200ms -- after which "not seen yet" is
+     * indistinguishable from "cannot happen". It cannot say WHICH case a later line
+     * belongs to; it can only say that nothing matching had appeared by now. That is
+     * the wrong tool for the job the comment claimed: it does not make the line below
+     * attributable, it just fails occasionally when the buffer happens to be further
+     * along. A positive wait for the state the case needs is both attributable and
+     * deterministic.
+     *
+     * `owned=0` IS THE ASSERTION, not decoration: it is B saying, in its own log,
+     * that it does not own this channel. If B had claimed it -- the Linux failure --
+     * this line would read `origin=" NAME_B " owned=1` and the wait would time out
+     * HERE, naming the actual cause, instead of failing fifteen seconds later on an
+     * assertion about an arm this topology never took. */
+    {
+        char seen[192];
+
+        (void)snprintf(seen, sizeof seen,
+                       "fed_sjoin: channel=" CHAN " member=" NICK_B
+                       " server=" NAME_A);
+        TF_CHECK_MSG(nf_expect(&b, seen, T_IO_MS) == 0,
+                     "node B never learned that " CHAN " belongs to " NAME_A ", so the "
+                     "forward arm this case is about cannot be reached: without that "
+                     "SJOIN B has no record of the channel, and the first client to "
+                     "JOIN it on B would make B the ORIGIN, take the local-write arm "
+                     "instead, and print no `chan_state_forward:` line at all.\n"
+                     "  node said: %s", b.out);
+    }
+
+    register_client(&carol, b.port, NICK_C);
+    register_client(&dave, b.port, "dave");
+    TF_CHECK_MSG(tc_send(&carol, "JOIN " CHAN) == 0, "carol's JOIN send failed");
+    TF_CHECK_MSG(tc_expect(&carol, " 366 ", T_IO_MS) == 0,
+                 "carol's JOIN never completed on the node that does not own it");
+    TF_CHECK_MSG(tc_send(&dave, "JOIN " CHAN) == 0, "dave's JOIN send failed");
+    TF_CHECK_MSG(tc_expect(&dave, " 366 ", T_IO_MS) == 0, "dave's JOIN never completed");
+
+    /* B DID NOT TAKE OWNERSHIP, and that is the premise the forward arm rests on. It
+     * is asserted POSITIVELY, by the arm carol's JOIN took, rather than by the absence
+     * of a line: a forward for `verb=JOIN` is only possible on a channel B does not
+     * own, so this is the same fact as "B took the forward arm" and it is checkable
+     * here, before the TOPIC is sent. If B had claimed the channel, this waits out its
+     * timeout here and says so. */
+    TF_CHECK_MSG(nf_expect(&b, "chan_state_forward: channel=" CHAN " verb=JOIN "
+                           "origin=" NAME_A, T_IO_MS) == 0,
+                 "carol's JOIN did not take the forward arm, so node B owns " CHAN " "
+                 "when it should not: a node that owns a channel writes state changes "
+                 "to it locally, and the forward arm under test is unreachable. The "
+                 "first client to JOIN a channel a node has never heard of makes that "
+                 "node the origin -- which is what happened on Linux, where carol's "
+                 "JOIN reached B before B had processed " NAME_A "'s SJOIN.\n"
+                 "  node said: %s", b.out);
+
+    mark_d = tc_received(&dave);
+    TF_CHECK_MSG(tc_send(&carol, "TOPIC " CHAN " :" PAYLOAD) == 0,
+                 "carol's TOPIC send failed");
+
+    /* 1. B TOOK THE FORWARD ARM. Asserted before the strip, because every claim
+     * below is a claim about that arm. */
+    TF_CHECK_MSG(nf_expect(&b, "chan_state_forward: channel=" CHAN " verb=TOPIC "
+                           "origin=" NAME_A, T_IO_MS) == 0,
+                 "node B did not forward carol's TOPIC, so nothing below is about "
+                 "the forward arm at all.\n  node said: %s", b.out);
+
+    /* 2. THE STRIP, WITH BOTH LENGTHS, ON THE BRANCH THAT FORWARDED. The lengths
+     * come from strlen() of the two literals rather than from numbers typed in, so
+     * the assertion cannot be made permanently wrong by an arithmetic slip -- which
+     * is the same failure as an assertion that cannot fail. The point of the
+     * comparison is that kept_len is STRICTLY LESS than in_len: a strip that had
+     * been reverted would print them equal. */
+    {
+        char needle[192];
+        const size_t raw = strlen(PAYLOAD);
+        const size_t kept = strlen(PAYLOAD_STRIPPED);
+        size_t hits;
+
+        (void)snprintf(needle, sizeof needle,
+                       "chan_topic_forward: channel=" CHAN " nick=" NICK_C
+                       " in_len=%zu kept_len=%zu forwarded=1", raw, kept);
+        TF_CHECK_MSG(nf_expect(&b, needle, T_IO_MS) == 0,
+                     "node B did not record the topic strip on the forward arm; "
+                     "expected \"%s\". The payload carries two ESCs, so kept_len must "
+                     "be strictly less than in_len -- equal is what a reverted strip "
+                     "prints.\n  node said: %s", needle, b.out);
+        /* AND EXACTLY ONCE, because a second occurrence would mean the record is
+         * printed outside the branch that forwarded, which is the property that
+         * makes it evidence. */
+        hits = tf_count(b.out, "chan_topic_forward: channel=" CHAN);
+        TF_CHECK_MSG(hits == 1u,
+                     "node B recorded %lu TOPIC forwards and this case sent one "
+                     "TOPIC. A record printed outside the forwarding branch would be "
+                     "counted here, and it is the branch that makes `forwarded=1` "
+                     "mean the STRIPPED value went on the wire.\n  node said: %s",
+                     (unsigned long)hits, b.out);
+    }
+
+    /* 3. THE FORWARD REALLY CROSSED, and the origin discarded it -- which is 2.2's
+     * single-writer rule, not a failure of the mesh. Asserted because it is what
+     * makes claim 2 about the wire rather than about a branch nobody took: if B had
+     * not sent, A would not have ignored anything. */
+    TF_CHECK_MSG(nf_expect(&a, "fed_topic_ignored: channel=" CHAN " from=" NAME_B,
+                           T_IO_MS) == 0,
+                 "the origin never recorded discarding the forwarded topic, so the "
+                 "forward did not cross and claim 2 is about a branch that was not "
+                 "taken.\n  node said: %s", a.out);
+
+    /* 4. NO CONTROL BYTE ON EITHER NODE. B emitted it into the forward and A
+     * received it; neither may have let one into its own output. */
+    {
+        size_t i;
+
+        for (i = 0; i < b.out_len; i++) {
+            const unsigned char ch = (unsigned char)b.out[i];
+
+            if (ch == '\r' || ch == '\n') {
+                continue;
+            }
+            TF_CHECK_MSG(ch > 0x1fu && ch != 0x7fu,
+                         "a byte from the log-injection set (0x%02x) reached node "
+                         "B's own output on the TOPIC forward arm (0x%02x).\n"
+                         "  node said: %s", ch, ch, b.out);
+        }
+        for (i = 0; i < a.out_len; i++) {
+            const unsigned char ch = (unsigned char)a.out[i];
+
+            if (ch == '\r' || ch == '\n') {
+                continue;
+            }
+            TF_CHECK_MSG(ch > 0x1fu && ch != 0x7fu,
+                         "a byte from the log-injection set (0x%02x) reached node "
+                         "A's own output, having crossed the link.\n  node said: %s",
+                         ch, a.out);
+        }
+    }
+
+    /* 5. AND NO LOCAL DELIVERY, which is the fact that makes 1-4 the whole of the
+     * arm's exposure. dave is a member of B's cache and got nothing, because a
+     * non-owned channel's state-change emission is FORWARD ONLY. */
+    TF_CHECK_MSG(tc_send(&dave, "PING :post-topic") == 0, "dave's PING send failed");
+    TF_CHECK_MSG(tc_expect(&dave, "PONG", T_IO_MS) == 0,
+                 "dave got no PONG, so the absence below is about the read schedule "
+                 "rather than about what he was sent");
+    TF_CHECK_MSG(strstr(tc_buffer(&dave) + mark_d, "TOPIC " CHAN) == NULL,
+                 "a local member of the non-owning node's cache received the TOPIC. "
+                 "3.1's row for a non-owned channel is `state-change`: FORWARD ONLY, "
+                 "never a local write -- so this is not a bug in the forward arm, it "
+                 "is the reason the arm has no LOCAL exposure to fix, and it is pinned "
+                 "here because relaxing that row would bring the local exposure back "
+                 "with nothing else noticing.\n  dave saw: %s", tc_buffer(&dave) + mark_d);
+
+    /* dave is still a usable connection and his cache is still coherent. */
+    TF_CHECK_MSG(strstr(tc_buffer(&dave), " 366 ") != NULL,
+                 "dave's own JOIN numerics never arrived, so the negative above was "
+                 "measured against a client that had not arrived on the channel");
+
+    tc_close(&bob);
+    tc_close(&carol);
+    tc_close(&dave);
+    TF_CHECK_MSG(nf_stop(&a) == 0, "node A did not exit cleanly");
+    TF_CHECK_MSG(nf_stop(&b) == 0, "node B did not exit cleanly");
+    nf_free(&a);
+    nf_free(&b);
+}
+
 
 int main(void)
 {
     case_zero_member_node_relays();
     case_owner_with_no_local_members_relays();
+    case_topic_forward_strips();
     tf_done("fed_relay");
     return 0;
 }

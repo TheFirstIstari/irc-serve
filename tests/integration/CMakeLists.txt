@@ -707,3 +707,40 @@ irc_add_integration_test(test_tls test_tls.c)
 # startup rather than accepted and ignored.
 set(irc_timeout_test_peer_tls 180)
 irc_add_integration_test(test_peer_tls test_peer_tls.c)
+
+# The log-injection set (#121): `conn_byte_is_bad()` and the three policies built
+# on it. Its own file because the three fields have three different CONSUMERS and
+# therefore three different answers -- a servername nothing reads is MEASURED, an
+# away message and a topic that reach other members' terminals are STRIPPED and the
+# strip is announced, and a realname that is reported to third parties is still
+# REFUSED -- so "one predicate, per-field policy" is only checkable if all three
+# policies and both positive controls are in one place. The two "keeps good bytes"
+# cases are the ones that keep the strip from eating spaces and UTF-8, which is the
+# failure mode that would be worse than the injection because it is silent.
+irc_add_integration_test(test_control_bytes test_control_bytes.c)
+
+# The LOG-ONLY client-supplied fields (#121, second pass). Its own file because its
+# claim is a NUMBER rather than a per-site assertion: put a control byte in every
+# position a client can put one and require that NONE of them reaches this node's
+# stdout. That is a stronger claim than "each site was fixed", because it also
+# covers the site nobody enumerated -- and the audit method that found the 22
+# surviving bytes was exactly this one, so committing it is what stops the finding
+# from having to be rediscovered.
+irc_add_integration_test(test_log_injection test_log_injection.c)
+
+# The relay SHAPE behind four #121 bugs: an emission carrying `m->params` instead of
+# the value the node stored. A source test, because the defect leaves every runtime
+# invariant intact -- a field and its announcement can be two different values and
+# nothing on the wire says so -- which is the same situation test_close_sites.c
+# checks by looking rather than by running. It counts what it expects to FIND as
+# well as what it expects not to, so deleting the emissions turns it red instead of
+# vacuous.
+irc_add_integration_test(test_relay_shape test_relay_shape.c)
+
+# Relayed PRIVMSG/NOTICE text: the strip/keep split, end to end. Its own file
+# because the rule is two-sided and a test of only one half passes while the other
+# is broken -- a strip that removed ESC but also the mIRC codes passes every
+# "nothing dangerous arrived" assertion and silently breaks colour on every client.
+# test_msg_text.c asserts BOTH halves, the two C1 subtleties (the pair, and the
+# UTF-8 that collides with it), and the announcement decision.
+irc_add_integration_test(test_msg_text test_msg_text.c)

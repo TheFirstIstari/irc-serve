@@ -1105,12 +1105,40 @@ void handle_part(server_t *s, conn_t *c, const message_t *m)
     char store[CHAN_MAX_LIST_ARGS * (CHAN_MAX_NAME + 1u)];
     const char *names[CHAN_MAX_LIST_ARGS];
     const char *reason = (m->nparams > 1) ? m->params[1] : NULL;
+    /* THE REASON IS RELAYED, SO IT IS STRIPPED, and this buffer is why.
+     *
+     * `chan_member_leave()` puts a PART's `<reason>` on the wire to every member of
+     * the channel, and the FORWARD arm above puts the same string on the link to
+     * the origin, so `PART #c :<ESC>[2J` reached every member's terminal. RFC 2812
+     * 3.3.2 gives a PART reason no length limit and this node imposes none, so
+     * unlike the topic and the kick reason there is no field bound to copy: the
+     * largest value that can arrive is the line cap, and the buffer is sized to it.
+     *
+     * IRC_MAX_LINE + 1 ON THE STACK, 8 KiB, and that is the honest cost of the
+     * honest answer. The alternatives were an 8 KiB heap allocation per PART for a
+     * command a client sends once per channel, or a new length bound on a parameter
+     * the RFC leaves open -- which is a protocol change this pass is not making.
+     * 8 KiB in one non-recursive handler is a cost paid once per PART and nothing
+     * else; the strip can only shorten, so the result always fits.
+     *
+     * IT IS DONE ONCE, BEFORE THE LOOP, and that is the load-bearing part of the
+     * placement rather than an optimisation: the same reason goes to up to
+     * CHAN_MAX_LIST_ARGS channels, and a strip inside the loop would mean N
+     * separate buffers for one string. */
+    char clean[IRC_MAX_LINE + 1u];
+    size_t kept_reason = 0;
+    size_t raw_reason_len = 0;
     int n;
 
     if (m->nparams < 1) {
         (void)reply_refused(s, c, "PART", NULL, "461", NULL, 0,
                             "Not enough parameters");
         return;
+    }
+    if (reason != NULL) {
+        raw_reason_len = strlen(reason);
+        kept_reason = conn_text_strip(clean, sizeof clean, reason);
+        reason = (kept_reason != 0u) ? clean : NULL;
     }
     n = chan_split_list(store, sizeof store, m->params[0], names,
                         CHAN_MAX_LIST_ARGS);
@@ -1156,6 +1184,15 @@ void handle_part(server_t *s, conn_t *c, const message_t *m)
          * one, where 3.1 forbids a second pass through the table. */
         chan_member_leave(s, ch, c, 1, reason);
         (void)chan_detach_conn(c, ch);
+        if (kept_reason != 0u && kept_reason != raw_reason_len) {
+            /* Once per channel the client left, and only when something was
+             * dropped. A client that names five channels in one PART gets five
+             * lines, which is the right count: each is a separate channel's
+             * departure and each was a separate relay. */
+            printf("[observable] chan_part_stripped: channel=%s nick=%s in_len=%zu "
+                   "kept_len=%zu reason=CONTROL_BYTES\n",
+                   ch->name, c->nick, raw_reason_len, kept_reason);
+        }
         /* Disposal AFTER the departure, and this is the only place a PART frees
          * a channel. A channel with no local members AND no remote members has
          * nothing left to be authoritative about; one with remote members
@@ -1232,8 +1269,51 @@ void handle_topic(server_t *s, conn_t *c, const message_t *m)
          * what a line it was just sent says. A peer cannot rebuild a topic from a
          * bare `STOPIC #chan` either, which is why the same parameter serves
          * both renderings. */
-        params[0] = m->params[1];
-        deliver_state_change(s, c, ch, "TOPIC", prefix, params, 1);
+        /* STRIPPED, AND THE BUFFER IS EXACT. This is the arm the locally-owned
+         * path does not have, and it was the last raw relay of a client-controlled
+         * string left on the node: a `TOPIC` on a channel this node does not own
+         * put the client's bytes on the wire to every local member of the cache and
+         * to the origin. Nothing is stored here -- 2.2 forbids writing a cache field
+         * on a client's say-so -- so there is no "broadcast the stored field" to fix
+         * and the strip is the whole of it.
+         *
+         * `CHAN_MAX_TOPIC + 1` IS EXACT rather than a convenience, and the reason
+         * is that stripping must not silently WIDEN what the node accepts. The
+         * origin applies its own bound to whatever arrives over the link, so a
+         * 400-byte topic of which 200 bytes are control characters would strip to
+         * 200 here, fit, and be stored by the origin -- where the same 400 bytes
+         * unstripped were refused. Checking the RAW length first keeps the origin's
+         * answer a function of what the client sent rather than of which bytes
+         * happened to be in it. */
+        char clean[CHAN_MAX_TOPIC + 1u];
+        size_t in_len = strlen(m->params[1]);
+
+        if (in_len > (size_t)CHAN_MAX_TOPIC) {
+            /* Not stripped, AND NOT FORWARDED. The origin refuses a topic longer
+             * than its own bound, and a node that quietly shortened its way inside
+             * that bound would be answering for a message the origin never
+             * accepted -- so the whole forward is skipped and the client is still
+             * answered 332/333 below with what this node holds, which is what this
+             * arm has always done.
+             *
+             * The `forwarded=0` is on THIS line and not on a shared one, and that is
+             * the point of putting the record inside each branch: a reader -- or a
+             * test -- must be able to conclude from `forwarded=1` that the value that
+             * went on the wire was the stripped one, because that is the branch that
+             * put `clean` into the parameter list. A single summary line printed
+             * after both arms could not carry that, and a test could not use it. */
+            printf("[observable] chan_topic_forward: channel=%s nick=%s in_len=%zu "
+                   "kept_len=0 forwarded=0 reason=TOO_LONG\n",
+                   ch->name, c->nick, in_len);
+        } else {
+            size_t kept = conn_text_strip(clean, sizeof clean, m->params[1]);
+
+            params[0] = clean;
+            deliver_state_change(s, c, ch, "TOPIC", prefix, params, 1);
+            printf("[observable] chan_topic_forward: channel=%s nick=%s in_len=%zu "
+                   "kept_len=%zu forwarded=1 reason=CONTROL_BYTES\n",
+                   ch->name, c->nick, in_len, kept);
+        }
         send_topic(s, c, ch);
         return;
     }
@@ -1248,6 +1328,23 @@ void handle_topic(server_t *s, conn_t *c, const message_t *m)
     }
     printf("[observable] chan_topic: channel=%s nick=%s len=%zu when=%lld\n",
            ch->name, c->nick, strlen(ch->topic), (long long)ch->topic_when);
+    /* THE STRIP IS ANNOUNCED (#121). chan_set_topic() removed any control bytes,
+     * so the length on the line above is the length that was STORED rather than
+     * the length that arrived; a reader comparing a member's terminal against the
+     * setter's screen needs to know they can differ, and needs to know by how
+     * much. Deriving the count from the two strings rather than measuring it again
+     * keeps the strip one pass and keeps this line and the stored value from being
+     * able to disagree.
+     *
+     * ONLY WHEN IT HAPPENED. A `TOPIC` of ordinary text takes neither branch, so
+     * the common case adds one comparison and no line -- and a needle that fires
+     * for every topic change would be a needle a test could not use to tell a
+     * strip from an ordinary set. */
+    if (strlen(m->params[1]) != strlen(ch->topic)) {
+        printf("[observable] chan_topic_stripped: channel=%s nick=%s "
+               "in_len=%zu kept_len=%zu reason=CONTROL_BYTES\n",
+               ch->name, c->nick, strlen(m->params[1]), strlen(ch->topic));
+    }
 
     {
         char prefix[CONN_HOSTMASK_MAX];
@@ -1256,7 +1353,17 @@ void handle_topic(server_t *s, conn_t *c, const message_t *m)
         if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
             return;
         }
-        params[0] = m->params[1];
+        /* `ch->topic`, NOT `m->params[1]` (#121). This used to echo the client's
+         * own bytes to every member of the channel, which meant the strip inside
+         * chan_set_topic() would have changed what the node STORES while leaving
+         * what it RELAYS untouched -- the stored copy stripped, the announced copy
+         * raw, and a member's terminal the only place the ESC still arrived. The
+         * broadcast is a second copy of the field and the copy on the wire is the
+         * one that executes, so it is the copy that has to be the stored one. It is
+         * also more correct for a reason that predates the strip: what a member is
+         * told the topic is, should be what the node holds rather than what the
+         * setter typed. */
+        params[0] = ch->topic;
         deliver_state_change(s, c, ch, "TOPIC", prefix, params, 1);
     }
     /* The setter is told the topic back as 332/333, which is how it learns the
@@ -1414,6 +1521,9 @@ void handle_kick(server_t *s, conn_t *c, const message_t *m)
     chan_t *ch;
     struct member *target;
     const char *reason;
+    char clean_reason[CHAN_MAX_KICK_REASON + 1u];
+    size_t kept_reason;
+    size_t raw_reason_len;
     char prefix[CONN_HOSTMASK_MAX];
     const char *params[4];
 
@@ -1431,6 +1541,7 @@ void handle_kick(server_t *s, conn_t *c, const message_t *m)
      * kicker, which is the most useful default available -- it is in the message
      * already and it is what the target will see. */
     reason = (m->nparams > 2) ? m->params[2] : c->nick;
+    raw_reason_len = strlen(reason);
 
     /* ------------------------------------------------------------------------
      * THE REASON BOUND, AND WHY IT IS CHECKED HERE AND NOT AT THE END
@@ -1465,14 +1576,66 @@ void handle_kick(server_t *s, conn_t *c, const message_t *m)
      * (63), so the substituted value is always inside this bound. A future change
      * that defaulted the reason to something client-supplied would have to move
      * this test. */
-    if (strlen(reason) > (size_t)CHAN_MAX_KICK_REASON) {
+    if (raw_reason_len > (size_t)CHAN_MAX_KICK_REASON) {
         (void)reply_refused(s, c, "KICK", NULL, "417", NULL, 0,
                             "Kick reason is too long");
-        printf("[observable] chan_kick_refused: channel=%s nick=%s reason=too_long "
-               "len=%zu max=%d\n",
-               m->params[0], c->nick, strlen(reason), CHAN_MAX_KICK_REASON);
+        /* MEASURED, and the ORDERING is what makes it necessary: this line names
+         * `m->params[0]` -- the CHANNEL -- and it is printed BEFORE
+         * `resolve_joined()` has run `chan_name_valid()` over it. Every other
+         * `channel=%s` in this file prints `ch->name`, which is a stored name that
+         * passed the validator; this one is the exception and it was the raw path.
+         *
+         * Not a strip: the value is log-only, and a channel name is an identifier
+         * whose diagnostic value is that it is readable. Withheld when a byte in it
+         * would execute, with the length and the count beside it.
+         *
+         * THE 417 IS UNAFFECTED. The reason was rejected for being over-long, which
+         * is the fact the numeric reports, and the channel name plays no part in
+         * it -- so nothing here changes which numerics a client sees. */
+        {
+            char shown[CONN_LOG_FIELD_MAX + 1u];
+
+            (void)conn_text_logsafe(shown, sizeof shown, m->params[0]);
+            printf("[observable] chan_kick_refused: channel=%s channel_len=%zu "
+                   "channel_bad_bytes=%zu nick=%s reason=too_long len=%zu max=%d\n",
+                   shown, strlen(m->params[0]), conn_text_bad_count(m->params[0]),
+                   c->nick, strlen(reason), CHAN_MAX_KICK_REASON);
+        }
         return;
     }
+
+    /* ------------------------------------------------------------------------
+     * THE REASON IS RELAYED, SO IT IS STRIPPED -- AND IT IS STRIPPED HERE, AFTER
+     * THE BOUND ABOVE AND NOT BEFORE IT
+     * ------------------------------------------------------------------------
+     * The strip closes the last raw relay of a client-controlled string left on the
+     * node: `handle_kick()` puts the client's own `<reason>` into the KICK it
+     * broadcasts to every member of the channel, so `KICK #c nick :<ESC>[2J`
+     * reached every member's terminal with the ESC intact. The bound above is a
+     * LENGTH bound and said nothing about which bytes.
+     *
+     * AFTER THE BOUND, and that ordering is the whole of it. Stripping first would
+     * have been a REGRESSION, and test_standard_replies.c's 256-byte case caught it:
+     * `CHAN_MAX_KICK_REASON + 1` holds exactly 255 characters plus a terminator, so
+     * a 256-character reason stripped into it is TRUNCATED to 255, and the length
+     * check that follows would then see 255 and accept the very input the 417
+     * exists to refuse. Stripping after the bound means the strip can only ever run
+     * on a value already known to fit, so `clean_reason` is exact and the refusal is
+     * a function of what the client sent. (The same ordering is load-bearing in the
+     * TOPIC forward arm and in the MODE mask below, and it is why all three test
+     * the RAW length before stripping.)
+     *
+     * `clean_reason` IS WHAT IS BROADCAST, announced and stored nowhere else -- there
+     * is no stored reason, which is why this is a strip and not a "send the stored
+     * field". The default, `c->nick`, is a nickname that passed `valid_nick()`, so
+     * the common no-reason KICK is unchanged: the strip is idempotent on it and
+     * announces nothing.
+     *
+     * IT COSTS, and the cost is the same one the away message and the topic
+     * accepted: the members see a shorter sentence than the kicker wrote, and the
+     * log line below is the only record of the difference. */
+    kept_reason = conn_text_strip(clean_reason, sizeof clean_reason, reason);
+    reason = clean_reason;
 
     ch = resolve_joined(s, c, m->params[0]);
     if (ch == NULL) {
@@ -1533,6 +1696,15 @@ void handle_kick(server_t *s, conn_t *c, const message_t *m)
     params[0] = target->c->nick;
     params[1] = reason;
     deliver_state_change(s, c, ch, "KICK", prefix, params, 2);
+    /* ANNOUNCED, on the same rule as the away message and the topic: silent
+     * mutation is its own defect, and the member who sees a shortened reason has no
+     * way to know the kicker wrote something longer. The count is what separates
+     * "one stray byte" from "the reason was mostly control characters". */
+    if (kept_reason != raw_reason_len) {
+        printf("[observable] chan_kick_stripped: channel=%s nick=%s in_len=%zu "
+               "kept_len=%zu reason=CONTROL_BYTES\n",
+               ch->name, c->nick, raw_reason_len, kept_reason);
+    }
 
     {
         conn_t *kicked = target->c;
@@ -1859,6 +2031,13 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
         }
 
         if (mode == 'b') {
+            /* Declared here rather than at the top of the function because this is
+             * the only branch that uses them, and a loop over up to MAXPARAMS modes
+             * reuses one buffer per iteration rather than holding four per mode. */
+            char clean_mask[CHAN_MAX_BAN + 1u];
+            const char *effective;
+            size_t kept_mask;
+
             if (m->nparams < 3) {
                 /* THE QUERY FORM, not a too-few-params case. RFC 2812 3.3.2:
                  * "If the <modestring> parameter is given with a list of mode
@@ -1871,8 +2050,43 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
                 send_ban_list(s, c, ch);
                 return;
             }
+            /* A BAN MASK IS RELAYED, SO IT IS STRIPPED, and the store and the
+             * broadcast MUST get the SAME COPY. That is the whole shape of this
+             * fix and it is the one `handle_topic()` got wrong on the locally-owned
+             * path: there the stored copy was filtered and the announced copy was
+             * the client's bytes, so every member got the raw value. Here the mask
+             * is stored by `chan_ban_add()` AND announced in the MODE echo, so a
+             * strip applied to only one of them leaves the other raw.
+             *
+             * ONE COPY, CHOSEN ABOVE BOTH CALLS, is what makes that impossible to
+             * get wrong from here: `effective` is computed once and is what the
+             * store sees, what the broadcast sends, and what the log prints.
+             *
+             * `CHAN_MAX_BAN + 1` IS EXACT, and the over-long case is DELIBERATELY
+             * NOT STRIPPED. Stripping could take a 200-byte mask inside the bound
+             * and have it stored, where the same mask unstripped is refused today --
+             * so the refusal would become a function of which bytes were in the mask
+             * rather than of how long it was. An over-long mask goes to
+             * `chan_ban_add()` unchanged and gets the refusal it gets today.
+             *
+             * AN ALL-REFUSED MASK LANDS ON AN EXISTING BRANCH, and that is worth
+             * naming because 478's text does not fit it: a mask that strips to
+             * nothing is empty, and `chan_ban_add()` already refuses an empty mask
+             * with the same -1. The client is told the list is full for a mask this
+             * node would not store, which is imprecise -- but it is imprecise TODAY
+             * for an over-long mask as well, because the same -1 answers both. Adding
+             * a numeric for "this mask is not acceptable" is a wire change this pass
+             * is not making, and inventing one would be worse than the imprecision. */
+            if (strlen(m->params[2]) > (size_t)CHAN_MAX_BAN) {
+                effective = m->params[2];
+                kept_mask = strlen(m->params[2]);
+            } else {
+                kept_mask = conn_text_strip(clean_mask, sizeof clean_mask,
+                                            m->params[2]);
+                effective = clean_mask;
+            }
             if (plus) {
-                if (chan_ban_add(ch, m->params[2]) != 0) {
+                if (chan_ban_add(ch, effective) != 0) {
                     /* 478 ERR_BANLISTFULL, whose RFC 2812 5.1 field list is
                      * "<channel> <char> :Channel list is full" -- so the channel
                      * AND the mode letter are middle parameters.
@@ -1914,9 +2128,9 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
                  * hiding one inside the other makes both harder to find. */
                 (void)chan_mode_set(ch, 'b', 1);
             } else {
-                if (chan_ban_remove(ch, m->params[2]) != 0) {
+                if (chan_ban_remove(ch, effective) != 0) {
                     (void)reply(s, c, "368",
-                                (const char *const[]){ ch->name, m->params[2] }, 2,
+                                (const char *const[]){ ch->name, effective }, 2,
                                 "Ban mask is not set on this channel");
                     return;
                 }
@@ -1928,11 +2142,16 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
             rendered[1] = 'b';
             rendered[2] = '\0';
             params[0] = rendered;
-            params[1] = m->params[2];
+            params[1] = effective;
             deliver_state_change(s, c, ch, "MODE", prefix, params, 2);
             printf("[observable] chan_ban_mode: channel=%s by=%s mask=%s set=%d "
-                   "nbans=%zu origin=%s\n", ch->name, c->nick, m->params[2], plus,
+                   "nbans=%zu origin=%s\n", ch->name, c->nick, effective, plus,
                    ch->nbans, ch->origin);
+            if (kept_mask != strlen(m->params[2])) {
+                printf("[observable] chan_ban_mask_stripped: channel=%s by=%s "
+                       "in_len=%zu kept_len=%zu reason=CONTROL_BYTES\n",
+                       ch->name, c->nick, strlen(m->params[2]), kept_mask);
+            }
             continue;
         }
 

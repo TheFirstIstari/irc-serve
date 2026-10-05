@@ -387,15 +387,22 @@ size_t conn_hostmask(const conn_t *c, char *out, size_t cap)
  *                sizes its own buffer from; a server that stores a fifth of it is the
  *                server that broke the promise.
  *
- *   BAD_BYTE     A realname reaches the node's own LOG, and it is the one
- *                client-supplied free-text field with no escaping between the socket
- *                and a printf("%s"). message_parse_n() refuses CR, LF and NUL
- *                already, so the three that matter most cannot arrive; what CAN
- *                arrive is every other C0 control and DEL. 0x07 rings the recipient's
- *                terminal bell, and ESC followed by `[` is a CSI sequence any
- *                terminal will execute -- which is a realname that rewrites the
- *                operator's screen, from a channel member, into a log that other
- *                tooling also reads.
+ *   BAD_BYTE     A realname reaches the node's own LOG, with no escaping between
+ *                the socket and a printf("%s"). message_parse_n() refuses CR, LF
+ *                and NUL already, so the three that matter most cannot arrive; what
+ *                CAN arrive is every other C0 control and DEL. 0x07 rings the
+ *                recipient's terminal bell, and ESC followed by `[` is a CSI
+ *                sequence any terminal will execute -- which is a realname that
+ *                rewrites the operator's screen, from a channel member, into a log
+ *                that other tooling also reads.
+ *
+ *                It was once "the one client-supplied free-text field with no
+ *                escaping between the socket and a printf(\"%s\")", and that was
+ *                true until #121 found the two that were not -- USER's
+ *                <servername> and AWAY's text -- and then found the topic as well.
+ *                The claim is corrected here rather than left: it is exactly the
+ *                kind of sentence that makes the next reader believe the set is
+ *                closed.
  *
  *                The test is `ch <= 0x1f || ch == 0x7f`, and it is the SAME rule
  *                `chan_name_valid()` already applies to a channel name (channel.c),
@@ -406,7 +413,20 @@ size_t conn_hostmask(const conn_t *c, char *out, size_t cap)
  *
  * NULL IS OK: an empty realname is a legal state (chan_verbs.c's extended-join
  * comment says so, and renders it as a bare `:`), and a client that clears its own
- * realname must be able to say so. */
+ * realname must be able to say so.
+ *
+ * THE BYTE TEST IS NOT WRITTEN HERE. It is `conn_byte_is_bad()` below, which the
+ * header names as the single definition of the log-injection set, and this
+ * function asks it for a count and treats a non-zero count as the refusal. That
+ * is a deliberate indirection: a third field needs the same question asked and
+ * answering it from its own copy of `ch <= 0x1f || ch == 0x7f` is how the two
+ * come to disagree about which bytes are dangerous.
+ *
+ * WHAT IT COSTS: the loop no longer stops at the FIRST bad byte, because the
+ * count is a count. On a registration path, over a string the parser has already
+ * bounded at one IRC line, that is one extra pass over at most a few hundred
+ * bytes on a command a client sends once -- and it buys the exact byte count the
+ * log line below reports. */
 conn_realname_verdict_t conn_realname_check(const char *name)
 {
     if (name == NULL) {
@@ -415,12 +435,307 @@ conn_realname_verdict_t conn_realname_check(const char *name)
     if (strlen(name) > (size_t)CONN_MAX_REALNAME) {
         return CONN_REALNAME_TOO_LONG;
     }
-    for (size_t i = 0; name[i] != '\0'; i++) {
-        const unsigned char ch = (unsigned char)name[i];
-
-        if (ch <= 0x1fu || ch == 0x7fu) {
-            return CONN_REALNAME_BAD_BYTE;
-        }
+    if (conn_text_bad_count(name) != 0u) {
+        return CONN_REALNAME_BAD_BYTE;
     }
     return CONN_REALNAME_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * THE LOG-INJECTION SET, defined once
+ * ---------------------------------------------------------------------------
+ * The whole of §9's hazard is these bytes: 0x07 rings a terminal's bell, and ESC
+ * followed by `[` is a CSI sequence any terminal executes -- so a channel member
+ * can rewrite an operator's screen through a log line, and a member's terminal can
+ * be rewritten by another member. `message_parse_n()` refuses CR, LF and NUL
+ * before any of this runs, so the range that reaches a caller is 0x01-0x08, 0x0b,
+ * 0x0c, 0x0e-0x1f and 0x7f.
+ *
+ * DEL (0x7f) is in the set and that is not an accident of the C0 range: it is not
+ * a control character to a terminal, it is an ordinary printable glyph in most
+ * fonts, and it is invisible in a log. A byte that cannot be seen but can be
+ * matched is worth refusing for a log the node has just described as the place
+ * where refusals are made findable.
+ *
+ * SPACE (0x20) is OUT, and TAB (0x09) is IN. The argument for both is at the
+ * header: space is the commonest byte in every field this touches, and TAB is a
+ * rendering accident in a sentence somebody typed.
+ *
+ * BYTES >= 0x80 ARE OUT, permanently. That is the line that keeps UTF-8 intact:
+ * every continuation byte of every multi-byte sequence is >= 0x80, so a filter
+ * that reached them would corrupt non-ASCII text SILENTLY, which is a worse
+ * failure than the injection this closes because the user cannot see it happen.
+ *
+ * STATIC, and that is a design statement rather than an encapsulation habit: it
+ * is THE predicate, and it has exactly two callers in this file. Both are exposed
+ * in connection.h because a field in another module must be able to ask the
+ * question, and neither needs the byte test itself -- asking "how many" answers
+ * "is there any" as `!= 0`, and the strip is the other operation. */
+static int conn_byte_is_bad(char ch)
+{
+    const unsigned char u = (unsigned char)ch;
+
+    return (u <= 0x1fu || u == 0x7fu) ? 1 : 0;
+}
+
+/* How many bytes of `s` are in the set. 0 for NULL, because NULL is not a string
+ * and a caller that has no value has no bad byte -- which is what lets an empty
+ * or absent parameter take the same path as a clean one. */
+size_t conn_text_bad_count(const char *s)
+{
+    size_t n = 0;
+
+    if (s == NULL) {
+        return 0;
+    }
+    for (size_t i = 0; s[i] != '\0'; i++) {
+        if (conn_byte_is_bad(s[i]) != 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* One pass, two outputs: the kept bytes go to `dst` and the KEPT COUNT comes back
+ * to the caller, which derives "how many were dropped" by subtracting the input's
+ * own strlen() from it. A caller that instead called conn_text_bad_count() first
+ * to get that number would walk the same client-supplied string twice to learn
+ * one integer, on a path that runs once per away change rather than once per
+ * packet. */
+size_t conn_text_strip(char *dst, size_t cap, const char *src)
+{
+    size_t kept = 0;
+
+    if (dst == NULL || cap == 0u) {
+        return 0;
+    }
+    if (src == NULL) {
+        dst[0] = '\0';
+        return 0;
+    }
+    for (size_t i = 0; src[i] != '\0'; i++) {
+        if (conn_byte_is_bad(src[i]) != 0) {
+            continue;
+        }
+        /* The bound is a SAFETY net rather than a policy. Every caller has already
+         * applied its field's own length bound and stripping only removes bytes,
+         * so this cannot fire -- and it is written rather than assumed because the
+         * alternative is a silent overflow of a field whose size is a protocol
+         * constant three modules deep. `cap` counts the terminator, so `kept` is
+         * always <= cap - 1 and the store above is always in bounds. */
+        if (kept + 1u >= cap) {
+            break;
+        }
+        dst[kept] = src[i];
+        kept++;
+    }
+    dst[kept] = '\0';
+    return kept;
+}
+
+/* ---------------------------------------------------------------------------
+ * conn_text_strip_relay: the KEEP half of the split, as a switch
+ * ---------------------------------------------------------------------------
+ * EIGHT BYTES, NAMED, rather than a range test -- because a range test is the
+ * mistake waiting to happen here. `u >= 0x02 && u <= 0x1F` looks like the keep
+ * list and is not: it would swallow 0x07 BEL and 0x1B ESC, which is the whole
+ * hazard, and would return 0 for 0x01, which corrupts every CTCP. A reader who
+ * wants to add a code to the keep list has to add it HERE, in the switch, where
+ * the list is visible as a list.
+ *
+ * DEL is not here: it is a strip, handled by the caller below rather than here,
+ * because 0x7F is not C0 and belongs to neither C0 group.
+ */
+static int relay_byte_kept(unsigned char u)
+{
+    switch (u) {
+    case 0x01u: /* the CTCP delimiter -- removing it CORRUPTS rather than sanitises */
+    case 0x02u: /* mIRC bold */
+    case 0x03u: /* mIRC colour */
+    case 0x0fu: /* mIRC plain */
+    case 0x11u: /* mIRC mono */
+    case 0x16u: /* mIRC reverse */
+    case 0x1du: /* mIRC italic */
+    case 0x1fu: /* mIRC underline */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* WHAT TO DO WITH ONE BYTE. Split out of the loop so the walk below is a walk and
+ * not a decision tree, and so the rule for a single byte can be read in one place. */
+enum {
+    RELAY_EMIT = 0,  /* copy it */
+    RELAY_DROP = 1   /* remove it, and `*skip` more bytes with it */
+};
+
+/* One step of the walk. `*need` is how many continuation bytes the sequence in
+ * progress still expects and is the WHOLE of the UTF-8 state; `*skip` is how many
+ * extra bytes this one verdict consumes, which is 1 for the encoded C1 pair and 0
+ * for everything else. `at` points at the byte being judged, so `at[1]` is the next
+ * one -- the terminator when `at` is the last byte, which is why every range tested
+ * below excludes `0x00`.
+ *
+ * THE ORDER IS THE DESIGN and it is the one thing a reader must not reshuffle. The
+ * `*need` test comes FIRST because a continuation byte is defined by the byte before
+ * it: `0x90` following a lead is the second half of a Cyrillic A and is EMITTED, and
+ * the identical byte with nothing expecting it is a raw C1 and is DROPPED. Ask
+ * anything about `u` on its own first and those two cases become indistinguishable,
+ * which is the mistake that costs every Greek and Cyrillic message on the node. */
+static int relay_step(unsigned char u, const char *at, size_t *need, size_t *skip)
+{
+    *skip = 0;
+
+    /* MID-SEQUENCE. */
+    if (*need > 0u) {
+        if (u >= 0x80u && u <= 0xbfu) {
+            (*need)--;
+            return RELAY_EMIT;
+        }
+        /* Not a continuation after all -- a truncated or malformed sequence. The lead
+         * byte was already emitted, so this byte is re-examined on its own rather than
+         * swallowed. Being permissive here only ever KEEPS a byte, which is the safe
+         * direction in which to be wrong. */
+        *need = 0;
+    }
+
+    /* ASCII. The deny half of the split, plus DEL. ESC and BEL arrive here. */
+    if (u < 0x80u) {
+        if (u < 0x20u && relay_byte_kept(u) == 0) {
+            return RELAY_DROP;
+        }
+        if (u == 0x7fu) {
+            return RELAY_DROP;
+        }
+        return RELAY_EMIT;
+    }
+
+    /* THE ENCODED C1 PAIR. `0xC2` is the only lead byte a C1 control can carry in
+     * UTF-8, and `0xC2` + `0x80-0x9F` is CSI and its relatives. Both bytes go, and
+     * they are recognised BEFORE `0xC2` is treated as an ordinary lead -- otherwise
+     * `0xC2 0x9B` would pass as a valid sequence and the 8-bit escape would survive,
+     * which is the specific hole this case exists to close. */
+    if (u == 0xc2u && (unsigned char)at[1] >= 0x80u && (unsigned char)at[1] <= 0x9fu) {
+        *skip = 1;
+        return RELAY_DROP;
+    }
+
+    /* A RAW C1: in 0x80-0x9F with nothing expecting a continuation. On an 8-bit
+     * terminal `0x9B` IS CSI, so leaving it is the hazard this function exists to
+     * remove. The alternative -- dropping 0x80-0x9F unconditionally -- would eat the
+     * Cyrillic, the Greek and every accented character on the node, and it is the
+     * mistake this code is most likely to be "simplified" into. */
+    if (u >= 0x80u && u <= 0x9fu) {
+        return RELAY_DROP;
+    }
+
+    /* AN ORDINARY MULTI-BYTE LEAD, and the only reason the Cyrillic survives. */
+    if (u >= 0xc2u && u <= 0xdfu) {
+        *need = 1u;
+        return RELAY_EMIT;
+    }
+    if (u >= 0xe0u && u <= 0xefu) {
+        *need = 2u;
+        return RELAY_EMIT;
+    }
+    if (u >= 0xf0u && u <= 0xf4u) {
+        *need = 3u;
+        return RELAY_EMIT;
+    }
+
+    /* `0xC0` and `0xC1` can never lead a UTF-8 sequence -- they would only ever
+     * encode an overlong NUL -- and `0xF5`-`0xFF` lie outside UTF-8 entirely. Neither
+     * is named in the strip set and neither can move a cursor, so both are copied
+     * unchanged. This function removes what is on the list, not everything it does not
+     * recognise. */
+    return RELAY_EMIT;
+}
+
+size_t conn_text_strip_relay(char *dst, size_t cap, const char *src)
+{
+    size_t kept = 0;
+    size_t need = 0;
+
+    if (dst == NULL || cap == 0u) {
+        return 0;
+    }
+    if (src == NULL) {
+        dst[0] = '\0';
+        return 0;
+    }
+    for (size_t i = 0; src[i] != '\0'; i++) {
+        unsigned char u = (unsigned char)src[i];
+        size_t skip = 0;
+
+        if (relay_step(u, src + i, &need, &skip) == RELAY_DROP) {
+            i += skip;
+            continue;
+        }
+        /* The bound is a SAFETY net on the same terms as conn_text_strip()'s: the
+         * caller has already applied 3.2's line cap, and this only removes bytes, so
+         * it cannot fire in practice. */
+        if (kept + 1u >= cap) {
+            break;
+        }
+        dst[kept] = (char)u;
+        kept++;
+    }
+    dst[kept] = '\0';
+    return kept;
+}
+
+/* ---------------------------------------------------------------------------
+ * conn_text_logsafe, and the one decision it makes
+ * ---------------------------------------------------------------------------
+ * The test is `conn_byte_is_bad()` and nothing else, so this function and
+ * `conn_text_bad_count()` cannot disagree about a string: a caller that prints
+ * `s` here and reports `conn_text_bad_count(s)` bad bytes is describing one set,
+ * not two.
+ *
+ * PRINTABLE ASCII, 0x20 to 0x7e, is the accepted range and that is wider than the
+ * strictest reading on purpose. A verb, a nickname, a channel name, a server mask
+ * and an opaque token are all ASCII, and the whole value of a log line that names
+ * one of them is that the name is readable. So the value is kept whenever keeping
+ * it is safe, and the function's job is to know exactly when that is.
+ *
+ * `-` RATHER THAN AN EMPTY STRING, because `field=` with nothing after it reads as
+ * a rendering bug on a log line and `-` is already this tree's spelling for "there
+ * was no value" at every other site -- `ping: token=-` for an absent PING argument
+ * is the same convention.
+ *
+ * WHAT IT CANNOT DO is make an unsafe value safe by rewriting it. A caller that
+ * wants a mutated value wants `conn_text_strip()`, and a caller that has already
+ * stripped a field should not reach for this at all: the value is then printable
+ * and the two would agree, at the cost of a second pass. */
+size_t conn_text_logsafe(char *out, size_t cap, const char *s)
+{
+    if (out == NULL || cap < 2u) {
+        return 0;
+    }
+    if (s == NULL || s[0] == '\0') {
+        out[0] = '-';
+        out[1] = '\0';
+        return 1u;
+    }
+    for (size_t i = 0; s[i] != '\0'; i++) {
+        const unsigned char u = (unsigned char)s[i];
+
+        if (conn_byte_is_bad((char)u) != 0 || u > 0x7eu) {
+            out[0] = '-';
+            out[1] = '\0';
+            return 1u;
+        }
+        /* LENGTH IS THE THIRD REASON FOR WITHHOLDING, and it is checked in the same
+         * pass so a caller learns about it without a second walk. One `-` then means
+         * three things -- absent, unsafe, or too long for the field -- and the `len=`
+         * every caller prints beside it is what tells the last two apart. */
+        if (i + 2u > cap) {
+            out[0] = '-';
+            out[1] = '\0';
+            return 1u;
+        }
+    }
+    (void)snprintf(out, cap, "%s", s);
+    return strlen(out);
 }

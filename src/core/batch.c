@@ -12,6 +12,9 @@
 #include <strings.h>
 
 #include "core/cap.h"
+/* For conn_text_logsafe() and CONN_LOG_FIELD_MAX -- the log-injection set, applied
+ * to the reference tags this file renders. */
+#include "core/connection.h"
 #include "core/reply.h"
 
 /* ---------------------------------------------------------------------------
@@ -167,9 +170,32 @@ static void note_reference(conn_t *c, const message_t *m, char sigil)
         return; /* absent, which is the common case and not an error */
     }
     if (batch_ref_valid(ref) == 0) {
-        printf("[observable] batch_ref_refused: fd=%d sigil=%c ref=%s "
-               "reason=ILLEGAL\n",
-               c->fd, sigil, (ref[0] != '\0') ? ref : "-");
+        /* MEASURED, NOT STRIPPED. This is the interesting half of the two `ref=`
+         * lines in this file: `ref` is here precisely because it FAILED
+         * `batch_ref_valid()`, so its whole value is what the client got wrong --
+         * a near-miss like `my_ref` is the diagnostic, and stripping or withholding
+         * the whole string would throw it away. What is withheld is only the part
+         * a terminal would execute.
+         *
+         * The other `ref=` line further down takes `m->params[0] + 1`, which is
+         * unbounded, and both are handled the same way for the same reason: the
+         * bytes are measured with the shared predicate rather than filtered with a
+         * second copy of the rule.
+         *
+         * EVERY OTHER REFERENCE THIS FILE PRINTS IS ALREADY SAFE, and it is worth
+         * naming so the next reader does not re-audit them: `c->batch_ref` and
+         * `c->batch_type` are written only after `batch_ref_valid()` passes, and
+         * `wanted=`/`batch_close: ref=` print a `ref` that passed the same test on
+         * the line above. The grammar is alnum and '-', so none of them can hold a
+         * byte from the set. */
+        char shown[CONN_LOG_FIELD_MAX + 1u];
+        const char *shown_ref = (ref[0] != '\0') ? ref : "";
+
+        (void)conn_text_logsafe(shown, sizeof shown, shown_ref);
+        printf("[observable] batch_ref_refused: fd=%d sigil=%c ref=%s ref_len=%zu "
+               "ref_bad_bytes=%zu reason=ILLEGAL\n",
+               c->fd, sigil, shown, strlen(shown_ref),
+               conn_text_bad_count(shown_ref));
         return;
     }
     /* AN OPEN BATCH MAKES A `+` A NO-OP HERE, and this is where "one batch at a time"
@@ -405,9 +431,16 @@ void handle_batch(server_t *s, conn_t *c, const message_t *m)
              * unsafe parameter is the right trade, and the log carries it. */
             (void)reply_refused(s, c, "BATCH", "INVALID_REFTAG", "417", NULL, 0,
                                 "Reference tag is not acceptable");
-            printf("[observable] batch_refused: fd=%d reason=INVALID_REFTAG "
-                   "ref=%s len=%zu\n",
-                   c->fd, (ref[0] != '\0') ? ref : "-", strlen(ref));
+            {
+                char shown[CONN_LOG_FIELD_MAX + 1u];
+                const char *shown_ref = (ref[0] != '\0') ? ref : "";
+
+                (void)conn_text_logsafe(shown, sizeof shown, shown_ref);
+                printf("[observable] batch_refused: fd=%d reason=INVALID_REFTAG "
+                       "ref=%s len=%zu ref_len=%zu ref_bad_bytes=%zu\n",
+                       c->fd, shown, strlen(shown_ref), strlen(shown_ref),
+                       conn_text_bad_count(shown_ref));
+            }
             return;
         }
         /* A TYPE IS REQUIRED, and 461 rather than 462: this is a missing PARAMETER,

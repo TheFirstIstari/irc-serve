@@ -303,6 +303,310 @@ typedef enum {
  * definition. */
 conn_realname_verdict_t conn_realname_check(const char *name);
 
+/* ---------------------------------------------------------------------------
+ * THE LOG-INJECTION SET: ONE BYTE TEST, TWO OPERATIONS, THREE POLICIES
+ * ---------------------------------------------------------------------------
+ * §9 names this class: "`0x07` rings a recipient's bell and ESC `[` is a CSI
+ * sequence a terminal executes". A client-supplied string reaches either this
+ * node's own `printf("%s")` or another client's terminal, and in both cases the
+ * dangerous bytes are the same ones -- a C0 control (0x00-0x1f) or DEL (0x7f).
+ * `message_parse_n()` refuses CR, LF and NUL ahead of every consumer, so what
+ * gets through is everything else in that range plus DEL.
+ *
+ * WHY THE SET IS DEFINED HERE AND NOT AT EACH FIELD. The three fields that reach
+ * output with client bytes in them have THREE DIFFERENT CONSUMERS, and the
+ * consumer is what decides the policy -- see the table at the bottom of this
+ * block. Three policies written three times is three chances to spell the byte
+ * test differently, and a fourth field would then have no rule at all. So the
+ * byte test exists once, here, and a field chooses only its POLICY.
+ *
+ * THE TWO OPERATIONS, AND WHY ONLY TWO.
+ *
+ *   conn_text_bad_count()  MEASURE. How many bytes of this string are in the set.
+ *                         Zero means "needs no policy", which is what lets a
+ *                         caller make the log line for the common case cost one
+ *                         integer rather than a branch. It is also the ONLY place
+ *                         the count exists, so a caller reporting "3 bytes were
+ *                         dropped" and a caller asking "was this clean" cannot
+ *                         disagree about how many there were.
+ *
+ *   conn_text_strip()     MUTATE. Copy with the set's bytes removed, and report
+ *                         how many bytes were KEPT -- the caller derives "how many
+ *                         were dropped" from its own strlen() of the input, so the
+ *                         measure and the mutation are the same pass.
+ *
+ * WHAT IS DELIBERATELY NOT HERE, because each is a policy and not a predicate:
+ * truncation (3.2 refuses a silently shortened field), escaping (nothing in this
+ * node escapes, so a reader would have to un-escape it), and a per-field byte
+ * filter. A caller that wants a field REFUSED does not call strip() and then
+ * notice an empty string -- it calls conn_text_bad_count() and refuses.
+ *
+ * THE COST OF THE SET, named once so every caller does not have to name it:
+ *
+ *   - SPACE is NOT in the set and TAB IS. Space is the single most common byte in
+ *     every one of these fields and removing it would mangle ordinary text. TAB
+ *     (0x09) is inside the C0 range, so it goes: a TAB in a sentence somebody
+ *     typed is a rendering accident, and a terminal is entitled to expand it to
+ *     eight columns in a field the sender did not measure.
+ *   - BYTES >= 0x80 ARE NOT IN THE SET and never will be. UTF-8 is the ordinary
+ *     encoding of a real nickname, a real topic and a real away message, and its
+ *     continuation bytes are all >= 0x80. A filter that removed them would break
+ *     every non-ASCII user on the node, SILENTLY -- a mangled multi-byte sequence
+ *     is indistinguishable from text the sender wrote. That failure is worse than
+ *     the one this block exists to close, which is why the set stops at 0x7f.
+ *   - Consequently the set cannot be split or shortened by a read boundary: the
+ *     stripper sees one already-assembled NUL-terminated parameter, and a
+ *     multi-byte sequence the client sent in two TCP writes is one string by then.
+ */
+size_t conn_text_bad_count(const char *s);
+
+/* Copy `src` into `dst`, dropping every byte the set contains, and
+ * NUL-terminate. Returns the number of bytes KEPT.
+ *
+ * `cap` counts the terminator, as everywhere else in this header. `src` shorter
+ * than `cap` minus one is the only case that can arise: every caller has already
+ * applied the field's own length bound, and removing bytes can only make the
+ * result shorter, so a caller that got here with a value that fitted still fits.
+ *
+ * WHAT IT COSTS, and what a strip is NOT: it is not truncation, so it never
+ * shortens a field that had no bad byte in it, and it never reorders or rewrites
+ * anything it keeps. `0x00` cannot arrive (the parser refuses it) and is in the
+ * set anyway, so the result is always a well-formed C string.
+ *
+ * SILENT MUTATION IS ITS OWN DEFECT, which is why nothing in this node strips
+ * without also logging that it did. A caller that uses this MUST emit a line
+ * saying so; the byte count it returns is what that line reports. */
+size_t conn_text_strip(char *dst, size_t cap, const char *src);
+
+/* ---------------------------------------------------------------------------
+ * conn_text_strip_relay(): THE SAME STRIP, FOR A FIELD THAT IS *MESSAGE TEXT*
+ * ---------------------------------------------------------------------------
+ * Strip what can CONTROL A TERMINAL. Keep what is IRC MESSAGE SEMANTICS.
+ *
+ * This is NOT conn_text_strip() and the difference is load-bearing, so it is a
+ * separate function rather than a flag. conn_text_strip() refuses every C0
+ * control and DEL, which is right for an away message, a topic, a kick reason or
+ * anything this node STORES. It would be wrong for a PRIVMSG, because two groups
+ * of C0 bytes are how IRC has carried meaning for thirty years and every ircd
+ * relays them:
+ *
+ *   | STRIP                                   | KEEP                            |
+ *   |-----------------------------------------|---------------------------------|
+ *   | 0x1B ESC -- moves the cursor, retitles | 0x01 -- the CTCP DELIMITER       |
+ *   |   the window, sets the clipboard, and   | 0x02 bold, 0x0F plain, 0x03     |
+ *   |   switches terminal modes               |   colour, 0x11 mono, 0x16       |
+ *   | 0x07 BEL -- rings the terminal's bell   |   reverse, 0x1D italic, 0x1F    |
+ *   | 0x7F DEL -- invisible in a log, an      |   underline: the mIRC codes     |
+ *   |   ordinary glyph in most fonts          |                                 |
+ *   | 0xC2 0x80-0x9F -- C1, the 8-bit        |                                 |
+ *   |   equivalent of the same escapes        |                                 |
+ *
+ * WHY THE SPLIT IS WHERE IT IS, group by group, because a reader who does not
+ * know this will "simplify" it back into a deny-list and silently break colour.
+ *
+ *   ESC IS THE INJECTION. It is what a CSI sequence, an OSC title-set, a DECSC
+ *     and a clipboard write are made of, so it is the byte that actually lets one
+ *     user rewrite another's screen. Stripping it removes the hazard entirely.
+ *
+ *   BEL IS NOISE, NOT CONTROL -- but it is stripped anyway. It cannot rewrite a
+ *     screen, and a client that wants an audible alert has one. It goes because it
+ *     is a byte no message text needs and it is the loudest thing a stranger can
+ *     put in your terminal.
+ *
+ *   THE mIRC CODES ARE NOT A TERMINAL HAZARD AND ARE NOT PROSE. They are how IRC
+ *     carries colour and emphasis, a client renders them and strips them before
+ *     display, and an operator reading a raw log has never seen them. STRIPPING
+ *     THEM WOULD BREAK COLOUR ON EVERY CLIENT THAT USES IT -- a functional
+ *     regression traded for a cosmetic one, and the reason this function exists
+ *     rather than being conn_text_strip().
+ *
+ *   CTCP IS `0x01`-DELIMITED AND THE DELIMITER IS THE MEANING. `ACTION
+ *     waves` is one message because of the two `0x01`s. Remove either and it
+ *     stops being a CTCP and becomes text that happens to start with the word
+ *     ACTION -- so stripping `0x01` does not sanitise, it CORRUPTS. This is also
+ *     why no reader may be placed inside the kept group.
+ *
+ *   C1 IS STRIPPED AS A CONTROL AND KEPT AS A LETTER, and this is the one
+ *     subtlety in the function, because the two are the same BYTES. In UTF-8 a C1
+ *     control is `0xC2` followed by `0x80-0x9F` -- and those trailing bytes are also
+ *     the continuation bytes of ordinary text:
+ *
+ *         0xC2 0x9B   CSI          a control      -> both bytes removed
+ *         0xD0 0x90   Cyrillic A   a letter       -> both bytes kept
+ *         0xCE 0x91   Greek alpha  a letter       -> both bytes kept
+ *         0xC3 0xA9   e-acute      a letter       -> both bytes kept
+ *         0x9B        CSI on an 8-bit terminal   -> removed
+ *
+ *     So the walk keeps ONE piece of state -- how many continuation bytes the sequence
+ *     in progress still expects -- and asks it BEFORE anything looks at the byte on its
+ *     own. A byte in 0x80-0x9F with nothing expecting a continuation is a raw C1 and
+ *     is removed; the identical byte inside a valid sequence is somebody's letter and
+ *     is kept.
+ *
+ *     The failure this replaces is worth naming because it is the obvious
+ *     implementation. A filter over the RANGE `0x80-0x9F` -- which is what the table
+ *     literally says, and what the first version of this function did -- removes every
+ *     accented, Greek and Cyrillic character on the node: measured, 8128 code points
+ *     below U+3000 have a continuation byte in that range. It is not a filter, it is a
+ *     character-set downgrade, and it fails silently on the messages that matter.
+ *
+ *     BYTES 0xA0 AND ABOVE ARE LEFT ALONE, and that is a decision rather than an
+ *     oversight. They are not on the deny list, and `0xC0`/`0xC1` can never lead a
+ *     UTF-8 sequence while `0xF5`-`0xFF` lie outside it entirely -- so neither group
+ *     can move a cursor. This function removes what is on the list rather than what it
+ *     does not recognise.
+ *
+ * IT RUNS ON AN ASSEMBLED PARAMETER, NOT ON A READ, and that is what makes the
+ * read-boundary case a non-case. `message_parse_n()` hands `m->params[]` one
+ * complete NUL-terminated parameter per line, so a `0x01` at the end of one recv()
+ * and the word after it at the start of the next are already one string by the
+ * time anything here runs. A per-read filter would have to carry state across
+ * reads to avoid splitting a sequence; this one has nothing to carry because it
+ * never sees a fragment. That is the same argument as the UTF-8 case at
+ * conn_text_strip() and it is why there is no partial-sequence handling below.
+ *
+ * `cap` counts the terminator. `src` shorter than `cap` minus one is the only
+ * case that can arise: the caller has already applied 3.2's line cap, and this
+ * only ever removes bytes. Returns the number of bytes KEPT, which is what lets a
+ * caller count the difference without walking the string twice.
+ *
+ * WHAT IT COSTS, named: a message containing ESC, BEL, DEL or an encoded C1
+ * reaches the recipient with those bytes missing, SILENTLY -- the relay path does
+ * not announce, and msg_verbs.c says why at the call. A caller that needs to know
+ * whether anything was removed compares the return value against strlen() of the
+ * input, which is exact because this only ever removes bytes and never reorders
+ * them. */
+size_t conn_text_strip_relay(char *dst, size_t cap, const char *src);
+
+/* ---------------------------------------------------------------------------
+ * conn_text_logsafe(): RENDERING A CLIENT STRING INTO A LOG LINE
+ * ---------------------------------------------------------------------------
+ * Rule 1's operation, and the one the log-only fields need. Where
+ * `conn_text_strip()` MUTATES a field that is relayed to other people, this one
+ * decides whether a value may be PRINTED -- and it is a different question, which
+ * is why it is a different function rather than a flag on the strip.
+ *
+ * WRITES `s` INTO `out` VERBATIM when every byte is printable ASCII (0x20-0x7e),
+ * and a single `-` otherwise. Returns the number of bytes written, excluding the
+ * terminator. A NULL or empty `s` yields `-`.
+ *
+ * WHY VERBATIM-OR-`-` AND NOT A STRIP. A stripped command word is no longer the
+ * command word: `cmd_unknown: command=NICK` printed as `command=NICK` is the whole
+ * diagnostic, and printed as `command=NI` (ESC removed from `NICK\x1b`) would name
+ * a command the client did not send and would defeat the line's only purpose. So
+ * for a log the value is kept when it is KNOWN SAFE and withheld when it is not,
+ * with the measurement beside it -- which is also why this is not the same
+ * operation as the strip: one is about what a terminal will execute, the other
+ * about what an operator can read.
+ *
+ * WHY 0x20 AND NOT 0x21. Space is printable, it is the byte a nick or a verb can
+ * legitimately hold in a log field, and nothing here needs to be a shell argument.
+ * The set this screens out is exactly `conn_byte_is_bad()`'s -- C0 and DEL -- plus
+ * nothing else, so `conn_text_logsafe()` and `conn_text_bad_count()` can never
+ * disagree about a string.
+ *
+ * `cap` IS THE WIDEST VALUE THIS NODE WILL PRINT, AND A LONGER ONE PRINTS AS `-`.
+ * That is not a truncation and it is deliberate: a log line that shortened a value
+ * mid-word would name a different thing than the client sent, which is 3.2's rule
+ * and is exactly the failure this function exists to prevent. So a value too long
+ * for the field is WITHHELD rather than shortened, and the caller's `len=` beside
+ * it is what says how long it really was. The cost is that a verb longer than the
+ * field prints as `-`; every verb in `commands.c`'s table is under 20 bytes and the
+ * field is 64, so no real input reaches it.
+ *
+ * WHAT IT DOES NOT DO, and the caller must: it writes the value, not the
+ * measurement. Every caller pairs it with `strlen()` and
+ * `conn_text_bad_count()` on the SAME string, so the line carries
+ * `<field>=<value or -> <field>_len=N <field>_bad_bytes=M` and a reader learns
+ * both what was said and what was not safe to say. The two counts come from the
+ * same predicate as the decision, which is the property that makes the line
+ * trustworthy rather than merely quiet.
+ *
+ * COST: one pass, on a string already in memory, on a path that runs once per
+ * command. `cap` must be at least 2. */
+/* The widest client-supplied string this node prints VERBATIM into one of its own
+ * log lines, and the buffer size every `conn_text_logsafe()` caller derives from it.
+ *
+ * 64 is `CONN_MAX_BATCH_REF`, which is the widest identifier-shaped value in the
+ * tree, and it is chosen for the stack rather than for the wire: every call site is
+ * a local in a handler or in the read step, so this is bytes on the stack per frame
+ * and nothing else. It is deliberately NOT `IRC_MAX_LINE` -- an 8 KiB buffer in the
+ * read step, on a path that runs once per received line, to hold a command word
+ * whose longest real value is 12 bytes, is the kind of cost that gets paid on every
+ * connection forever to serve an input no client sends.
+ *
+ * WHAT A LONGER VALUE COSTS, and it is a real cost rather than a rounding error: it
+ * prints as `-` instead of as itself. `conn_text_logsafe()` withholds rather than
+ * shortens, so nothing on the line names something the client did not send, and
+ * every caller prints the value's true `len=` beside the `-`, which is what makes
+ * the withholding diagnosable instead of mysterious. */
+#define CONN_LOG_FIELD_MAX 64
+
+size_t conn_text_logsafe(char *out, size_t cap, const char *s);
+
+/* ---------------------------------------------------------------------------
+ * THE POLICY TABLE, and why three fields do not get three copies of this comment
+ * ---------------------------------------------------------------------------
+ * The field decides what to DO with a string in this set, and the decision is
+ * made by its CONSUMER rather than by the string:
+ *
+ *   REALNAME   (conn_t::realname)     REFUSED. It is rendered to every member of
+ *                                     every channel the user is on and to two
+ *                                     peers, so a rewritten value is reported to
+ *                                     third parties as though they wrote it.
+ *                                     conn_realname_check() above, and both
+ *                                     writers run it.
+ *   AWAY TEXT  (conn_t::away)         STRIPPED. It is legitimate user content a
+ *                                     real client sends, so refusing it breaks a
+ *                                     working feature; and a member's terminal is
+ *                                     where it lands.
+ *   TOPIC      (chan_t::topic)        STRIPPED. Same answer for the same reason,
+ *                                     and worse in exposure: a topic is stored,
+ *                                     replayed to every future joiner by 332/333
+ *                                     and forwarded to peers, so one write is a
+ *                                     long-lived injection rather than an
+ *                                     immediate one.
+ *   KICK REASON                       STRIPPED. Relayed to every remaining member
+ *                                     of the channel; there is no stored copy, so
+ *                                     a strip is what "do not relay the client's
+ *                                     bytes" means here.
+ *   PART REASON                       STRIPPED. Relayed to every member AND put on
+ *                                     the link by the forward arm. The one field
+ *                                     with no length bound in the RFC or here.
+ *   BAN MASK          (MODE +b)       STRIPPED, and ONE copy: the stored mask and
+ *                                     the announced mask are the same bytes,
+ *                                     because the stored one is what
+ *                                     chan_banned() enforces and two different
+ *                                     answers to "what is this channel's ban"
+ *                                     is the defect this set exists to prevent.
+ *   SERVERNAME (USER's <servername>)  NOT LOGGED AT ALL. This node ignores it --
+ *                                     the host is observed -- so emitting it buys
+ *                                     no diagnostic and creates the whole hazard.
+ *                                     commands.c's handle_user() reports its LENGTH
+ *                                     and whether it was well-formed instead, and
+ *                                     that needs no call into this block at all.
+ *
+ * A field with a different consumer gets a different entry, and the entry is the
+ * argument. What no field may do is print the raw value.
+ *
+ * ---------------------------------------------------------------------------
+ * AND WHAT IS *LOGGED* RATHER THAN STORED -- conn_text_logsafe(), NOT A STRIP
+ * ---------------------------------------------------------------------------
+ * A client string this node puts only into its own stdout is a different question
+ * and gets a different operation. There is no second reader to protect, so there
+ * is nothing to protect by rewriting one and a great deal to lose:
+ * `cmd_unknown: command=NICK` is the entire diagnostic, and printed with a byte
+ * removed it would name a verb the client never sent. So those are MEASURED --
+ * verbatim when every byte is printable ASCII, withheld with a length and a
+ * bad-byte count when one is not. See conn_text_logsafe()'s own block, and §9.
+ *
+ * WHAT IS NEITHER, and is named because leaving it out of this table would be the
+ * same overstatement this table exists to avoid: PRIVMSG and NOTICE text. It is
+ * relayed verbatim, because relaying a message is what the node is for and
+ * `0x01` is how CTCP works, so a deny-list would have to become an allow-list and
+ * the answer would be a decision about IRC rather than about this class. Peer
+ * strings are the other one, behind the FEDERATE secret. */
+
 /* conn_t::account -- the second axis of scoped identity (2.1), added in Phase
  * 10.1.
  *
