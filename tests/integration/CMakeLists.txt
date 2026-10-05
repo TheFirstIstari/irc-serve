@@ -763,6 +763,20 @@ irc_add_integration_test(test_control_bytes test_control_bytes.c)
 # from having to be rediscovered.
 irc_add_integration_test(test_log_injection test_log_injection.c)
 
+# The REACHABILITY property, replacing the site enumeration that did not work.
+# test_log_injection.c's battery is hand-listed: somebody decided which verbs and
+# which argument positions reach a log line, and #121 shipped with two live
+# bypasses precisely where that list was wrong. This one derives the verb list out
+# of `commands.c`'s `k_commands[]` -- the dispatch table itself -- and generates the
+# (verb, argument position, marker byte) space rather than listing it, so a verb or
+# a position added tomorrow is covered tomorrow. The claim is unchanged and is the
+# one that matters: no byte in the terminal-injection set reaches this node's stdout
+# or any client socket. Its own file because that is a different KIND of claim from
+# the battery's -- the battery asserts per-site, this one asserts a property of the
+# reachable surface -- and because a sweep this wide is the one place where the
+# "whole-buffer walk, not a substring search" requirement has to be load-bearing.
+irc_add_integration_test(test_terminal_sweep test_terminal_sweep.c)
+
 # The relay SHAPE behind four #121 bugs: an emission carrying `m->params` instead of
 # the value the node stored. A source test, because the defect leaves every runtime
 # invariant intact -- a field and its announcement can be two different values and

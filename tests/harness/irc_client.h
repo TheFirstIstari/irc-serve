@@ -32,6 +32,14 @@ typedef struct {
     char  *buf;
     size_t len;
     size_t cap;
+    /* Set once any read on this connection has seen the peer close, and NOT reset
+     * afterwards. Every read path reports a close through its own `*eof` out-param,
+     * which means a caller that reads in a loop and ignores one of those flags has
+     * silently thrown the fact away -- and the next call then waits for a reply that
+     * can no longer arrive and reports a TIMEOUT for a connection that closed two
+     * reads ago. Holding the fact here makes it non-lossy, which is what
+     * tc_closed() is for. */
+    int    closed;
 } test_client_t;
 
 /* Prepare an unconnected client. tc_connect() zeroes the client itself, so this
@@ -245,5 +253,39 @@ void tc_set_pump_hook(tc_pump_fn fn);
  * read before the deadline, 1 if bytes were appended, -1 on a hard error, and
  * sets `*eof` when the peer closed. */
 int tc_drain(test_client_t *c, int timeout_ms, int *eof);
+
+/* Read every byte the kernel ALREADY has for this connection -- without waiting for
+ * more -- appending to the client's accumulated buffer. Returns the number of bytes
+ * appended, 0 when there was nothing to read, or -1 on a hard error. `*eof` is set
+ * when the peer closed.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY IT EXISTS, and it is not a convenience
+ * ---------------------------------------------------------------------------
+ * The other two ways to read this socket each break one thing a test needs:
+ *
+ *   `tc_drain()` COMPACTS. Its first act in every iteration is to shift the unread
+ *   tail down over the accumulated history, so after it returns `tc_buffer()` holds
+ *   only what arrived since the last call. A test that wants to scan everything a
+ *   connection received cannot use it, and cannot find out that it lost the bytes:
+ *   the scan simply sees less.
+ *
+ *   `tc_expect()` waits, and reports "TIMEOUT after N ms" when it breaks out of its
+ *   loop on EOF -- which it does, because a close ends the wait. A test that closes
+ *   connections on purpose then gets a report claiming a timeout that did not
+ *   happen, which sends the reader looking for a hang.
+ *
+ * What is needed is the read without either property, and one caller needed it
+ * badly enough to add it: tests/integration/test_terminal_sweep.c sends thousands of
+ * lines per probe and has to keep BOTH ends moving -- the node's stdout pipe and
+ * this socket -- or the node blocks inside write() and stops serving the very client
+ * being probed. `MSG_DONTWAIT` is what makes the read non-blocking without a select()
+ * round trip, and it costs one flag word. */
+int tc_read_available(test_client_t *c, int *eof);
+
+/* Has ANY read on this connection already seen the peer close? Sticky: it stays true
+ * once it becomes true, because the close is a fact about the connection rather than
+ * about one read. See the field's own comment. */
+int tc_closed(const test_client_t *c);
 
 #endif /* TEST_HARNESS_IRC_CLIENT_H */
