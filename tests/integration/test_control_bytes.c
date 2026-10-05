@@ -1104,6 +1104,117 @@ static void case_realname_still_refused(void)
     nf_free(&node);
 }
 
+/* ---------------------------------------------------------------------------
+ * CASE 7 -- `MODE`'s 472: A PLACEHOLDER ON THE WIRE AND A MEASUREMENT IN THE LOG
+ * ---------------------------------------------------------------------------
+ * This case exists because of a bypass, and the bypass is the reason the case is
+ * shaped the way it is rather than one more "no control byte anywhere" assertion.
+ *
+ * WHAT THE BUG WAS. `chan_verbs.c` refused an unknown mode character twice: once as
+ * the numeric's `<char>` parameter and once in the observable line's `reason=`
+ * field, and both were the client's byte. `MODE #T <ESC>` put an ESC on the
+ * operator's terminal AND in a `472` on the socket. The ONLY gate in front of it is
+ * `chan_has_flag(ch, c, CHAN_MEMBER_OP)`, and `chan_verbs.c` OPERATES THE CHANNEL
+ * CREATOR on the creator's own JOIN -- so the gate is self-issued, one line after the
+ * JOIN, and an anonymous client reaches it.
+ *
+ * WHY THE CLAIM IS ABOUT THE PLACEHOLDER AND NOT ONLY ABOUT THE ABSENCE. The
+ * RFC 2812 5.2 field list is `<client> <char> :is unknown mode char to me for
+ * <channel>`, so a client that parses 472 BY POSITION reads exactly one character
+ * out of that field. An absence-only assertion would pass an implementation that
+ * answered `472 <client>` with the field simply missing, and that breaks every
+ * positional parser on the network. So the case pins the whole line, byte for byte,
+ * for BOTH routes into the branch -- the mode argument with no sign, and one byte of
+ * a signed mode string -- because those are two separate sites that answer the same
+ * numeric.
+ *
+ * AND IT PINS THE POSITIVE ARM, which is the other half: a PRINTABLE mode this node
+ * does not evaluate must still come back as itself. A placeholder that swallowed
+ * every unknown character would pass every assertion above while breaking the one
+ * thing 472 exists to tell a user, which is WHICH character was wrong.
+ *
+ * The whole-buffer scans are here too, so this case is also a plain
+ * no-control-byte-reached-anything assertion for this path.
+ */
+static void case_mode_472_refusal_is_measured(void)
+{
+    nf_node_t node;
+    test_client_t c;
+    char line[256];
+    char want[256];
+    size_t mark;
+
+    TF_CHECK_MSG(nf_spawn_binary(&node) == 0, "could not spawn the node");
+    /* The CREATOR of #T, deliberately: an operator is the only client this node lets
+     * reach the mode-string argument at all, and the creator is the only operator a
+     * lone client can be. */
+    register_as(&c, node.port, "vic", "*spoofed", NULL);
+    join(&c, CHAN);
+
+    mark = tc_received(&c);
+
+    /* ROUTE 1: the mode ARGUMENT has no sign. `MODE #T <ESC>` -- the argument IS the
+     * refused character, which is the branch at the top of the handler. */
+    (void)snprintf(line, sizeof line, "MODE %s " ESC, CHAN);
+    TF_CHECK_MSG(tc_send(&c, line) == 0, "the unsigned-mode 472 send failed");
+    (void)snprintf(want, sizeof want, " 472 vic ? :is unknown mode char to me for "
+                 "channel %s\r\n", CHAN);
+    TF_CHECK_MSG(tc_expect(&c, want, T_IO_MS) == 0,
+                 "the client did not receive a 472 whose <char> parameter is the "
+                 "one-byte placeholder `?`. The field has to stay ONE byte -- a "
+                 "positional parser reads exactly one character out of it -- and it "
+                 "has to be printable.\n  window: %s", tc_buffer(&c) + mark);
+    drain(&c);
+
+    /* ROUTE 2: one byte INSIDE a signed mode string, which is a different site with
+     * the same field list and therefore the same placeholder. Without this arm a fix "
+     "that only guarded the argument would pass. */
+    mark = tc_received(&c);
+    (void)snprintf(line, sizeof line, "MODE %s +" ESC, CHAN);
+    TF_CHECK_MSG(tc_send(&c, line) == 0, "the signed-mode 472 send failed");
+    (void)snprintf(want, sizeof want, " 472 vic ? :is unknown mode char to me for "
+                 "channel %s\r\n", CHAN);
+    TF_CHECK_MSG(tc_expect(&c, want, T_IO_MS) == 0,
+                 "the signed-mode route did not produce the same 472, so the two "
+                 "sites have drifted apart.\n  window: %s", tc_buffer(&c) + mark);
+    drain(&c);
+
+    /* THE POSITIVE ARM: `q` is not a mode this node evaluates, so it is refused --
+     * and it is a PRINTABLE character, so it must be echoed as itself rather than as
+     * the placeholder. This is the assertion that fails if the fix were "answer 472
+     * with `?` for everything". */
+    mark = tc_received(&c);
+    (void)snprintf(line, sizeof line, "MODE %s q", CHAN);
+    TF_CHECK_MSG(tc_send(&c, line) == 0, "the printable-mode 472 send failed");
+    (void)snprintf(want, sizeof want, " 472 vic q :is unknown mode char to me for "
+                 "channel %s\r\n", CHAN);
+    TF_CHECK_MSG(tc_expect(&c, want, T_IO_MS) == 0,
+                 "a PRINTABLE unknown mode character must be echoed as itself: 472 "
+                 "exists to tell a user which character was wrong, and answering `?` "
+                 "to everything would throw that away.\n  window: %s",
+                 tc_buffer(&c) + mark);
+    drain(&c);
+
+    assert_no_controls(&c, 0, "the MODE 472 refusals, the whole session");
+
+    /* THE OPERATOR'S HALF. Rule 1: the value has no consumer beyond the line, so it
+     * is WITHHELD rather than filtered -- `reason=-` -- and the measurement beside it
+     * says how long it was, WHICH byte it was, and that it was unsafe. `reason_byte=`
+     * is the field that makes the withholding diagnosable, and it is the reason an
+     * operator can still act on this line. */
+    TF_CHECK_MSG(nf_expect(&node, "chan_mode_refused: channel=" CHAN " nick=vic "
+                           "reason=- reason_len=1 reason_byte=0x1b "
+                           "reason_bad_bytes=1", T_IO_MS) == 0,
+                 "the node did not report the measurement the 472's log line is "
+                 "supposed to carry: the withheld value with its length, its byte in "
+                 "hex, and its bad-byte count. `reason=-` alone would be "
+                 "indistinguishable from an absent value.\n  node said: %s", node.out);
+    assert_no_controls_in_log(&node, 0, "the MODE 472 refusals, the whole log");
+
+    TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
+    tf_unregister(&node);
+}
+
 int main(void)
 {
     case_servername_is_summarised();
@@ -1113,6 +1224,7 @@ int main(void)
     case_topic_strip_keeps_good_bytes();
     case_relayed_parameters_are_stripped();
     case_realname_still_refused();
+    case_mode_472_refusal_is_measured();
 
     tf_done("control-bytes");
     return 0;
