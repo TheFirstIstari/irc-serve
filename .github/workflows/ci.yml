@@ -397,19 +397,48 @@ jobs:
   # of reporting, so a macOS run of this configuration is not a slower version of
   # this job -- it is a job that hangs. The hosted Linux runner is used rather
   # than the self-hosted one for ci_test's reason, sharpened: this gate must
-  # produce a result on infrastructure the maintainer does not control, and the
-  # self-hosted machine is mid-reconfiguration.
+  # produce a result on infrastructure the maintainer does not control.
   #
-  # ADVISORY, and it stays that way. continue-on-error means this job can never
-  # fail a workflow, and it is not in the required-check list, so it can never
-  # block a merge either. A sanitizer is a gate that earns trust by being
-  # believed, and a new gate reports its first findings as failures; making that
-  # merge-blocking on the day it is added would be a way of not finding out.
+  # THIS JOB GATES NOW. continue-on-error is gone, and the decision rests on the
+  # job's own run history rather than on a preference about sanitizers, because
+  # "should a sanitizer gate" is a question about whether it has ever produced a
+  # false positive, and that is answerable here. Every ci_sanitizers failure in
+  # this repository, from the API's job list and the run logs:
+  #
+  #     8  LeakSanitizer: detected memory leaks  -- REAL findings, all fixed.
+  #        "Reconnect" leaked 4096 bytes in 1 allocation and 8192 in 2;
+  #        test_account and test_batch leaked 4096 in 1. Reproducible across
+  #        consecutive runs at a consistent byte count, which is what a real leak
+  #        looks like and not what a flake looks like.
+  #     2  Build step -- the `(void)read(...)` __wur break at run 37242557613,
+  #        a compile error that ci_test also reported.
+  #     1  AutoScale -- an ordinary test failure that ci_test also reported.
+  #     0  AddressSanitizer memory errors and 0 UndefinedBehaviorSanitizer
+  #        runtime errors. Not one, across every run.
+  #
+  # So the honest reading is the OPPOSITE of the usual one. The instinct is to
+  # gate ASan/UBSan as "deterministic" and hold LSan back as the flaky one, and
+  # for this tree that is backwards: LSan is the half with proven value (it caught
+  # eight real leaks) AND proven stability (49 green runs since, and zero noise
+  # reports among the failures), while ASan/UBSan are the halves with no observed
+  # firing at all. Gating on an unproven capability is not "cautious", it is
+  # claiming a result nobody has seen. Gating on LSan is claiming a result that
+  # is in the log.
+  #
+  # WHY NOT SPLIT IT IN TWO THEN, to gate only the proven half? Because it would
+  # double the configure/build/85-test cycles for no additional detection: one
+  # instrumented binary runs all three checks, and detect_leaks=1 does not
+  # displace the other two. Splitting would spend hosted minutes to hold the
+  # unproven half to a lower standard, which is the opposite of the point.
+  #
+  # WHAT "GATES" STILL REQUIRES FROM THE MAINTAINER: this job is not in the
+  # required-check list, so removing continue-on-error means it can fail a
+  # WORKFLOW but still cannot block a MERGE until its two names are added to main
+  # branch protection. That is a settings change, not a workflow change.
   ci_sanitizers:
     name: ci_sanitizers (ASan+UBSan) WITH_TLS=${{ matrix.with_tls }}
     runs-on: ubuntu-22.04
     timeout-minutes: 40
-    continue-on-error: true
     permissions:
       contents: read
     # TWO CELLS, AND THE SECOND ONE IS THE ONLY DYNAMIC LEAK CHECK THIS PROJECT
@@ -547,7 +576,30 @@ jobs:
           # sanitizer nobody acts on.
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: halt_on_error=1
-        run: ctest --output-on-failure --timeout 120 -j 2
+        # `shell: bash` and not the default, for the reason ci_test gives: the
+        # default is `bash -e {0}`, which has no pipefail, so `ctest | tee` would
+        # return tee's status and a FAILED suite would sail through a job that is
+        # now a gate rather than an advisory.
+        shell: bash
+        run: ctest --output-on-failure --timeout 120 -j 2 | tee ctest.log
+      # THE SKIP RATCHET, HERE TOO, and the reason is specific to this job
+      # rather than a copy of ci_test's. The WITH_TLS=ON cell is the only place
+      # any host ever leak-checks SSL* and SSL_CTX*, and that check is performed
+      # BY test_tls and test_peer_tls. If either of them ever started skipping,
+      # this cell would keep reporting 85/85 and LeakSanitizer would keep
+      # reporting nothing -- not because there are no leaks, but because the code
+      # that allocates them was never run. A green leak check that has quietly
+      # stopped exercising the allocation is the exact failure this job exists to
+      # prevent, so the ratchet is the step that keeps it honest.
+      #
+      # Cheap here because tests/known_skips.txt is EMPTY -- Phase 9 retired all
+      # five of its entries, so the gate is "no test may skip" and there is no
+      # permitted set to reconcile. Verified against a real log: with the list
+      # empty and nothing skipped, check-skips.sh reports "the gate has nothing to
+      # check and found nothing" and exits 0 rather than treating the absent skip
+      # block as unreadable.
+      - name: Skip gate (ratchet)
+        run: ./scripts/check-skips.sh -b build build/ctest.log
 
   # --- Advisory only, hosted ---------------------------------------------
   # Benchmark and compliance run on the hosted runner rather than the
