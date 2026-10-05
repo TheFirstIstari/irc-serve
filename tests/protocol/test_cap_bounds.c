@@ -261,16 +261,23 @@ static void sweep_cap_available_list(void)
          * cap-1 bytes without terminating, which is the same defect as the write
          * the canary above looks for. */
         if (strlen((const char *)buf) != n) {
+            /* THE PRECISION, and it is not decoration: gcc-16's
+             * -Wformat-truncation is an ERROR in this tree and it is right, because
+             * `buf` is SWEEP_MAX + CANARY_LEN bytes and `msg` is 512. Truncating a
+             * diagnostic is acceptable -- it is the diagnostic, not the buffer under
+             * test -- but it has to be truncation the COMPILER can see, which is what
+             * the precision says and what a bare `%s` does not. The number being
+             * reported is the whole claim either way. */
             (void)snprintf(msg, sizeof msg,
                            "cap_available_list returned %zu but the buffer holds "
-                           "\"%s\", so the count and the string disagree",
+                           "\"%.400s\", so the count and the string disagree",
                            n, (const char *)buf);
             report(__FILE__, __LINE__, msg);
             return;
         }
         if (n > longest) {
             longest = n;
-            (void)snprintf(widest, sizeof widest, "%s", (const char *)buf);
+            (void)snprintf(widest, sizeof widest, "%.500s", (const char *)buf);
         }
     }
 
@@ -318,14 +325,15 @@ static void sweep_cap_available_list(void)
               "this build has TLS and the worst-case node has a TLS port, so `sts` "
               "and its value must have been rendered, and the longest list was %zu "
               "bytes -- the sentinel or the credential did not take and every arm "
-              "that accounts for a value's length was never reached",
-              longest);
+              "that accounts for a value's length was never reached. widest=[%.400s]",
+              longest, widest);
     } else {
         CHECK(longest >= 150u,
               "this build has no TLS backend, so `sts` and its value are correctly "
               "withheld and the widest list is the names alone -- but it was %zu "
-              "bytes, which is below the floor for a table with a credential in it",
-              longest);
+              "bytes, which is below the floor for a table with a credential in it. "
+              "widest=[%.400s]",
+              longest, widest);
     }
     /* THE HEADROOM, as a number rather than an absence, so the sweep's result is
      * legible. `longest` is the size of the largest list THIS node renders, which
@@ -333,7 +341,7 @@ static void sweep_cap_available_list(void)
      * test_cap_negotiation.c measures the same node with `sts` at its maximum
      * against the same constant. */
     printf("[observable] cap_sweep: fits=%zu refusals=%zu longest=%zu cap_ls_max=%u "
-           "tls=%d tls_port=%d sasl=%zu widest=[%s]\n",
+           "tls=%d tls_port=%d sasl=%zu widest=[%.500s]\n",
            fits, refusals, longest, (unsigned)CAP_LS_MAX, tls_backend_available(),
            server_tls_port(&s), sasl_store_count(s.sasl_store), widest);
 
