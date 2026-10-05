@@ -208,11 +208,24 @@ static int install_handler(int sig, void (*handler)(int))
 
 static void usage(FILE *out, const char *argv0)
 {
+    /* THE VERSION, FIRST LINE, FROM THE SAME MACRO THE STARTUP LINE USES.
+     *
+     * IT IS HERE BECAUSE A FLAG SURFACE THAT DOES NOT SAY WHAT IT IS has to be
+     * cross-referenced against something else to find out, and this project has
+     * already shipped a version it could not answer that question from: the
+     * README said v1.0.0 while the binary and the build both said 0.1.0, and
+     * `--help` said nothing at all, so there was no way to tell from the tool
+     * which of the three was true. One macro, printed in both places, is the
+     * whole fix; tests/integration/test_version_truth.c asserts the three agree --
+     * this text, the startup line, and the number CMake parsed out of the same
+     * header. */
+    fprintf(out, "%s\n", IRC_SERVE_VERSION);
     fprintf(out, "usage: %s [port] [--name NAME] [--secret S]\n", argv0);
     fprintf(out, "            [--sasl-store PATH] [--account-store PATH]\n");
     fprintf(out, "            [--peer NAME,HOST,PORT]... [--peer-tls NAME]...\n");
     fprintf(out, "            [--tls-cert PATH --tls-key PATH] [--tls-ca PATH]\n");
     fprintf(out, "            [--tls-port PORT] [--tls-require] [--tls-insecure]\n");
+    fprintf(out, "            [--tls-ocsp-staple PATH] [--tls-staple-permissive]\n");
     fprintf(out, "            [--tls-sts-duration SECONDS]\n");
     fprintf(out, "\n");
     fprintf(out, "  port   TCP port to listen on, 0-%d; 0 asks the kernel for\n"
@@ -313,11 +326,18 @@ static void usage(FILE *out, const char *argv0)
                  "         handshake rather than starting one with no name check\n"
                  "         configured at all.\n"
                  "\n"
-                 "         REVOCATION IS NOT IMPLEMENTED: no CRL and no OCSP are\n"
-                 "         consulted, and a revoked certificate is accepted until\n"
-                 "         it EXPIRES. This is the largest gap in what --tls-ca\n"
-                 "         buys you. The `tls_init` startup line says revocation=none\n"
-                 "         so one line of node output shows the whole policy.\n");
+                 "         REVOCATION is checked separately: see\n"
+                 "         --tls-ocsp-staple and --tls-staple-permissive below,\n"
+                 "         and the `tls_init` startup line, which reports\n"
+                 "         revocation= and ocsp_staple= together so one line of node\n"
+                 "         output shows the whole peer-certificate policy.\n"
+                 "\n"
+                 "         GIVE A MESH A REAL CA. Two nodes that trust each\n"
+                 "         other's certificate directly, as this project's own tests\n"
+                 "         do, have no issuer -- so there is nobody who could have\n"
+                 "         issued a revocation status, and revocation checking\n"
+                 "         refuses the link with NO_ISSUER. That is a true statement\n"
+                 "         about the configuration rather than a fault in the check.\n");
     fprintf(out, "\n");
     fprintf(out, "  --tls-insecure\n"
                  "         accept a peer certificate this node cannot verify. An\n"
@@ -325,6 +345,49 @@ static void usage(FILE *out, const char *argv0)
                  "         refusal with a named reason, and this flag is the thing\n"
                  "         an operator types when they mean it. Every link it\n"
                  "         affects prints mode=INSECURE when it is established.\n");
+    fprintf(out, "\n");
+    fprintf(out, "  --tls-ocsp-staple PATH\n"
+                 "         an OCSP RESPONSE for this node's own certificate, DER\n"
+                 "         or PEM, stapled on every handshake this node performs.\n"
+                 "         It is read ONCE at startup and NEVER refreshed and\n"
+                 "         never fetched: no HTTP, no DNS, no blocking call anywhere\n"
+                 "         in the event loop. Replace the file and restart to\n"
+                 "         refresh it.\n"
+                 "\n"
+                 "         THE FAILURE POLICY IS THIS ONE BOOLEAN, and it FAILS\n"
+                 "         CLOSED BY DEFAULT: an outbound peer link is REFUSED unless\n"
+                 "         the peer staples a status this node can verify, that is\n"
+                 "         still inside its nextUpdate, and that says GOOD. Missing,\n"
+                 "         stale, unverifiable and revoked are all refusals. The\n"
+                 "         weakening direction is --tls-staple-permissive, which has\n"
+                 "         to be typed.\n"
+                 "\n"
+                 "         BOTH SIDES OF A MESH NEED IT. A node with no staple has\n"
+                 "         nothing to staple, so a strict peer's handshake gets no\n"
+                 "         status and is refused with MISSING_STAPLE. Upgrading ONE\n"
+                 "         side of a running mesh therefore stops peer links until\n"
+                 "         both are configured; the startup line's ocsp_staple= field\n"
+                 "         is where an operator checks that. A peer whose certificate\n"
+                 "         is SELF-SIGNED is refused with NO_ISSUER whatever this flag\n"
+                 "         says, because nobody could have issued a status for it --\n"
+                 "         that one needs a CA in --tls-ca.\n"
+                 "\n"
+                 "         This is the OUTBOUND PEER-LINK path only. There is no\n"
+                 "         inbound client-certificate authentication in this program\n"
+                 "         at all -- the server never asks a client for a certificate\n"
+                 "         -- so revocation is moot inbound rather than implemented\n"
+                 "         inbound.\n");
+    fprintf(out, "\n");
+    fprintf(out, "  --tls-staple-permissive\n"
+                 "         do NOT refuse a peer link whose stapled revocation\n"
+                 "         status is missing, stale or unverifiable: log the\n"
+                 "         reason and continue. A REVOKED certificate is then\n"
+                 "         accepted, which is why the default is the strict policy\n"
+                 "         and this is the flag that turns it off. Every link this\n"
+                 "         affects prints policy=permissive on the\n"
+                 "         tls_peer_revocation line, so a reader of the log can\n"
+                 "         tell a checked link from a tolerated one without\n"
+                 "         reading the command line.\n");
     fprintf(out, "\n");
     fprintf(out, "  --tls-port PORT\n"
                  "         bind a SECOND listener on which every byte is TLS from\n"
@@ -513,6 +576,22 @@ typedef struct {
      * failure mode a security option exists to prevent, so the insecure mode has
      * to be written down. */
     int         tls_insecure;
+    /* --tls-ocsp-staple PATH, and this pointer is NULL unless an operator gave one.
+     * The file is read by the TLS backend at node init -- before the event loop is
+     * armed, like every other configuration file -- and stapled on every server-role
+     * handshake. It is NOT refreshed: see tls_openssl.c's "STAPLED, NEVER FETCHED"
+     * for why, and for the cost that a stale staple stays stale until somebody
+     * replaces the file. */
+    const char *tls_ocsp_staple;
+    /* --tls-staple-permissive: the ONE boolean of the revocation failure policy, and
+     * its DEFAULT IS THE OTHER WAY ROUND. Zero here means fail closed -- refuse a
+     * peer link whose stapled status is missing, stale, unverifiable or revoked --
+     * and one means log the reason and continue. The flag is named for the direction
+     * it moves you because the insecure direction is the one that has to be typed;
+     * see tls_openssl.c's "THE FAILURE POLICY, AND WHICH DIRECTION IS THE DEFAULT"
+     * for the argument and for the cost of failing closed on a mesh whose peers do
+     * not staple. */
+    int         tls_staple_permissive;
     uint32_t    tls_sts_duration;
     /* The peers whose links must carry TLS. Names rather than indices, because
      * --peer and --peer-tls are separate options in any order and an index would
@@ -618,6 +697,7 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
             strcmp(arg, "--account-store") == 0 ||
             strcmp(arg, "--peer-tls") == 0 || strcmp(arg, "--tls-cert") == 0 ||
             strcmp(arg, "--tls-key") == 0 || strcmp(arg, "--tls-ca") == 0 ||
+            strcmp(arg, "--tls-ocsp-staple") == 0 ||
             strcmp(arg, "--tls-sts-duration") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "irc-serve: %s needs a value\n", arg);
@@ -640,16 +720,21 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
             o->have_tls_port = 1;
             continue;
         } else if (strcmp(arg, "--tls-require") == 0 ||
-                   strcmp(arg, "--tls-insecure") == 0) {
+                   strcmp(arg, "--tls-insecure") == 0 ||
+                   strcmp(arg, "--tls-staple-permissive") == 0) {
             /* FLAGS, and they take no value. Accepting one as `--tls-require=0`
              * is not a thing this parser does for anything else either, and a
              * silently-ignored value on a security flag is the worst outcome
              * available: an operator who typed `--tls-require=no` would get a node
-             * that requires TLS and believes it does not. */
+             * that requires TLS and believes it does not. The same argument is why
+             * --tls-staple-permissive is here and is named the way it is: the
+             * weakening direction is typed, and the default is the strict one. */
             if (strcmp(arg, "--tls-require") == 0) {
                 o->tls_require = 1;
-            } else {
+            } else if (strcmp(arg, "--tls-insecure") == 0) {
                 o->tls_insecure = 1;
+            } else {
+                o->tls_staple_permissive = 1;
             }
             continue;
         } else if (arg[0] == '-') {
@@ -679,6 +764,17 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
             o->tls_key = value;
         } else if (strcmp(arg, "--tls-ca") == 0) {
             o->tls_ca = value;
+        } else if (strcmp(arg, "--tls-ocsp-staple") == 0) {
+            /* EMPTY IS REFUSED rather than treated as "no staple": it is a flag an
+             * operator typed and meant, and a node that quietly treated
+             * `--tls-ocsp-staple ""` as absent would staple nothing and print
+             * ocsp_staple=none -- which is at least visible, but only after the peer
+             * links have already started failing with MISSING_STAPLE. */
+            if (value[0] == '\0') {
+                fprintf(stderr, "irc-serve: --tls-ocsp-staple needs a path\n");
+                return -1;
+            }
+            o->tls_ocsp_staple = value;
         } else if (strcmp(arg, "--tls-sts-duration") == 0) {
             char *end = NULL;
             long seconds;
@@ -944,7 +1040,10 @@ int main(int argc, char **argv)
             return 1;
         }
         if (tls_backend_node_init(&srv.tls, opts.tls_cert, opts.tls_key,
-                                  opts.tls_ca, opts.tls_insecure) != 0) {
+                                  opts.tls_ca, opts.tls_insecure,
+                                  opts.tls_ocsp_staple,
+                                  (opts.tls_staple_permissive != 0) ? 0 : 1)
+            != 0) {
             /* A CERTIFICATE THAT DID NOT LOAD IS A STARTUP FAILURE, and this is
              * the one configuration error in the phase that is. The reasoning is
              * cap.h's rule applied to the node rather than to a capability: a node
@@ -974,7 +1073,8 @@ int main(int argc, char **argv)
          * have. */
         if (opts.have_tls_port || opts.tls_require != 0 ||
             opts.tls_ca != NULL || opts.tls_sts_duration != 0u ||
-            opts.tls_insecure != 0) {
+            opts.tls_insecure != 0 || opts.tls_ocsp_staple != NULL ||
+            opts.tls_staple_permissive != 0) {
             fprintf(stderr, "irc-serve: TLS options were given without "
                             "--tls-cert and --tls-key\n");
             server_shutdown(&srv);

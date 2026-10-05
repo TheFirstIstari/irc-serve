@@ -74,6 +74,62 @@ int tf_tls_make_cert(const char *dir, const char *stem, const char *cn,
     return -1;
 }
 
+/* THE THREE GENERATORS THAT NEED A CRYPTO LIBRARY, and why they are stubs rather
+ * than missing.
+ *
+ * MISSING WOULD NOT LINK. tests/integration/test_tls_revocation.c calls them from
+ * main() behind a tf_tls_available() branch, and a branch is not a translation unit:
+ * the calls are in the object file either way and the linker wants the symbols. The
+ * established pattern in this harness is the one used above -- the function EXISTS in
+ * both fixtures -- so these three exist in both.
+ *
+ * THEY RETURN -1 AND SAY WHY, which is the same rule the generator above follows and
+ * for the same reason: a stub that returned 0 would write no file and let a test
+ * assert against a certificate that was never created. No caller reaches these in a
+ * no-TLS build -- test_tls_revocation.c returns before its first call -- so the return
+ * value is a linker obligation rather than a decision any code makes. */
+int tf_tls_make_ca(const char *dir, const char *stem, const char *cn,
+                   long not_before_offset, long not_after_offset)
+{
+    (void)dir;
+    (void)stem;
+    (void)cn;
+    (void)not_before_offset;
+    (void)not_after_offset;
+    return -1;
+}
+
+int tf_tls_make_issued(const char *dir, const char *stem, const char *cn,
+                       const char *san, const char *issuer_stem,
+                       long not_before_offset, long not_after_offset)
+{
+    (void)dir;
+    (void)stem;
+    (void)cn;
+    (void)san;
+    (void)issuer_stem;
+    (void)not_before_offset;
+    (void)not_after_offset;
+    return -1;
+}
+
+int tf_tls_make_ocsp(const char *dir, const char *stem, const char *issuer_stem,
+                     const char *subject_stem, const char *signer_stem,
+                     int status, int sha256_certid, long thisupd_offset,
+                     long nextupd_offset)
+{
+    (void)dir;
+    (void)stem;
+    (void)issuer_stem;
+    (void)subject_stem;
+    (void)signer_stem;
+    (void)status;
+    (void)sha256_certid;
+    (void)thisupd_offset;
+    (void)nextupd_offset;
+    return -1;
+}
+
 /* IMPLEMENTED, and the reason it is here rather than stubbed is a coverage hole a
  * fault injection found.
  *

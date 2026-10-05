@@ -2750,14 +2750,27 @@ holding any CA-issued certificate could impersonate any digit-named peer.
 
 **§9's known gaps, named here because the audit requires them visible, not fixed:**
 
-- **REVOCATION IS NOT IMPLEMENTED. `revocation=none`.** No CRL and no OCSP are
-  consulted, so a revoked certificate that chains to the configured CA is **accepted
-  until it expires**. This is the largest gap in the boundary and it is stated three
-  ways so it cannot be missed: this paragraph, `tls_openssl.c`'s "WHAT IS NOT
-  ENFORCED" list, and the `revocation=none` field on the `tls_init` startup line, so
-  one line of node output shows the whole policy. Deferring it is the right call for
-  this phase — a CRL distribution point is an operational dependency this project does
-  not have — but **deferring is not the same as not saying so**.
+- **REVOCATION IS CHECKED FROM THE PEER'S STAPLED OCSP RESPONSE, ON THE OUTBOUND
+  PEER-LINK PATH ONLY. `revocation=staple-strict`.** An outbound peer link is refused
+  unless the peer staples a status this node can verify against `--tls-ca`, that is
+  inside its `nextUpdate`, and that says GOOD. `--tls-staple-permissive` is the
+  explicit weakening. What remains open, and it is a list rather than a sentence:
+  - **No CRL.** A distribution point has to be fetched, and 3.4 forbids a blocking
+    call inside the event loop; an unreachable one treated as reachable is the
+    decorative check the audit warned about. **Nothing in the revocation path opens a
+    socket, resolves a name or reads a file**, which
+    `tests/integration/test_tls_revocation.c` asserts by reading the source with its
+    comments stripped.
+  - **Nothing refreshes a staple.** Read once at startup from `--tls-ocsp-staple`.
+  - **A self-signed peer certificate is refused with `NO_ISSUER`**, because nobody
+    could have issued a status for it.
+  - **INBOUND IS MOOT, NOT IMPLEMENTED.** The server context is `SSL_VERIFY_NONE`
+    and never asks a client for a certificate, so there is nothing to check a status
+    of. Inbound mTLS is deliberately not built, and the accepting node prints nothing
+    about revocation so no line can imply coverage it does not have.
+  - **`notAfter` REMAINS THE OUTER BOUND,** so every established peer link logs
+    `not_after=` and `not_after_in=` — which is the auditor's second point, that an
+    operator could not previously answer "when does my exposure window close?"
 - **`sts` HAS NO SNI / HOSTNAME GATING.** The persistence policy is advertised on
   every connection to the plaintext port regardless of which hostname the client
   arrived with, because **this node does not know a hostname for itself**: there is no

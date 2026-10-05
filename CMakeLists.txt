@@ -1,5 +1,59 @@
 cmake_minimum_required(VERSION 3.20)
-project(irc-serve VERSION 0.1.0 LANGUAGES C)
+
+# ---------------------------------------------------------------------------
+# THE VERSION, AND WHY IT IS READ OUT OF A HEADER RATHER THAN WRITTEN HERE
+# ---------------------------------------------------------------------------
+# IT USED TO BE A LITERAL -- a second copy of a number whose first copy is
+# src/core/server.h's IRC_SERVE_VERSION, which is what 002, 004, PONG, the FEDERATE
+# handshake and the startup line all report. Two copies of a version is the same
+# failure as two copies of a constant, and it had already happened: README.md's Status
+# heading claimed v1.0.0 while this file and the binary both said the number below,
+# which is not a value that drifted but a value that was never connected to anything.
+#
+# THE LITERAL IS NOT REPEATED HERE EVEN IN THIS COMMENT, and
+# tests/integration/test_version_truth.c searches the whole file for one and fails on
+# a match -- comments included. That is the reason: a version written down in prose is
+# a version that goes stale silently, which is exactly what the README's did. The
+# history of the change is in git, which is where a historical number belongs.
+#
+# SO THE HEADER IS THE ONE DEFINITION AND EVERYTHING ELSE DERIVES FROM IT:
+#
+#   src/core/server.h            the definition. It is there rather than here because
+#                                it is the value the C code reports on the wire.
+#   CMakeLists.txt (this block)  parsed out of the header at configure time, so
+#                                project() VERSION and anything packaging reads are
+#                                the header's number and not a copy of it.
+#   --help                       prints IRC_SERVE_VERSION, so the flag surface and
+#                                the startup line cannot disagree.
+#   packaging/arch/PKGBUILD      `pkgver` is a sed of the same header.
+#   packaging/debian/changelog   NOT derived -- a changelog is a record of what was
+#                                uploaded, not a place to compute anything -- so
+#                                tests/integration/test_version_truth.c asserts its
+#                                newest entry agrees instead.
+#
+# AND A FATAL ERROR IF THE PARSE FINDS NOTHING, rather than a default. A regex that
+# stops matching because someone reformatted the macro would otherwise leave the
+# build configuring against a version that does not exist, which is the exact shape of
+# the bug this block exists to remove: a build that works and reports something false.
+#
+# WHY NOT THE OTHER DIRECTION (a version file that C includes and CMake reads as a
+# whole file): a header is what the C code already includes, so there is one file to
+# open and no build-order dependency between configure and compile.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/core/server.h" _irc_serve_server_h)
+string(REGEX MATCH
+       "#[ \t]*define[ \t]+IRC_SERVE_VERSION[ \t]+\"irc-serve-([0-9]+\\.[0-9]+\\.[0-9]+)\""
+       _irc_serve_version_match "${_irc_serve_server_h}")
+if(NOT _irc_serve_version_match)
+  message(FATAL_ERROR
+    "irc-serve: could not find IRC_SERVE_VERSION in src/core/server.h.\n"
+    "This project keeps exactly ONE copy of the version, and it is that macro; "
+    "CMake reads it rather than repeating it. If the macro was renamed or "
+    "reformatted, the regex above is what has to change -- not a second literal.")
+endif()
+set(IRC_SERVE_VERSION "${CMAKE_MATCH_1}")
+message(STATUS "irc-serve: version ${IRC_SERVE_VERSION} (from src/core/server.h)")
+
+project(irc-serve VERSION ${IRC_SERVE_VERSION} LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)

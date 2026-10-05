@@ -96,6 +96,65 @@ int tf_tls_make_cert(const char *dir, const char *stem, const char *cn,
                      const char *san, long not_before_offset,
                      long not_after_offset, unsigned key_mode);
 
+/* ---------------------------------------------------------------------------
+ * THE SAME GENERATOR, WITH AN ISSUER, because revocation needs one
+ * ---------------------------------------------------------------------------
+ * tf_tls_make_cert() makes a SELF-SIGNED CA:TRUE certificate, which is what every
+ * Phase 12 case uses and which is deliberately unchanged: two nodes that trust each
+ * other's certificate directly have no issuer, so there is nobody who could have
+ * issued a revocation status for either of them.
+ *
+ * These two are the shapes a revocation check needs. tf_tls_make_ca() is the
+ * self-signed authority (the same bytes tf_tls_make_cert() produces, named
+ * separately so a reader of a revocation test can see which file is the CA).
+ * tf_tls_make_issued() is a leaf whose ISSUER is another stem in the same
+ * directory, and it writes leaf + issuer into `<stem>.crt` -- one file, because
+ * --tls-cert takes a chain and a node presenting a bare leaf leaves its peer with no
+ * issuer at all.
+ *
+ * Returns 0 on success; -1 on any failure, with OpenSSL's error queue cleared.
+ * --------------------------------------------------------------------------- */
+int tf_tls_make_ca(const char *dir, const char *stem, const char *cn,
+                   long not_before_offset, long not_after_offset);
+
+int tf_tls_make_issued(const char *dir, const char *stem, const char *cn,
+                       const char *san, const char *issuer_stem,
+                       long not_before_offset, long not_after_offset);
+
+/* ---------------------------------------------------------------------------
+ * A REAL OCSP RESPONSE, written as DER to `<stem>.ocsp`
+ * ---------------------------------------------------------------------------
+ *   issuer_stem    whose certificate and key build the CertID AND, by default, sign
+ *                  the response -- which is what a real issuer does;
+ *   subject_stem   the certificate the status is ABOUT;
+ *   signer_stem    whose key signs it. NULL, or equal to issuer_stem, means the
+ *                  issuer. A DIFFERENT stem produces the rogue-responder case: a
+ *                  well-formed response with a correct CertID, signed by somebody the
+ *                  issuer never authorised, which is the case that proves the
+ *                  verifier checks the SIGNER rather than only reading the status out
+ *                  of the staple;
+ *   status         TF_OCSP_GOOD or TF_OCSP_REVOKED;
+ *   sha256_certid  non-zero builds the CertID with SHA-256, zero with SHA-1. The
+ *                  digest is the RESPONDER'S choice, so the suite uses both and a
+ *                  verifier that understood only one would fail one required case;
+ *   thisupd_offset seconds from now for thisUpdate;
+ *   nextupd_offset seconds from now for nextUpdate, or TF_OCSP_NO_NEXT_UPDATE for a
+ *                  response with no nextUpdate at all -- which is legal, and which
+ *                  the verifier must refuse rather than treat as fresh for ever.
+ *
+ * Returns 0 on success. The response is a real signed OCSPResponse that OpenSSL's
+ * own OCSP_basic_verify() accepts when the signer is the issuer, so the revocation
+ * case is a revocation and not a corrupted signature.
+ * --------------------------------------------------------------------------- */
+#define TF_OCSP_GOOD 0
+#define TF_OCSP_REVOKED 1
+#define TF_OCSP_NO_NEXT_UPDATE (-2)
+
+int tf_tls_make_ocsp(const char *dir, const char *stem, const char *issuer_stem,
+                     const char *subject_stem, const char *signer_stem,
+                     int status, int sha256_certid, long thisupd_offset,
+                     long nextupd_offset);
+
 /* Write `n` bytes to `path` with exactly `mode`. Used by the fixture's own
  * cleanup-free helpers and exposed because the world-readable-key case has to be
  * able to CHANGE a key's mode after the fact, which is what an operator's

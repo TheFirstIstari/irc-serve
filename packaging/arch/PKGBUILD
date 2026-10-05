@@ -1,7 +1,22 @@
 # Maintainer: TheFirstIstari <euphonium.ashe.f@gmail.com>
 # Contributor: Finn Robinson
 pkgname=irc-serve
-pkgver=0.1.0
+# DERIVED, NOT TYPED. This project's one version definition is the IRC_SERVE_VERSION
+# macro in src/core/server.h -- the value 002, 004, PONG, the FEDERATE handshake and
+# the startup line all report -- and packaging reads it out of there rather than
+# keeping a second copy. A pkgver that is a literal is a version that has to be
+# edited in two files on every bump, and one of them will be missed: README.md said
+# v1.0.0 while this file and the binary both said 0.1.0 until they were all connected.
+# A silent `sed` and an empty result (which makepkg would turn into a malformed
+# pkgver) are both checked below.
+_hdr=src/core/server.h
+# POSIX BREs ONLY: [0-9][0-9]* rather than [0-9]\+, and [[:space:]] rather than
+# \t inside a bracket expression. The first is a GNU extension that BSD sed reads as
+# a literal '+', and the second is the reverse -- BSD reads \t inside brackets as
+# backslash-or-t. Either one silently produces an EMPTY match, which is why the
+# line below refuses rather than handing makepkg a malformed pkgver.
+pkgver=$(sed -n 's/^#[[:space:]]*define[[:space:]][[:space:]]*IRC_SERVE_VERSION[[:space:]][[:space:]]*"irc-serve-\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' "$_hdr")
+[ -n "$pkgver" ] || { echo "PKGBUILD: could not read IRC_SERVE_VERSION out of $_hdr" >&2; exit 1; }
 pkgrel=1
 pkgdesc="Federated modern-spec IRC server in C — performance-first, minimal footprint"
 arch=('x86_64' 'aarch64')
@@ -12,7 +27,13 @@ url="https://github.com/TheFirstIstari/irc-serve"
 license=('custom:Unlicensed')
 depends=('glibc')
 makedepends=('make' 'cmake>=3.20' 'gcc' 'clang')
-source=("git+https://github.com/TheFirstIstari/irc-serve.git#tag=v${pkgver}")
+# BRANCH, NOT A TAG, and this used to be `#tag=v${pkgver}` -- which named a tag that
+# does not exist. The repository's tags are PER PHASE and stop at v0.7.0-messaging;
+# there is no v0.1.0 tag and there is no release, so a source line pointing at one
+# makes `makepkg -e` fail on a package nobody can build. A branch is what this
+# project actually has, and the #branch= field keeps makepkg from silently building
+# a stale HEAD.
+source=("git+https://github.com/TheFirstIstari/irc-serve.git#branch=main")
 sha256sums=('SKIP')  # TODO: generate real hashes once a stable release tarball is published
 
 CTEST_TIMEOUT=${CTEST_TIMEOUT:-120}

@@ -145,13 +145,41 @@ Tags mark every phase boundary, so "go back to the last working state" is a
 lookup rather than an archaeology exercise.
 
 ```
-v0.1.0-preserved     738f254  preserved work, corrected docs, federation design
-v0.2.0-tokenizer     8d8c416  Phase 1: tokenizer, tag format, nick charset
-v0.3.0-core          e958ea9  Phase 2: poll loop, conn_t, registries
-v0.4.0-registration  cbb1d16  Phase 3: registration, 001-005, reply() invariant
-v0.5.0-channels      7d0fe4b  Phase 4: channels, final struct shapes
-v0.6.0-docs          5291c85  macOS CI, self-hosted runner, generated stats
+v0.1.0-preserved     1e0bbe4  Preserve prior work, correct docs, adopt federation
+v0.2.0-tokenizer     4e01501  Phase 1: message tokenizer, tag format, nick charset
+v0.3.0-core          d33bbf0  Phase 2: server core - poll loop, conn_t, framing
+v0.4.0-registration  dc871d3  registration, 001-005 numerics, reply() invariant
+v0.5.0-channels      cbf1eeb  Phase 4: channels, final struct shapes, single-writer
+v0.6.0-docs          7166382  macOS CI, self-hosted runner, generated stats
+v0.7.0-messaging     6757d4e  PRIVMSG, NOTICE, WHO, WHOIS, ISON, away-notify
 ```
+
+Every one of those SHAs was WRONG until now, and the table was also missing a tag
+— which is the same failure the README's version number was, in a file whose whole
+purpose is to tell you where to roll back to. The history was rewritten once
+(there are `backup-before-*-rewrite` tags recording it), the phase tags were
+re-created against the rewritten commits, and this table kept naming the pre-rewrite
+objects. They are still in the object store, so `git show 738f254` succeeds and
+returns a commit that is not what `v0.1.0-preserved` resolves to — which is worse
+than a missing SHA, because it looks right.
+
+**AND THE TAGS ARE NOT RELEASES.** `v0.7.0-messaging` is the newest one and the
+project is at a much later phase; the number in a tag names the *phase*, which is
+also why the version in `src/core/server.h` and the number in these tags are two
+different series that will not track each other. There is no `v0.8.0` because
+nothing after Phase 5 was tagged, and there is no `v1.0.0` because there has been no
+release.
+
+**TO CHECK THIS TABLE RATHER THAN TRUST IT:**
+
+```sh
+git tag -l --sort=creatordate --format='%(refname:short)  %(objectname:short)  %(subject)'
+git for-each-ref --format='%(refname:short)  %(objectname:short)' refs/tags | \
+  while read -r tag _; do printf '%-24s %s\n' "$tag" "$(git rev-list -n1 "$tag" | cut -c1-7)"; done
+```
+
+**AND IF YOU ADD A TAG, ADD IT HERE.** A rollback table that describes a repository
+which no longer exists is worse than no rollback table.
 
 ### Finding the last good state
 
