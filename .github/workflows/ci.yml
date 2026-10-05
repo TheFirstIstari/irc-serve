@@ -162,6 +162,30 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      # BEFORE THE BUILD, on purpose: it is a text check over the working tree,
+      # takes well under a second, and needs no build directory at all -- so a
+      # violation should cost a second rather than the two minutes it would cost
+      # at the end. It sits with the other gates rather than next to the compile
+      # for the same reason it sits first among them.
+      #
+      # IT IS HERE, IN ci_test, BECAUSE ci_test IS THE JOB THAT CATCHES THIS
+      # CLASS ON A PULL REQUEST. It is hosted Linux with GCC against glibc, and
+      # it is what reported `(void)read(...)` as
+      #   error: ignoring return value of 'read' declared with attribute
+      #   'warn_unused_result' [-Werror=unused-result]
+      # at run 37242557613, before that branch merged. Nothing here replaces
+      # that; see the script for why it cannot.
+      #
+      # WHAT IT ADDS ON TOP is that it fails on ANY host. Both required macOS
+      # cells passed that build clean -- the macOS SDK does not declare read()
+      # with warn_unused_result at all -- and Clang stays silent even against
+      # real glibc headers, because it exempts an explicit (void) cast. So the
+      # defect was simultaneously invisible to every macOS cell and to any
+      # Clang-based Linux cell, and visible only to GCC-on-glibc. A grep is not
+      # cleverer than that build; it is simply available on a machine that has
+      # no glibc, which is where a contributor's laptop is.
+      - name: glibc __wur discard gate
+        run: ./scripts/check-wur-discards.sh
       - name: Configure
         run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
       - name: Build
