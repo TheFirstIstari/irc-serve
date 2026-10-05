@@ -155,6 +155,7 @@
 
 #include "harness/irc_client.h"
 #include "harness/node_fixture.h"
+#include "harness/sweep_scan.h"
 #include "harness/test_util.h"
 
 #define T_IO_MS 15000
@@ -178,178 +179,49 @@
 #define SW_CHAN_FMT "#SW%02u"
 
 #define SW_MAX_VERBS 128
-#define SW_MARKERS 62u
+#define SW_MARKERS SWS_MARKER_COUNT
 
-/* ---------------------------------------------------------------------------
- * THE MARKER SET
- * ---------------------------------------------------------------------------
- * Written out as a predicate rather than as a table so that the exclusions above
- * are visible where the membership test is, which is what a reader has to check in
- * order to believe the set. */
-static int marker_in_set(unsigned char b)
-{
-    if (b <= 0x08u) {
-        return 1;
-    }
-    if (b == 0x0bu || b == 0x0cu) {
-        return 1;
-    }
-    if (b >= 0x0eu && b <= 0x1fu) {
-        return 1;
-    }
-    if (b == 0x7fu) {
-        return 1;
-    }
-    if (b >= 0x80u && b <= 0x9fu) {
-        return 1;
-    }
-    return 0;
-}
+/* THE MARKER SET, THE mIRC BYTES, THE MASKS AND THE WALK ARE IN
+ * `harness/sweep_scan.h`, which the PEER sweep includes too. One instrument, two
+ * surfaces: the two binaries sweep different sockets and the same threat, and a
+ * second copy of the predicate is a copy that can drift out of step with the first
+ * without anything going red.
+ *
+ * The local names below are the shared ones, spelled the way this file used to
+ * spell them, so the rest of this file is unchanged and the diff is the removal
+ * rather than a rewrite. */
+#define marker_in_set     sws_marker_in_set
+#define sw_mask_of        sws_mask_of
+#define sw_mask_has       sws_mask_has
+#define sw_masks_init     sws_masks_init
+#define k_mirc_bytes      sws_mirc_bytes
+#define k_mask_c1         sws_mask_c1
+#define k_mask_all        sws_mask_all
+#define k_mask_mirc       sws_mask_mirc
 
-/* ---------------------------------------------------------------------------
- * THE EXCEPTION LIST
- * ---------------------------------------------------------------------------
- * ONE ENTRY PER BYTE RANGE THAT MAY APPEAR, with a reason and with the substring
- * that identifies the one site that produces it. The scan refuses an occurrence
- * whose `where` does not appear, and `assert_exceptions_all_used()` FAILS a listed
- * entry whose `where` never appears at all.
- *
- * ===========================================================================
- * WHAT IS IN IT, AND WHY: A NICKNAME MAY HOLD A BARE C1 BYTE
- * ===========================================================================
- * Every entry below is the SAME root cause and it is NOT a sweep artifact.
- *
- * `nick_char_illegal()` in `src/core/message.c` REFUSES bytes <= 0x20 and DEL and
- * ACCEPTS every byte >= 0x80, and the comment there says why: "UTF-8 nicknames are
- * ordinary and are not control characters". So `NICK a\x80z` is a legal nickname on
- * this node, `conn_t::nick` stores the byte, and every site that NAMES a member
- * prints it raw. The sweep reaches it from `NICK a<marker>z` and `NICK <marker>`
- * with 32 of the 62 marker bytes, and the byte then appears in the log at seven
- * different sites, none of which is the sweep's fault and all of which are honest
- * renderings of state the node decided to accept.
- *
- * AND IT REACHES THE WIRE, which the first version of this comment got wrong and
- * which is the most serious thing the sweep found. An earlier draft of this file said
- * "the wire is not affected: `message_format()` refuses a non-final parameter, so a
- * client sees an empty field". That is true of a numeric's `<client>` PARAMETER and
- * false of a nickname, because a nickname is not a parameter -- it is the SOURCE of
- * every line its owner sends and the `<client>` field of every numeric it receives.
- * `NICK a<0x9F>z` therefore puts a C1 byte in front of everything that client then
- * says to every other channel member's terminal, and a 353 NAMES list renders it
- * beside the other members. So this is a CROSS-CLIENT injection, not an operator-log
- * one, and the earlier draft's reassurance was the kind of claim that stops somebody
- * looking.
- *
- * WHY IT IS NOT FIXED HERE. Two reasons, and the second is the one that matters.
- * First, it is out of scope: this pass is two named bugs and a test. Second, the fix
- * is a POLICY decision rather than a mechanical one. Narrowing the grammar to refuse
- * bare 0x80-0x9F would still admit 0xA0-0xFF, which is not a clean split: valid UTF-8
- * continuation bytes run 0x80-0xBF, so U+0080-U+009F -- C1 control characters in
- * Unicode, CSI among them -- encode to `\xc2\x9b` and would be REFUSED by a
- * bare-byte rule. So the choice is between accepting bare C1 bytes, refusing them and
- * losing those Unicode characters from nicknames, or refusing any non-ASCII nickname
- * at all. That is a decision about what this node accepts from clients, it reaches the
- * peer path's SBURST shadow, and it belongs to whoever owns that decision.
- *
- * It is reported rather than pinned silently: SECURITY.md's not-defended list names
- * it, and the ONE `anywhere` entry below is what keeps this sweep green while that
- * report exists.
- */
+#define SW_MAX_EXCEPTIONS 64
+
+/* One row per BYTE RANGE that may appear on a scanned surface, with the reason and
+ * with the substring that identifies the one site that produces it. */
 struct sw_exception {
-    const unsigned char *mask; /* which bytes this entry excuses */
-    const char *why;          /* why they may legitimately appear HERE */
-    const char *where;        /* the site, or the field rendering, that produces them */
-    /* NON-ZERO MEANS "ANYWHERE": the byte is excused whatever line it is on and
-     * whatever else that line says. It exists for exactly one entry, and the reason
-     * is worth stating because it is the difference between an honest class-level
-     * exception and a hole: this node's own `conn_byte_is_bad()` does NOT include
-     * 0x80-0x9F, so a stored nickname or channel name is allowed to hold one and
-     * every rendering of it -- in a log line, in a numeric's `<client>` field, in
-     * another client's SOURCE, in a 353 NAMES list -- is the same defect at a
-     * different site. Naming sites would mean an entry per rendering forever, and
-     * the first version of this table had five of them and still missed the sixth.
-     */
+    const unsigned char *mask;
+    const char *why;
+    const char *where;
     int anywhere;
-    /* NON-ZERO MEANS `assert_exceptions_all_used()` REQUIRES THIS ENTRY TO FIRE, which
-     * is what stops the list accumulating entries nobody exercises. Every entry
-     * currently sets it: the wire-echo entries fire thousands of times per run
-     * because every marker in every position reaches them, and the `anywhere` entry
-     * fires because the nickname grammar admits 32 of the 62 marker bytes. The field
-     * exists so that a FUTURE entry which cannot be relied on to fire has to say so in
-     * its own row rather than by leaving a check out -- and it is 1 on every row
-     * today, which is the honest state rather than a convenient one. */
     int required;
 };
 
-/* THE MARKER BIT, AND THE MASKS.
+/* WHICH ENTRIES ARE STILL BEING USED, recorded by `sw_excuse()` as the scan runs.
  *
- * A 256-BIT MASK rather than a `lo`/`hi` range, because the set is not a range: the
- * marker set is `C0 minus TAB/LF/CR`, plus DEL, plus the encoded C1 range, which is
- * four disjoint stretches. A `lo`/`hi` pair could not say that without every entry
- * spelling out its own byte list, and an entry with its own byte list is an entry
- * that can disagree with the scan.
- *
- * THREE masks rather than one, because the three classes need three different byte
- * sets: a wire-echo entry carries whatever the client sent, so it takes the whole set;
- * a stored-name entry is C1-ONLY, because a C0 byte in a nickname is refused by
- * `nick_char_illegal()` and never gets stored, so excusing it there would be excusing
- * something that cannot happen; and the mIRC entry takes exactly the eight bytes
- * `relay_byte_kept()` keeps, which is neither of those and is written out one by one
- * because a range is what the source explicitly rejects.
- *
- * The first two are filled from `marker_in_set()`, the ONE predicate the scan uses, so
- * an entry and the scan cannot disagree about what the set is. They are non-const
- * because they are computed once at startup from that predicate rather than written out
- * by hand. */
-static unsigned char k_mask_c1[32];
-static unsigned char k_mask_all[32];
-/* THE mIRC FORMATTING BYTES, spelled out one by one, and that is the point.
- *
- * `relay_byte_kept()` in `src/core/connection.c` is a switch over exactly these
- * eight, and its comment says why it is a switch rather than a range test: a range
- * test `0x02..0x1F` would swallow BEL and ESC, which is the entire hazard, and would
- * return 0 for 0x01, which "corrupts every CTCP". A mIRC client renders colour and
- * bold from these bytes and a relay that removed them would break every one of them,
- * so relaying them is a FEATURE and not an oversight. Reproducing the list here rather
- * than writing a range is deliberate: this file's mask is the sweep's claim about what
- * is allowed through, and a range is what the source explicitly rejects. */
-static const unsigned char k_mirc_bytes[] = {
-    0x01u, 0x02u, 0x03u, 0x0fu, 0x11u, 0x16u, 0x1du, 0x1fu
-};
-static unsigned char k_mask_mirc[32];
-
-static unsigned char sw_mask_of(unsigned char ch)
-{
-    return (unsigned char)(1u << (unsigned int)(ch & 7u));
-}
-
-static int sw_mask_has(const unsigned char *mask, unsigned char ch)
-{
-    return (mask[ch >> 3] & sw_mask_of(ch)) != 0u ? 1 : 0;
-}
-
-static void sw_masks_init(void)
-{
-    unsigned char ch;
-
-    memset(k_mask_c1, 0, sizeof k_mask_c1);
-    memset(k_mask_all, 0, sizeof k_mask_all);
-    for (ch = 0; ch < 0xffu; ch++) {
-        if (marker_in_set(ch) == 0) {
-            continue;
-        }
-        k_mask_all[ch >> 3] |= sw_mask_of(ch);
-        if (ch >= 0x80u && ch <= 0x9fu) {
-            k_mask_c1[ch >> 3] |= sw_mask_of(ch);
-        }
-    }
-    memset(k_mask_mirc, 0, sizeof k_mask_mirc);
-    for (size_t i = 0; i < sizeof k_mirc_bytes / sizeof k_mirc_bytes[0]; i++) {
-        const unsigned char m = k_mirc_bytes[i];
-
-        k_mask_mirc[m >> 3] |= sw_mask_of(m);
-    }
-}
+ * The check is over the WHOLE RUN -- every client socket and the node's stdout -- and
+ * not over the log alone, because two of the classes are wire-only: an exception that
+ * is never exercised is either stale or pointing at nothing, and both are how a filter
+ * gets quietly switched off. The bound is `SW_MAX_EXCEPTIONS` and `main()` asserts the
+ * entry count against it. */
+typedef struct {
+    int used[SW_MAX_EXCEPTIONS];
+} sw_exc_ctx;
+static sw_exc_ctx g_exc;
 
 /* THE ENTRY MACROS.
  *
@@ -372,7 +244,6 @@ static void sw_masks_init(void)
  * not over the log alone, because two of the classes are wire-only: an exception that
  * is never exercised is either stale or pointing at nothing, and both are how a filter
  * gets quietly switched off. */
-static int g_exc_used[SW_MAX_EXCEPTIONS];
 
 /* ---------------------------------------------------------------------------
  * THE EXCEPTION LIST, AND IT IS ONE ENTRY LONG
@@ -443,7 +314,7 @@ static int g_exc_used_count(void)
     int n = 0;
 
     for (int e = 0; e < SW_EXCEPTIONS; e++) {
-        if (g_exc_used[e] != 0) {
+        if (g_exc.used[e] != 0) {
             n++;
         }
     }
@@ -585,42 +456,6 @@ static void sw_flush(test_client_t *c, sw_buf *b, nf_node_t *node)
     pump_node(node, c);
 }
 
-/* ---------------------------------------------------------------------------
- * THE SCAN
- * ---------------------------------------------------------------------------
- * A WHOLE-BUFFER BYTE WALK, and this is the part the teeth test exists to prove.
- *
- * `strstr(buf, "\033")` would answer "is there an escape"; it would NOT answer
- * "is there a control byte", and a node that stripped ESC and relayed BEL would
- * pass it. So this walks every byte of the buffer and refuses every member of the
- * set, which is what makes the assertion about the SET rather than about the two
- * bytes one person happened to think of.
- *
- * THE EXCEPTION CHECK IS TWO-HALFED. An occurrence is excused only when its byte
- * is listed AND its line carries that entry's `where`, so an entry cannot become
- * a blanket amnesty for a byte; and `assert_exceptions_all_used()` FAILS a
- * listed entry whose `where` never appears, so the list cannot accumulate entries
- * nobody exercises. */
-/* Print one line of the finding report with every byte that is not printable ASCII
- * shown as `\xNN`.
- *
- * IT IS NOT COSMETIC, and the version without it was unreadable in exactly the way
- * that matters: the offending byte IS the finding, so a report that prints it raw
- * prints a line that looks like `reason=` and reads as a formatting bug rather than
- * as the injection it is. A failure message has to show the thing it is complaining
- * about. */
-static void print_escaped(const char *s)
-{
-    for (const char *p = s; *p != '\0'; p++) {
-        const unsigned char ch = (unsigned char)*p;
-
-        if (ch >= 0x20u && ch <= 0x7eu) {
-            (void)fputc((int)ch, stderr);
-        } else {
-            (void)fprintf(stderr, "\\x%02x", ch);
-        }
-    }
-}
 
 /* ---------------------------------------------------------------------------
  * FINDINGS, COLLECTED ACROSS THE WHOLE RUN AND REPORTED ONCE
@@ -660,120 +495,58 @@ static int span_has(const char *s, size_t len, const char *needle)
     return 0;
 }
 
-struct finding {
-    char site[48];
-    char line[192];
-};
+/* THE WALK IS THE SHARED ONE, in `harness/sweep_scan.h`. This file's contribution
+ * is the EXCUSION CALLBACK, which is its own exception list applied to a line: an
+ * occurrence is excused only when its byte is in the entry's set AND the line carries
+ * the entry's `where`, so an entry can never become a blanket amnesty for a byte.
+ * Recording which entries fired is what `assert_exceptions_all_used()` reads. */
+static int sw_excuse(unsigned char ch, const char *line, size_t len, void *ctx)
+{
+    sw_exc_ctx *c = (sw_exc_ctx *)ctx;
 
-static struct finding g_found[16];
-static size_t g_nfound;
-static size_t g_total;
-static char g_what[48];
-static char g_who[48];
+    for (int e = 0; e < SW_EXCEPTIONS; e++) {
+        int hit;
+
+        if (sw_mask_has(k_exceptions[e].mask, ch) == 0) {
+            continue;
+        }
+        if (k_exceptions[e].anywhere != 0) {
+            hit = 1;
+        } else {
+            hit = span_has(line, len, k_exceptions[e].where);
+        }
+        if (hit != 0) {
+            c->used[e] = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static sws_scan g_scan;
+static char g_who[SWS_TEXT_MAX];
 
 static void record_findings(const char *buf, size_t len, const char *what,
                             const char *who)
 {
-    (void)snprintf(g_what, sizeof g_what, "%s", what);
-    (void)snprintf(g_who, sizeof g_who, "%s", who);
-
-    for (size_t i = 0; i < len; i++) {
-        const unsigned char ch = (unsigned char)buf[i];
-        size_t start;
-        size_t stop;
-        size_t shown;
-        char line[512];
-        int excused = 0;
-        int known = 0;
-        char site[sizeof g_found[0].site];
-        const char *colon;
-        size_t klen;
-
-        if (marker_in_set(ch) == 0) {
-            continue;
-        }
-        /* The line this occurrence is on, for the report and for the exception
-         * match. Bounded, because the log is megabytes by the end of a sweep and a
-         * failure message that prints a megabyte is unreadable. */
-        start = i;
-        while (start > 0u && buf[start - 1u] != '\n') {
-            start--;
-        }
-        stop = i;
-        while (stop < len && buf[stop] != '\n') {
-            stop++;
-        }
-        shown = stop - start;
-        if (shown > sizeof line - 1u) {
-            shown = sizeof line - 1u;
-        }
-        memcpy(line, buf + start, shown);
-        line[shown] = '\0';
-        for (int e = 0; e < SW_EXCEPTIONS; e++) {
-            int hit;
-
-            if (sw_mask_has(k_exceptions[e].mask, ch) == 0) {
-                continue;
-            }
-            if (k_exceptions[e].anywhere != 0) {
-                hit = 1;
-            } else {
-                hit = span_has(line, shown, k_exceptions[e].where);
-            }
-            if (hit != 0) {
-                excused = 1;
-                g_exc_used[e] = 1;
-                break;
-            }
-        }
-        if (excused != 0) {
-            continue;
-        }
-        g_total++;
-        /* THE SITE KEY IS THE LINE UP TO ITS FIRST COLON, so the twenty-two lines
-         * `chan_mode_refused` writes for twenty-two different mode characters
-         * collapse to ONE finding rather than filling the report with near
-         * duplicates of the same defect. */
-        colon = strchr(line, ':');
-        klen = (colon != NULL) ? (size_t)(colon - line + 1u) : strlen(line);
-        if (klen > sizeof site - 1u) {
-            klen = sizeof site - 1u;
-        }
-        memcpy(site, line, klen);
-        site[klen] = '\0';
-        for (size_t f = 0; f < g_nfound; f++) {
-            if (strcmp(g_found[f].site, site) == 0) {
-                known = 1;
-                break;
-            }
-        }
-        if (known == 0 && g_nfound < sizeof g_found / sizeof g_found[0]) {
-            (void)snprintf(g_found[g_nfound].site, sizeof g_found[0].site, "%s", site);
-            (void)snprintf(g_found[g_nfound].line, sizeof g_found[0].line, "%s", line);
-            g_nfound++;
-        }
+    /* One scan for the whole run, so the report is one summary naming every
+     * surface rather than a paragraph per socket. */
+    if (g_scan.excuse == NULL) {
+        (void)snprintf(g_who, sizeof g_who, "%s", who);
+        sws_scan_begin(&g_scan, what, sw_excuse, &g_exc);
     }
+    sws_scan_bytes(&g_scan, buf, len);
 }
 
 /* Print every collected finding and fail if there is one. This is the ONLY place the
  * sweep can fail on a marker byte, and it runs once, after the node has exited. */
 static void assert_no_findings(void)
 {
-    if (g_total == 0u) {
+    (void)snprintf(g_scan.who, sizeof g_scan.who, "%s", g_who);
+    if (sws_scan_clean(&g_scan) != 0) {
         return;
     }
-    fprintf(stderr,
-            "note: the terminal-injection sweep found %lu unmarked byte(s) in %s "
-            "(%s), at %lu distinct site(s):\n",
-            (unsigned long)g_total, g_what, g_who, (unsigned long)g_nfound);
-    for (size_t f = 0; f < g_nfound; f++) {
-        fprintf(stderr, "    %s\n        ", g_found[f].site);
-        print_escaped(g_found[f].line);
-        fprintf(stderr, "\n");
-    }
-    if (g_total > (size_t)(sizeof g_found / sizeof g_found[0])) {
-        fprintf(stderr, "    (and more occurrences of the sites above)\n");
-    }
+    (void)sws_scan_report(&g_scan);
     fprintf(stderr,
             "note: this node's output is the only place a control byte can come "
             "from. 0x07 rings a terminal's bell and ESC followed by `[` is a CSI "
@@ -783,7 +556,7 @@ static void assert_no_findings(void)
                  "the terminal-injection sweep found %lu unmarked byte(s) at %lu "
                  "site(s). They are listed above; each is one emission that "
                  "renders a client-supplied value with no filter.",
-                 (unsigned long)g_total, (unsigned long)g_nfound);
+                 (unsigned long)g_scan.total, (unsigned long)g_scan.nfound);
 }
 
 /* The other half of the exception list: every entry must still be exercised. A
@@ -795,7 +568,7 @@ static void assert_exceptions_all_used(void)
         if (k_exceptions[e].required == 0) {
             continue;
         }
-        TF_CHECK_MSG(g_exc_used[e] != 0,
+        TF_CHECK_MSG(g_exc.used[e] != 0,
                      "the sweep's exception list carries an entry for `%s` (%s) and "
                      "the whole sweep -- every client socket and the node's entire "
                      "stdout -- never produced a byte that entry excuses. Either the "
@@ -1683,7 +1456,7 @@ int main(void)
     nf_node_t node;
 
     sw_masks_init();
-    memset(g_exc_used, 0, sizeof g_exc_used);
+    memset(&g_exc, 0, sizeof g_exc);
 
     derive_verbs();
 
@@ -1697,11 +1470,11 @@ int main(void)
                  "build of the tree has known classes of marker byte on its output "
                  "and every one of them is listed. An empty list means the table lost "
                  "its terminator row.");
-    TF_CHECK_MSG((size_t)SW_EXCEPTIONS <= sizeof g_exc_used / sizeof g_exc_used[0],
+    TF_CHECK_MSG((size_t)SW_EXCEPTIONS <= sizeof g_exc.used / sizeof g_exc.used[0],
                  "the exception list holds %d entries and the sweep's per-entry "
                  "bookkeeping array holds %lu, so the two would overrun.",
                  SW_EXCEPTIONS,
-                 (unsigned long)(sizeof g_exc_used / sizeof g_exc_used[0]));
+                 (unsigned long)(sizeof g_exc.used / sizeof g_exc.used[0]));
     TF_CHECK_MSG((size_t)SH_SUBJECT_FIRST < (size_t)SH_COUNT,
                  "the shape table's split point is not inside the table");
     TF_CHECK_MSG(strchr(k_shapes[0], '\x01') == NULL &&

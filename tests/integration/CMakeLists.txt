@@ -13,6 +13,7 @@
 add_library(test_harness STATIC
   ../harness/irc_client.c
   ../harness/node_fixture.c
+  ../harness/peer_fixture.c
   ../harness/test_util.c
   # Phase 12: the TLS client and the certificate generator. Compiled ONLY when
   # WITH_TLS is ON, because it includes <openssl/ssl.h> and there is no point (and
@@ -271,6 +272,13 @@ irc_add_integration_test(test_echo_message test_echo_message.c)
 # no caller in src/, so this is the test that makes it load-bearing. Asserts the
 # RESPONSE, never that the function was called.
 irc_add_integration_test(test_nick_rule test_nick_rule.c)
+
+# The nickname grammar is UTF-8-AWARE: `ā` (C4 81), `café`, `日本` register and
+# appear in the prefix a SECOND client receives, while a bare 0x80-0x9F, the
+# encoded 0xC2 0x80-0x9F pair, and a lead byte with no continuations are refused
+# with 432 and leave no byte on the wire. test_valid_nick.c proves the predicate;
+# this proves what the other client SEES, which the predicate cannot.
+irc_add_integration_test(test_nick_utf8 test_nick_utf8.c)
 
 # 7/Phase 3: duplicate nick -> 433, and the incumbent keeps it.
 irc_add_integration_test(test_dup_nick test_dup_nick.c)
@@ -776,6 +784,13 @@ irc_add_integration_test(test_log_injection test_log_injection.c)
 # reachable surface -- and because a sweep this wide is the one place where the
 # "whole-buffer walk, not a substring search" requirement has to be load-bearing.
 irc_add_integration_test(test_terminal_sweep test_terminal_sweep.c)
+
+# The SAME sweep on the PEER path. Same instrument -- tests/harness/sweep_scan.h --
+# and a different surface: a raw socket standing in for the other node, so the
+# bytes a peer sends that reach this node's log, its forward to a second peer, or a
+# client all get swept. It is a separate binary because reaching a peer link needs a
+# different fixture, not because it is a different claim.
+irc_add_integration_test(test_peer_terminal_sweep test_peer_terminal_sweep.c)
 
 # The relay SHAPE behind four #121 bugs: an emission carrying `m->params` instead of
 # the value the node stored. A source test, because the defect leaves every runtime
