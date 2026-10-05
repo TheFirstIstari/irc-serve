@@ -33,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
@@ -1021,7 +1022,18 @@ int tf_tls_send(tf_tls_t *t, const char *line)
         if (t->ssl != NULL) {
             w = SSL_write((SSL *)t->ssl, buf + sent, n - sent);
         } else {
-            w = (int)send(t->fd, buf + sent, (size_t)(n - sent), 0);
+            /* MSG_NOSIGNAL for the reason, and with the same reasoning, as
+             * tc_send_raw() in irc_client.c: a plaintext write into a peer that
+             * has closed must come back as EPIPE rather than as a signal, because
+             * the harness cannot afford to lose the assertions after it.
+             *
+             * The SSL_write branch above is deliberately NOT given the flag and
+             * cannot be: it is OpenSSL's socket BIO, which already suppresses
+             * SIGPIPE for its own writes, and send(2) flags do not pass through
+             * an SSL object. So this branch is the whole of the harness's TLS
+             * write exposure, and it is the same shape of call as the plaintext
+             * one. */
+            w = (int)send(t->fd, buf + sent, (size_t)(n - sent), MSG_NOSIGNAL);
         }
         if (w > 0) {
             sent += w;
