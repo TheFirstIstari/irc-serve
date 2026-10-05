@@ -387,15 +387,22 @@ size_t conn_hostmask(const conn_t *c, char *out, size_t cap)
  *                sizes its own buffer from; a server that stores a fifth of it is the
  *                server that broke the promise.
  *
- *   BAD_BYTE     A realname reaches the node's own LOG, and it is the one
- *                client-supplied free-text field with no escaping between the socket
- *                and a printf("%s"). message_parse_n() refuses CR, LF and NUL
- *                already, so the three that matter most cannot arrive; what CAN
- *                arrive is every other C0 control and DEL. 0x07 rings the recipient's
- *                terminal bell, and ESC followed by `[` is a CSI sequence any
- *                terminal will execute -- which is a realname that rewrites the
- *                operator's screen, from a channel member, into a log that other
- *                tooling also reads.
+ *   BAD_BYTE     A realname reaches the node's own LOG, with no escaping between
+ *                the socket and a printf("%s"). message_parse_n() refuses CR, LF
+ *                and NUL already, so the three that matter most cannot arrive; what
+ *                CAN arrive is every other C0 control and DEL. 0x07 rings the
+ *                recipient's terminal bell, and ESC followed by `[` is a CSI
+ *                sequence any terminal will execute -- which is a realname that
+ *                rewrites the operator's screen, from a channel member, into a log
+ *                that other tooling also reads.
+ *
+ *                It was once "the one client-supplied free-text field with no
+ *                escaping between the socket and a printf(\"%s\")", and that was
+ *                true until #121 found the two that were not -- USER's
+ *                <servername> and AWAY's text -- and then found the topic as well.
+ *                The claim is corrected here rather than left: it is exactly the
+ *                kind of sentence that makes the next reader believe the set is
+ *                closed.
  *
  *                The test is `ch <= 0x1f || ch == 0x7f`, and it is the SAME rule
  *                `chan_name_valid()` already applies to a channel name (channel.c),
@@ -406,7 +413,20 @@ size_t conn_hostmask(const conn_t *c, char *out, size_t cap)
  *
  * NULL IS OK: an empty realname is a legal state (chan_verbs.c's extended-join
  * comment says so, and renders it as a bare `:`), and a client that clears its own
- * realname must be able to say so. */
+ * realname must be able to say so.
+ *
+ * THE BYTE TEST IS NOT WRITTEN HERE. It is `conn_byte_is_bad()` below, which the
+ * header names as the single definition of the log-injection set, and this
+ * function asks it for a count and treats a non-zero count as the refusal. That
+ * is a deliberate indirection: a third field needs the same question asked and
+ * answering it from its own copy of `ch <= 0x1f || ch == 0x7f` is how the two
+ * come to disagree about which bytes are dangerous.
+ *
+ * WHAT IT COSTS: the loop no longer stops at the FIRST bad byte, because the
+ * count is a count. On a registration path, over a string the parser has already
+ * bounded at one IRC line, that is one extra pass over at most a few hundred
+ * bytes on a command a client sends once -- and it buys the exact byte count the
+ * log line below reports. */
 conn_realname_verdict_t conn_realname_check(const char *name)
 {
     if (name == NULL) {
@@ -415,12 +435,100 @@ conn_realname_verdict_t conn_realname_check(const char *name)
     if (strlen(name) > (size_t)CONN_MAX_REALNAME) {
         return CONN_REALNAME_TOO_LONG;
     }
-    for (size_t i = 0; name[i] != '\0'; i++) {
-        const unsigned char ch = (unsigned char)name[i];
-
-        if (ch <= 0x1fu || ch == 0x7fu) {
-            return CONN_REALNAME_BAD_BYTE;
-        }
+    if (conn_text_bad_count(name) != 0u) {
+        return CONN_REALNAME_BAD_BYTE;
     }
     return CONN_REALNAME_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * THE LOG-INJECTION SET, defined once
+ * ---------------------------------------------------------------------------
+ * The whole of §9's hazard is these bytes: 0x07 rings a terminal's bell, and ESC
+ * followed by `[` is a CSI sequence any terminal executes -- so a channel member
+ * can rewrite an operator's screen through a log line, and a member's terminal can
+ * be rewritten by another member. `message_parse_n()` refuses CR, LF and NUL
+ * before any of this runs, so the range that reaches a caller is 0x01-0x08, 0x0b,
+ * 0x0c, 0x0e-0x1f and 0x7f.
+ *
+ * DEL (0x7f) is in the set and that is not an accident of the C0 range: it is not
+ * a control character to a terminal, it is an ordinary printable glyph in most
+ * fonts, and it is invisible in a log. A byte that cannot be seen but can be
+ * matched is worth refusing for a log the node has just described as the place
+ * where refusals are made findable.
+ *
+ * SPACE (0x20) is OUT, and TAB (0x09) is IN. The argument for both is at the
+ * header: space is the commonest byte in every field this touches, and TAB is a
+ * rendering accident in a sentence somebody typed.
+ *
+ * BYTES >= 0x80 ARE OUT, permanently. That is the line that keeps UTF-8 intact:
+ * every continuation byte of every multi-byte sequence is >= 0x80, so a filter
+ * that reached them would corrupt non-ASCII text SILENTLY, which is a worse
+ * failure than the injection this closes because the user cannot see it happen.
+ *
+ * STATIC, and that is a design statement rather than an encapsulation habit: it
+ * is THE predicate, and it has exactly two callers in this file. Both are exposed
+ * in connection.h because a field in another module must be able to ask the
+ * question, and neither needs the byte test itself -- asking "how many" answers
+ * "is there any" as `!= 0`, and the strip is the other operation. */
+static int conn_byte_is_bad(char ch)
+{
+    const unsigned char u = (unsigned char)ch;
+
+    return (u <= 0x1fu || u == 0x7fu) ? 1 : 0;
+}
+
+/* How many bytes of `s` are in the set. 0 for NULL, because NULL is not a string
+ * and a caller that has no value has no bad byte -- which is what lets an empty
+ * or absent parameter take the same path as a clean one. */
+size_t conn_text_bad_count(const char *s)
+{
+    size_t n = 0;
+
+    if (s == NULL) {
+        return 0;
+    }
+    for (size_t i = 0; s[i] != '\0'; i++) {
+        if (conn_byte_is_bad(s[i]) != 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* One pass, two outputs: the kept bytes go to `dst` and the KEPT COUNT comes back
+ * to the caller, which derives "how many were dropped" by subtracting the input's
+ * own strlen() from it. A caller that instead called conn_text_bad_count() first
+ * to get that number would walk the same client-supplied string twice to learn
+ * one integer, on a path that runs once per away change rather than once per
+ * packet. */
+size_t conn_text_strip(char *dst, size_t cap, const char *src)
+{
+    size_t kept = 0;
+
+    if (dst == NULL || cap == 0u) {
+        return 0;
+    }
+    if (src == NULL) {
+        dst[0] = '\0';
+        return 0;
+    }
+    for (size_t i = 0; src[i] != '\0'; i++) {
+        if (conn_byte_is_bad(src[i]) != 0) {
+            continue;
+        }
+        /* The bound is a SAFETY net rather than a policy. Every caller has already
+         * applied its field's own length bound and stripping only removes bytes,
+         * so this cannot fire -- and it is written rather than assumed because the
+         * alternative is a silent overflow of a field whose size is a protocol
+         * constant three modules deep. `cap` counts the terminator, so `kept` is
+         * always <= cap - 1 and the store above is always in bounds. */
+        if (kept + 1u >= cap) {
+            break;
+        }
+        dst[kept] = src[i];
+        kept++;
+    }
+    dst[kept] = '\0';
+    return kept;
 }

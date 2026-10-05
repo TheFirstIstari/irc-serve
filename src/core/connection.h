@@ -303,6 +303,113 @@ typedef enum {
  * definition. */
 conn_realname_verdict_t conn_realname_check(const char *name);
 
+/* ---------------------------------------------------------------------------
+ * THE LOG-INJECTION SET: ONE BYTE TEST, TWO OPERATIONS, THREE POLICIES
+ * ---------------------------------------------------------------------------
+ * §9 names this class: "`0x07` rings a recipient's bell and ESC `[` is a CSI
+ * sequence a terminal executes". A client-supplied string reaches either this
+ * node's own `printf("%s")` or another client's terminal, and in both cases the
+ * dangerous bytes are the same ones -- a C0 control (0x00-0x1f) or DEL (0x7f).
+ * `message_parse_n()` refuses CR, LF and NUL ahead of every consumer, so what
+ * gets through is everything else in that range plus DEL.
+ *
+ * WHY THE SET IS DEFINED HERE AND NOT AT EACH FIELD. The three fields that reach
+ * output with client bytes in them have THREE DIFFERENT CONSUMERS, and the
+ * consumer is what decides the policy -- see the table at the bottom of this
+ * block. Three policies written three times is three chances to spell the byte
+ * test differently, and a fourth field would then have no rule at all. So the
+ * byte test exists once, here, and a field chooses only its POLICY.
+ *
+ * THE TWO OPERATIONS, AND WHY ONLY TWO.
+ *
+ *   conn_text_bad_count()  MEASURE. How many bytes of this string are in the set.
+ *                         Zero means "needs no policy", which is what lets a
+ *                         caller make the log line for the common case cost one
+ *                         integer rather than a branch. It is also the ONLY place
+ *                         the count exists, so a caller reporting "3 bytes were
+ *                         dropped" and a caller asking "was this clean" cannot
+ *                         disagree about how many there were.
+ *
+ *   conn_text_strip()     MUTATE. Copy with the set's bytes removed, and report
+ *                         how many bytes were KEPT -- the caller derives "how many
+ *                         were dropped" from its own strlen() of the input, so the
+ *                         measure and the mutation are the same pass.
+ *
+ * WHAT IS DELIBERATELY NOT HERE, because each is a policy and not a predicate:
+ * truncation (3.2 refuses a silently shortened field), escaping (nothing in this
+ * node escapes, so a reader would have to un-escape it), and a per-field byte
+ * filter. A caller that wants a field REFUSED does not call strip() and then
+ * notice an empty string -- it calls conn_text_bad_count() and refuses.
+ *
+ * THE COST OF THE SET, named once so every caller does not have to name it:
+ *
+ *   - SPACE is NOT in the set and TAB IS. Space is the single most common byte in
+ *     every one of these fields and removing it would mangle ordinary text. TAB
+ *     (0x09) is inside the C0 range, so it goes: a TAB in a sentence somebody
+ *     typed is a rendering accident, and a terminal is entitled to expand it to
+ *     eight columns in a field the sender did not measure.
+ *   - BYTES >= 0x80 ARE NOT IN THE SET and never will be. UTF-8 is the ordinary
+ *     encoding of a real nickname, a real topic and a real away message, and its
+ *     continuation bytes are all >= 0x80. A filter that removed them would break
+ *     every non-ASCII user on the node, SILENTLY -- a mangled multi-byte sequence
+ *     is indistinguishable from text the sender wrote. That failure is worse than
+ *     the one this block exists to close, which is why the set stops at 0x7f.
+ *   - Consequently the set cannot be split or shortened by a read boundary: the
+ *     stripper sees one already-assembled NUL-terminated parameter, and a
+ *     multi-byte sequence the client sent in two TCP writes is one string by then.
+ */
+size_t conn_text_bad_count(const char *s);
+
+/* Copy `src` into `dst`, dropping every byte the set contains, and
+ * NUL-terminate. Returns the number of bytes KEPT.
+ *
+ * `cap` counts the terminator, as everywhere else in this header. `src` shorter
+ * than `cap` minus one is the only case that can arise: every caller has already
+ * applied the field's own length bound, and removing bytes can only make the
+ * result shorter, so a caller that got here with a value that fitted still fits.
+ *
+ * WHAT IT COSTS, and what a strip is NOT: it is not truncation, so it never
+ * shortens a field that had no bad byte in it, and it never reorders or rewrites
+ * anything it keeps. `0x00` cannot arrive (the parser refuses it) and is in the
+ * set anyway, so the result is always a well-formed C string.
+ *
+ * SILENT MUTATION IS ITS OWN DEFECT, which is why nothing in this node strips
+ * without also logging that it did. A caller that uses this MUST emit a line
+ * saying so; the byte count it returns is what that line reports. */
+size_t conn_text_strip(char *dst, size_t cap, const char *src);
+
+/* ---------------------------------------------------------------------------
+ * THE POLICY TABLE, and why three fields do not get three copies of this comment
+ * ---------------------------------------------------------------------------
+ * The field decides what to DO with a string in this set, and the decision is
+ * made by its CONSUMER rather than by the string:
+ *
+ *   REALNAME   (conn_t::realname)     REFUSED. It is rendered to every member of
+ *                                     every channel the user is on and to two
+ *                                     peers, so a rewritten value is reported to
+ *                                     third parties as though they wrote it.
+ *                                     conn_realname_check() above, and both
+ *                                     writers run it.
+ *   AWAY TEXT  (conn_t::away)         STRIPPED. It is legitimate user content a
+ *                                     real client sends, so refusing it breaks a
+ *                                     working feature; and a member's terminal is
+ *                                     where it lands.
+ *   TOPIC      (chan_t::topic)        STRIPPED. Same answer for the same reason,
+ *                                     and worse in exposure: a topic is stored,
+ *                                     replayed to every future joiner by 332/333
+ *                                     and forwarded to peers, so one write is a
+ *                                     long-lived injection rather than an
+ *                                     immediate one.
+ *   SERVERNAME (USER's <servername>)  NOT LOGGED AT ALL. This node ignores it --
+ *                                     the host is observed -- so emitting it buys
+ *                                     no diagnostic and creates the whole hazard.
+ *                                     commands.c's handle_user() reports its LENGTH
+ *                                     and whether it was well-formed instead, and
+ *                                     that needs no call into this block at all.
+ *
+ * A field with a different consumer gets a different entry, and the entry is the
+ * argument. What no field may do is print the raw value. */
+
 /* conn_t::account -- the second axis of scoped identity (2.1), added in Phase
  * 10.1.
  *

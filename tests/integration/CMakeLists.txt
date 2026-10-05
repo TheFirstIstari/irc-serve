@@ -707,3 +707,14 @@ irc_add_integration_test(test_tls test_tls.c)
 # startup rather than accepted and ignored.
 set(irc_timeout_test_peer_tls 180)
 irc_add_integration_test(test_peer_tls test_peer_tls.c)
+
+# The log-injection set (#121): `conn_byte_is_bad()` and the three policies built
+# on it. Its own file because the three fields have three different CONSUMERS and
+# therefore three different answers -- a servername nothing reads is MEASURED, an
+# away message and a topic that reach other members' terminals are STRIPPED and the
+# strip is announced, and a realname that is reported to third parties is still
+# REFUSED -- so "one predicate, per-field policy" is only checkable if all three
+# policies and both positive controls are in one place. The two "keeps good bytes"
+# cases are the ones that keep the strip from eating spaces and UTF-8, which is the
+# failure mode that would be worse than the injection because it is silent.
+irc_add_integration_test(test_control_bytes test_control_bytes.c)

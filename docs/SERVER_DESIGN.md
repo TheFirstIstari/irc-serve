@@ -1205,6 +1205,12 @@ code rather than a claim about it. It refuses two things:
   accident rather than a name, and no current client sends one. That is the cost and
   it is named rather than assumed.
 
+  Since #121 this is no longer a rule written at this predicate. The byte test is
+  **`conn_byte_is_bad()`**, defined once in `connection.c` behind
+  `conn_text_bad_count()` and `conn_text_strip()`, and this function asks the count
+  question rather than looping over the string itself. See §9's row below for why
+  three fields share it and what each of them does with the answer.
+
 **Why `USER` behaves differently on length, on purpose.** `USER` *truncates* an
 over-long realname and *empties* a control-bearing one, where `SETNAME` refuses both.
 The asymmetry is about when the command arrives: `SETNAME` lands on a live
