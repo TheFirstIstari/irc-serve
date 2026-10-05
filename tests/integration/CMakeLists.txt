@@ -35,6 +35,12 @@ target_include_directories(test_harness PUBLIC ${PROJECT_SOURCE_DIR}/tests)
 target_compile_definitions(test_harness PUBLIC
   NF_SERVER_BIN="$<TARGET_FILE:irc-serve>"
   IRCSERVE_SRC_DIR="${PROJECT_SOURCE_DIR}"
+  # WHAT CMAKE PARSED OUT OF src/core/server.h, as a string. It is here so a test can
+  # compare it against IRC_SERVE_VERSION from the same translation unit and say so at
+  # RUNTIME: if the regex in the top-level CMakeLists stops matching, or someone puts a
+  # literal back into project(), this definition disagrees with the header and a test
+  # fails. A definition nobody compares is a comment.
+  IRC_SERVE_CMAKE_VERSION="${IRC_SERVE_VERSION}"
   # Where the TLS fixture writes its generated certificates. A build directory
   # rather than /tmp, and per-process rather than shared, so two runs of this test
   # -- which a developer does while bisecting -- cannot collide over a directory
@@ -715,6 +721,13 @@ irc_add_integration_test(test_tls test_tls.c)
 # 30s, per the rule above.
 set(irc_timeout_test_tls_revocation 240)
 irc_add_integration_test(test_tls_revocation test_tls_revocation.c)
+
+# THE VERSION, AND THE RULE THAT KEEPS IT FROM DRIFTING. Its own file because the
+# claim is a NEGATIVE -- no file outside the definition may hold a literal -- and a
+# negative is only checkable by looking at every candidate at once. It also runs in
+# the default build: every check is a source inspection or a run of the shipped
+# binary's --help and startup line, and none of them needs a crypto library.
+irc_add_integration_test(test_version_truth test_version_truth.c)
 
 # Phase 12 item 5: TLS on a PEER LINK, and the mixed-mesh decision. Its own file
 # because the decision is the deliverable as much as the code is: a mesh may MIX TLS

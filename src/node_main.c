@@ -208,6 +208,18 @@ static int install_handler(int sig, void (*handler)(int))
 
 static void usage(FILE *out, const char *argv0)
 {
+    /* THE VERSION, FIRST LINE, FROM THE SAME MACRO THE STARTUP LINE USES.
+     *
+     * IT IS HERE BECAUSE A FLAG SURFACE THAT DOES NOT SAY WHAT IT IS has to be
+     * cross-referenced against something else to find out, and this project has
+     * already shipped a version it could not answer that question from: the
+     * README said v1.0.0 while the binary and the build both said 0.1.0, and
+     * `--help` said nothing at all, so there was no way to tell from the tool
+     * which of the three was true. One macro, printed in both places, is the
+     * whole fix; tests/integration/test_version_truth.c asserts the three agree --
+     * this text, the startup line, and the number CMake parsed out of the same
+     * header. */
+    fprintf(out, "%s\n", IRC_SERVE_VERSION);
     fprintf(out, "usage: %s [port] [--name NAME] [--secret S]\n", argv0);
     fprintf(out, "            [--sasl-store PATH] [--account-store PATH]\n");
     fprintf(out, "            [--peer NAME,HOST,PORT]... [--peer-tls NAME]...\n");

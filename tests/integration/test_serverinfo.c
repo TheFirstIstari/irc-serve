@@ -61,6 +61,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "core/server.h"
 #include "harness/irc_client.h"
 #include "harness/node_fixture.h"
 #include "harness/test_util.h"
@@ -69,7 +70,14 @@
 #define T_IO_MS 15000
 
 #define BIN_NAME "irc.test"
-#define VERSION "irc-serve-0.1.0"
+/* IRC_SERVE_VERSION, AND NOT A LITERAL, which is what this used to be. The rule was
+ * already written down -- tests/integration/test_registration.c says it in as many
+ * words, that asserting a hardcoded "0.1.0" "would make this test fail on every
+ * version bump, and a test that gets deleted or loosened on each release is worth
+ * less than one that keeps checking the FORMAT" -- and this file broke it anyway,
+ * which is the whole argument for having a test that can see a second copy rather
+ * than a comment asking nicely. See tests/integration/test_version_truth.c. */
+#define VERSION IRC_SERVE_VERSION
 #define NETWORK "irc-serve"
 
 /* 4.4's server-info range and the ceiling 251/265/266 carry. 1024 is
