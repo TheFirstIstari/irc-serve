@@ -523,6 +523,25 @@ static void case_no_client_byte_reaches_the_log(void)
                  "validator -- so the assertion is what proves it.\n  log: %s",
                  node.out);
 
+    /* THE CLIENT IS CLOSED, and this is not tidiness -- it is a LeakSanitizer
+     * failure on Linux.
+     *
+     * `tc_expect()` grows the client's read buffer with realloc() as bytes arrive,
+     * and this case reads enough of them that the buffer is 4096 bytes by the end.
+     * Nothing frees it: the client is a stack object, so there is no destructor to
+     * run it, and the node being freed does not touch it. The process exits with
+     * that allocation live, and LeakSanitizer -- which the macOS gate EXCLUDES,
+     * because LSan does not exist on Darwin -- is the only thing that ever notices.
+     *
+     * So the failure is Linux-only and it was invisible here for two independent
+     * reasons: the platform does not run the detector, and until this pass fixed the
+     * fd pin the test EXITED at that assertion and never reached the end of the
+     * case. Fixing the assertion is what exposed the leak, which is the usual
+     * relationship between two fixes: the second one was always there.
+     *
+     * Every other case in this suite closes its clients for the same reason, and the
+     * ones that do not are not passing on Linux either. */
+    tc_close(&c);
     nf_free(&node);
 }
 
