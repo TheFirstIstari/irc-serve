@@ -16,6 +16,10 @@
 #include <strings.h>
 
 #include "core/commands.h"
+/* For conn_text_logsafe() and CONN_LOG_FIELD_MAX -- the log-injection set, applied to
+ * the capability names this file renders. Named rather than reached through a
+ * transitive include. */
+#include "core/connection.h"
 #include "core/reply.h"
 #include "account_store.h"
 #include "sasl_framework.h"
@@ -909,9 +913,34 @@ static void cap_do_req(server_t *s, conn_t *c, const message_t *m)
     if (gn == 0u && rn == 0u) {
         cap_reply(s, c, "NAK", "");
     }
-    printf("[observable] cap: fd=%d sub=REQ requested=%d granted=%s refused=%s\n",
-           c->fd, n, (granted[0] != '\0') ? granted : "-",
-           (refused[0] != '\0') ? refused : "-");
+    /* BOTH NAMES ARE CLIENT TEXT, and both are measured. `refused` is assembled
+     * from `m->params[1]` by `cap_split()`/`cap_append_name()`, so it is whatever
+     * capability names the client asked for -- including ones this node has never
+     * heard of, which is exactly the diagnostic on the line this node emits when
+     * it refuses. A raw print put a client's bytes in the log here.
+     *
+     * MEASURED RATHER THAN STRIPPED, and the reason is that this is a log: nothing
+     * downstream of it reads the value. A stripped `multi-prefix` is still
+     * `multi-prefix`, but a stripped `<ESC>[2J` is a shorter lie about what the
+     * client asked for, and `multi-prefix` is what a reader of a NAK actually came
+     * to the log for.
+     *
+     * `cap_append_name()` already bounds `refused` to CAP_LS_MAX, which is why the
+     * counts are honest rather than a truncation in disguise. */
+    {
+        char shown_granted[CONN_LOG_FIELD_MAX + 1u];
+        char shown_refused[CONN_LOG_FIELD_MAX + 1u];
+        const char *g = (granted[0] != '\0') ? granted : "";
+        const char *r = (refused[0] != '\0') ? refused : "";
+
+        (void)conn_text_logsafe(shown_granted, sizeof shown_granted, g);
+        (void)conn_text_logsafe(shown_refused, sizeof shown_refused, r);
+        printf("[observable] cap: fd=%d sub=REQ requested=%d granted=%s "
+               "granted_bad_bytes=%zu refused=%s refused_len=%zu "
+               "refused_bad_bytes=%zu\n",
+               c->fd, n, shown_granted, conn_text_bad_count(g), shown_refused,
+               strlen(r), conn_text_bad_count(r));
+    }
 }
 
 /* CAP DEL.
@@ -944,8 +973,17 @@ static void cap_do_del(server_t *s, conn_t *c, const message_t *m)
         }
     }
     cap_reply(s, c, "NAK", refused);
-    printf("[observable] cap: fd=%d sub=DEL refused=%s reason=NOT_NEGOTIABLE\n",
-           c->fd, (refused[0] != '\0') ? refused : "-");
+    /* As the REQ line above: a log-only value, so measured. The NAK still carries
+     * the client's own names back to the client that sent them. */
+    {
+        char shown[CONN_LOG_FIELD_MAX + 1u];
+        const char *r = (refused[0] != '\0') ? refused : "";
+
+        (void)conn_text_logsafe(shown, sizeof shown, r);
+        printf("[observable] cap: fd=%d sub=DEL refused=%s refused_len=%zu "
+               "refused_bad_bytes=%zu reason=NOT_NEGOTIABLE\n",
+               c->fd, shown, strlen(r), conn_text_bad_count(r));
+    }
 }
 
 /* CAP END.
@@ -1015,5 +1053,18 @@ void cap_handle(server_t *s, conn_t *c, const message_t *m)
      * recognise, so the operator can see which client asked for what. */
     (void)reply(s, c, RPL_INVALIDCAPSUBCOMMAND, (const char *const[]){ sub }, 1,
                 "Invalid CAP subcommand: %s", sub);
-    printf("[observable] cap: fd=%d sub=%s reason=UNKNOWN\n", c->fd, sub);
+    /* UNBOUNDED, and that is the difference from the two lines above. `sub` is
+     * `m->params[0]`, so it may be as long as the line cap rather than as long as
+     * CAP_LS_MAX -- which is why this one cannot even be reasoned about as a
+     * bounded buffer and is measured with the same shared predicate. It is also
+     * the branch a client reaches without any negotiation at all, which is what
+     * made `CAP <ESC>[2J` a one-line injection. */
+    {
+        char shown[CONN_LOG_FIELD_MAX + 1u];
+
+        (void)conn_text_logsafe(shown, sizeof shown, sub);
+        printf("[observable] cap: fd=%d sub=%s sub_len=%zu sub_bad_bytes=%zu "
+               "reason=UNKNOWN\n",
+               c->fd, shown, strlen(sub), conn_text_bad_count(sub));
+    }
 }

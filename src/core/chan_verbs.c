@@ -1495,9 +1495,28 @@ void handle_kick(server_t *s, conn_t *c, const message_t *m)
     if (strlen(reason) > (size_t)CHAN_MAX_KICK_REASON) {
         (void)reply_refused(s, c, "KICK", NULL, "417", NULL, 0,
                             "Kick reason is too long");
-        printf("[observable] chan_kick_refused: channel=%s nick=%s reason=too_long "
-               "len=%zu max=%d\n",
-               m->params[0], c->nick, strlen(reason), CHAN_MAX_KICK_REASON);
+        /* MEASURED, and the ORDERING is what makes it necessary: this line names
+         * `m->params[0]` -- the CHANNEL -- and it is printed BEFORE
+         * `resolve_joined()` has run `chan_name_valid()` over it. Every other
+         * `channel=%s` in this file prints `ch->name`, which is a stored name that
+         * passed the validator; this one is the exception and it was the raw path.
+         *
+         * Not a strip: the value is log-only, and a channel name is an identifier
+         * whose diagnostic value is that it is readable. Withheld when a byte in it
+         * would execute, with the length and the count beside it.
+         *
+         * THE 417 IS UNAFFECTED. The reason was rejected for being over-long, which
+         * is the fact the numeric reports, and the channel name plays no part in
+         * it -- so nothing here changes which numerics a client sees. */
+        {
+            char shown[CONN_LOG_FIELD_MAX + 1u];
+
+            (void)conn_text_logsafe(shown, sizeof shown, m->params[0]);
+            printf("[observable] chan_kick_refused: channel=%s channel_len=%zu "
+                   "channel_bad_bytes=%zu nick=%s reason=too_long len=%zu max=%d\n",
+                   shown, strlen(m->params[0]), conn_text_bad_count(m->params[0]),
+                   c->nick, strlen(reason), CHAN_MAX_KICK_REASON);
+        }
         return;
     }
 

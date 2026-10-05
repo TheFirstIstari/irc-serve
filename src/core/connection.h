@@ -379,6 +379,72 @@ size_t conn_text_bad_count(const char *s);
 size_t conn_text_strip(char *dst, size_t cap, const char *src);
 
 /* ---------------------------------------------------------------------------
+ * conn_text_logsafe(): RENDERING A CLIENT STRING INTO A LOG LINE
+ * ---------------------------------------------------------------------------
+ * Rule 1's operation, and the one the log-only fields need. Where
+ * `conn_text_strip()` MUTATES a field that is relayed to other people, this one
+ * decides whether a value may be PRINTED -- and it is a different question, which
+ * is why it is a different function rather than a flag on the strip.
+ *
+ * WRITES `s` INTO `out` VERBATIM when every byte is printable ASCII (0x20-0x7e),
+ * and a single `-` otherwise. Returns the number of bytes written, excluding the
+ * terminator. A NULL or empty `s` yields `-`.
+ *
+ * WHY VERBATIM-OR-`-` AND NOT A STRIP. A stripped command word is no longer the
+ * command word: `cmd_unknown: command=NICK` printed as `command=NICK` is the whole
+ * diagnostic, and printed as `command=NI` (ESC removed from `NICK\x1b`) would name
+ * a command the client did not send and would defeat the line's only purpose. So
+ * for a log the value is kept when it is KNOWN SAFE and withheld when it is not,
+ * with the measurement beside it -- which is also why this is not the same
+ * operation as the strip: one is about what a terminal will execute, the other
+ * about what an operator can read.
+ *
+ * WHY 0x20 AND NOT 0x21. Space is printable, it is the byte a nick or a verb can
+ * legitimately hold in a log field, and nothing here needs to be a shell argument.
+ * The set this screens out is exactly `conn_byte_is_bad()`'s -- C0 and DEL -- plus
+ * nothing else, so `conn_text_logsafe()` and `conn_text_bad_count()` can never
+ * disagree about a string.
+ *
+ * `cap` IS THE WIDEST VALUE THIS NODE WILL PRINT, AND A LONGER ONE PRINTS AS `-`.
+ * That is not a truncation and it is deliberate: a log line that shortened a value
+ * mid-word would name a different thing than the client sent, which is 3.2's rule
+ * and is exactly the failure this function exists to prevent. So a value too long
+ * for the field is WITHHELD rather than shortened, and the caller's `len=` beside
+ * it is what says how long it really was. The cost is that a verb longer than the
+ * field prints as `-`; every verb in `commands.c`'s table is under 20 bytes and the
+ * field is 64, so no real input reaches it.
+ *
+ * WHAT IT DOES NOT DO, and the caller must: it writes the value, not the
+ * measurement. Every caller pairs it with `strlen()` and
+ * `conn_text_bad_count()` on the SAME string, so the line carries
+ * `<field>=<value or -> <field>_len=N <field>_bad_bytes=M` and a reader learns
+ * both what was said and what was not safe to say. The two counts come from the
+ * same predicate as the decision, which is the property that makes the line
+ * trustworthy rather than merely quiet.
+ *
+ * COST: one pass, on a string already in memory, on a path that runs once per
+ * command. `cap` must be at least 2. */
+/* The widest client-supplied string this node prints VERBATIM into one of its own
+ * log lines, and the buffer size every `conn_text_logsafe()` caller derives from it.
+ *
+ * 64 is `CONN_MAX_BATCH_REF`, which is the widest identifier-shaped value in the
+ * tree, and it is chosen for the stack rather than for the wire: every call site is
+ * a local in a handler or in the read step, so this is bytes on the stack per frame
+ * and nothing else. It is deliberately NOT `IRC_MAX_LINE` -- an 8 KiB buffer in the
+ * read step, on a path that runs once per received line, to hold a command word
+ * whose longest real value is 12 bytes, is the kind of cost that gets paid on every
+ * connection forever to serve an input no client sends.
+ *
+ * WHAT A LONGER VALUE COSTS, and it is a real cost rather than a rounding error: it
+ * prints as `-` instead of as itself. `conn_text_logsafe()` withholds rather than
+ * shortens, so nothing on the line names something the client did not send, and
+ * every caller prints the value's true `len=` beside the `-`, which is what makes
+ * the withholding diagnosable instead of mysterious. */
+#define CONN_LOG_FIELD_MAX 64
+
+size_t conn_text_logsafe(char *out, size_t cap, const char *s);
+
+/* ---------------------------------------------------------------------------
  * THE POLICY TABLE, and why three fields do not get three copies of this comment
  * ---------------------------------------------------------------------------
  * The field decides what to DO with a string in this set, and the decision is

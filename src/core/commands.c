@@ -1102,6 +1102,39 @@ static void handle_setname(server_t *s, conn_t *c, const message_t *m)
 /* PING. Legal before registration, like every liveness probe: a client that
  * sent NICK and USER in one segment and then PINGs must get its answer, and a
  * client stuck mid-registration must be able to tell the node is alive. */
+/*
+ * ---------------------------------------------------------------------------
+ * EVERY LOG LINE IN THIS FILE THAT NAMES A CLIENT-SUPPLIED STRING
+ * ---------------------------------------------------------------------------
+ * `conn_text_logsafe()` is the one rule for all of them, and it exists because
+ * there were fourteen of them and each had been written as `%s`.
+ *
+ * A command word, a PING token, a QUIT reason, a server mask, a nickname a client
+ * offered and a SASL mechanism are all bytes off a socket, and every one of them
+ * reached this node's own stdout unfiltered. The reachable ones needed no
+ * credential and no registration: one unrecognised verb carrying ESC in its word,
+ * one `PING`, one `QUIT`. `0x07` rings a terminal's bell and ESC `[` is a CSI
+ * sequence any terminal executes, so this was a way for anyone who could open a
+ * socket to rewrite an operator's screen.
+ *
+ * WHY NOT STRIP THESE. A STRIP is for a field that is RELAYED to other people --
+ * an away message, a topic, a kick reason -- where removing the byte changes what
+ * they read. Every value below is LOG-ONLY: nothing else ever sees it, so there is
+ * nothing to protect by rewriting it and a great deal to lose. `cmd_unknown:
+ * command=NICK` is the entire diagnostic; printed with a byte removed it would
+ * name a verb the client never sent. So these are MEASURED: the value is kept when
+ * every byte is printable ASCII, withheld when one is not, and the length and the
+ * bad-byte count go beside it either way.
+ *
+ * NOT ALL FOURTEEN WERE BROKEN, and the ones that were not are named at their own
+ * definitions rather than here. `commands.c` prints `c->nick`, `c->user`,
+ * `c->host`, `c->realname`, `c->account` and `ch->name` throughout: every one of
+ * those passed `valid_nick()`, `chan_name_valid()`, `conn_realname_check()` or
+ * `account_name_wire_safe()` on the way in, and a field that cannot hold a byte
+ * from the set needs no second opinion on the way out.
+ * ---------------------------------------------------------------------------
+ */
+
 static void handle_ping(server_t *s, conn_t *c, const message_t *m)
 {
     const char *token = (m->nparams > 0) ? m->params[0] : NULL;
@@ -1109,8 +1142,19 @@ static void handle_ping(server_t *s, conn_t *c, const message_t *m)
     /* A PING with no argument is answered with the server name (RFC 1459 2.4);
      * send_pong() applies that to an absent or empty token. */
     (void)send_pong(s, c, token);
-    printf("[observable] ping: fd=%d token=%s\n", c->fd,
-           (token != NULL) ? token : "-");
+    {
+        char shown[CONN_LOG_FIELD_MAX + 1u];
+
+        /* The token is an OPAQUE STRING THE CLIENT MADE UP, and this is the only
+         * place it is ever rendered. It reaches the wire too -- inside the PONG --
+         * but that goes back to the client that sent it, so the log is where the
+         * hazard is: `PING <ESC>[2J` put a control byte in an operator's terminal
+         * from one line, before registration. */
+        (void)conn_text_logsafe(shown, sizeof shown, token);
+        printf("[observable] ping: fd=%d token=%s token_len=%zu token_bad_bytes=%zu\n",
+               c->fd, shown, (token != NULL) ? strlen(token) : 0u,
+               conn_text_bad_count(token));
+    }
 }
 
 /* PONG. Accepted and answered with nothing: a PONG is a reply to something the
@@ -1120,8 +1164,19 @@ static void handle_ping(server_t *s, conn_t *c, const message_t *m)
 static void handle_pong(server_t *s, conn_t *c, const message_t *m)
 {
     (void)s; /* the accepted PONG answers nothing, so it needs no node state */
-    printf("[observable] pong: fd=%d token=%s\n", c->fd,
-           (m->nparams > 0) ? m->params[0] : "-");
+    {
+        const char *tok = (m->nparams > 0) ? m->params[0] : NULL;
+        char shown[CONN_LOG_FIELD_MAX + 1u];
+
+        /* The same rule as PING, and the same reason: this token is echoed to the
+         * log and to nobody else. A PONG is the one line a client can send whose
+         * entire content is attacker-chosen and unexamined, so it is the cheapest
+         * injection on this node and it is closed by the same shared predicate. */
+        (void)conn_text_logsafe(shown, sizeof shown, tok);
+        printf("[observable] pong: fd=%d token=%s token_len=%zu token_bad_bytes=%zu\n",
+               c->fd, shown, (tok != NULL) ? strlen(tok) : 0u,
+               conn_text_bad_count(tok));
+    }
 }
 
 /* QUIT. Release the nickname, then mark the connection CLOSING.
@@ -1160,9 +1215,29 @@ static void handle_quit(server_t *s, conn_t *c, const message_t *m)
 
     server_nick_unclaim(s, c);
     /* The reason is logged, never stored: there is no NickServ, no quit cache,
-     * and no reason for one to exist until Phase 9. */
-    printf("[observable] quit: fd=%d nick=%s reason=%s\n", c->fd, c->nick,
-           (reason != NULL) ? reason : "-");
+     * and no reason for one to exist until Phase 9.
+     *
+     * WHICH MAKES IT A LOG-ONLY FIELD, and that is the whole policy: measured, not
+     * filtered. A `QUIT :<ESC>[2J` reached an operator's terminal raw, and unlike
+     * the away message this value is never relayed to another client, so there is
+     * no reader downstream to protect and a stripped copy would only be a shorter
+     * lie about what the client sent. The length is reported beside the value
+     * because a reason is free text of unbounded length -- up to the line cap --
+     * and a withheld one has to be diagnosable.
+     *
+     * NOT TRUNCATED, which is why the field is withheld rather than shortened when
+     * it exceeds the print width. A log line that cut a sentence in half would be
+     * a different sentence from the one the client sent, and 3.2's rule against
+     * silently shortening a parameter is about exactly that even here. */
+    {
+        char shown[CONN_LOG_FIELD_MAX + 1u];
+
+        (void)conn_text_logsafe(shown, sizeof shown, reason);
+        printf("[observable] quit: fd=%d nick=%s reason=%s reason_len=%zu "
+               "reason_bad_bytes=%zu\n",
+               c->fd, c->nick, shown, (reason != NULL) ? strlen(reason) : 0u,
+               conn_text_bad_count(reason));
+    }
     conn_mark_closing(c);
 }
 
@@ -1293,9 +1368,20 @@ static int refuse_foreign_server(server_t *s, conn_t *c, const char *verb,
 {
     (void)reply(s, c, "402", (const char *const[]){ arg }, 1,
                 "No such server: %s cannot reach %s", s->name, arg);
-    printf("[observable] srv_query: verb=%s nick=%s server=%s "
-           "reason=NO_SUMSERVER\n",
-           verb, c->nick, arg);
+    /* `arg` is `m->params[i]` from whichever verb asked -- LUSERS, VERSION, TIME,
+     * STATS, LINKS, MOTD -- so it is whatever the client put there, and this line
+     * named it. Measured, like every other log-only value in this file: the 402
+     * above still echoes the same string back to the client that sent it, which is
+     * the right thing for a refusal and is not a hazard, because there is no second
+     * reader. */
+    {
+        char shown[CONN_LOG_FIELD_MAX + 1u];
+
+        (void)conn_text_logsafe(shown, sizeof shown, arg);
+        printf("[observable] srv_query: verb=%s nick=%s server=%s server_len=%zu "
+               "server_bad_bytes=%zu reason=NO_SUMSERVER\n",
+               verb, c->nick, shown, strlen(arg), conn_text_bad_count(arg));
+    }
     return 1;
 }
 
@@ -1562,8 +1648,20 @@ static void handle_choper(server_t *s, conn_t *c, const message_t *m)
     if (who == NULL) {
         (void)reply(s, c, "401", (const char *const[]){ m->params[0] }, 1,
                     "No such nick/channel");
-        printf("[observable] choper_refused: by=%s target=%s reason=NO_SUCH_NICK\n",
-               c->nick, m->params[0]);
+        /* Measured, for the reason every other log-only value here is: this
+         * branch is reached precisely when the name is one this node does NOT
+         * hold, so it is the one place a nickname-shaped string arrives that has
+         * not been through `valid_nick()`. The 401 above still names it back to
+         * its sender. */
+        {
+            char shown[CONN_LOG_FIELD_MAX + 1u];
+
+            (void)conn_text_logsafe(shown, sizeof shown, m->params[0]);
+            printf("[observable] choper_refused: by=%s target=%s target_len=%zu "
+                   "target_bad_bytes=%zu reason=NO_SUCH_NICK\n",
+                   c->nick, shown, strlen(m->params[0]),
+                   conn_text_bad_count(m->params[0]));
+        }
         return;
     }
 
@@ -2090,8 +2188,26 @@ static void handle_authenticate(server_t *s, conn_t *c, const message_t *m)
         params[0] = (sasl_store_count(s->sasl_store) > 0u) ? "PLAIN" : "";
         (void)reply(s, c, RPL_SASLMECHS, params, 1,
                     "are available SASL mechanisms");
-        printf("[observable] sasl: fd=%d outcome=MECH_REFUSED mech=%s\n", c->fd,
-               mech);
+        /* THE MECHANISM IS MEASURED, NOT ASSUMED SAFE. It is worth saying
+         * explicitly because an earlier reading of this pass claimed `mech` was
+         * "already bounded and named by 908" -- it is NEITHER. Nothing bounds it
+         * before this line: it is `m->params[0]`, so it may be as long as the line
+         * cap, and 908 names the mechanism in a REPLY to the client rather than
+         * constraining what the log may print. Measured on the pre-fix binary, a
+         * single `AUTHENTICATE <ESC>[2J` put both bytes in the log.
+         *
+         * `authzid` is excluded from this line and from every other line on this
+         * path deliberately, and the header at handle_authenticate() gives the
+         * reason: it is the other half of a credential and adding it to a log buys
+         * nothing. That exclusion is unchanged. */
+        {
+            char shown[CONN_LOG_FIELD_MAX + 1u];
+
+            (void)conn_text_logsafe(shown, sizeof shown, mech);
+            printf("[observable] sasl: fd=%d outcome=MECH_REFUSED mech=%s "
+                   "mech_len=%zu mech_bad_bytes=%zu\n",
+                   c->fd, shown, strlen(mech), conn_text_bad_count(mech));
+        }
         return;
     }
 
@@ -2387,8 +2503,15 @@ void commands_dispatch(server_t *s, conn_t *c, const message_t *m)
      * carrying "QUIT :bye" and "PING :are you there" hands this function a
      * second line after the first has already marked the conn CLOSING. */
     if (c->state == CONN_CLOSING) {
-        printf("[observable] cmd_dropped: fd=%d command=%s reason=closing\n",
-               c->fd, m->command);
+        /* Measured, like poll_loop.c's `line:` and for the same reason: this is a
+         * verb off a socket and a verb is an identifier, so the value is kept when
+         * it is printable and withheld when it is not. */
+        char shown[CONN_LOG_FIELD_MAX + 1u];
+
+        (void)conn_text_logsafe(shown, sizeof shown, m->command);
+        printf("[observable] cmd_dropped: fd=%d command=%s command_len=%zu "
+               "command_bad_bytes=%zu reason=closing\n",
+               c->fd, shown, strlen(m->command), conn_text_bad_count(m->command));
         return;
     }
 
@@ -2407,9 +2530,22 @@ void commands_dispatch(server_t *s, conn_t *c, const message_t *m)
     if (cmd == NULL) {
         const char *mid[1];
 
+        /* THE 421 ECHOES THE VERB BACK VERBATIM AND THAT STAYS. The verb is going
+         * to the client that sent it, so there is no second reader and no hazard,
+         * and RFC 2812 3.3.4's 421 names the command precisely so a client can
+         * match it. It is the LOG that needed the measurement, and only the log.
+         *
+         * This is also the most exposed single line on the node: an unrecognised
+         * verb is answerable before registration, needs no credential, and nothing
+         * examined the word before it was printed. */
+        char shown[CONN_LOG_FIELD_MAX + 1u];
+
         mid[0] = m->command;
         (void)reply(s, c, "421", mid, 1, "Unknown command");
-        printf("[observable] cmd_unknown: fd=%d command=%s\n", c->fd, m->command);
+        (void)conn_text_logsafe(shown, sizeof shown, m->command);
+        printf("[observable] cmd_unknown: fd=%d command=%s command_len=%zu "
+               "command_bad_bytes=%zu\n",
+               c->fd, shown, strlen(m->command), conn_text_bad_count(m->command));
         return;
     }
     if (cmd->fn == NULL) {
@@ -2420,10 +2556,17 @@ void commands_dispatch(server_t *s, conn_t *c, const message_t *m)
          * alternative is silence, and silence is the failure mode these
          * numerics exist to prevent. The [observable] line says which of the
          * two it was, so a log reader is not misled. */
+        /* As `cmd_unknown` above: the 421 names the verb to its own sender, the
+         * log measures it. `KILL` is the verb that reaches this branch on this
+         * build, so the line is not hypothetical. */
+        char shown[CONN_LOG_FIELD_MAX + 1u];
+
         mid[0] = m->command;
         (void)reply(s, c, "421", mid, 1, "Unknown command");
-        printf("[observable] cmd_unimplemented: fd=%d command=%s\n", c->fd,
-               m->command);
+        (void)conn_text_logsafe(shown, sizeof shown, m->command);
+        printf("[observable] cmd_unimplemented: fd=%d command=%s command_len=%zu "
+               "command_bad_bytes=%zu\n",
+               c->fd, shown, strlen(m->command), conn_text_bad_count(m->command));
         return;
     }
 

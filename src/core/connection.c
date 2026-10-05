@@ -532,3 +532,58 @@ size_t conn_text_strip(char *dst, size_t cap, const char *src)
     dst[kept] = '\0';
     return kept;
 }
+
+/* ---------------------------------------------------------------------------
+ * conn_text_logsafe, and the one decision it makes
+ * ---------------------------------------------------------------------------
+ * The test is `conn_byte_is_bad()` and nothing else, so this function and
+ * `conn_text_bad_count()` cannot disagree about a string: a caller that prints
+ * `s` here and reports `conn_text_bad_count(s)` bad bytes is describing one set,
+ * not two.
+ *
+ * PRINTABLE ASCII, 0x20 to 0x7e, is the accepted range and that is wider than the
+ * strictest reading on purpose. A verb, a nickname, a channel name, a server mask
+ * and an opaque token are all ASCII, and the whole value of a log line that names
+ * one of them is that the name is readable. So the value is kept whenever keeping
+ * it is safe, and the function's job is to know exactly when that is.
+ *
+ * `-` RATHER THAN AN EMPTY STRING, because `field=` with nothing after it reads as
+ * a rendering bug on a log line and `-` is already this tree's spelling for "there
+ * was no value" at every other site -- `ping: token=-` for an absent PING argument
+ * is the same convention.
+ *
+ * WHAT IT CANNOT DO is make an unsafe value safe by rewriting it. A caller that
+ * wants a mutated value wants `conn_text_strip()`, and a caller that has already
+ * stripped a field should not reach for this at all: the value is then printable
+ * and the two would agree, at the cost of a second pass. */
+size_t conn_text_logsafe(char *out, size_t cap, const char *s)
+{
+    if (out == NULL || cap < 2u) {
+        return 0;
+    }
+    if (s == NULL || s[0] == '\0') {
+        out[0] = '-';
+        out[1] = '\0';
+        return 1u;
+    }
+    for (size_t i = 0; s[i] != '\0'; i++) {
+        const unsigned char u = (unsigned char)s[i];
+
+        if (conn_byte_is_bad((char)u) != 0 || u > 0x7eu) {
+            out[0] = '-';
+            out[1] = '\0';
+            return 1u;
+        }
+        /* LENGTH IS THE THIRD REASON FOR WITHHOLDING, and it is checked in the same
+         * pass so a caller learns about it without a second walk. One `-` then means
+         * three things -- absent, unsafe, or too long for the field -- and the `len=`
+         * every caller prints beside it is what tells the last two apart. */
+        if (i + 2u > cap) {
+            out[0] = '-';
+            out[1] = '\0';
+            return 1u;
+        }
+    }
+    (void)snprintf(out, cap, "%s", s);
+    return strlen(out);
+}

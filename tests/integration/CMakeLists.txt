@@ -718,3 +718,12 @@ irc_add_integration_test(test_peer_tls test_peer_tls.c)
 # cases are the ones that keep the strip from eating spaces and UTF-8, which is the
 # failure mode that would be worse than the injection because it is silent.
 irc_add_integration_test(test_control_bytes test_control_bytes.c)
+
+# The LOG-ONLY client-supplied fields (#121, second pass). Its own file because its
+# claim is a NUMBER rather than a per-site assertion: put a control byte in every
+# position a client can put one and require that NONE of them reaches this node's
+# stdout. That is a stronger claim than "each site was fixed", because it also
+# covers the site nobody enumerated -- and the audit method that found the 22
+# surviving bytes was exactly this one, so committing it is what stops the finding
+# from having to be rediscovered.
+irc_add_integration_test(test_log_injection test_log_injection.c)
