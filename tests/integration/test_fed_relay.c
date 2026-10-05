@@ -704,6 +704,70 @@ static void case_topic_forward_strips(void)
      * member -- membership is a local fact while the channel's state is the origin's
      * -- so carol may set the topic on B at all, and dave is a member rather than an
      * empty channel. */
+    /* ------------------------------------------------------------------
+     * THE PRECONDITION, AND IT IS NOW A BARRIER RATHER THAN AN ABSENCE
+     * ------------------------------------------------------------------
+     * B MUST LEARN THAT #T IS A's BEFORE ANY CLIENT JOINS IT ON B, and this waits
+     * for exactly that. It is not a formality: without it the case has a race, and
+     * that race is what made this test red on Linux and green on macOS.
+     *
+     * WHAT THE RACE WAS, from the CI log rather than from theory. A owns #T, and
+     * bob's JOIN makes A announce it to its peer -- so B learns of #T over the link.
+     * Whether B has processed that SJOIN by the time carol's JOIN arrives is not
+     * ordered by anything the test does. On macOS the SJOIN won:
+     *
+     *     fed_sjoin: channel=#T member=bob server=irc.a ... origin=irc.a owned=0
+     *     chan_state_forward: channel=#T verb=JOIN origin=irc.a
+     *
+     * so B had a non-owned cache and carol's JOIN took the forward arm. On Linux
+     * carol's JOIN won, and B CREATED the channel itself:
+     *
+     *     chan_create: channel=#T origin=irc.b epoch=40449 creator=carol
+     *     chan_topic: channel=#T nick=carol len=20
+     *     chan_topic_stripped: channel=#T nick=carol in_len=22 kept_len=20
+     *
+     * B was now the origin, so `authority_ok()` took the LOCAL WRITE arm and
+     * `chan_state_forward:` was never printed at all. The assertion below then waited
+     * fifteen seconds for a line this topology can never produce.
+     *
+     * NOTE WHAT IS NOT IN THAT STORY, because two explanations were considered and
+     * rejected against the log: no earlier case forwarded a TOPIC into this buffer --
+     * every case spawns its own nodes, so `b.out` starts empty and only this case can
+     * write to it -- and no prior forward arrived late, because there was no prior
+     * forward. The line was absent because this case had put the node in the wrong
+     * topology, not because another case had got there first.
+     *
+     * WHY THE OLD FORM WAS WRONG IN ITS OWN RIGHT, separately from the race. It
+     * asserted the ABSENCE of a `verb=TOPIC` line, which is a claim about a log other
+     * activity is still appending to, and an absence claim over a growing log has to be
+     * made under a timeout -- here 200ms -- after which "not seen yet" is
+     * indistinguishable from "cannot happen". It cannot say WHICH case a later line
+     * belongs to; it can only say that nothing matching had appeared by now. That is
+     * the wrong tool for the job the comment claimed: it does not make the line below
+     * attributable, it just fails occasionally when the buffer happens to be further
+     * along. A positive wait for the state the case needs is both attributable and
+     * deterministic.
+     *
+     * `owned=0` IS THE ASSERTION, not decoration: it is B saying, in its own log,
+     * that it does not own this channel. If B had claimed it -- the Linux failure --
+     * this line would read `origin=" NAME_B " owned=1` and the wait would time out
+     * HERE, naming the actual cause, instead of failing fifteen seconds later on an
+     * assertion about an arm this topology never took. */
+    {
+        char seen[192];
+
+        (void)snprintf(seen, sizeof seen,
+                       "fed_sjoin: channel=" CHAN " member=" NICK_B
+                       " server=" NAME_A);
+        TF_CHECK_MSG(nf_expect(&b, seen, T_IO_MS) == 0,
+                     "node B never learned that " CHAN " belongs to " NAME_A ", so the "
+                     "forward arm this case is about cannot be reached: without that "
+                     "SJOIN B has no record of the channel, and the first client to "
+                     "JOIN it on B would make B the ORIGIN, take the local-write arm "
+                     "instead, and print no `chan_state_forward:` line at all.\n"
+                     "  node said: %s", b.out);
+    }
+
     register_client(&carol, b.port, NICK_C);
     register_client(&dave, b.port, "dave");
     TF_CHECK_MSG(tc_send(&carol, "JOIN " CHAN) == 0, "carol's JOIN send failed");
@@ -712,13 +776,21 @@ static void case_topic_forward_strips(void)
     TF_CHECK_MSG(tc_send(&dave, "JOIN " CHAN) == 0, "dave's JOIN send failed");
     TF_CHECK_MSG(tc_expect(&dave, " 366 ", T_IO_MS) == 0, "dave's JOIN never completed");
 
-    /* THE PRECONDITION, before the message: B has not forwarded a TOPIC yet, so the
-     * line asserted below is about this case and not about something earlier. */
-    TF_CHECK_MSG(nf_expect(&b, "chan_state_forward: channel=" CHAN " verb=TOPIC",
-                           200) == -1,
-                 "node B already logged a TOPIC forward before the case sent one, so "
-                 "the assertions below would be about something else.\n  node said: %s",
-                 b.out);
+    /* B DID NOT TAKE OWNERSHIP, and that is the premise the forward arm rests on. It
+     * is asserted POSITIVELY, by the arm carol's JOIN took, rather than by the absence
+     * of a line: a forward for `verb=JOIN` is only possible on a channel B does not
+     * own, so this is the same fact as "B took the forward arm" and it is checkable
+     * here, before the TOPIC is sent. If B had claimed the channel, this waits out its
+     * timeout here and says so. */
+    TF_CHECK_MSG(nf_expect(&b, "chan_state_forward: channel=" CHAN " verb=JOIN "
+                           "origin=" NAME_A, T_IO_MS) == 0,
+                 "carol's JOIN did not take the forward arm, so node B owns " CHAN " "
+                 "when it should not: a node that owns a channel writes state changes "
+                 "to it locally, and the forward arm under test is unreachable. The "
+                 "first client to JOIN a channel a node has never heard of makes that "
+                 "node the origin -- which is what happened on Linux, where carol's "
+                 "JOIN reached B before B had processed " NAME_A "'s SJOIN.\n"
+                 "  node said: %s", b.out);
 
     mark_d = tc_received(&dave);
     TF_CHECK_MSG(tc_send(&carol, "TOPIC " CHAN " :" PAYLOAD) == 0,

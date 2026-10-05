@@ -139,6 +139,96 @@ static void assert_log_clean(const nf_node_t *node, const char *what)
 }
 
 /* ---------------------------------------------------------------------------
+ * log_line_has_tail(): "this line, after this prefix, carries this tail"
+ * ---------------------------------------------------------------------------
+ * FOR MATCHING A LOG LINE THAT CARRIES ONE UNSTABLE FIELD, and the reason this
+ * exists is a Linux-only CI failure that cost a whole review cycle.
+ *
+ * The obvious way to assert a `cmd_*:` line is to write the whole thing out:
+ *
+ *     strstr(node.out, "cmd_unimplemented: fd=4 command=KILL "
+ *                      "command_len=4 command_bad_bytes=0")
+ *
+ * and that is what this file did. It passes on macOS and fails on Linux, and the
+ * `4` is the reason: it is the node's file descriptor for the client, which
+ * depends on how many descriptors the process happens to hold open when that
+ * connection is accepted -- the listener, the epoll/kqueue descriptor, the peer
+ * link, the log, and whatever the allocator left open. Two platforms, one
+ * descriptor-count difference, and a test asserting an implementation detail of
+ * the kernel's descriptor table.
+ *
+ * NOTHING ELSE IN THE SUITE DID THIS, which is what made it an obvious mistake
+ * rather than a house style: no other integration test pins `fd=N` anywhere, and
+ * a convention nobody follows is a convention that is wrong.
+ *
+ * So the fd is excluded and EVERYTHING ELSE IS NOT. This helper finds the line
+ * carrying `prefix`, confines the search to that line, and requires `tail`
+ * somewhere in it -- which still pins the fields, their order, and their values,
+ * because a line that lost `command_bad_bytes=` or reported the wrong length does
+ * not contain that tail. The claim the assertion exists to make is about
+ * `command=`, `command_len=` and `command_bad_bytes=`, and that claim is intact.
+ *
+ * WHY NOT A LOOSE `strstr` FOR THE TAIL ALONE: without the prefix anchor, the
+ * tail could be satisfied by a DIFFERENT line, which is how "the value survived"
+ * turns into "some line somewhere has these words in it". Confining the search to
+ * the line that carries the prefix is what keeps the assertion pointed at the line
+ * it names.
+ *
+ * CONFINED TO ONE LINE, and not to the rest of the buffer, because these lines are
+ * newline-terminated and the next `cmd_*:` line starts with its own prefix: a
+ * buffer-wide search for the tail would let one line's fields satisfy another's
+ * prefix. Returns 1 when the line exists and carries the tail.
+ */
+static int log_line_has_tail(const char *log, const char *prefix, const char *tail)
+{
+    size_t want;
+    const char *at;
+
+    if (log == NULL || prefix == NULL || tail == NULL) {
+        return 0;
+    }
+    want = strlen(tail);
+    if (want == 0u) {
+        return 0;
+    }
+    /* EVERY LINE CARRYING THE PREFIX IS CONSIDERED, not just the first, and that is
+     * not a convenience -- it is the difference between working and not.
+     *
+     * `cmd_unknown:` appears many times in this battery, once per unrecognised
+     * command word, and the lines differ: one carries a printable word verbatim,
+     * another carries `-` with a length and a bad-byte count. Anchoring on the FIRST
+     * occurrence and requiring the tail there fails as soon as the first `cmd_unknown:`
+     * line happens to be a different one -- which is exactly what happened when this
+     * helper was first written, and the failure looks like "the value is not printed"
+     * rather than like "the helper looked in the wrong place".
+     *
+     * The first version DID anchor on the first occurrence, and it passed on the case
+     * above it (`cmd_unimplemented:`, which appears once) and failed on this one. Two
+     * assertions differing only in how many times their prefix occurs, with the
+     * difference showing up as a content failure, is a trap worth writing down.
+     *
+     * Each candidate is still examined ONE LINE AT A TIME, so the tail can never be
+     * satisfied by a different line's fields: the prefix and the tail have to be on
+     * the same line, which is what keeps the assertion pointed at the line it names.
+     */
+    for (at = log; (at = strstr(at, prefix)) != NULL; at += strlen(prefix)) {
+        const char *nl = strchr(at, '\n');
+        size_t span = (nl != NULL) ? (size_t)(nl - at) : strlen(at);
+        size_t i;
+
+        if (span < want) {
+            continue;
+        }
+        for (i = 0; i + want <= span; i++) {
+            if (memcmp(at + i, tail, want) == 0) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
  * THE BATTERY, in the order a client can send it
  * ---------------------------------------------------------------------------
  * Pre-registration first, because that is where the exposure is: everything up to
@@ -345,19 +435,26 @@ static void case_no_client_byte_reaches_the_log(void)
                  "the node never logged a cmd_unimplemented line, so the branch this "
                  "assertion is about was not reached and the value cannot have been "
                  "checked.\n  log: %s", node.out);
-    TF_CHECK_MSG(strstr(node.out, "cmd_unimplemented: fd=4 command=KILL "
-                           "command_len=4 command_bad_bytes=0") != NULL,
+    TF_CHECK_MSG(log_line_has_tail(node.out, "cmd_unimplemented: fd=",
+                                  "command=KILL command_len=4 "
+                 "command_bad_bytes=0") != 0,
                  "a KNOWN, PRINTABLE command word is no longer printed. `KILL` is "
                  "4 bytes with no control byte in it, so the value must be verbatim "
                  "and the count must be 0 -- a fix that withheld every value would "
                  "leave every `cmd_*:` line naming `-` and this log useless for the "
-                 "question it exists to answer.\n  log: %s", node.out);
+                 "question it exists to answer. The descriptor is deliberately "
+                 "NOT in the needle: it is the node's fd for the client, it "
+                 "differs between platforms and between runs, and pinning it "
+                 "tested the kernel's descriptor table rather than this log. "
+                 "Every other field on the line is pinned, in order.\n  log: %s",
+                 node.out);
 
     /* AND THE WITHHELD CASE, which is the other half. `KILL ` + a control byte is
      * the same branch with a word that cannot be printed, and it must produce the
      * MEASUREMENT instead: the value withheld, the true length, and the count. */
-    TF_CHECK_MSG(strstr(node.out, "cmd_unknown: fd=4 command=- command_len=9 "
-                           "command_bad_bytes=2") != NULL,
+    TF_CHECK_MSG(log_line_has_tail(node.out, "cmd_unknown: fd=",
+                                  "command=- command_len=9 "
+                 "command_bad_bytes=2") != 0,
                  "an UNPRINTABLE command word was not measured. `KILL` (4) plus ESC "
                  "(1) plus `[2J` (3) plus BEL (1) is 9 bytes carrying two members of "
                  "the set, so the line must carry `command=-` with the true length 9 "
@@ -373,14 +470,16 @@ static void case_no_client_byte_reaches_the_log(void)
         char needle[160];
 
         (void)snprintf(needle, sizeof needle,
-                       "cmd_unknown: fd=4 command=- command_len=%zu "
-                       "command_bad_bytes=0", long_verb_len);
-        TF_CHECK_MSG(strstr(node.out, needle) != NULL,
+                       "command=- command_len=%zu command_bad_bytes=0",
+                       long_verb_len);
+        TF_CHECK_MSG(log_line_has_tail(node.out, "cmd_unknown: fd=", needle) != 0,
                      "an over-long but PRINTABLE command word was not withheld with "
                      "its length; expected \"%s\". The zero count is what distinguishes "
                      "this from the unprintable case above, which has the same `-` and "
                      "a non-zero count -- so the two withholding reasons are only "
-                     "separable because the length is printed.\n  log: %s", needle,
+                     "separable because the length is printed. As above, the fd is "
+                     "excluded because it is a descriptor number and not a property of "
+                     "this log.\n  log: %s", needle,
                      node.out);
     }
 
