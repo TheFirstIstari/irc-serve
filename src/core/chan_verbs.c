@@ -2064,6 +2064,38 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
         char mode = m->params[1][i];
         char rendered[4];
 
+        /* THE ALLOWLIST IS ASKED, NOT FALLEN THROUGH TO.
+         *
+         * This loop's shape has always been "act on `b`, act on `o`/`v`, and answer
+         * 472 for whatever is left", and the 472 at the bottom was the fall-through.
+         * That is a rule expressed as an ABSENCE, and an absence is not something a
+         * second path can ask the same question of -- which is exactly how the peer
+         * `SMODES` path came to have no such rule at all and how a peer ended up able
+         * to write a control byte into `ch->modes[]`.
+         *
+         * So it is asked now, here, at the top of the loop. The answer is
+         * non-deterministic from this loop's point of view -- the arms below still
+         * decide what `b` does -- so it is asked as a GATE rather than as a dispatch,
+         * and a letter this node does not implement leaves the loop by the 472 arm at
+         * the bottom instead of by reaching it. One predicate, three callers
+         * (`SMODES`, `chan_mode_set()` and here) and a test that the client path
+         * refuses exactly its complement. */
+        if (chan_mode_implemented(mode) == 0) {
+            char wire[2];
+            char shown[CONN_LOG_FIELD_MAX + 1u];
+            size_t len;
+            size_t bad;
+
+            mode_refusal_render(mode, wire, sizeof wire, shown, sizeof shown, &len,
+                                &bad);
+            (void)reply(s, c, "472", (const char *const[]){ wire }, 1,
+                        "is unknown mode char to me for channel %s", ch->name);
+            printf("[observable] chan_mode_refused: channel=%s nick=%s reason=%s "
+                   "reason_len=%zu reason_byte=0x%02x reason_bad_bytes=%zu\n",
+                   ch->name, c->nick, shown, len, (unsigned char)mode, bad);
+            return;
+        }
+
         if (chan_mode_is_origin_only(mode) && !chan_origin_is_self(s, ch)) {
             /* Unreachable while authority_ok() gates every state change, and
              * deliberately still here: authority_ok() decides whether the node
@@ -2255,6 +2287,13 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
          * not act on would have a 324 that disagrees with its behaviour, so the
          * unevaluated ones are refused by name.
          *
+         * IT IS `chan_mode_implemented()` THAT GOT HERE, not a `switch` arm that
+         * happened not to match. `SMODES` asks the same predicate on the peer path --
+         * see channel.c -- and the point of it being a function rather than a
+         * fall-through is that the two paths cannot drift: a mode letter this node
+         * does not evaluate is a 472 for a client and a refusal for a peer, and both
+         * answers come from one switch. `test_fed_guards.c` asserts they agree.
+         *
          * THE SAME FIELD LIST AS THE OTHER 472 ABOVE, and for the same reasons:
          * RFC 2812 5.2 is "<client> <char> :is unknown mode char to me for
          * <channel>", so the middle parameter is the CHARACTER the client asked
@@ -2280,6 +2319,7 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
         mode_refusal_render(mode, wire, sizeof wire, shown, sizeof shown, &len, &bad);
         (void)reply(s, c, "472", (const char *const[]){ wire }, 1,
                     "is unknown mode char to me for channel %s", ch->name);
+        (void)chan_mode_implemented(mode); /* the predicate that routed us here */
         printf("[observable] chan_mode_refused: channel=%s nick=%s reason=%s "
                "reason_len=%zu reason_byte=0x%02x reason_bad_bytes=%zu\n",
                ch->name, c->nick, shown, len, (unsigned char)mode, bad);
