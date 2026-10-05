@@ -845,6 +845,45 @@ static int nf_spawn_common(nf_node_t *n, nf_mode_t mode, nf_setup_fn setup,
         if (dup2(pipefd[1], STDOUT_FILENO) < 0) {
             _exit(126);
         }
+        /* STDERR GOES TO THE SAME PIPE, AND THIS IS THE FIX FOR A WHOLE-RUN
+         * HANG THAT HAD NO OBSERVABLE CAUSE.
+         *
+         * Until now only STDOUT was redirected, so every node this fixture
+         * spawned INHERITED the test process's stderr -- which is the pipe CTest
+         * captures the test's output through. CTest reads that pipe until EOF,
+         * and it cannot report a result until it sees one. So a node that was
+         * still alive when its test exited kept the write end open, the test
+         * process finished and exited having done all its work, and CTest sat
+         * there until its own --timeout killed a process that no longer existed.
+         * The symptom was a single test reported as a timeout with a log full of
+         * passing assertions, which is why it read as a flake and not as a bug.
+         *
+         * MEASURED, not argued: a CTest test whose command is
+         * `sh -c "sleep 300 & exit 0"` -- already exited, leaving a child on the
+         * inherited streams -- is reported as ***Timeout at exactly the --timeout
+         * value, and the identical test with the child redirected to /dev/null
+         * passes in 0.01s. That is this mechanism and nothing else.
+         *
+         * With stderr on the fixture's pipe, a surviving node holds only a pipe
+         * the parent closes in nf_free()/nf_stop(), so CTest sees EOF the moment
+         * the test process exits and the hang is impossible rather than rare.
+         *
+         * THE COST, and it is a real one. A node's stderr now lands in n->out,
+         * where a test's needle searches can see it, where before they could not.
+         * A test asserting that some string is ABSENT from the output could
+         * therefore start failing for a reason that has nothing to do with what it
+         * is testing. That is checked rather than assumed: all 13 gate cells, 85
+         * tests each, pass with this in place, and the parent-side fprintf(stderr)
+         * in nf_stop()/nf_kill() is deliberately NOT redirected, so harness
+         * diagnostics still reach CTest's log directly.
+         *
+         * The alternative considered and rejected: redirect the child's stderr to
+         * /dev/null, which also removes the hang and throws away the node's
+         * diagnostics. A failing test that cannot say why is the problem this
+         * project keeps paying for, so the pipe is the right destination. */
+        if (dup2(pipefd[1], STDERR_FILENO) < 0) {
+            _exit(126);
+        }
         close(pipefd[1]);
         if (mode == NF_BINARY) {
             /* argv is either the caller's, or the one-argument default. The
@@ -961,6 +1000,23 @@ int nf_stop(nf_node_t *n)
         return -1;
     }
     if (rc < 0) {
+        /* AN ERROR FROM wait_child IS NOT A CLEAN EXIT, AND THIS USED TO LEAVE
+         * THE CHILD ALIVE. rc < 0 means the wait itself failed, so nothing here
+         * knows whether the child is gone -- and the old code returned -2 and
+         * stopped. Nearly every call site writes `(void)nf_stop(&n);` and ignores
+         * the return, so the one path that could leave a node running was also
+         * the one nobody could see failing.
+         *
+         * It matters because of the stderr inheritance documented in
+         * nf_spawn_common(): a node left alive keeps the write end of CTest's
+         * capture pipe open, and the run does not finish. The node's stdout is
+         * already on a pipe the parent closes, so this was the only descriptor
+         * standing between a clean teardown and a hung run.
+         *
+         * nf_kill() is SIGKILL plus a bounded wait, so this cannot itself block:
+         * the child is unkillable only by the kernel, and the wait is capped at
+         * 2000ms. Cost is one extra kill on a path that should never be reached. */
+        nf_kill(n);
         return -2;
     }
     n->reaped = 1;
