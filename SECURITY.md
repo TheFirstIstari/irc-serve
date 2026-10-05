@@ -40,6 +40,38 @@ controls this project does not yet have.
 - **No operator privileges are enforced beyond channel `+o`.** There is no
   server operator role.
 
+## Control bytes in client-supplied fields
+
+**What is defended.** A C0 control byte or DEL in a client-supplied field can
+rewrite an operator's screen or ring every channel member's bell: `0x07` rings
+a terminal, and ESC followed by `[` is a CSI sequence any terminal executes.
+One byte test — `conn_byte_is_bad()` in `core/connection.c` — decides what such
+a byte is, and each field's **consumer** decides what happens to it:
+
+| Field | Consumer | Policy |
+|---|---|---|
+| `conn_t::realname` | every member of every channel, and peers | **refused** — `USER` empties it and says so, `SETNAME` answers `417` |
+| `conn_t::away` (`AWAY`) | other members' terminals, via the announcement and `301` | **stripped**, and the strip is logged |
+| `chan_t::topic` (`TOPIC`) | other members' terminals, on `332`/`333` — now and to every later joiner | **stripped**, and the strip is logged |
+| `USER`'s `<servername>` | **nothing** — this node uses the observed peer address | **not printed**: its length, a well-formedness verdict and a bad-byte count are logged instead |
+
+Stripping removes the bytes rather than escaping them, because nothing in this
+node escapes and a reader would have to know which surface to un-escape. Bytes
+at or above `0x80` are outside the set permanently, so UTF-8 is never touched —
+a filter that reached them would corrupt non-ASCII text silently.
+
+**What is not defended, and this is the list that matters.** The four fields
+above are the ones this node stores or relays to a client *verbatim*. A
+client-supplied string that this node puts only into **its own log** is still
+printed raw, and several such paths exist — `QUIT`'s reason, and the command
+word of an unrecognised verb. Both are reachable **before registration
+completes** and need no credential. Treat this node's log as untrusted input if
+you render it on a terminal, and see `docs/SERVER_DESIGN.md` §9.
+
+**The trade you are accepting when a field is stripped rather than refused.** A
+sender and a recipient can disagree about what was said, and the only record of
+the difference is the log line. That is why every strip is announced.
+
 ## TLS
 
 Available, and **off by default**. With `-DWITH_TLS=ON` this node can serve

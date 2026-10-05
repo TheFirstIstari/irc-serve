@@ -24,11 +24,6 @@
  *   | channel TOPIC             | other members' terminals     | strip   |
  *   | realname                  | every member of every channel| refuse  |
  *
- * THIS STAGE (#121, commit 3 of 4) ADDS THE TWO AWAY CASES: what a member receives on
- * the wire, what the operator log records, the state divergence a strip creates when
- * NOTHING survives it, and -- the second case -- the bytes the strip must NOT eat,
- * because a strip that mangles UTF-8 silently is worse than the injection it removes.
- *
  * A reader who wants to know whether this is one predicate with three answers, or
  * three predicates, needs only to read the one function and then this file's four
  * cases.
@@ -507,6 +502,92 @@ static void case_away_stripped_for_member(void)
  * locally-owned channel on a single node -- `authority_ok()` grants TOPIC to any
  * member, so no +o is needed and the case does not depend on operator setup.
  */
+static void case_topic_stripped_for_members(void)
+{
+    nf_node_t node;
+    test_client_t setter;
+    test_client_t member;
+    test_client_t joiner;      /* joins AFTER, and is the claim that bites */
+    char want[160];
+    size_t mark_setter;
+    size_t mark_member;
+
+    TF_CHECK_MSG(nf_spawn_binary(&node) == 0, "could not spawn the node");
+    tc_init(&setter);
+    register_as(&setter, node.port, "vic", "*spoofed", NULL);
+    tc_init(&member);
+    register_as(&member, node.port, "bob", "*spoofed", NULL);
+    join(&setter, CHAN);
+    join(&member, CHAN);
+
+    mark_setter = tc_received(&setter);
+    mark_member = tc_received(&member);
+    TF_CHECK_MSG(tc_send(&setter, "TOPIC " CHAN " :" CSI) == 0, "TOPIC send failed");
+
+    /* 1. The setter is told what was stored. */
+    (void)snprintf(want, sizeof want, ":%s 332 vic " CHAN " :" CSI_STRIPPED "\r\n",
+                   SRV);
+    TF_CHECK_MSG(tc_expect(&setter, want, T_IO_MS) == 0,
+                 "the setter was not told the stripped topic \"%s\". It is sent "
+                 "332/333 back precisely so it learns the canonical form the node "
+                 "stored, so a strip that did not reach the stored value is visible "
+                 "here.\n  setter saw: %s", want, tc_buffer(&setter) + mark_setter);
+
+    /* 2. The member sees the exact stripped line, and no control byte anywhere. */
+    (void)snprintf(want, sizeof want,
+                   ":vic!vic@" OBSERVED_HOST " TOPIC " CHAN " :" CSI_STRIPPED "\r\n");
+    TF_CHECK_MSG(tc_expect(&member, want, T_IO_MS) == 0,
+                 "the member did not receive the exact stripped TOPIC line \"%s\". "
+                 "Written out in full rather than searched for, so a strip that "
+                 "removed the wrong bytes fails here.\n  member saw: %s",
+                 want, tc_buffer(&member) + mark_member);
+    assert_no_controls(&member, mark_member, "the TOPIC broadcast");
+
+    /* 3. THE JOINER. This is the claim a handler-local strip fails: the stored copy
+     * is what 332 renders, so if the broadcast were cleaned and the store were not,
+     * the member would be clean and every later joiner would not be. */
+    {
+        size_t mark_joiner;
+
+        tc_init(&joiner);
+        register_as(&joiner, node.port, "zaphod", "*spoofed", NULL);
+        mark_joiner = tc_received(&joiner);
+        join(&joiner, CHAN);
+        (void)snprintf(want, sizeof want,
+                       ":%s 332 zaphod " CHAN " :" CSI_STRIPPED "\r\n", SRV);
+        TF_CHECK_MSG(tc_expect(&joiner, want, T_IO_MS) == 0,
+                     "a client that joined AFTER the topic was set did not receive "
+                     "the stripped topic \"%s\" on 332. The stored value is what a "
+                     "later joiner is shown, so a strip applied only to the "
+                     "broadcast would leave every future member of this channel with "
+                     "the raw bytes on their screen.\n  joiner saw: %s", want,
+                     tc_buffer(&joiner) + mark_joiner);
+        assert_no_controls(&joiner, mark_joiner, "332 for a later joiner");
+        tc_close(&joiner);
+    }
+
+    /* 4. The log, with both lengths, so the mutation is a record. */
+    {
+        char log_want[160];
+
+        (void)snprintf(log_want, sizeof log_want,
+                       "chan_topic_stripped: channel=" CHAN
+                       " nick=vic in_len=%zu kept_len=%zu reason=CONTROL_BYTES",
+                       strlen(CSI), strlen(CSI_STRIPPED));
+        TF_CHECK_MSG(nf_expect(&node, log_want, T_IO_MS) == 0,
+                     "the operator log did not record the topic strip; expected "
+                     "\"%s\". Without it a member and the setter disagree about what "
+                     "the topic says with no record of why, and the stored length on "
+                     "the `chan_topic:` line cannot be compared with what the client "
+                     "sent.\n  node said: %s", log_want, node.out);
+    }
+
+    tc_close(&setter);
+    tc_close(&member);
+    TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
+    nf_free(&node);
+}
+
 /* ---------------------------------------------------------------------------
  * CASES 4 AND 5 -- WHAT THE STRIP MUST NOT EAT
  * ---------------------------------------------------------------------------
@@ -659,6 +740,83 @@ static void case_away_strip_keeps_good_bytes(void)
 }
 
 /* TOPIC: the same constraint, on the field whose exposure is larger. */
+static void case_topic_strip_keeps_good_bytes(void)
+{
+    nf_node_t node;
+    test_client_t setter;
+    test_client_t member;
+    char want[512];
+    size_t mark;
+
+    TF_CHECK_MSG(nf_spawn_binary(&node) == 0, "could not spawn the node");
+    tc_init(&setter);
+    register_as(&setter, node.port, "vic", "*spoofed", NULL);
+    tc_init(&member);
+    register_as(&member, node.port, "bob", "*spoofed", NULL);
+    join(&setter, CHAN);
+    join(&member, CHAN);
+
+    mark = tc_received(&member);
+    TF_CHECK_MSG(tc_send(&setter, "TOPIC " CHAN " :" ESC UTF8_TEXT) == 0,
+                 "TOPIC send failed");
+    (void)snprintf(want, sizeof want,
+                   ":vic!vic@" OBSERVED_HOST " TOPIC " CHAN " :" UTF8_TEXT "\r\n");
+    TF_CHECK_MSG(tc_expect(&member, want, T_IO_MS) == 0,
+                 "the member did not receive the topic \"%s\" byte for byte with "
+                 "only its leading ESC removed. A topic is stored and replayed to "
+                 "every future joiner, so a strip that ate a space or a UTF-8 "
+                 "continuation byte would corrupt it for the channel's whole life "
+                 "rather than for one message.\n  member saw: %s", want,
+                 tc_buffer(&member) + mark);
+    assert_no_controls(&member, mark, "a topic with spaces and UTF-8");
+
+    /* A LATER JOINER gets the same bytes, because the stored value is the one that
+     * matters and this is the only path that reads it back. */
+    {
+        test_client_t joiner;
+        size_t mark_joiner;
+
+        tc_init(&joiner);
+        register_as(&joiner, node.port, "zaphod", "*spoofed", NULL);
+        mark_joiner = tc_received(&joiner);
+        join(&joiner, CHAN);
+        (void)snprintf(want, sizeof want,
+                       ":%s 332 zaphod " CHAN " :" UTF8_TEXT "\r\n", SRV);
+        TF_CHECK_MSG(tc_expect(&joiner, want, T_IO_MS) == 0,
+                     "a later joiner did not receive the stored topic byte for "
+                     "byte.\n  joiner saw: %s", tc_buffer(&joiner) + mark_joiner);
+        tc_close(&joiner);
+    }
+
+    /* An ordinary topic changes nothing about the log: the strip line fires only
+     * when a strip happened, so a needle for it means something. */
+    TF_CHECK_MSG(tc_send(&setter, "TOPIC " CHAN " :plain ascii topic") == 0,
+                 "plain TOPIC send failed");
+    TF_CHECK_MSG(tc_expect(&setter, " 332 ", T_IO_MS) == 0,
+                 "a plain ASCII topic was not accepted");
+    {
+        char log_want[160];
+
+        (void)snprintf(log_want, sizeof log_want,
+                       "chan_topic_stripped: channel=" CHAN
+                       " nick=vic in_len=%zu kept_len=%zu",
+                       strlen(ESC UTF8_TEXT), strlen(UTF8_TEXT));
+        TF_CHECK_MSG(nf_expect(&node, log_want, T_IO_MS) == 0,
+                     "the log did not report the UTF-8 topic's strip as %zu in / %zu "
+                     "kept. Both lengths have to be right: a `kept_len` equal to the "
+                     "input would mean the strip removed nothing, and a `kept_len` "
+                     "shorter than the text would mean it removed something it should "
+                     "have kept -- which is the failure these two cases exist to "
+                     "catch.\n  node said: %s", strlen(ESC UTF8_TEXT),
+                     strlen(UTF8_TEXT), node.out);
+    }
+
+    tc_close(&setter);
+    tc_close(&member);
+    TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
+    nf_free(&node);
+}
+
 /* ---------------------------------------------------------------------------
  * CASE 6 -- THE REALNAME IS STILL REFUSED (Rule 3's regression guard)
  * ---------------------------------------------------------------------------
@@ -756,10 +914,12 @@ static void case_realname_still_refused(void)
 
 int main(void)
 {
-    case_realname_still_refused();
     case_servername_is_summarised();
     case_away_stripped_for_member();
+    case_topic_stripped_for_members();
     case_away_strip_keeps_good_bytes();
+    case_topic_strip_keeps_good_bytes();
+    case_realname_still_refused();
 
     tf_done("control-bytes");
     return 0;

@@ -1248,6 +1248,23 @@ void handle_topic(server_t *s, conn_t *c, const message_t *m)
     }
     printf("[observable] chan_topic: channel=%s nick=%s len=%zu when=%lld\n",
            ch->name, c->nick, strlen(ch->topic), (long long)ch->topic_when);
+    /* THE STRIP IS ANNOUNCED (#121). chan_set_topic() removed any control bytes,
+     * so the length on the line above is the length that was STORED rather than
+     * the length that arrived; a reader comparing a member's terminal against the
+     * setter's screen needs to know they can differ, and needs to know by how
+     * much. Deriving the count from the two strings rather than measuring it again
+     * keeps the strip one pass and keeps this line and the stored value from being
+     * able to disagree.
+     *
+     * ONLY WHEN IT HAPPENED. A `TOPIC` of ordinary text takes neither branch, so
+     * the common case adds one comparison and no line -- and a needle that fires
+     * for every topic change would be a needle a test could not use to tell a
+     * strip from an ordinary set. */
+    if (strlen(m->params[1]) != strlen(ch->topic)) {
+        printf("[observable] chan_topic_stripped: channel=%s nick=%s "
+               "in_len=%zu kept_len=%zu reason=CONTROL_BYTES\n",
+               ch->name, c->nick, strlen(m->params[1]), strlen(ch->topic));
+    }
 
     {
         char prefix[CONN_HOSTMASK_MAX];
@@ -1256,7 +1273,17 @@ void handle_topic(server_t *s, conn_t *c, const message_t *m)
         if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
             return;
         }
-        params[0] = m->params[1];
+        /* `ch->topic`, NOT `m->params[1]` (#121). This used to echo the client's
+         * own bytes to every member of the channel, which meant the strip inside
+         * chan_set_topic() would have changed what the node STORES while leaving
+         * what it RELAYS untouched -- the stored copy stripped, the announced copy
+         * raw, and a member's terminal the only place the ESC still arrived. The
+         * broadcast is a second copy of the field and the copy on the wire is the
+         * one that executes, so it is the copy that has to be the stored one. It is
+         * also more correct for a reason that predates the strip: what a member is
+         * told the topic is, should be what the node holds rather than what the
+         * setter typed. */
+        params[0] = ch->topic;
         deliver_state_change(s, c, ch, "TOPIC", prefix, params, 1);
     }
     /* The setter is told the topic back as 332/333, which is how it learns the

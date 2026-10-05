@@ -31,12 +31,12 @@ into a temporary one that clears on the next resync.
 
 ## Status
 
-**v1.0.0 — the nine-phase plan plus an IRCv3 phase is complete. 85 tests, 0
+**v1.0.0 — the nine-phase plan plus an IRCv3 phase is complete. 86 tests, 0
 skipped, 0 code-scanning alerts, 0 required third-party dependencies.**
 
 | | |
 |---|---|
-| Tests | **85 passing, 0 skipped**, 0 failing |
+| Tests | **86 passing, 0 skipped**, 0 failing |
 | Warnings | **0**, on gcc-16, upstream Clang 23 and Apple clang 21 (`-Weverything`), Release **and** Debug |
 | Fortify cell | `-D_FORTIFY_SOURCE=2` (`IRC_FORTIFY=1 ./local-ci.sh`) — a **no-op on macOS**, see below |
 | Sanitizers | ASan + UBSan clean locally; **LeakSanitizer clean** on the Linux CI job |
@@ -70,6 +70,12 @@ socket** — not inferred from the source:
   the list is at `CHAN_MAX_BANS`
 - `254` from `LUSERS` once any channel exists, absent while the count is zero
 - CTCP (`\x01ACTION\x01`) relayed intact
+- **No control byte in a client-supplied field reaches another client's terminal.**
+  An away message and a channel topic arrive at members with every C0 control and
+  DEL removed — spaces and UTF-8 byte for byte — and the node's own log says how
+  many bytes it dropped (`away_stripped:`, `chan_topic_stripped:`). `USER`'s
+  `<servername>` is **measured rather than printed**, so no client-supplied byte from
+  it reaches the log at all. See [SECURITY.md](SECURITY.md) for what is *not* covered
 - Every RFC 2812 numeric, what this node does with each one and why — see
   [docs/RFC2812_CONFORMANCE.md](docs/RFC2812_CONFORMANCE.md)
 - **Federation** — peer links, the `FEDERATE` handshake, the S-verb set, `SBURST`
