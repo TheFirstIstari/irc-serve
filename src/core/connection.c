@@ -697,16 +697,81 @@ static int text_step(unsigned char u, const char *at, size_t *need, size_t *skip
         return TEXT_DROP;
     }
 
-    /* AN ORDINARY MULTI-BYTE LEAD, and the only reason the Cyrillic survives. */
+    /* AN ORDINARY MULTI-BYTE LEAD, and the only reason the Cyrillic survives --
+     * with the FOUR LEADS THAT ARE NOT ORDINARY taken out of the ranges, and the
+     * reason they are not ordinary is a filter-bypass vector.
+     *
+     * `0xE0 0x80` and `0xF0 0x80` are OVERLONG: they encode a code point a shorter
+     * form already encodes, and `0xC0 0xAF` is the textbook example -- an overlong
+     * SOLIDUS that decodes to `/` and compares equal to `/` in anything that
+     * decodes before it compares. A filter that reads bytes sees something no
+     * allowlist mentions; a filter that decodes sees `/`. Two filters disagreeing
+     * about one value is the whole of that class of attack, and the cheapest way to
+     * disagree is to let the encoding be non-canonical in the first place.
+     *
+     * `0xED 0xA0` is a SURROGATE HALF. U+D800-U+DFFF are reserved for UTF-16 and
+     * have no UTF-8 encoding at all; the byte sequence is how the encoding says
+     * "this is not a character", and a value that is not a character cannot be
+     * displayed, compared or logged honestly.
+     *
+     * SO THE FOUR ARE EXCLUDED FROM THE RANGES AND CHECKED EXPLICITLY, each
+     * against its own first-continuation bound, which is the tightest rule UTF-8
+     * has: the SECOND byte of a sequence is what makes it minimal, and every other
+     * byte is 0x80-0xBF. One check on one byte per sequence, and the ranges above
+     * and below it stay three comparisons each.
+     *
+     * THE CHECK IS IN CHECK MODE ONLY, and that is a decision rather than an
+     * omission. A STRIPPER may pass an ill-formed byte through -- the recipient's
+     * client decides what to do with a byte it cannot interpret, and
+     * `conn_text_logsafe()` withholds every non-printable byte whatever produced it
+     * -- but a STORED value may not, because there is no copy to sanitise later and
+     * an ill-formed sequence would be copied around the mesh for ever with no way
+     * to tell what it was meant to be. That is the same split `valid_nick()` is
+     * built on and the reason this predicate exists.
+     *
+     * COST: one comparison per multi-byte lead in check mode, and none at all in
+     * strip mode. No new state and no second walk. */
+    if (u == 0xe0u) {
+        if (verdict != NULL && (unsigned char)at[1] < 0xa0u) {
+            *verdict = CONN_DISPLAY_UTF8;
+            return TEXT_FAULT;
+        }
+        *need = 2u;
+        return TEXT_EMIT;
+    }
+    if (u == 0xedu) {
+        if (verdict != NULL && (unsigned char)at[1] > 0x9fu) {
+            *verdict = CONN_DISPLAY_UTF8;
+            return TEXT_FAULT;
+        }
+        *need = 2u;
+        return TEXT_EMIT;
+    }
+    if (u == 0xf0u) {
+        if (verdict != NULL && (unsigned char)at[1] < 0x90u) {
+            *verdict = CONN_DISPLAY_UTF8;
+            return TEXT_FAULT;
+        }
+        *need = 3u;
+        return TEXT_EMIT;
+    }
+    if (u == 0xf4u) {
+        if (verdict != NULL && (unsigned char)at[1] > 0x8fu) {
+            *verdict = CONN_DISPLAY_UTF8;
+            return TEXT_FAULT;
+        }
+        *need = 3u;
+        return TEXT_EMIT;
+    }
     if (u >= 0xc2u && u <= 0xdfu) {
         *need = 1u;
         return TEXT_EMIT;
     }
-    if (u >= 0xe0u && u <= 0xefu) {
+    if ((u >= 0xe1u && u <= 0xecu) || (u >= 0xeeu && u <= 0xefu)) {
         *need = 2u;
         return TEXT_EMIT;
     }
-    if (u >= 0xf0u && u <= 0xf4u) {
+    if (u >= 0xf1u && u <= 0xf3u) {
         *need = 3u;
         return TEXT_EMIT;
     }

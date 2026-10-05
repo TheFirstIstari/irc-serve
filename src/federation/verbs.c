@@ -292,6 +292,135 @@ static int fed_queue_refuse(fed_queue_why_t *why_out, fed_queue_why_t why)
     return -1;
 }
 
+/* ---------------------------------------------------------------------------
+ * fed_relay_clean(): THE ONE PLACE A PEER-BOUND LINE IS FILTERED
+ * ---------------------------------------------------------------------------
+ * WHY IT EXISTS. `conn_text_strip` appeared NOWHERE in this file, in
+ * federation/link.c or in core/fanout.c: a message a peer sent arrived on one link
+ * and was written to another with its bytes untouched. The peer-path sweep found
+ * it -- 64 marker bytes reaching a peer socket on one run, from
+ * `: irc.b SPRIVMSG #P19 :marker \x04 text` -- and `relay_byte_kept()` is what
+ * should have removed that `0x04`, because it keeps exactly the eight mIRC bytes
+ * and drops every other C0 byte including ESC and BEL.
+ *
+ * WHY IT IS HERE AND NOT AT EACH VERB. Three reasons, and the first two are the
+ * whole of it:
+ *
+ *   1. IT IS BELOW THE VERB TABLE, so a verb added later cannot forget it. Every
+ *      other site that could have filtered this is a site that knows a verb's
+ *      parameter layout, and the peer sweep has already caught one row written with
+ *      the channel in the wrong slot -- a generator bug that a filter's withholding
+ *      then disguised as a pass.
+ *   2. IT IS BESIDE `fed_queue_line()`, which is the ONLY place a peer-bound line is
+ *      built. One call site is one thing to check; a filter per verb is N things to
+ *      keep in step, and this file has now shipped two divergences from exactly
+ *      that cause: SMODES applying modes the client path refuses, and the log
+ *      values bypassing `fed_obs()`.
+ *   3. IT NAMES `conn_text_strip_relay()` AND `conn_text_strip()` IN THE TABLE
+ *      rather than reimplementing either. Those two ARE the single implementations
+ *      of "what a relayed message may contain" and "what a stored value may
+ *      contain"; the client relay path in core/msg_verbs.c calls the first for
+ *      PRIVMSG text. This table is a statement about WHICH FIELD and WHICH POLICY,
+ *      and nothing else -- the byte rules live in one place per policy and a change
+ *      to either is a change to both surfaces.
+ *
+ * WHY TWO POLICIES IN ONE TABLE. Because the client path has two, and a peer relay
+ * carries both kinds of field. A message's text is RELAYED, and `relay_byte_kept()`
+ * keeps the mIRC formatting bytes a mIRC client renders and dropping them would
+ * break. A topic, a kick reason and a mode string are STORED VALUES by the node
+ * that receives them, and they go through the stricter stored-value policy -- which
+ * is the same split core/msg_verbs.c makes, for the same reason.
+ *
+ * THE FIELD COUNT AND EVERY POSITION ARE PRESERVED. A stripped parameter becomes an
+ * EMPTY parameter, never a missing one: `needs_colon()` puts the `:` marker on an
+ * empty final parameter, so a positional parser on the far side finds the field
+ * exactly where 4.3 says it is. A relay that dropped the parameter instead would
+ * shift every field after it, which is a protocol divergence rather than a filter.
+ *
+ * COST: one extra pass over the parameters and, when a row matches, one copy of the
+ * bytes that were kept. The arena is IRC_MAX_LINE, the same bound the render below
+ * it works within, so a value that cannot fit is one `message_format()` would have
+ * refused anyway -- and it is reported rather than truncated, because a truncated
+ * parameter is a lie about what the peer sent.
+ */
+typedef size_t (*fed_clean_fn)(char *dst, size_t cap, const char *src);
+
+static const struct {
+    const char *verb;
+    int at;             /* which parameter carries the text */
+    fed_clean_fn clean; /* WHICH policy, named as the function that owns it */
+} OUTBOUND_TEXT[] = {
+    /* The two message verbs: index 1 is the text, and it is the same field and the
+     * same policy as PRIVMSG's on the client relay path. */
+    { "SPRIVMSG", 1, conn_text_strip_relay },
+    { "SNOTICE",  1, conn_text_strip_relay },
+    /* The state verbs' free-text fields, all of which the receiving node STORES or
+     * renders to clients rather than relays. 4.3's frozen shapes put the channel in
+     * the second slot for all three and the evaluating server in the first, which is
+     * why these indices are what they are -- and why getting one wrong is a field
+     * read from the wrong place rather than a visible error. */
+    { "STOPIC",   2, conn_text_strip },
+    { "SKICK",    3, conn_text_strip },
+    { "SMODES",   2, conn_text_strip }
+};
+#define OUTBOUND_TEXT_COUNT \
+    ((int)(sizeof OUTBOUND_TEXT / sizeof OUTBOUND_TEXT[0]))
+
+/* Replace the one text parameter of `verb` with a filtered copy of itself.
+ *
+ * `cleaned` is an array of `IRC_MAX_PARAMS` pointers that the CALLER owns, and
+ * only one slot of it ever changes: the field count and every position are
+ * preserved, and that is what "the field count is preserved" means in code. A
+ * relay that dropped the parameter instead would shift every field after it,
+ * which is a protocol divergence rather than a filter.
+ *
+ * THREE ANSWERS, and the third is the interesting one:
+ *
+ *   0  NOTHING TO DO. No row for this verb, or the verb's shape has no such
+ *      parameter. NOT a refusal: arity belongs to the verb's own table, and a
+ *      second arity check here would be one more thing that can disagree with it.
+ *   1  `cleaned` IS THE ARRAY TO BUILD FROM. Exactly one slot points into `arena`;
+ *      every other slot is the caller's own pointer, copied across unchanged.
+ *   -1 THE VALUE CANNOT BE REPRESENTED, and the caller refuses. That this is not a
+ *      behaviour change is the point: `strlen(src) + 1 > cap` with cap ==
+ *      IRC_MAX_LINE means the rendered line cannot fit either, so
+ *      `message_format()` was going to refuse it anyway. Refusing here rather than
+ *      truncating the value is the difference between a line that was never
+ *      deliverable and a line that lies about what the peer sent.
+ */
+static int fed_relay_clean(const char *verb, const char *const *params,
+                           int nparams, char *arena, size_t cap,
+                           const char **cleaned, size_t *src_len,
+                           size_t *kept_len)
+{
+    *src_len = 0u;
+    *kept_len = 0u;
+    for (int i = 0; i < OUTBOUND_TEXT_COUNT; i++) {
+        const char *src;
+
+        if (strcmp(verb, OUTBOUND_TEXT[i].verb) != 0) {
+            continue;
+        }
+        if (OUTBOUND_TEXT[i].at >= nparams ||
+            params[OUTBOUND_TEXT[i].at] == NULL) {
+            return 0;
+        }
+        src = params[OUTBOUND_TEXT[i].at];
+        *src_len = strlen(src);
+        if (*src_len + 1u > cap) {
+            *src_len = 0u;
+            return -1;
+        }
+        for (int k = 0; k < nparams; k++) {
+            cleaned[k] = params[k];
+        }
+        *kept_len = OUTBOUND_TEXT[i].clean(arena, cap, src);
+        cleaned[OUTBOUND_TEXT[i].at] = arena;
+        return 1;
+    }
+    return 0;
+}
+
 /* The stamp, the build, the render, the terminator and the queue, in that
  * order, once. The two callers of this used to be the whole of
  * fed_send_sverb()'s body and T3's keepalive in federation/link.c, and the
@@ -309,6 +438,17 @@ int fed_queue_line(server_t *s, conn_t *peer, const irc_serve_tags_t *tags,
 {
     char block[IRC_MAX_TAG_OVERHEAD];
     char line[IRC_MAX_LINE + 2];
+    /* The arena `fed_relay_clean()` filters into. IRC_MAX_LINE rather than a
+     * per-field bound because it is the bound that matters: a filtered value has
+     * to fit inside a line the render below cannot exceed, so anything larger was
+     * never deliverable. It is a third buffer and that is the cost -- named here
+     * rather than left for a reader to notice. */
+    char arena[IRC_MAX_LINE];
+    const char *cleaned[IRC_MAX_PARAMS];
+    const char *const *use = params;
+    size_t src_len = 0u;
+    size_t kept_len = 0u;
+    int filter_rc;
     message_t m;
     size_t blen;
     size_t len;
@@ -343,7 +483,37 @@ int fed_queue_line(server_t *s, conn_t *peer, const irc_serve_tags_t *tags,
     if (blen == 0u) {
         return fed_queue_refuse(why_out, FED_QUEUE_TAG_TOO_LONG);
     }
-    if (message_build(&m, block, prefix, verb, params, nparams) != 0) {
+    /* THE FILTER, AND IT IS ABOVE THE BUILD so that what gets rendered is what
+     * was filtered. Below the argument checks and below the stamp, and above
+     * `message_build()` -- which is the whole of "one place a peer-bound line is
+     * filtered": there is no path from a parameter to a peer socket in this file
+     * that does not pass through these six lines.
+     *
+     * AND THE MEASUREMENT IS REPORTED. Stripping a value a peer sent is invisible
+     * on the wire -- the far side sees a shorter field and cannot tell that
+     * anything happened -- so a node that silently shortened relayed text would be
+     * indistinguishable from one that mangled it. The line is the same shape as
+     * every other measurement in this tree: what was kept, how many bytes came
+     * off, and how many of those were in the strip set. */
+    filter_rc = fed_relay_clean(verb, params, nparams, arena, sizeof arena,
+                                cleaned, &src_len, &kept_len);
+    if (filter_rc < 0) {
+        return fed_queue_refuse(why_out, FED_QUEUE_UNRENDERABLE);
+    }
+    if (filter_rc > 0) {
+        use = cleaned;
+        /* REPORTED ONLY WHEN SOMETHING CAME OFF, because a line for every relayed
+         * message would put this node's log rate under the mesh's message rate, and
+         * a log that cannot be read is not a measurement. The count is what an
+         * operator needs: a peer whose text is arriving shortened is either a peer
+         * with a broken client or a peer doing this on purpose. */
+        if (kept_len < src_len) {
+            fed_obs("[observable] fed_relay_stripped: verb=%s kept=%zu "
+                   "removed=%zu\n",
+                   verb, kept_len, src_len - kept_len);
+        }
+    }
+    if (message_build(&m, block, prefix, verb, use, nparams) != 0) {
         return fed_queue_refuse(why_out, FED_QUEUE_UNBUILDABLE);
     }
     len = message_format(&m, line, sizeof line - 2u);

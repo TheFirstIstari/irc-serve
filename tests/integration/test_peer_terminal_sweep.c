@@ -119,6 +119,12 @@
 struct ps_shape {
     const char *tmpl;
     const char *needle;
+    /* The `name=-` this shape's marker must appear AS, and the measurement that
+     * must stand beside it. Both NULL when the node does not print the field at
+     * all -- which is itself a fact the table records rather than leaves to be
+     * discovered. See `ps_expect_withheld()`. */
+    const char *field;
+    const char *measure;
 };
 
 static const struct ps_shape k_shapes[] = {
@@ -130,64 +136,77 @@ static const struct ps_shape k_shapes[] = {
      *
      * `relay_byte_kept()` keeps the eight mIRC bytes in exactly this field, which
      * is what the one exception entry is for. */
+    /* The needle is the SITE PREFIX rather than one verdict line, and that is a
+     * decision about the product rather than about the test. `fed_message:` and
+     * `fed_topic_ignored:` and `fed_modes_ignored:` all say the same thing for this
+     * sweep's purposes -- the node took the field, looked at it, and said so -- and
+     * WHICH verdict a given probe gets depends on the node's own ownership rules:
+     * a topic from a peer that does not own the channel is IGNORED, while a mode
+     * change naming this node as the evaluator is APPLIED. Pinning one verdict
+     * would make these rows tests of the ownership rules, which are covered where
+     * they belong, and would fail on correct behaviour. */
     { ":" PEER " SPRIVMSG \x02 :marker \x01 text",
-      "fed_message: channel=" },
+      "fed_message: channel=", NULL, NULL },
     /* THE CHANNEL NAME, from a peer. The channel does not exist -- the name carries
      * the marker, so it could not be the one that was created -- so this is a
      * refusal, and the refusal is what is swept: `fed_malformed:` prints the target
      * it refused. A shape that can only be refused is still worth having here, and
      * unlike a roster name it is not redundant with the nickname tests, because
      * nothing about a channel NAME is validated against a charset at all. */
+    /* The channel name is the MARKER here, so the value the filter withholds is
+     * the target itself and the line proves it: `target=-` with a `reason=` beside
+     * it. That is the shape `ps_expect_withheld()` was written for. */
     { ":" PEER " SPRIVMSG #P\x01 :in the channel name",
-      "fed_malformed:" },
-    /* THE MODE, TOPIC AND KICK ROWS ARE NOT HERE YET, AND THE REASON IS THE MOST
-     * USEFUL THING THIS FILE HAS LEARNED.
+      "fed_malformed:", "target=-", "reason=" },
+    /* A MODE STRING.
      *
-     * They were, and each was rejected by the node before it looked at the value --
-     * which is the failure mode a sweep cannot have, because the row still "ran" and
-     * still reported a marker swept. The three rejections, in order:
+     * THE STATE VERBS NAME THE CHANNEL IN THE SECOND PARAMETER and the first is the
+     * node that EVALUATED the change -- 4.3's frozen shape, and `fed_dispatch()`
+     * computes `at = (SJOIN) ? 0 : 1` right where it does the lookup. Two earlier
+     * versions of this row had the channel first and were refused with
+     * `field=channel channel=-`, which is this node's own logsafe withholding the
+     * marker that had landed in the channel's slot: a reported-clean field that was
+     * not, which is why `ps_expect_field()` now exists.
      *
-     *   `SMODES #P +X`            -> `field=arity nparams=2 want=3..4`. The mode
-     *                               string was never reached because the line had
-     *                               too few parameters.
-     *   `SMODES #P +X nick`       -> `field=channel channel=-`. Three parameters
-     *                               is enough, but the state verbs name the channel
-     *                               in the SECOND parameter and the first is the node
-     *                               that evaluated the change (4.3's frozen shape;
-     *                               `fed_dispatch()` computes `at = (SJOIN) ? 0 : 1`
-     *                               right where it does the lookup). The `-` is this
-     *                               node's own logsafe withholding the marker that
-     *                               had landed in the slot the channel belonged in --
-     *                               so the sweep was reporting a clean field while
-     *                               the marker was in the wrong one.
-     *   `SMODES irc.a #P +X nick` -> `field=channel channel=#P03`. Four parameters,
-     *                               the right shape, and the channel is STILL not
-     *                               found by `fed_in_channel()`, which only SJOIN may
-     *   (create=false)                create. Whatever `#P03` and `#P03` disagree about
-     *                               -- canonical form, the channel table's key, or the
-     *                               lookup's comparison -- is the open question, and
-     *                               it is a QUESTION rather than a guess: guessing
-     *                               would produce a row that reports a swept marker
-     *                               for a line the node refused.
-     *
-     * So the rows are absent, the sweep covers the two shapes that are genuinely
-     * reachable, and the gap is written down where whoever adds them will read it.
-     * A sweep that quietly omits a surface is the thing this whole exercise exists
-     * to prevent; a sweep that omits one surface and SAYS SO, with the evidence, is
-     * a to-do list. */
-
+     * So: origin, channel, modes, member. Four parameters, and the mode parameter
+     * is NOT a trailing one -- `SMODES o #c :+m nick` has three, because the `:`
+     * makes everything after it one. */
+    { ":" PEER " SMODES " NAME_A " \x02 +\x01 " NICK_C, "fed_modes:",
+      "modes=-", "modes_bad_bytes=" },
+    /* Origin first, channel second, for the reason the SMODES row gives. */
+    /* `fed_topic_ignored:` and NOT `fed_topic:`, because the channel this probe
+     * uses was created by a CLIENT on this node and its origin is therefore this
+     * node's own name -- and 2.2 gives only the origin the topic. The probe is
+     * still meaningful: the node took the topic, refused it for a REASON that is
+     * about ownership rather than about the bytes, and printed the channel. */
+    { ":" PEER " STOPIC " NAME_A " \x02 :topic with \x01 in it",
+      "fed_topic", NULL, NULL },
+    { ":" PEER " SKICK " NAME_A " \x02 " NICK_C " :reason \x01 here",
+      "fed_skick", NULL, NULL },
     /* THE SERVER NAME IN A PREFIX, which is a peer-chosen string this node cannot
      * validate beyond its own name table: `irc.b` is the configured name and
      * `irc.<marker>` is not, so the line is refused as an untagged relay and the
      * refusal is printed. */
-    { ":irc.\x01 SPRIVMSG \x02 :from a prefix", "fed_untagged:" },
+    { ":irc.\x01 SPRIVMSG \x02 :from a prefix", "fed_untagged:", NULL, NULL },
     /* An ADVERTISE whose NAME is the marker: the store holds it and
      * `fed_advertise:` prints it. */
-    { ":" PEER " ADVERTISE irc.\x01 127.0.0.1 1234 10",
-      "fed_advertise" },
+    /* An ADVERTISE whose NAME is the marker. The store HOLDS the name and the
+     * refusal prints it, so this is the one row whose withheld field is the thing
+     * the row is about rather than an incidental parameter -- and it is why the
+     * needle is `fed_advertise_refused:` and not `fed_advertise`, which also
+     * matches the node's own periodic `fed_advertise_sent:` summary and would be
+     * satisfied by a line with no advertised name in it at all. */
+    /* AND THE LOAD COMES FIRST: `ADVERTISE <load> <name> <host> <port>`. The first
+     * version of this row had the natural order -- name, host, port, load -- and
+     * the node read `irc.<marker>` as the load and refused it for LOAD_NOT_NUML, so
+     * the withheld field was the LOAD and the row's own `name=-` requirement failed.
+     * The row had been written from the shape one would guess rather than the shape
+     * the code reads, which is the same mistake as the parameter index. */
+    { ":" PEER " ADVERTISE 10 irc.\x01 127.0.0.1 1234",
+      "fed_advertise_refused:", "name=-", "peer=" },
     /* A SHUTDOWN naming a peer that is not this one, so the node reports it and
      * refuses rather than leaving -- which keeps the link for the probes after it. */
-    { ":" PEER " SHUTDOWN irc.\x01 :going away", "fed_shutdown" },
+    { ":" PEER " SHUTDOWN irc.\x01 :going away", "fed_shutdown", NULL, NULL },
     /* 0x00, AND IT IS HERE RATHER THAN IN THE LOOP BELOW, because it is the one
      * marker byte this framing layer cannot deliver at all: 3.2 refuses an embedded
      * NUL, so a line containing one is never a line. The client sweep has the same
@@ -198,7 +217,8 @@ static const struct ps_shape k_shapes[] = {
      * The needle is the framing layer's own count rather than a fed_ line: the node
      * DID act, by refusing, and a probe that waited for a `fed_` line here would
      * time out on correct behaviour. */
-    { ":" PEER " SPRIVMSG \x02 :marker \x01 text", "parse_reject=" },
+    { ":" PEER " SPRIVMSG \x02 :marker \x01 text", "parse_reject=",
+      NULL, NULL },
 };
 #define SH_COUNT ((int)(sizeof k_shapes / sizeof k_shapes[0]))
 #define SH_CHAN_FMT "#P%02u"
@@ -327,6 +347,326 @@ static void child_setup(server_t *s)
     TF_CHECK_MSG(fed_link_configure(s, PEER_C, (const struct sockaddr *)&sa,
                                     (socklen_t)sizeof sa) != NULL,
                  "the child could not configure peer %s", PEER_C);
+}
+
+/* ---------------------------------------------------------------------------
+ * THE THREE STANDING CHECKS FOR THE THREE WAYS THIS SWEEP REPORTED CLEAN WHILE
+ * COVERING NOTHING
+ * ---------------------------------------------------------------------------
+ * All three happened during this pass, all three were found by a red run rather
+ * than by reading, and all three are the same shape of mistake: a probe that did
+ * not do what it claimed, reported as a pass. They are here as checks and not as
+ * comments, because a comment is a promise and a check is a gate.
+ *
+ * 1. A NEEDLE SATISFIED BY AN EARLIER PROBE'S ANSWER. `tc_expect(client,
+ *    " 366 ")` searches the accumulated buffer, and after the first probe the
+ *    buffer already holds a ` 366 `. So the wait returned on the PREVIOUS
+ *    channel's answer, the probe went out before the node had created this
+ *    probe's channel, and the node reported `field=channel channel=#P05` for a
+ *    channel that did not exist. It reads exactly like a lookup bug.
+ *    -> `ps_needles_are_per_probe()` below, plus the JOIN ECHO needle itself.
+ *
+ * 2. A WITHHELD FIELD DISGUISING A MISPLACED ONE. `conn_text_logsafe()` renders a
+ *    value with a byte in the strip set as `-`, so a field that is WRONG and a
+ *    field that has been correctly filtered both print as `name=-`. A row with
+ *    the channel in the wrong parameter reported itself clean for that reason.
+ *    -> `ps_expect_withheld()`.
+ *
+ * 3. A PROBE THE NODE IGNORED, REPORTED AS CLEAN. Nothing at all is the easiest
+ *    thing for a sweep to get wrong, because a node that never received the line
+ *    produces no findings.
+ *    -> the per-probe `nf_expect()` below and the per-marker PING in
+ *    `wait_for_pong()`.
+ */
+
+/* CHECK 1: no shape's needle can satisfy another shape's wait.
+ *
+ * Two needles where one contains the other is the mechanical form of the bug: the
+ * shorter is satisfied by the longer's line, so a probe whose verb prints nothing
+ * is passed off on its neighbour's evidence. `SPRIVMSG`'s two rows and the
+ * `fed_modes`/`fed_topic` prefixes are the shapes this actually rules out.
+ *
+ * It also asserts that every needle is non-empty, which is the degenerate case of
+ * the same bug: `strstr(x, "")` returns `x`, so an empty needle matches every
+ * answer there has ever been. */
+static void ps_needles_are_per_probe(void)
+{
+    for (int i = 0; i < SH_COUNT; i++) {
+        TF_CHECK_MSG(k_shapes[i].needle[0] != '\0',
+                     "shape %d has an empty needle, and an empty needle matches "
+                     "every line the node has ever printed", i);
+        for (int j = 0; j < SH_COUNT; j++) {
+            if (i == j) {
+                continue;
+            }
+            TF_CHECK_MSG(strstr(k_shapes[j].needle, k_shapes[i].needle) == NULL,
+                         "shape %d's needle \"%s\" is a substring of shape %d's "
+                         "\"%s\", so a wait on shape %d can be satisfied by shape "
+                         "%d's line and a probe the node ignored will pass",
+                         i, k_shapes[i].needle, j, k_shapes[j].needle, i, j);
+        }
+    }
+    /* And the JOIN wait's needle, which is built per probe and therefore cannot be
+     * in this table -- asserted here so that the two live in one place. A bare
+     * ` 366 ` would satisfy itself from the first probe's answer forever. */
+    {
+        char join_echo[32];
+        int n = snprintf(join_echo, sizeof join_echo, " JOIN #%02u\r\n", 0u);
+
+        TF_CHECK_MSG(n > 0 && (size_t)n < sizeof join_echo,
+                     "the sample JOIN needle could not be built");
+        TF_CHECK_MSG(strstr(join_echo, "#00") != NULL,
+                     "the JOIN needle does not name the probe's channel, so it "
+                     "cannot be unique per probe: \"%s\"", join_echo);
+    }
+}
+
+/* CHECK 4, WHICH IS FINDING 5: THE INVERTED ASSERTION.
+ *
+ * An inverted assertion is one whose CONDITION and whose MESSAGE disagree: a check
+ * that passes when the thing it names is absent, carrying a message that describes
+ * the absent case as if it were the failure, or the reverse. It is the worst kind of
+ * defect in a test suite because it is green, it is readable, and it means the
+ * opposite of what it says.
+ *
+ * HOW FAR THE MECHANICAL FORM GOES, and the limit is stated here rather than left
+ * for somebody to discover:
+ *
+ *   IT CATCHES the form this pass actually produced -- a condition that asserts a
+ *   value is ABSENT (`== NULL`, `!strstr`, `!memmem`, a negated search) whose
+ *   message does not read as an absence. That is checkable with no judgement: read
+ *   the condition, read the message, require the message to contain a negation.
+ *
+ *   IT DOES NOT CATCH the general case, and pretending otherwise would be a lie
+ *   about the check. A condition like `count == 3` with the message "expected 3"
+ *   is correct; `count == 3` with the message "3 replies were seen" is also
+ *   correct; `count == 3` with the message "no replies were seen" is inverted.
+ *   Deciding which of those a message is requires reading it as English, and a
+ *   check that guesses at English is a check that will be wrong in the direction
+ *   that hides a defect. So the mechanical part covers the negation forms, and the
+ *   rest stays a reviewer's job -- which is why this paragraph is here and not just
+ *   the code.
+ *
+ * IT READS BOTH SWEEP FILES, not just this one, because the mistake is not local
+ * to a file and a check that only guards the file it lives in is a check with a
+ * hole in it. */
+static int ps_reads_as_absence(const char *msg, size_t len)
+{
+    /* A closed list of the words this codebase uses for "this must not be here",
+     * written out rather than searched for, because the alternative -- searching
+     * for "not" -- matches "notice" and "another" and would make the check pass on
+     * a message that says the opposite. */
+    static const char *const words[] = {
+        "not ", "no ", "never", "cannot", "must not", "did not", "without",
+        "absent", "refus", "nothing"
+    };
+    size_t at = 0;
+
+    while (at < len) {
+        for (size_t w = 0; w < sizeof words / sizeof words[0]; w++) {
+            const size_t wl = strlen(words[w]);
+
+            if (at + wl <= len && memcmp(msg + at, words[w], wl) == 0) {
+                return 1;
+            }
+        }
+        at++;
+    }
+    return 0;
+}
+
+static void ps_assert_no_inverted_assertions(void)
+{
+    static const char *const files[] = {
+        "tests/integration/test_peer_terminal_sweep.c",
+        "tests/integration/test_terminal_sweep.c"
+    };
+
+    for (size_t f = 0; f < sizeof files / sizeof files[0]; f++) {
+        char *code = tf_read_code(files[f], NULL);
+        size_t at = 0;
+
+        TF_CHECK_MSG(code != NULL,
+                     "could not read %s (is IRCSERVE_SRC_DIR set?)", files[f]);
+        if (code == NULL) {
+            continue;
+        }
+        for (;;) {
+            const char *hit = strstr(code + at, "TF_CHECK");
+            size_t cond_at;
+            size_t msg_at;
+            size_t cond_len;
+            size_t msg_len;
+            char cond[512];
+            const char *msg;
+            int asserts_absent;
+
+            if (hit == NULL) {
+                break;
+            }
+            cond_at = (size_t)(hit - code);
+            /* Skip the macro name itself so `TF_CHECK` inside the message is not
+             * read as a new assertion. */
+            cond_at += strlen("TF_CHECK");
+            while (code[cond_at] == '_') {
+                while (code[cond_at] != '\0' && code[cond_at] != '(') {
+                    cond_at++;
+                }
+                if (code[cond_at] == '(') {
+                    cond_at++;
+                    break;
+                }
+            }
+            if (code[cond_at] != '(') {
+                at += 1u;
+                continue;
+            }
+            at = cond_at + 1u;
+            /* THE CONDITION: up to the comma that separates it from the message,
+             * counted at depth zero so a comma inside `TF_CHECK_MSG(a, f(b, c))`
+             * does not end it early. */
+            {
+                size_t depth = 0;
+                size_t i = cond_at;
+
+                while (code[i] != '\0') {
+                    if (code[i] == '(') {
+                        depth++;
+                    } else if (code[i] == ')') {
+                        if (depth == 0u) {
+                            break;
+                        }
+                        depth--;
+                    } else if (code[i] == ',' && depth == 0u) {
+                        break;
+                    }
+                    i++;
+                }
+                cond_len = i - (cond_at + 1u);
+                msg_at = i;
+            }
+            if (cond_len >= sizeof cond) {
+                cond_len = sizeof cond - 1u;
+            }
+            memcpy(cond, code + cond_at + 1u, cond_len);
+            cond[cond_len] = '\0';
+
+            /* THE MESSAGE: the first string literal after the comma, which is where
+             * a message is and where a format string with commas in it still is. */
+            msg = strchr(code + msg_at, '"');
+            if (msg == NULL) {
+                continue;
+            }
+            msg++;
+            msg_len = 0;
+            while (msg[msg_len] != '\0' && msg[msg_len] != '"') {
+                if (msg[msg_len] == '\\' && msg[msg_len + 1u] != '\0') {
+                    msg_len++;
+                }
+                msg_len++;
+            }
+            if (msg_len >= sizeof cond) {
+                msg_len = sizeof cond - 1u;
+            }
+
+            /* The four negation forms this pass produced and the one shape that
+             * covers them. `== NULL` and `!strstr`/`!memmem` are the assertions that
+             * a value is ABSENT. */
+            asserts_absent = (strstr(cond, "== NULL") != NULL) ||
+                             (strstr(cond, "!= NULL") == NULL &&
+                              (strstr(cond, "!strstr") != NULL ||
+                               strstr(cond, "!memmem") != NULL));
+            if (asserts_absent != 0 && msg_len > 0u) {
+                TF_CHECK_MSG(ps_reads_as_absence(msg, msg_len) != 0,
+                             "%s: an assertion whose condition is `%s` asserts "
+                             "that a value is ABSENT, and its message \"%.*s\" "
+                             "does not read as an absence. An inverted assertion "
+                             "is green and means the opposite of what it says.",
+                             files[f], cond, (int)msg_len, msg);
+            }
+        }
+        free(code);
+    }
+}
+
+/* THE LAST LINE OF THE NODE'S OUTPUT THAT CONTAINS `needle`, or NULL.
+ *
+ * The LAST rather than the first because `nf_expect()` searches the whole
+ * accumulated buffer: after a few hundred probes the first matching line is from
+ * the first probe, and checking a field there would prove nothing about the probe
+ * in hand. */
+static const char *ps_last_line_with(const char *out, size_t len, const char *needle)
+{
+    const char *found = NULL;
+    const char *p = out;
+    const char *end = out + len;
+
+    while (p < end) {
+        const char *nl = (const char *)memchr(p, '\n', (size_t)(end - p));
+        size_t n = (nl != NULL) ? (size_t)(nl - p) : (size_t)(end - p);
+
+        if (n >= strlen(needle) && memmem(p, n, needle, strlen(needle)) != NULL) {
+            found = p;
+        }
+        p += n + 1u;
+    }
+    return found;
+}
+
+/* ps_expect_withheld(): A WITHHELD VALUE MUST STILL BE A FIELD.
+ *
+ * WHY THIS EXISTS, and it is the most dangerous class of bug this sweep has
+ * produced. `conn_text_logsafe()` renders a value with a byte in the strip set as
+ * `-`, so a field that is WRONG -- the marker landed in the channel's slot instead
+ * of the text's, say -- and a field that has been CORRECTLY FILTERED both print as
+ * `name=-`. During development a sweep row with the channel in the wrong parameter
+ * reported itself clean for exactly that reason: `fed_malformed: ... channel=-`,
+ * where the `-` was the mode string being withheld from a field it did not belong
+ * in. The filter hid the generator bug.
+ *
+ * SO A ROW THAT PUTS ITS MARKER IN A PRINTED FIELD ALSO ASSERTS THAT THE FIELD IS
+ * PRESENT-AND-WITHHELD rather than absent entirely: the `name=-` must be on the
+ * line, and the MEASUREMENT must stand beside it. A field that is simply missing
+ * cannot produce `name=-`, so this catches the case the withholding disguises, and
+ * the measurement is what distinguishes "the filter withheld it" from "the field
+ * was empty when it got here".
+ *
+ * It cannot catch everything, and the limit is worth stating rather than leaving
+ * implied: a row whose marker lands in a field the node does not print has nothing
+ * to assert here, and `field == NULL` says so in the table rather than passing
+ * quietly. Those rows are covered by the CLIENT sweep for the same fields, and by
+ * the byte count below -- which is the claim that keeps them from being decorative.
+ */
+static void ps_expect_withheld(const nf_node_t *node, const struct ps_shape *sh,
+                               unsigned char mark, size_t idx)
+{
+    const char *line;
+    size_t n;
+
+    if (sh->field == NULL) {
+        return;
+    }
+    line = ps_last_line_with(node->out, node->out_len, sh->needle);
+    TF_CHECK_MSG(line != NULL, "marker 0x%02x on shape %zu: no `%s` line to "
+                 "check the withheld field on", (unsigned)mark, idx, sh->needle);
+    if (line == NULL) {
+        return;
+    }
+    n = strcspn(line, "\n");
+    /* BOTH halves. The field proves the value is being rendered in the slot this
+     * row meant it to be in; the measurement proves the `-` is the FILTER's
+     * decision and not an empty field that happened to be there. */
+    TF_CHECK_MSG(memmem(line, n, sh->field, strlen(sh->field)) != NULL,
+                 "marker 0x%02x on shape %zu: the `%s` line does not carry `%s`, "
+                 "so the value this row put there is not being reported at all. "
+                 "A WITHHELD field and a MISPLACED one look identical on the wire "
+                 "and in the log, and this is the check that tells them apart: %.*s",
+                 (unsigned)mark, idx, sh->needle, sh->field, (int)n, line);
+    TF_CHECK_MSG(memmem(line, n, sh->measure, strlen(sh->measure)) != NULL,
+                 "marker 0x%02x on shape %zu: the `%s` line carries `%s` but not "
+                 "`%s`, so the `-` cannot be told from an empty field: %.*s",
+                 (unsigned)mark, idx, sh->needle, sh->field, sh->measure,
+                 (int)n, line);
 }
 
 /* THE NODE'S OWN STDOUT IS A PIPE, AND A FULL ONE STOPS THE NODE.
@@ -458,6 +798,7 @@ int main(void)
     long peer_rx_len = 0;
     char chan[16];
     char join_line[32];
+    char join_echo[32];
     char token[64];
     int listen_fd;
     unsigned probes = 0;
@@ -470,6 +811,12 @@ int main(void)
 
     sws_masks_init();
     memset(g_exc_used, 0, sizeof g_exc_used);
+
+    /* The standing checks run BEFORE the sweep rather than after it, because a
+     * check that reports the instrument was broken is only useful while there is
+     * still something to instrument correctly. */
+    ps_needles_are_per_probe();
+    ps_assert_no_inverted_assertions();
     sws_scan_begin(&scan, "the peer path", ps_excuse, NULL);
 
     pf_peer_init(&peer);
@@ -545,12 +892,32 @@ int main(void)
             n = snprintf(join_line, sizeof join_line, "JOIN %s", chan);
             TF_CHECK_MSG(n > 0 && (size_t)n < sizeof join_line,
                          "the JOIN line could not be built");
+            n = snprintf(join_echo, sizeof join_echo, " JOIN %s\r\n", chan);
+            TF_CHECK_MSG(n > 0 && (size_t)n < sizeof join_echo,
+                         "the JOIN echo needle could not be built");
             TF_CHECK_MSG(tc_send(&client, join_line) == 0,
                          "the JOIN could not be sent");
-            TF_CHECK_MSG(tc_expect(&client, " 366 ", T_IO_MS) == 0,
+            /* THE NEEDLE NAMES THE PROBE, and this is not a detail.
+             *
+             * `tc_expect(client, " 366 ")` is satisfied by the accumulated buffer,
+             * and after the first probe the buffer already holds a ` 366 `. So the
+             * wait returned instantly on the PREVIOUS channel's answer, the probe
+             * went out before the node had created this probe's channel, and the
+             * node reported `field=channel channel=#P05` for a channel that did
+             * not exist yet -- which reads exactly like a lookup bug and is what
+             * made Decision F's diagnosis take an hour instead of a minute.
+             *
+             * The fix is the one the client sweep already uses: the needle is the
+             * JOIN ECHO for THIS probe's channel, which is unique because the
+             * channel is unique. This is the standing form of that mistake -- a
+             * needle that does not name the probe -- and the check that keeps it
+             * from coming back is in `ps_needles_are_per_probe()`. */
+            TF_CHECK_MSG(tc_expect(&client, join_echo, T_IO_MS) == 0,
                          "the client never joined %s, so a line about that "
                          "channel has nobody to reach and the probe would prove "
-                         "nothing", chan);
+                         "nothing. The needle is the echo of THIS join rather than "
+                         "a bare ` 366 `, so a stale answer from an earlier probe "
+                         "cannot satisfy it.", chan);
 
             TF_CHECK_MSG(send_shape(peer.fd, k_shapes[i].tmpl, (unsigned char)b,
                                     (unsigned)probes) == 0,
@@ -565,6 +932,8 @@ int main(void)
                          "marker 0x%02x on shape %d produced no `%s`, so this "
                          "probe tested a line the node never acted on",
                          (unsigned)b, i, k_shapes[i].needle);
+            ps_expect_withheld(&node, &k_shapes[i], (unsigned char)b,
+                               (size_t)i);
             probes++;
 
             /* Drain the peer's socket, non-blocking. A peer socket nobody reads

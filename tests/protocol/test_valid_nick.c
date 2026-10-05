@@ -205,6 +205,49 @@ int main(void)
         }
     }
     {
+        /* THE OVERLONG AND SURROGATE SHAPES, asserted in BOTH directions, which
+         * is the point of putting them here rather than in a list of known-bad
+         * inputs. They survived the first version of the UTF-8 rule because
+         * `text_step()` validated the SHAPE of a sequence -- a lead byte followed
+         * by continuations -- and not whether the sequence was CANONICAL. Every one
+         * of these is a well-shaped sequence of the wrong code point:
+         *
+         *   0xE0 0x80 0xAF  overlong '/'   encodes U+002F, which 0x2F encodes
+         *   0xF0 0x80 0x80 0xAF  overlong '/'  the same, in four bytes
+         *   0xC0 0xAF      overlong '/'   the classic, and 0xC0 can never lead
+         *   0xED 0xA0 0x80  U+D800       a surrogate half, which is not a character
+         *   0xED 0xBF 0xBF  U+DFFF       the other end of the surrogate range
+         *   0xF4 0x90 0x80 0x80  beyond U+10FFFF, which is not Unicode at all
+         *
+         * AND WHY IT IS A FILTER-BYPASS VECTOR rather than pedantry: an overlong
+         * encoding decodes to the same code point as a shorter one, so a filter
+         * that DECODES before it compares and a filter that compares BYTES disagree
+         * about one value, and `0xC0 0xAF` is the case where they do. Two filters
+         * disagreeing about one value is the whole of that attack.
+         *
+         * THE ACCEPTED SIDE IS ASSERTED TOO, and it is the half that would be easy
+         * to leave out and that makes this a test of a rule rather than of a
+         * blacklist: the four leads the check carves out of the ranges are the four
+         * NEAREST legal values, and a check written as `u <= 0xDF || u >= 0xF5`
+         * instead of as four exclusions would refuse all of them and every accented
+         * character on the network. Those cases are in `utf8_ok` above; this block
+         * is here so that both directions live in one place and neither can be
+         * changed without the other being looked at. */
+        static const char *const noncanonical[] = {
+            "a\xe0\x80\xaf" "b",       /* overlong solidus, three bytes */
+            "a\xf0\x80\x80\xaf" "b",   /* overlong solidus, four bytes */
+            "a\xc0\xaf",                /* overlong solidus, the C0 lead */
+            "a\xc1\xbf",                /* overlong solidus, the C1 lead */
+            "a\xed\xa0\x80" "b",       /* U+D800, the low surrogate */
+            "a\xed\xbf\xbf" "b",       /* U+DFFF, the high surrogate */
+            "a\xf4\x90\x80\x80" "b",   /* U+110000, past the end of Unicode */
+            "\xed\xa0\x80",             /* and one with nothing around it */
+        };
+        for (size_t i = 0; i < sizeof noncanonical / sizeof noncanonical[0]; i++) {
+            assert_invalid(noncanonical[i]);
+        }
+    }
+    {
         /* shape 4 */
         static const char *const impossible[] = {
             "a\xc0\xaf",    /* overlong solidus, the classic path-traversal shape */
