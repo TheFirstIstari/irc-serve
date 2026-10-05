@@ -563,9 +563,99 @@ static int relay_byte_kept(unsigned char u)
     }
 }
 
+/* WHAT TO DO WITH ONE BYTE. Split out of the loop so the walk below is a walk and
+ * not a decision tree, and so the rule for a single byte can be read in one place. */
+enum {
+    RELAY_EMIT = 0,  /* copy it */
+    RELAY_DROP = 1   /* remove it, and `*skip` more bytes with it */
+};
+
+/* One step of the walk. `*need` is how many continuation bytes the sequence in
+ * progress still expects and is the WHOLE of the UTF-8 state; `*skip` is how many
+ * extra bytes this one verdict consumes, which is 1 for the encoded C1 pair and 0
+ * for everything else. `at` points at the byte being judged, so `at[1]` is the next
+ * one -- the terminator when `at` is the last byte, which is why every range tested
+ * below excludes `0x00`.
+ *
+ * THE ORDER IS THE DESIGN and it is the one thing a reader must not reshuffle. The
+ * `*need` test comes FIRST because a continuation byte is defined by the byte before
+ * it: `0x90` following a lead is the second half of a Cyrillic A and is EMITTED, and
+ * the identical byte with nothing expecting it is a raw C1 and is DROPPED. Ask
+ * anything about `u` on its own first and those two cases become indistinguishable,
+ * which is the mistake that costs every Greek and Cyrillic message on the node. */
+static int relay_step(unsigned char u, const char *at, size_t *need, size_t *skip)
+{
+    *skip = 0;
+
+    /* MID-SEQUENCE. */
+    if (*need > 0u) {
+        if (u >= 0x80u && u <= 0xbfu) {
+            (*need)--;
+            return RELAY_EMIT;
+        }
+        /* Not a continuation after all -- a truncated or malformed sequence. The lead
+         * byte was already emitted, so this byte is re-examined on its own rather than
+         * swallowed. Being permissive here only ever KEEPS a byte, which is the safe
+         * direction in which to be wrong. */
+        *need = 0;
+    }
+
+    /* ASCII. The deny half of the split, plus DEL. ESC and BEL arrive here. */
+    if (u < 0x80u) {
+        if (u < 0x20u && relay_byte_kept(u) == 0) {
+            return RELAY_DROP;
+        }
+        if (u == 0x7fu) {
+            return RELAY_DROP;
+        }
+        return RELAY_EMIT;
+    }
+
+    /* THE ENCODED C1 PAIR. `0xC2` is the only lead byte a C1 control can carry in
+     * UTF-8, and `0xC2` + `0x80-0x9F` is CSI and its relatives. Both bytes go, and
+     * they are recognised BEFORE `0xC2` is treated as an ordinary lead -- otherwise
+     * `0xC2 0x9B` would pass as a valid sequence and the 8-bit escape would survive,
+     * which is the specific hole this case exists to close. */
+    if (u == 0xc2u && (unsigned char)at[1] >= 0x80u && (unsigned char)at[1] <= 0x9fu) {
+        *skip = 1;
+        return RELAY_DROP;
+    }
+
+    /* A RAW C1: in 0x80-0x9F with nothing expecting a continuation. On an 8-bit
+     * terminal `0x9B` IS CSI, so leaving it is the hazard this function exists to
+     * remove. The alternative -- dropping 0x80-0x9F unconditionally -- would eat the
+     * Cyrillic, the Greek and every accented character on the node, and it is the
+     * mistake this code is most likely to be "simplified" into. */
+    if (u >= 0x80u && u <= 0x9fu) {
+        return RELAY_DROP;
+    }
+
+    /* AN ORDINARY MULTI-BYTE LEAD, and the only reason the Cyrillic survives. */
+    if (u >= 0xc2u && u <= 0xdfu) {
+        *need = 1u;
+        return RELAY_EMIT;
+    }
+    if (u >= 0xe0u && u <= 0xefu) {
+        *need = 2u;
+        return RELAY_EMIT;
+    }
+    if (u >= 0xf0u && u <= 0xf4u) {
+        *need = 3u;
+        return RELAY_EMIT;
+    }
+
+    /* `0xC0` and `0xC1` can never lead a UTF-8 sequence -- they would only ever
+     * encode an overlong NUL -- and `0xF5`-`0xFF` lie outside UTF-8 entirely. Neither
+     * is named in the strip set and neither can move a cursor, so both are copied
+     * unchanged. This function removes what is on the list, not everything it does not
+     * recognise. */
+    return RELAY_EMIT;
+}
+
 size_t conn_text_strip_relay(char *dst, size_t cap, const char *src)
 {
     size_t kept = 0;
+    size_t need = 0;
 
     if (dst == NULL || cap == 0u) {
         return 0;
@@ -576,42 +666,15 @@ size_t conn_text_strip_relay(char *dst, size_t cap, const char *src)
     }
     for (size_t i = 0; src[i] != '\0'; i++) {
         unsigned char u = (unsigned char)src[i];
+        size_t skip = 0;
 
-        /* The deny half of the split: every C0 byte that is not one of the eight
-         * named above. ESC and BEL arrive here and do not leave. */
-        if (u < 0x20u && relay_byte_kept(u) == 0) {
-            continue;
-        }
-        /* DEL. Not a C0 byte and not in the keep list, so it is simply dropped. */
-        if (u == 0x7fu) {
-            continue;
-        }
-        /* C1, AS THE ENCODED PAIR AND NOT AS RAW BYTES. `0xC2` is the only lead byte
-         * that can begin a C1 control in UTF-8, and it is followed by 0x80-0x9F --
-         * the same range that carries the continuation byte of ordinary text. So the
-         * two bytes are consumed TOGETHER and only when the leading byte is present:
-         *
-         *     0xC2 0x9B  ->  CSI, removed
-         *     0xD0 0x90  ->  Cyrillic A, untouched
-         *     0xCE 0x91  ->  Greek capital alpha, untouched
-         *     0xC3 0xA9  ->  e-acute, untouched
-         *
-         * Stripping the trailing byte on its own would remove the C1 escape and every
-         * accented, Greek and Cyrillic character on the node along with it -- measured
-         * at 8128 code points below U+3000. A filter that cannot tell those apart is
-         * not a filter, it is a character-set downgrade.
-         *
-         * A trailing `0xC2` with nothing after it is not a control and is kept: the
-         * `i + 1u` read is the NUL terminator, which is outside every range tested
-         * above, so it cannot be mistaken for one. */
-        if (u == 0xc2u && (unsigned char)src[i + 1u] >= 0x80u &&
-            (unsigned char)src[i + 1u] <= 0x9fu) {
-            i++; /* both bytes go, as a pair */
+        if (relay_step(u, src + i, &need, &skip) == RELAY_DROP) {
+            i += skip;
             continue;
         }
         /* The bound is a SAFETY net on the same terms as conn_text_strip()'s: the
-         * caller has applied 3.2's line cap, and this only removes bytes, so it
-         * cannot fire in practice. */
+         * caller has already applied 3.2's line cap, and this only removes bytes, so
+         * it cannot fire in practice. */
         if (kept + 1u >= cap) {
             break;
         }

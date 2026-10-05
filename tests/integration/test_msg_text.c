@@ -494,6 +494,64 @@ static void case_clean_message_does_not_count(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * THE TABLE, WRITTEN DOWN ONCE
+ * ---------------------------------------------------------------------------
+ * This is the oracle the 255-value battery checks the strip against, and it is a copy
+ * of the rule in connection.h's comment rather than of the implementation -- which is
+ * the whole reason it is a separate function. A test whose oracle is the thing under
+ * test asserts that the thing is consistent with itself.
+ *
+ *     C0 and not one of the eight   -> denied
+ *     one of the eight named bytes   -> kept   (CTCP + the mIRC codes)
+ *     DEL                            -> denied
+ *     printable ASCII 0x20-0x7E      -> kept
+ *     C1 0x80-0x9F                   -> denied
+ *     0xA0 and above                 -> kept
+ *
+ * `0x00` is not reachable through a C string -- it is the terminator -- so the battery
+ * starts at 1 and this returns 0 for it only so the function is total.
+ */
+static int expect_kept_alone(unsigned char b)
+{
+    switch (b) {
+    case 0x01u: /* the CTCP delimiter */
+    case 0x02u: /* mIRC bold */
+    case 0x03u: /* mIRC colour */
+    case 0x0fu: /* mIRC plain */
+    case 0x11u: /* mIRC mono */
+    case 0x16u: /* mIRC reverse */
+    case 0x1du: /* mIRC italic */
+    case 0x1fu: /* mIRC underline */
+        return 1;
+    default:
+        break;
+    }
+    if (b >= 0x20u && b < 0x7fu) {
+        return 1; /* printable ASCII */
+    }
+    if (b >= 0x80u && b <= 0x9fu) {
+        return 0; /* C1, alone */
+    }
+    if (b < 0x20u) {
+        return 0; /* the rest of C0 */
+    }
+    if (b == 0x7fu) {
+        return 0; /* DEL */
+    }
+    return 1; /* 0xA0 and above: not on the deny list */
+}
+
+/* ---------------------------------------------------------------------------
+ * THE PREDICATE ITSELF, against the two groups directly
+ * ---------------------------------------------------------------------------
+ * The wire cases above go through a node and a socket, which is the right level for
+ * a claim about what a client sees. This one is at the level of the RULE, and it
+ * exists because the strip is a function someone will edit: every byte in the keep
+ * group and every byte in the deny group is asserted here, so a change to one of
+ * them is a red test rather than a colour regression somebody reports a month
+ * later.
+ */
+/* ---------------------------------------------------------------------------
  * THE PREDICATE ITSELF, against the two groups directly
  * ---------------------------------------------------------------------------
  * The wire cases above go through a node and a socket, which is the right level for
@@ -505,106 +563,134 @@ static void case_clean_message_does_not_count(void)
  */
 static void case_the_two_groups(void)
 {
-    /* EVERY KEPT BYTE SURVIVES ALONE.
+    /* THE WHOLE RANGE, ALL 255 OF IT, AND THE TABLE AS THE ORACLE.
      *
-     * TAB IS NOT HERE, and its absence is the point. The architect's table splits C0
-     * into "strip what can control the terminal" and "keep what is IRC message
-     * semantics", and 0x09 is in NEITHER: it is not an escape sequence, and a client
-     * rendering a message with a TAB in it lays the line out in columns. An earlier
-     * version of this array listed it under "kept" and the test caught the
-     * disagreement immediately -- the strip denies it, correctly, because
-     * `relay_byte_kept()`'s switch names eight bytes and TAB is not one of them.
-     * What TAB does on a receiving terminal is outside this node's business, and the
-     * honest resolution is that it is DENIED, not that it is kept. It appears in the
-     * denied list below, and this comment is here so a reader does not "fix" the
-     * array by adding it back. */
-    static const unsigned char kept[] = {
-        0x01u, 0x02u, 0x03u, 0x0fu, 0x11u, 0x16u, 0x1du, 0x1fu,
-        ' ', 'a', 'Z', '0', '~', 0x7eu,
-        0xc3u, 0xa9u, /* e-acute */
-        0xd0u, 0x90u, /* Cyrillic A -- continuation byte inside the C1 range */
-        0xceu, 0x91u, /* Greek capital alpha -- likewise */
-        0xe4u, 0xb8u, 0xadu /* CJK, three bytes */
-    };
-    /* EVERY DENIED BYTE IS REMOVED ALONE. ESC, BEL, DEL and one more from each
-     * remaining part of the range, so the deny half is not just the three named
-     * bytes: a future reader adding 0x08 to the keep set would break this. */
-    static const unsigned char denied[] = {
-        0x1bu, /* ESC */
-        0x07u, /* BEL */
-        0x7fu, /* DEL */
-        0x00u + 0x04u, 0x05u, 0x08u, /* backspace and friends */
-        0x09u,                        /* TAB -- neither IRC semantics nor listed
-                                       * as kept, so it is denied; see above */
-        0x0bu, 0x0cu, 0x0eu,          /* form feed, shift */
-        0x12u, 0x13u, 0x14u, 0x15u, 0x17u, 0x18u, 0x19u, 0x1au,
-        0x1cu, 0x1eu
-    };
-    size_t i;
-
-    for (i = 0; i < sizeof kept; i++) {
-        char in[4];
+     * The earlier version of this case listed the kept bytes and the denied bytes by
+     * hand and asserted each one. That is a list of the bytes somebody remembered, and
+     * it was the wrong shape twice over: it could not notice a byte nobody listed, and
+     * it could not tell "this byte is denied" from "nobody thought about this byte".
+     *
+     * SO THE TABLE IS WRITTEN DOWN ONCE, AS A PREDICATE, AND EVERY BYTE IS CHECKED
+     * AGAINST IT. `expect_kept_alone()` is the architect's table and nothing else:
+     *
+     *     C0 and not one of the eight   -> denied
+     *     one of the eight named bytes   -> kept   (CTCP + the mIRC codes)
+     *     DEL                            -> denied
+     *     printable ASCII 0x20-0x7E      -> kept
+     *     C1 0x80-0x9F                   -> denied
+     *     0xA0 and above                 -> kept
+     *
+     * 0xA0 AND ABOVE BEING KEPT is the half that is easy to get wrong in BOTH
+     * directions, and the table has to say something definite about it. Those bytes
+     * are not on the deny list, and the strip removes what is on the list rather than
+     * what it does not recognise: `0xC0`/`0xC1` can never lead a UTF-8 sequence,
+     * `0xA0`-`0xBF` are the continuation bytes of ordinary text, and `0xF5`-`0xFF` lie
+     * outside UTF-8. None of them can move a cursor on their own.
+     *
+     * TAB IS DENIED, and that is a decision rather than an oversight: 0x09 is in
+     * neither group of the table. An earlier version of this file listed it under
+     * "kept" on the grounds that a client lays a message out in columns, and the
+     * disagreement was caught immediately, because the deny half of the table has no
+     * exception for it. */
+    for (unsigned int v = 1u; v <= 0xffu; v++) {
+        unsigned char b = (unsigned char)v;
+        char in[2];
         char out[8];
         size_t n;
+        int want = expect_kept_alone(b);
 
-        in[0] = (char)kept[i];
+        in[0] = (char)b;
         in[1] = '\0';
         n = conn_text_strip_relay(out, sizeof out, in);
-        TF_CHECK_MSG(n == 1u && (unsigned char)out[0] == kept[i],
-                     "byte 0x%02x is in the KEEP group and did not survive alone "
-                     "(returned %lu bytes, first 0x%02x).", kept[i],
-                     (unsigned long)n, (unsigned char)out[0]);
+        TF_CHECK_MSG(want ? (n == 1u && (unsigned char)out[0] == b)
+                          : (n == 0u && out[0] == '\0'),
+                     "byte 0x%02x alone: the table says %s, but the strip returned %lu "
+                     "byte(s) (first 0x%02x). The 255 values are checked against one "
+                     "written-down table rather than two hand-written lists, so a "
+                     "disagreement here means the strip and the table have parted "
+                     "company -- and one of them is the specification.",
+                     v, want ? "KEEP" : "DENY", (unsigned long)n,
+                     (unsigned char)out[0]);
     }
 
-    for (i = 0; i < sizeof denied; i++) {
+    /* THE TWO CONTEXTS A BYTE'S MEANING DEPENDS ON, which is where the table above is
+     * not the whole answer and a single byte cannot be judged alone.
+     *
+     * AFTER `0xC2` -- the encoded C1 pair. Every byte in 0x80-0x9F is a C1 control and
+     * BOTH bytes go; 0xA0 and up are NBSP and friends and both stay. This is the pair
+     * that a byte-wise filter cannot get right in either direction.
+     *
+     * AFTER `0xD0` -- a valid continuation position. Every byte in 0x80-0xBF is the
+     * second half of a real character and ALL of them stay, including the 0x90 that
+     * the table above denies on its own. The same byte, denied alone and kept in
+     * context, is the entire reason this strip is a walk with state rather than a
+     * filter over a set. */
+    for (unsigned int v = 0x80u; v <= 0xbfu; v++) {
+        unsigned char b = (unsigned char)v;
         char in[4];
         char out[8];
         size_t n;
+        int in_c1 = (v <= 0x9fu);
 
-        /* 0x00 cannot be embedded in a C string, so the array starts at 0x04 for
-         * that reason as well as the strip's; NUL is not in the keep group and the
-         * strip cannot meet one inside a parameter because the parser refuses it. */
-        in[0] = (char)denied[i];
-        in[1] = 'z';
+        in[0] = (char)0xc2u;
+        in[1] = (char)b;
         in[2] = '\0';
         n = conn_text_strip_relay(out, sizeof out, in);
-        TF_CHECK_MSG(n == 1u && out[0] == 'z' && out[1] == '\0',
-                     "byte 0x%02x is in the DENY group and was not removed alone "
-                     "(result \"%s\", %lu bytes kept).", denied[i], out,
-                     (unsigned long)n);
+        TF_CHECK_MSG(in_c1 ? (n == 0u) : (n == 2u),
+                     "`0xC2 0x%02x` should be %s as a PAIR, but the strip returned %lu "
+                     "byte(s). 0x80-0x9F after 0xC2 are the encoded C1 controls and "
+                     "both bytes go; 0xA0 and up are NBSP and friends and both stay.",
+                     v, in_c1 ? "removed" : "kept", (unsigned long)n);
+
+        in[0] = (char)0xd0u;
+        in[1] = (char)b;
+        in[2] = '\0';
+        n = conn_text_strip_relay(out, sizeof out, in);
+        TF_CHECK_MSG(n == 2u,
+                     "`0xD0 0x%02x` is the start of a real character and both bytes "
+                     "must survive, but the strip returned %lu. Every one of these is "
+                     "Cyrillic or a continuation byte, and denying any of them would "
+                     "damage every non-Latin message on the node.",
+                     v, (unsigned long)n);
     }
 
-    /* THE C1 PAIR, AS A PAIR. Both bytes go together, and -- the half that matters
-     * -- a `0xC2` followed by anything OUTSIDE 0x80-0x9F is an ordinary character
-     * and survives with its follower intact. `0xC2 0xA9` is e-acute; stripping its
-     * trailing byte would be a UTF-8 corruption that no byte-wise test would catch,
-     * because the lead byte looks identical either way. */
+    /* A THREE-BYTE SEQUENCE, because the walk carries a COUNT and a count of one is
+     * not a count. An emoji is four bytes with three continuations, the second of
+     * which is 0x9F -- a byte the table DENIES on its own. If the state were a flag
+     * rather than a count, this is the byte that breaks. */
+    {
+        static const char emoji[] = "\360\237\230\200"; /* U+1F600 */
+        char out[16];
+        size_t n = conn_text_strip_relay(out, sizeof out, emoji);
+
+        TF_CHECK_MSG(n == 4u && memcmp(out, emoji, 4u) == 0,
+                     "a four-byte emoji came back as %lu byte(s) \"%s\" rather than 4 "
+                     "intact. Its second byte is 0x9F, which the table denies ALONE, so "
+                     "this is the assertion that says the UTF-8 state is a count of "
+                     "continuations still expected rather than a flag.",
+                     (unsigned long)n, out);
+    }
+
+    /* e-acute IS COVERED BY THE BATTERY ABOVE, and what is kept here is the reason
+     * rather than the byte: `0xC3 0xA9` shares its LEAD BYTE with the encoded C1
+     * control `0xC2 0x9B` and differs only in the trailing byte. `0xC2 0xA9` would
+     * have been U+00A9 and would have made the contrast trivial, which is not what
+     * this is for. The number of bytes is asserted as well as the content, because the
+     * count is what a caller uses to decide whether anything was removed -- a strip
+     * that quietly returned the wrong count would make every count on this path wrong
+     * while still producing the right string. */
     {
         char out[16];
-        size_t n;
+        size_t n = conn_text_strip_relay(out, sizeof out, "\303\251z");
 
-        n = conn_text_strip_relay(out, sizeof out, "\302\233z");
-        TF_CHECK_MSG(n == 1u && out[0] == 'z' && out[1] == '\0',
-                     "the encoded C1 pair `0xC2 0x9B` was not removed as a pair "
-                     "(result \"%s\").", out);
-
-        /* e-acute is `0xC3 0xA9` -- the point of picking it is that it has the SAME
-         * LEAD BYTE as the encoded C1 control above and differs only in the trailing
-         * byte. `0xC2 0xA9` would have been U+00A9 and would have made the contrast
-         * trivial, which is not what this is testing. */
-        /* THREE bytes in and three kept -- `0xC3`, `0xA9` and the 'z'. The count is
-         * asserted as well as the content because the count is what a caller uses to
-         * decide whether anything was removed, and a strip that quietly reported the
-         * wrong one would make every count on this path wrong. */
-        n = conn_text_strip_relay(out, sizeof out, "\303\251z");
         TF_CHECK_MSG(n == 3u && (unsigned char)out[0] == 0xc3u &&
                      (unsigned char)out[1] == 0xa9u && out[2] == 'z',
                      "`0xC3 0xA9` (e-acute) did not survive intact: got \"%s\". It "
-                     "shares its lead byte with the encoded C1 control removed one "
-                     "assertion above and differs only in the trailing byte, so this "
-                     "is the pair test at the exact byte where a byte-wise filter "
-                     "would have to choose -- and it would choose wrong, on every "
-                     "accented character on the node.", out);
+                     "shares its lead byte with the encoded C1 control one assertion "
+                     "above and differs only in the trailing byte, so this is the pair "
+                     "test at the exact byte where a byte-wise filter has to choose -- "
+                     "and it would choose wrong, on every accented character on the "
+                     "node.", out);
     }
 
     /* AND THE ORDER OF A WHOLE STRING IS PRESERVED, which is what "not truncation"

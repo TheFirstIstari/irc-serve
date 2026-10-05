@@ -31,12 +31,12 @@ into a temporary one that clears on the next resync.
 
 ## Status
 
-**v1.0.0 — the nine-phase plan plus an IRCv3 phase is complete. 88 tests, 0
+**v1.0.0 — the nine-phase plan plus an IRCv3 phase is complete. 89 tests, 0
 skipped, 0 code-scanning alerts, 0 required third-party dependencies.**
 
 | | |
 |---|---|
-| Tests | **88 passing, 0 skipped**, 0 failing |
+| Tests | **89 passing, 0 skipped**, 0 failing |
 | Warnings | **0**, on gcc-16, upstream Clang 23 and Apple clang 21 (`-Weverything`), Release **and** Debug |
 | Fortify cell | `-D_FORTIFY_SOURCE=2` (`IRC_FORTIFY=1 ./local-ci.sh`) — a **no-op on macOS**, see below |
 | Sanitizers | ASan + UBSan clean locally; **LeakSanitizer clean** on the Linux CI job |
@@ -77,7 +77,16 @@ socket** — not inferred from the source:
   `PING` token, a `QUIT` reason, a SASL mechanism, a capability name) are **measured**
   rather than printed: kept when printable, withheld with a length and a bad-byte
   count when not. Asserted by a battery that puts a control byte into every position
-  a client can put one. `PRIVMSG` text is the exception and it is deliberate — see
+  a client can put one. **Relayed `PRIVMSG`/`NOTICE` text is filtered too**, and its
+  rule is the one exception worth knowing about: ESC, BEL, DEL and the C1 controls are
+  removed, while `0x01` (the CTCP delimiter) and the mIRC colour and emphasis codes are
+  **kept** — because stripping the delimiter would turn `ACTION` into prose, and
+  stripping the mIRC codes would break colour on every client that uses it. C1 is
+  removed as a control and kept as a letter: `0xC2 0x9B` goes, the `0x90` in the
+  Cyrillic letter A stays, and the byte that tells them apart is how many UTF-8
+  continuation bytes the sequence in progress still expects. Removing the whole
+  `0x80`–`0x9F` range instead would strip 8128 code points below U+3000. The strip is
+  silent and is reported once as `msg_stripped` in the node's summary line — see
   [SECURITY.md](SECURITY.md)
 - Every RFC 2812 numeric, what this node does with each one and why — see
   [docs/RFC2812_CONFORMANCE.md](docs/RFC2812_CONFORMANCE.md)

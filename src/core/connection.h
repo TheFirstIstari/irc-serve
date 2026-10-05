@@ -426,16 +426,35 @@ size_t conn_text_strip(char *dst, size_t cap, const char *src);
  *     ACTION -- so stripping `0x01` does not sanitise, it CORRUPTS. This is also
  *     why no reader may be placed inside the kept group.
  *
- *   C1 IS STRIPPED AS THE ENCODED PAIR, NEVER AS RAW BYTES, and this is the one
- *     subtlety in the function. In UTF-8 a C1 control is `0xC2` followed by
- *     `0x80-0x9F`, and those trailing bytes are ALSO the continuation bytes of
- *     ordinary text: `0xC2 0x9B` is CSI, and `0xD0 0x90` is the Cyrillic letter
- *     A, and `0xCE 0x91` is the Greek capital alpha. A byte-wise filter over
- *     `0x80-0x9F` would therefore mangle **every** Cyrillic, Greek and Latin-
- *     Extended message on the node -- measured: 8128 code points below U+3000
- *     have a continuation byte in that range. So the pair is matched as a PAIR
- *     and only the pair is removed, which strips the 8-bit escapes and leaves
- *     every other UTF-8 sequence byte-for-byte intact.
+ *   C1 IS STRIPPED AS A CONTROL AND KEPT AS A LETTER, and this is the one
+ *     subtlety in the function, because the two are the same BYTES. In UTF-8 a C1
+ *     control is `0xC2` followed by `0x80-0x9F` -- and those trailing bytes are also
+ *     the continuation bytes of ordinary text:
+ *
+ *         0xC2 0x9B   CSI          a control      -> both bytes removed
+ *         0xD0 0x90   Cyrillic A   a letter       -> both bytes kept
+ *         0xCE 0x91   Greek alpha  a letter       -> both bytes kept
+ *         0xC3 0xA9   e-acute      a letter       -> both bytes kept
+ *         0x9B        CSI on an 8-bit terminal   -> removed
+ *
+ *     So the walk keeps ONE piece of state -- how many continuation bytes the sequence
+ *     in progress still expects -- and asks it BEFORE anything looks at the byte on its
+ *     own. A byte in 0x80-0x9F with nothing expecting a continuation is a raw C1 and
+ *     is removed; the identical byte inside a valid sequence is somebody's letter and
+ *     is kept.
+ *
+ *     The failure this replaces is worth naming because it is the obvious
+ *     implementation. A filter over the RANGE `0x80-0x9F` -- which is what the table
+ *     literally says, and what the first version of this function did -- removes every
+ *     accented, Greek and Cyrillic character on the node: measured, 8128 code points
+ *     below U+3000 have a continuation byte in that range. It is not a filter, it is a
+ *     character-set downgrade, and it fails silently on the messages that matter.
+ *
+ *     BYTES 0xA0 AND ABOVE ARE LEFT ALONE, and that is a decision rather than an
+ *     oversight. They are not on the deny list, and `0xC0`/`0xC1` can never lead a
+ *     UTF-8 sequence while `0xF5`-`0xFF` lie outside it entirely -- so neither group
+ *     can move a cursor. This function removes what is on the list rather than what it
+ *     does not recognise.
  *
  * IT RUNS ON AN ASSEMBLED PARAMETER, NOT ON A READ, and that is what makes the
  * read-boundary case a non-case. `message_parse_n()` hands `m->params[]` one
