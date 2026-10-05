@@ -83,7 +83,82 @@ function(irc_add_integration_test name source)
   irc_ctest_name(${name} _ctest_name)
   add_test(NAME ${_ctest_name} COMMAND ${name})
   set_tests_properties(${_ctest_name} PROPERTIES LABELS Integration)
+  # TIMEOUT is looked up by TARGET name, and only if it was set. Keeping it a
+  # per-test opt-in variable rather than a default applied to all 60-odd tests is
+  # the point: the suite-wide 60s default stays the thing that catches a wedge,
+  # and a test earns an override by having a measurement.
+  if(DEFINED irc_timeout_${name})
+    set_tests_properties(${_ctest_name} PROPERTIES TIMEOUT ${irc_timeout_${name}})
+  endif()
 endfunction()
+
+# ---------------------------------------------------------------------------
+# PER-TEST TIMEOUTS: WHY THEY EXIST, AND WHY THEY ARE NOT `--timeout 400`
+# ---------------------------------------------------------------------------
+# Every CI job runs `ctest --timeout 60`, and three tests in this suite are
+# legitimately slower than that. The obvious fix -- raising the global -- is the
+# wrong one: 60s is what turns a WEDGED run red in a minute instead of an hour,
+# and raising it to accommodate three slow tests spends that detection on the
+# other eighty-two, which finish in under three seconds and would then hang
+# unnoticed for as long as the new limit allows. So the global default stays
+# 60 and only the tests with a measured reason get an override.
+#
+# The rule is one rule, applied to the measured maximum rather than chosen by
+# feel: SIX TIMES THE OBSERVED MAXIMUM, rounded up to the next 30 seconds, and
+# never below the global 60. Six because the fastest machine here is not the
+# machine CI runs on: a hosted runner is slower, it shares cores with whatever
+# else the account is running, and `-j2` means this test is competing with
+# another test for them.
+#
+# MEASURED, on this machine, Debug with WITH_TLS=ON (the slow configuration --
+# Debug is unsstripped and TLS adds a real handshake to every case), at -j2,
+# as the maximum over three runs and three compilers (gcc-16, upstream Clang 23,
+# Apple clang 21), all reporting 85/85:
+#
+#   test_peer_tls         28.75s   -> 180   (6.3x)
+#   test_topic_persist    22.81s   -> 150   (6.6x)
+#   FailoverReconnect     11.24s   ->  90   (8.0x)
+#
+# NOTHING ELSE GETS ONE, and that is a result rather than an omission: the fourth
+# slowest test is CapNegotiation at 4.53s, which is 13x inside 60, and every
+# other test in the suite is faster still. The rule produces three overrides and
+# stops; a fourth would be a number without a measurement behind it.
+#
+# THE COST, stated rather than discovered later. These three tests accumulate
+# MANY deadline-bounded waits rather than one long one -- test_peer_tls has 20
+# wait sites at 4s-20s each, test_topic_persist 20 at 15s, FailoverReconnect 13
+# at up to 20s -- so a run in which EVERY wait fully expires reaches roughly
+# 200s, 300s and 160s respectively. That is a failing run, not a hanging one,
+# and because these values sit below those structural worst cases, such a run
+# can surface as a ctest Timeout rather than as a named failed assertion. The
+# trade is deliberate: a 4-5 minute budget for a wedge is cheaper than the
+# alternative, which is a red CI run whose log says "timeout" where it could
+# have said which assertion gave up. `--output-on-failure` still prints
+# everything the test managed to print before it was killed, so the diagnosis is
+# degraded rather than lost.
+function(irc_test_timeout ctest_name seconds)
+  if(seconds GREATER 0)
+    set_tests_properties(${ctest_name} PROPERTIES TIMEOUT ${seconds})
+  endif()
+endfunction()
+
+# ---------------------------------------------------------------------------
+# The three overrides. Each is set immediately before the add_test() for the
+# test it is about, so the number and the test it belongs to are read together
+# rather than from a list somewhere else in the file.
+#
+# irc_timeout_test_peer_tls = 180
+#   Two nodes, a real mutual-TLS mesh, real OpenSSL handshakes. 20 bounded
+#   waits at 4s-20s. Measured 28.75s -- this is the test that made the global
+#   60 unsafe, at 2.1x headroom on a fast machine with nothing else running.
+# irc_timeout_test_topic_persist = 150
+#   20 bounded waits at T_IO_MS/T_READY_MS = 15s each. Measured 22.81s.
+# irc_timeout_test_failover_reconnect = 90
+#   13 bounded waits, 8 of them at T_IO_MS = 20s. Measured 11.24s -- the
+#   mildest of the three, and it still gets an override because a failover
+#   test's wall clock is dominated by deliberate backoff waits, which is the
+#   shape that degrades worst when the machine is busy.
+# ---------------------------------------------------------------------------
 
 # 7/Phase 2: "a client connects and is closed cleanly (assert accept -> EOF)".
 # Runs the SHIPPED BINARY over real TCP.
@@ -300,6 +375,7 @@ irc_add_integration_test(test_choper test_choper.c)
 # it -- and because the harness that reaches one is built by this file. The CTest
 # name TopicPersistence is unchanged, so nothing that has ever seen the test sees
 # a different thing.
+set(irc_timeout_test_topic_persist 150)
 irc_add_integration_test(test_topic_persist test_topic_persist.c)
 
 # 2.4 / 3.2 / 4.3: the internal tag block the relay path budgets against, from
@@ -410,6 +486,7 @@ irc_add_integration_test(test_fed_resync test_fed_resync.c)
 # ladder is scaled down per process through fed_set_retry(), because the shipped
 # base is 90 s and a test that waited out even the first rung would be a slow
 # test rather than a test.
+set(irc_timeout_test_failover_reconnect 90)
 irc_add_integration_test(test_failover_reconnect test_failover_reconnect.c)
 
 # 7/Phase 9: the 4.3 resync being DRIVEN by a reconnect, which is 8's
@@ -628,4 +705,5 @@ irc_add_integration_test(test_tls test_tls.c)
 # --tls-ca are main()'s options and an inline child has no command line. In the
 # default build it asserts the one thing that build can: --peer-tls is REFUSED at
 # startup rather than accepted and ignored.
+set(irc_timeout_test_peer_tls 180)
 irc_add_integration_test(test_peer_tls test_peer_tls.c)

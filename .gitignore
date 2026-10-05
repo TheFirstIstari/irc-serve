@@ -10,6 +10,16 @@ cmake-build-*/
 # lines above -- they are build artifacts, not sources -- named explicitly so a
 # future matrix does not have to remember.
 b*/
+
+# Build and gate LOGS written into the source root. These are the same artifacts
+# as the directories above and were the one thing still showing up in
+# `git status` after b*/ was added: a captured ctest or gate transcript dropped
+# beside the tree is not a source file, and a status that lists 25 stale entries
+# trains people to ignore `git status`, which is how a real one gets committed.
+# scripts/gate.sh writes its per-cell logs under build-gate/ (matched above by
+# build-*/); these patterns are for logs captured by hand into the root.
+*.log
+!NOTICE
 *.o
 *.a
 *.so
@@ -74,11 +84,6 @@ Thumbs.db
 # In-tree CMake build directories (any name, not just /build)
 build-*/
 
-# This phase's build matrix directories (b-prefixed: gcc-16 / upstream clang /
-# Apple clang x Release/Debug, plus the ASan/UBSan one). Same reasoning as the
-# lines above -- they are build artifacts, not sources -- named explicitly so a
-# future matrix does not have to remember.
-b*/
 # Stray compiled executables accidentally left in source dirs
 tests/benchmark/throughput
 tests/benchmark/footprint

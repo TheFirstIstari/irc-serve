@@ -50,6 +50,42 @@ jobs:
   # A real 4-way matrix, executed CONCURRENTLY because the machine runs six
   # runner instances. A runner process handles one job at a time, so the
   # instance count is what sets the parallelism.
+  #
+  # THIS JOB IS NOT DEAD, and that was worth checking rather than assuming. The
+  # GitHub API reports all four combinations as `success` on each of the last
+  # four merges to main (30c2aac, 118c617, 358db40, ab84b80), and each one ran
+  # the gcc and clang Release/Debug cells to completion. What looks like a dead
+  # job on a pull request is the `if:` below: `github.event_name == 'push'` is
+  # false for a pull_request, so the job is skipped by design, and a
+  # job-level `if` that evaluates false ALSO SUPPRESSES MATRIX EXPANSION --
+  # which is why the skipped run shows ONE job with the literal text
+  #   ci_linux ${{ matrix.compiler }} ${{ matrix.build_type }}
+  # rather than four named ones. That artifact is cosmetic in the UI and is a
+  # reliable signal of the cause; it is not a runner-matching failure. The
+  # distinction matters, because the two have opposite fixes: "no runner
+  # matched" means register a runner, and "skipped by if" means change nothing
+  # about the runner at all.
+  #
+  # SO IT STAYS SELF-HOSTED. Moving it to ubuntu-22.04 would be a one-line
+  # change that would also quietly delete the only reason this job exists:
+  # cachyos is a rolling distribution carrying a newer glibc than the pinned
+  # ubuntu-22.04 image, and a newer glibc declares more
+  # __attribute__((warn_unused_result)) and fortify paths than the older one.
+  # That is precisely the class that reached main history as a red PR --
+  # `(void)read(...)`, which glibc marks __wur and the macOS SDK does not
+  # declare at all. (The exact glibc release on the runner is not asserted
+  # here; it was not read from the machine. The claim that ubuntu-22.04's glibc
+  # already catches THAT one is not a claim about versions: it is read off the
+  # ci_test log at run 37242557613, which is ubuntu-22.04's own GCC reporting
+  # the diagnostic. The argument for keeping cachyos is about the NEXT one, in a
+  # function nobody thought to check.) Stating that plainly: the distro breadth
+  # IS preserved by keeping it, and WOULD NOT BE by moving it, and anyone
+  # reading a future commit that moves this to a hosted runner should treat that
+  # as a coverage regression rather than a cleanup.
+  #
+  # The availability cost is real and is paid on purpose: if the machine is off,
+  # a push to main waits. It does NOT affect pull requests, because the `if:`
+  # excludes them, so the PR-time gate -- ci_test, hosted -- is unaffected.
   ci_linux_cachyos:
     name: ci_linux ${{ matrix.compiler }} ${{ matrix.build_type }}
     runs-on: [self-hosted, Linux, X64, cachyos-x8664]
@@ -57,7 +93,20 @@ jobs:
     environment:
       name: ${{ github.actor == 'TheFirstIstari' && 'self-hosted-auto' || 'self-hosted' }}
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    continue-on-error: true
+    # continue-on-error IS GONE, deliberately, and the argument is short.
+    #
+    # This job CANNOT gate a merge: it is push-to-main only, so by the time it
+    # runs the merge has already happened. There is therefore no merge to
+    # protect by tolerating its failures, and continue-on-error bought nothing
+    # -- while costing the one thing a post-merge job exists to provide, which
+    # is a truthful result. Under it, a Linux-only build break found only on
+    # cachyos was reported as a GREEN TICK on main. A red push to main is
+    # information and blocks nothing; a fake green is worse than either.
+    #
+    # It is also now the only job whose result can distinguish "cachyos is
+    # healthy" from "cachyos never ran", since the job that used to be the
+    # merge gate for Linux is post-merge by construction.
+    #
     # Six runner instances are registered (cachyos-x8664-1..6), so this matrix
     # runs CONCURRENTLY rather than queueing behind a single runner.
     # Measured: `gcc Release` and `clang Debug` completed in 19s each, at the
@@ -81,6 +130,16 @@ jobs:
       - name: Build and test
         run: |
           set -euo pipefail
+          # WHAT GATES A PULL REQUEST, stated here so the two are not confused:
+          # ci_test, on ubuntu-22.04, with GCC against glibc, is the pre-merge
+          # Linux gate and is a required check. It is what reported the
+          # `(void)read(...)` __wur defect at run 37242557613, before the branch
+          # was merged. THIS job cannot gate a pull request -- the `if:` above
+          # excludes pull_request events -- so what it adds is a second Linux
+          # distribution on a newer glibc, confirming after the fact what ci_test
+          # could not reach. It is not a replacement for ci_test, and it is not
+          # the only Linux evidence; it is the only Linux evidence from a
+          # distro other than Ubuntu's.
           cmake -B build -S . -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=${{ matrix.compiler }}
           # NOT $(nproc). Four matrix jobs land on this box at once, so asking each
@@ -103,6 +162,30 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      # BEFORE THE BUILD, on purpose: it is a text check over the working tree,
+      # takes well under a second, and needs no build directory at all -- so a
+      # violation should cost a second rather than the two minutes it would cost
+      # at the end. It sits with the other gates rather than next to the compile
+      # for the same reason it sits first among them.
+      #
+      # IT IS HERE, IN ci_test, BECAUSE ci_test IS THE JOB THAT CATCHES THIS
+      # CLASS ON A PULL REQUEST. It is hosted Linux with GCC against glibc, and
+      # it is what reported `(void)read(...)` as
+      #   error: ignoring return value of 'read' declared with attribute
+      #   'warn_unused_result' [-Werror=unused-result]
+      # at run 37242557613, before that branch merged. Nothing here replaces
+      # that; see the script for why it cannot.
+      #
+      # WHAT IT ADDS ON TOP is that it fails on ANY host. Both required macOS
+      # cells passed that build clean -- the macOS SDK does not declare read()
+      # with warn_unused_result at all -- and Clang stays silent even against
+      # real glibc headers, because it exempts an explicit (void) cast. So the
+      # defect was simultaneously invisible to every macOS cell and to any
+      # Clang-based Linux cell, and visible only to GCC-on-glibc. A grep is not
+      # cleverer than that build; it is simply available on a machine that has
+      # no glibc, which is where a contributor's laptop is.
+      - name: glibc __wur discard gate
+        run: ./scripts/check-wur-discards.sh
       - name: Configure
         run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
       - name: Build
@@ -150,21 +233,165 @@ jobs:
         run: ./scripts/check-attribution.sh "origin/${{ github.ref_name }}" HEAD
 
   # --- macOS: cannot run on the self-hosted machine -----------------------
+  # WITH_TLS IS A MATRIX DIMENSION HERE, AND UNTIL THIS COMMIT IT WAS NOT
+  # ANYWHERE ELSE ON THIS RUNNER. That was the defect: src/tls_openssl.c is 663
+  # lines and it is the entire security boundary -- every SSL_new, SSL_read,
+  # SSL_free and SSL_CTX lifetime in the project lives in that one file. Until
+  # now, NO REQUIRED CHECK COMPILED IT. ci_macos configured with no -DWITH_TLS,
+  # and WITH_TLS defaults to OFF, so every macOS cell built src/tls_none.c
+  # instead. The only job that has ever compiled the file was the advisory,
+  # continue-on-error ci_sanitizers ON cell. A required check that does not
+  # compile the code is not a gate on that code.
+  #
+  # WHY THE OPENSSL DEPENDENCY IS INSTALLED FOR ONE CELL AND NOT THE OTHER.
+  # src/CMakeLists.txt's WITH_TLS comment states the project's dependency claim:
+  # eleven phases with no third-party package, and README says so in three
+  # places. The OFF cell is what PROVES that claim, because it installs nothing
+  # and still builds and passes. An unconditional `brew install openssl` would
+  # make the OFF cell green whether or not the default build needs OpenSSL --
+  # it would delete the experiment rather than run it. So the install step is
+  # conditional on the ON cell, and the step below asserts that the OFF cell's
+  # binary does not link libssl at all.
+  #
+  # macos-latest IS ARM64 and Homebrew lives in /opt/homebrew there. openssl@3
+  # is a KEG-ONLY formula, so it is deliberately not symlinked into
+  # $(brew --prefix)/lib and FindOpenSSL does not find it on its own -- hence
+  # OPENSSL_ROOT_DIR, exported from the formula's real prefix rather than
+  # hardcoded, so the cell keeps working if the runner's prefix or the formula's
+  # version changes.
   ci_macos:
     runs-on: macos-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      # matrix.include WITH AN EXPLICIT `name` PER CELL, and the reason is
+      # operational rather than stylistic. This job's two OFF cells keep their
+      # EXACT historical check names, "ci_macos (Release)" and "ci_macos
+      # (Debug)", because those two strings are what branch protection is
+      # already configured to require. Had the name been built by
+      # interpolation -- name: ci_macos (${{ matrix.build_type }}) -- every cell
+      # would have gained a suffix, the two required contexts would stop being
+      # reported, and EVERY pull request would hang waiting for a check name
+      # that can no longer arrive. Adding two required names is a settings
+      # change the maintainer makes once; renaming the two existing ones is a
+      # broken gate until they do.
       matrix:
-        build_type: [Release, Debug]
+        include:
+          - name: ci_macos (Release)
+            build_type: Release
+            with_tls: "OFF"
+          - name: ci_macos (Debug)
+            build_type: Debug
+            with_tls: "OFF"
+          - name: ci_macos (Release) WITH_TLS=ON
+            build_type: Release
+            with_tls: "ON"
+          - name: ci_macos (Debug) WITH_TLS=ON
+            build_type: Debug
+            with_tls: "ON"
+    name: ${{ matrix.name }}
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      # ON cell only. See the job comment: unconditional installation would
+      # destroy the zero-dependency claim the OFF cell exists to prove.
+      - name: Install OpenSSL (WITH_TLS=ON only)
+        if: matrix.with_tls == 'ON'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install openssl@3
+          prefix=$(brew --prefix openssl@3)
+          echo "prefix : ${prefix}"
+          echo "openssl: $(brew --prefix openssl@3)/bin/openssl version"
+          echo "OPENSSL_ROOT_DIR=${prefix}" >> "$GITHUB_ENV"
+      - name: Toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "  host     : $(uname -srm)"
+          echo "  cmake    : $(cmake --version | head -1)"
+          echo "  compiler : $(cc --version | head -1)"
+          if [ "${{ matrix.with_tls }}" = "ON" ]; then
+            echo "  OPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR:-<unset>}"
+          else
+            echo "  OPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR:-<unset>}  (expected unset: the default"
+            echo "             build must find no OpenSSL at all)"
+          fi
+      # OPENSSL_ROOT_DIR is passed explicitly, and only for the ON cell. It is
+      # in the environment already, but FindOpenSSL reads a CACHE variable and
+      # an ENVIRONMENT variable, and being explicit means the configure line in
+      # the log says where OpenSSL came from instead of leaving it to be
+      # inferred from a passing build.
       - name: Configure
-        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DBUILD_TESTING=ON
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.with_tls }}" = "ON" ]; then
+            cmake -B build -S . -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+              -DBUILD_TESTING=ON -DWITH_TLS=ON -DOPENSSL_ROOT_DIR="${OPENSSL_ROOT_DIR}"
+          else
+            cmake -B build -S . -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+              -DBUILD_TESTING=ON -DWITH_TLS=OFF
+          fi
       - name: Build
         run: cmake --build build --parallel $(sysctl -n hw.ncpu)
+      # THIS STEP IS WHY THE MATRIX DIMENSION IS NOT DECORATIVE.
+      #
+      # WITH_TLS is opt-in, so a misspelled or ignored -D produces a build with
+      # no error anywhere that silently compiles tls_none.c in all four cells and
+      # reports four green ticks for a TLS backend that was never compiled. The
+      # object file is therefore asserted, not assumed: the two backends are
+      # selected by a generator expression in src/CMakeLists.txt and land in the
+      # static library under different names, so the archive says which one was
+      # compiled. The linked binary is asserted too, because a translation unit
+      # being compiled is weaker than the TLS actually being reachable.
+      #
+      # The OFF cell's assertion is the zero-dependency claim made executable:
+      # it asserts libssl and libcrypto are ABSENT from the shipped binary's
+      # dependencies. That is a stronger statement than "we did not install
+      # OpenSSL" -- it is a statement about what got linked.
+      - name: Assert which TLS backend was actually compiled
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=build/src/libirc_core.a
+          test -f "$archive" || { echo "::error::$archive missing" >&2; exit 1; }
+          members=$(ar t "$archive")
+          echo "TLS objects in $archive:"
+          echo "$members" | grep -i tls | sed 's/^/  /'
+          has_openssl=$(echo "$members" | grep -cx 'tls_openssl.c.o' || true)
+          has_none=$(echo "$members" | grep -cx 'tls_none.c.o' || true)
+          if [ "${{ matrix.with_tls }}" = "ON" ]; then
+            [ "$has_openssl" = "1" ] || {
+              echo "::error::WITH_TLS=ON was requested but tls_openssl.c.o is not in $archive. The OpenSSL backend was NOT compiled, so this cell proves nothing about src/tls_openssl.c." >&2
+              exit 1
+            }
+            [ "$has_none" = "0" ] || {
+              echo "::error::WITH_TLS=ON also linked tls_none.c.o; the two backends must be mutually exclusive" >&2
+              exit 1
+            }
+            otool -L build/src/irc-serve | grep -q libssl || {
+              echo "::error::build/src/irc-serve does not link libssl under WITH_TLS=ON" >&2
+              exit 1
+            }
+            echo "OK: tls_openssl.c.o compiled and libssl linked"
+          else
+            [ "$has_openssl" = "0" ] || {
+              echo "::error::WITH_TLS=OFF still compiled tls_openssl.c.o" >&2
+              exit 1
+            }
+            [ "$has_none" = "1" ] || {
+              echo "::error::WITH_TLS=OFF did not compile tls_none.c.o; expected the stub backend" >&2
+              exit 1
+            }
+            if otool -L build/src/irc-serve | grep -qE 'libssl|libcrypto'; then
+              echo "::error::WITH_TLS=OFF linked OpenSSL. The zero-dependency default build must not." >&2
+              otool -L build/src/irc-serve | grep -E 'libssl|libcrypto' | sed 's/^/  /' >&2
+              exit 1
+            fi
+            echo "OK: tls_none.c.o compiled, no OpenSSL linked (zero-dependency default holds)"
+          fi
       - name: Unit Tests
         working-directory: build
         run: ctest --output-on-failure --timeout 60 -j 2
@@ -194,19 +421,48 @@ jobs:
   # of reporting, so a macOS run of this configuration is not a slower version of
   # this job -- it is a job that hangs. The hosted Linux runner is used rather
   # than the self-hosted one for ci_test's reason, sharpened: this gate must
-  # produce a result on infrastructure the maintainer does not control, and the
-  # self-hosted machine is mid-reconfiguration.
+  # produce a result on infrastructure the maintainer does not control.
   #
-  # ADVISORY, and it stays that way. continue-on-error means this job can never
-  # fail a workflow, and it is not in the required-check list, so it can never
-  # block a merge either. A sanitizer is a gate that earns trust by being
-  # believed, and a new gate reports its first findings as failures; making that
-  # merge-blocking on the day it is added would be a way of not finding out.
+  # THIS JOB GATES NOW. continue-on-error is gone, and the decision rests on the
+  # job's own run history rather than on a preference about sanitizers, because
+  # "should a sanitizer gate" is a question about whether it has ever produced a
+  # false positive, and that is answerable here. Every ci_sanitizers failure in
+  # this repository, from the API's job list and the run logs:
+  #
+  #     8  LeakSanitizer: detected memory leaks  -- REAL findings, all fixed.
+  #        "Reconnect" leaked 4096 bytes in 1 allocation and 8192 in 2;
+  #        test_account and test_batch leaked 4096 in 1. Reproducible across
+  #        consecutive runs at a consistent byte count, which is what a real leak
+  #        looks like and not what a flake looks like.
+  #     2  Build step -- the `(void)read(...)` __wur break at run 37242557613,
+  #        a compile error that ci_test also reported.
+  #     1  AutoScale -- an ordinary test failure that ci_test also reported.
+  #     0  AddressSanitizer memory errors and 0 UndefinedBehaviorSanitizer
+  #        runtime errors. Not one, across every run.
+  #
+  # So the honest reading is the OPPOSITE of the usual one. The instinct is to
+  # gate ASan/UBSan as "deterministic" and hold LSan back as the flaky one, and
+  # for this tree that is backwards: LSan is the half with proven value (it caught
+  # eight real leaks) AND proven stability (49 green runs since, and zero noise
+  # reports among the failures), while ASan/UBSan are the halves with no observed
+  # firing at all. Gating on an unproven capability is not "cautious", it is
+  # claiming a result nobody has seen. Gating on LSan is claiming a result that
+  # is in the log.
+  #
+  # WHY NOT SPLIT IT IN TWO THEN, to gate only the proven half? Because it would
+  # double the configure/build/85-test cycles for no additional detection: one
+  # instrumented binary runs all three checks, and detect_leaks=1 does not
+  # displace the other two. Splitting would spend hosted minutes to hold the
+  # unproven half to a lower standard, which is the opposite of the point.
+  #
+  # WHAT "GATES" STILL REQUIRES FROM THE MAINTAINER: this job is not in the
+  # required-check list, so removing continue-on-error means it can fail a
+  # WORKFLOW but still cannot block a MERGE until its two names are added to main
+  # branch protection. That is a settings change, not a workflow change.
   ci_sanitizers:
     name: ci_sanitizers (ASan+UBSan) WITH_TLS=${{ matrix.with_tls }}
     runs-on: ubuntu-22.04
     timeout-minutes: 40
-    continue-on-error: true
     permissions:
       contents: read
     # TWO CELLS, AND THE SECOND ONE IS THE ONLY DYNAMIC LEAK CHECK THIS PROJECT
@@ -344,7 +600,30 @@ jobs:
           # sanitizer nobody acts on.
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: halt_on_error=1
-        run: ctest --output-on-failure --timeout 120 -j 2
+        # `shell: bash` and not the default, for the reason ci_test gives: the
+        # default is `bash -e {0}`, which has no pipefail, so `ctest | tee` would
+        # return tee's status and a FAILED suite would sail through a job that is
+        # now a gate rather than an advisory.
+        shell: bash
+        run: ctest --output-on-failure --timeout 120 -j 2 | tee ctest.log
+      # THE SKIP RATCHET, HERE TOO, and the reason is specific to this job
+      # rather than a copy of ci_test's. The WITH_TLS=ON cell is the only place
+      # any host ever leak-checks SSL* and SSL_CTX*, and that check is performed
+      # BY test_tls and test_peer_tls. If either of them ever started skipping,
+      # this cell would keep reporting 85/85 and LeakSanitizer would keep
+      # reporting nothing -- not because there are no leaks, but because the code
+      # that allocates them was never run. A green leak check that has quietly
+      # stopped exercising the allocation is the exact failure this job exists to
+      # prevent, so the ratchet is the step that keeps it honest.
+      #
+      # Cheap here because tests/known_skips.txt is EMPTY -- Phase 9 retired all
+      # five of its entries, so the gate is "no test may skip" and there is no
+      # permitted set to reconcile. Verified against a real log: with the list
+      # empty and nothing skipped, check-skips.sh reports "the gate has nothing to
+      # check and found nothing" and exits 0 rather than treating the absent skip
+      # block as unreadable.
+      - name: Skip gate (ratchet)
+        run: ./scripts/check-skips.sh -b build build/ctest.log
 
   # --- Advisory only, hosted ---------------------------------------------
   # Benchmark and compliance run on the hosted runner rather than the

@@ -163,6 +163,49 @@ ctest --test-dir build --output-on-failure
 
 `make local-ci` reproduces the CI warning flags exactly.
 
+### The gate: 3 compilers × Release/Debug × `WITH_TLS` ON/OFF
+
+`make local-ci` covers **one** compiler and **one** configuration, because that is
+what `ci_test` covers. The gate is the breadth `ci_test` deliberately does not
+have.
+
+```sh
+make gate                      # all 12 cells + an ASan+UBSan cell
+make gate GATE_ARGS=-j2        # serial ctest, for bisecting a failure
+make gate GATE_ARGS=--no-asan  # 12 build cells only
+./scripts/gate.sh --help
+```
+
+A cell is **3 compilers × Release/Debug × `WITH_TLS` ON/OFF = 12**, plus one
+ASan+UBSan cell at `WITH_TLS=ON`. Each cell asserts all four of: **0 compiler
+errors, 0 compiler warnings, 0 failed tests, 0 skipped tests**. Skips are a
+separate invariant because `ctest`'s exit code cannot express "a test skipped".
+
+Three things about it are load-bearing:
+
+- **Every cell is configured into a fresh directory.** A reused build directory
+  reports "Built target" for a file it did not recompile, so a cell that should
+  have caught a compile error reports success instead.
+- **`WITH_TLS` is a dimension, not a flag.** The matrix was six builds of
+  `WITH_TLS=OFF` only, and a line in a TLS-only fixture compiled clean under both
+  clangs and then failed under gcc-16 the moment an ON cell existed. A compiler is
+  evidence about a file only if it compiled that file.
+- **It refuses to run on fewer than three compilers.** A gate that silently runs
+  six cells and prints a pass is worse than no gate.
+
+Compilers are discovered, not hardcoded — `/usr/bin/gcc`, `/usr/bin/clang` and
+`/usr/bin/cc` are all Apple's clang on macOS and collapse to one cell, and
+Homebrew's keg-only `llvm@NN` are found via `brew --prefix` because they are not
+on `PATH` at all. Override with `GATE_COMPILERS="gcc-16 clang cc"`. Build trees
+land in `build-gate/`, which is gitignored.
+
+**It is not a substitute for CI, and it is not a leak check.** LeakSanitizer does
+not exist on Darwin — an ASan binary run with `detect_leaks=1` there aborts with
+`detect_leaks is not supported on this platform`, taking every test with it — so
+the local ASan cell runs with leak detection off. The **only** dynamic leak check
+for `SSL*` and `SSL_CTX*` in this project is `ci_sanitizers`' `WITH_TLS=ON` cell on
+Linux.
+
 ### The fortify cell, and what it does not buy
 
 `IRC_FORTIFY=1 ./local-ci.sh` adds `-D_FORTIFY_SOURCE=2` to a whole
@@ -182,15 +225,24 @@ gcc-16 and Apple clang: **it changes nothing**, because the macOS SDK declares n
 `__*_chk` entry points for fortify to select. This class of defect lives in the
 platform's *declaration* of a function, and no `-D` flag on macOS can produce a
 glibc declaration. **`ci_macos` is not a slower version of the Linux gate for
-this class — it is blind to it**, and the Linux job is the gate.
+this class — it is blind to it**, and `ci_test` (hosted Linux, GCC against glibc)
+is the gate.
+
+`scripts/check-wur-discards.sh`, which runs in `ci_test`, greps for `(void)` casts
+of the libc functions glibc marks `__wur` and fails on any host. It does **not**
+replace that build and does not claim to — it is a tripwire for one pattern, added
+because the audit that found the original was a one-time manual pass over 1162
+sites and nothing stopped the next one. Note that `fwrite` is deliberately absent
+from its list: glibc declares it with `__nonnull` and no `__wur`.
 
 ### Platforms
 
 | Platform | Status |
 |---|---|
-| Linux — gcc, clang | Release + Debug in CI |
-| macOS | Release + Debug in CI |
-| Arch Linux, CachyOS | self-hosted runner, push to `main` only |
+| Linux — gcc, clang | Release + Debug in CI (`ci_test`, required) |
+| Linux — cachyos, self-hosted | gcc + clang × Release/Debug, **push to `main` only** |
+| Linux — ASan + UBSan + LSan | `WITH_TLS` OFF and ON, `ci_sanitizers` |
+| macOS | Release + Debug × `WITH_TLS` OFF/ON in CI (`ci_macos`, required) |
 
 The build is **strict C11** with POSIX opted into through feature-test macros,
 rather than relaxing to `gnu11`. Relaxing would silence a Linux build break by
