@@ -545,9 +545,79 @@ static void case_no_client_byte_reaches_the_log(void)
     nf_free(&node);
 }
 
+/* ---------------------------------------------------------------------------
+ * CASE 2 -- `BATCH`'s NO_SIGN, and why it needs its own case rather than a line
+ * ---------------------------------------------------------------------------
+ * The battery above sends `BATCH +<ESC>` and `BATCH -<ESC>`, which reach
+ * `batch_ref_refused:` and `reason=ILLEGAL_REF`. Neither reaches the line this case is
+ * about, and the reason is worth stating because it is the whole point of the case:
+ * the refusal the battery reached is guarded by `batch_ref_valid()`, which is a
+ * CHARACTER test, while the refusal below is guarded by nothing at all.
+ *
+ * `BATCH <ESC>` -- a reference with neither sign -- answers 462 and prints
+ * `batch_refused: reason=NO_SIGN first=<the client's byte>`. There is no validation
+ * between the socket and that `%c`: the byte is the first byte of the client's
+ * argument, the verb is `pre_reg`, and so the line is reachable from a socket that has
+ * never registered and never joined a channel. It is the lowest-privilege instance of
+ * the class in the tree, and the one an enumeration sorted by "which verbs log client
+ * data" ranks last.
+ *
+ * WHAT IS ASSERTED, in the order that makes each half mean something:
+ *
+ *   1. PRE-REGISTRATION. The probe never sends NICK or USER, so a fix that moved the
+ *      check behind the registration gate would stop this test reaching it -- and
+ *      would make the node BETTER while making the test vacuous, which is the one
+ *      outcome a regression test must never produce silently.
+ *   2. THE MEASUREMENT. `first=-` is the withholding, `first_byte=0x1b` says which
+ *      byte, `first_len=1` says how long it was and `first_bad_bytes=1` says it was
+ *      unsafe. All four, because `first=-` on its own is indistinguishable from an
+ *      absent value and `first_len=1` on its own cannot tell ESC from BEL.
+ *   3. NO CONTROL BYTE IN THE WHOLE LOG, which is this file's standing claim.
+ *
+ * `fd=` IS NOT ASSERTED ANYWHERE, for the reason the rest of this tree does not pin
+ * it: the node's descriptor for a connection differs between Linux and macOS.
+ */
+static void case_batch_no_sign_is_measured(void)
+{
+    nf_node_t node;
+    test_client_t c;
+    char line[128];
+
+    TF_CHECK_MSG(nf_spawn_binary(&node) == 0, "could not spawn the node");
+    tc_init(&c);
+    TF_CHECK_MSG(tc_connect(&c, node.port) == 0, "tc_connect failed");
+
+    /* NO NICK, NO USER. The comment above says why, and it is load-bearing: this
+     * case is about the pre-registration surface, so a node that started requiring
+     * registration for BATCH would make this test stop proving anything. */
+    (void)snprintf(line, sizeof line, "BATCH " ESC);
+    TF_CHECK_MSG(tc_send(&c, line) == 0, "the BATCH send failed");
+    /* The 462 is asserted because the CLIENT's answer is half the claim too: the
+     * refusal is a refusal either way, and what changed is what the operator is told. */
+    TF_CHECK_MSG(tc_expect(&c, " 462 ", T_IO_MS) == 0,
+                 "an unsigned BATCH reference did not get its 462");
+    drain(&c);
+
+    TF_CHECK_MSG(log_line_has_tail(node.out, "reason=NO_SIGN",
+                                  "first=- first_byte=0x1b first_len=1 "
+                                  "first_bad_bytes=1") == 1,
+                "the node did not report the NO_SIGN refusal as a measurement. "
+                "`first=` must be WITHHELD rather than the client's byte printed "
+                "raw, and the line must say WHICH byte was withheld in hex, because "
+                "a length alone cannot tell ESC from BEL from a NUL.\n  node said: %s",
+                node.out);
+    assert_log_clean(&node, "the pre-registration BATCH refusal");
+
+    (void)tc_send(&c, "QUIT :done");
+    TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
+    assert_log_clean(&node, "the pre-registration BATCH refusal, including QUIT");
+    tf_unregister(&node);
+}
+
 int main(void)
 {
     case_no_client_byte_reaches_the_log();
+    case_batch_no_sign_is_measured();
 
     tf_done("log-injection");
     return 0;
