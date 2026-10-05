@@ -24,11 +24,10 @@
  *   | channel TOPIC             | other members' terminals     | strip   |
  *   | realname                  | every member of every channel| refuse  |
  *
- * THIS STAGE (#121, commit 1 of 4) ASSERTS ONE CASE, and it is a GUARD rather than the
- * fix: `conn_realname_check()` now asks the shared predicate instead of running its
- * own loop, so the predicate is a refactor as well as an addition, and a fault in it
- * would break the one field that was already closed. The three fields the predicate
- * exists for arrive in the commits that follow.
+ * THIS STAGE (#121, commit 2 of 4) ADDS THE SERVERNAME CASE: the value is gone from
+ * the log and what replaces it is a measurement, so the claim is an absence with a
+ * number attached, plus the positive arm that says the well-formedness column is a
+ * verdict rather than a constant.
  *
  * A reader who wants to know whether this is one predicate with three answers, or
  * three predicates, needs only to read the one function and then this file's four
@@ -226,6 +225,65 @@ static void assert_no_controls_in_log(const nf_node_t *node, size_t mark,
  * The second registration sends `spoofed.example` and must report `wellformed=1`
  * with `bad_bytes=0` -- so the column is a verdict and not a constant.
  */
+static void case_servername_is_summarised(void)
+{
+    nf_node_t node;
+    test_client_t hostile;
+    test_client_t clean;
+    size_t mark;
+
+    TF_CHECK_MSG(nf_spawn_binary(&node) == 0, "could not spawn the node");
+
+    /* 1. The hostile registration. `*` is not used here: `USER <user> <mode>
+     * <servername> :<realname>`, and this is the field under test. */
+    tc_init(&hostile);
+    register_as(&hostile, node.port, "vic", ESC "[2J" BEL, NULL);
+
+    /* 2 and 3, over everything the node said from the moment this client arrived. */
+    TF_CHECK_MSG(nf_expect(&node, "asserted_host_len=5 asserted_host_wellformed=0 "
+                           "asserted_host_bad_bytes=2", T_IO_MS) == 0,
+                 "the node did not report the measurement #121 replaced the raw "
+                 "value with. `USER`'s third parameter was 5 bytes carrying an ESC "
+                 "and a BEL, so the measurement must say 5, not-well-formed, and 2 "
+                 "bad bytes.\n  node said: %s", node.out);
+    /* The dedicated line, which is what makes the drop visible as an EVENT rather
+     * than as a column somebody has to notice has gone unusual. */
+    TF_CHECK_MSG(nf_expect(&node, "asserted_host: fd=", T_IO_MS) == 0,
+                 "the node dropped the bad bytes without saying so.\n  node said: %s",
+                 node.out);
+
+    mark = 0;
+    assert_no_controls_in_log(&node, mark, "USER's <servername>");
+
+    /* The positive arm: a well-formed servername reports wellformed=1, so the
+     * column above is a verdict and not a constant. */
+    tc_init(&clean);
+    register_as(&clean, node.port, "clean", "spoofed.example", NULL);
+    TF_CHECK_MSG(nf_expect(&node, "asserted_host_len=15 asserted_host_wellformed=1 "
+                           "asserted_host_bad_bytes=0", T_IO_MS) == 0,
+                 "a well-formed <servername> was not reported as well-formed. "
+                 "`spoofed.example` is alnum, '-' and '.', which is exactly the "
+                 "grammar irc_serve_server_name_valid() applies to this node's own "
+                 "server name, so wellformed must be 1 -- a column that reports 0 "
+                 "for a name this node would itself have accepted is not measuring "
+                 "anything.\n  node said: %s", node.out);
+
+    /* The hostile connection is still fully usable after a value this node dropped:
+     * nothing about it was refused, because nothing about it was consumed. */
+    TF_CHECK_MSG(tc_send(&hostile, "WHOIS clean") == 0, "hostile WHOIS send failed");
+    TF_CHECK_MSG(tc_expect(&hostile, " 311 ", T_IO_MS) == 0,
+                 "the connection that sent a control-bearing <servername> stopped "
+                 "working. The policy for this field is \"print less\", not \"refuse "
+                 "-- a real client always sends a servername, so a refusal here "
+                 "would strand a half-registered client over a value the node never "
+                 "reads.");
+
+    tc_close(&hostile);
+    tc_close(&clean);
+    TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
+    nf_free(&node);
+}
+
 /* ---------------------------------------------------------------------------
  * CASE 2 -- AWAY: STRIPPED FOR THE RECIPIENT, ANNOUNCED IN THE LOG
  * ---------------------------------------------------------------------------
@@ -421,6 +479,7 @@ static void case_realname_still_refused(void)
 int main(void)
 {
     case_realname_still_refused();
+    case_servername_is_summarised();
 
     tf_done("control-bytes");
     return 0;

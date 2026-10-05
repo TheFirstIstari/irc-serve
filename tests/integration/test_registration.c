@@ -157,10 +157,58 @@ int main(void)
     TF_CHECK_MSG(nf_expect(&node, "host_source=observed", T_IO_MS) == 0,
                  "the node did not report that c->host is the observed peer "
                  "address");
-    TF_CHECK_MSG(nf_expect(&node, ASSERTED_HOST, T_IO_MS) == 0,
-                 "the node did not even record the hostname the client "
-                 "asserted, so the difference between the two is not observable "
-                 "when diagnosing a mismatch");
+    /* ------------------------------------------------------------------------
+     * THE ASSERTED HOST IS MEASURED, NOT PRINTED (#121), and this is the assertion
+     * that changed shape when it was.
+     *
+     * It used to be `nf_expect(&node, ASSERTED_HOST, ...)` -- the raw string, on
+     * the ground that "the node did not even record the hostname the client
+     * asserted" would make the observed/asserted difference diagnosable.
+     *
+     * That was true and it was a defect. `USER`'s third parameter is client
+     * controlled, arrives before registration, and needs no credential, so
+     * printing it put arbitrary bytes into an operator's terminal:
+     * `USER alice 0 <ESC>[2J<BEL> :x` rendered the ESC and rang the bell (#121).
+     * A field this node has no consumer for -- the host is OBSERVED, and nothing a
+     * client asserts moves it -- is not worth an injection vector, so the value is
+     * gone and what is left is the measurement.
+     *
+     * WHAT THIS STILL PROVES, and it is not a weaker claim:
+     *
+     *   - `asserted_host_len` is strlen(ASSERTED_HOST), so the node really did read
+     *     the client's parameter rather than ignoring the argument. A node that
+     *     dropped it entirely would report 0.
+     *   - `asserted_host_wellformed=1` says `spoofed.example` is a name this node's
+     *     own server-name grammar accepts. The FAILURE arm matters as much and is
+     *     asserted by test_control_bytes.c, which sends a name carrying control
+     *     bytes: a node that reported wellformed=1 for those would be claiming a
+     *     grammar that irc_serve_server_name_valid() does not have.
+     *   - The byte-exact 001 above is what proves the value never reached the WIRE,
+     *     and the assertion just below proves it never reached the client's own
+     *     socket. Neither of those moved, because neither of them was about the log.
+     *
+     * THE COST, restated because it is real: an operator can no longer read back
+     * what a client claimed it was talking to. The length, the well-formedness
+     * verdict and the bad-byte count survive. That is the trade #121 made on
+     * purpose, and this assertion is where a future reader will notice if somebody
+     * puts the string back.
+     * ---------------------------------------------------------------------- */
+    {
+        char want_host[96];
+
+        (void)snprintf(want_host, sizeof want_host,
+                       "asserted_host_len=%zu asserted_host_wellformed=1 "
+                       "asserted_host_bad_bytes=0",
+                       strlen(ASSERTED_HOST));
+        TF_CHECK_MSG(nf_expect(&node, want_host, T_IO_MS) == 0,
+                     "the node did not report a measurement of the hostname the "
+                     "client asserted (%s): expected \"%s\". The claim is measured "
+                     "rather than printed since #121, so a mismatch between the "
+                     "observed host and what a client said it was talking to is "
+                     "diagnosable from the length and the verdict even though the "
+                     "string itself is no longer in the log.",
+                     ASSERTED_HOST, want_host);
+    }
     TF_CHECK_MSG(strstr(tc_buffer(&c), ASSERTED_HOST) == NULL,
                  "the hostname USER asserted reached the wire. c->host is what "
                  "001 prints and what every later phase's access control will "

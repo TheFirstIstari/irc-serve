@@ -747,6 +747,9 @@ static void handle_user(server_t *s, conn_t *c, const message_t *m)
     int trunc_user = 0;
     int trunc_real = 0;
     conn_realname_verdict_t v;
+    size_t asserted_len;
+    int asserted_ok;
+    size_t asserted_bad;
 
     if (commands_registered(c)) {
         (void)reply_refused(s, c, "USER", NULL, "462", NULL, 0,
@@ -805,9 +808,77 @@ static void handle_user(server_t *s, conn_t *c, const message_t *m)
     } else {
         copy_field(c->realname, sizeof c->realname, m->params[3], &trunc_real);
     }
+    /* ------------------------------------------------------------------------
+     * `<servername>` IS NOT PRINTED, AND THAT IS THE FIX (#121)
+     * ------------------------------------------------------------------------
+     * `m->params[2]` used to be rendered raw on the line below. One pre-
+     * registration command from the wire put arbitrary bytes into an operator's
+     * terminal: `USER vic 0 <ESC>[2J<BEL> :x` produced
+     *
+     *     [observable] user: ... asserted_host=<ESC>[2J<BEL> host=127.0.0.1
+     *
+     * with the ESC and the BEL surviving, and 0x07 rings a terminal's bell while
+     * ESC `[` is a CSI sequence any terminal executes. No credential, no channel,
+     * no second client -- one line on a socket, before registration completes.
+     *
+     * THE FIX IS NOT A BYTE FILTER, and the reason is the only thing that decides
+     * it: **this node has no consumer for this field.** `host_source=observed` --
+     * the host on that same line is `c->host`, what accept() saw, and nothing a
+     * client asserts in `USER` moves it. So a filter would buy nothing for the
+     * bytes that pass it while still logging a value no reader can act on, and the
+     * hazard would remain for every byte the filter's author did not think of.
+     * A field with no consumer is not logged raw; it is summarised.
+     *
+     * WHAT IS REPORTED INSTEAD, and why each of the three is worth a column:
+     *
+     *   asserted_host_len          Is the client sending something at all? A
+     *                              client with no servername (or one sending an
+     *                              empty one) is a fact about the client, and
+     *                              `USER`'s parameters are all required, so it
+     *                              is a fact worth having.
+     *   asserted_host_wellformed   Did it send a name this node's OWN server-name
+     *                              grammar would accept?
+     *                              irc_serve_server_name_valid() is that grammar,
+     *                              and it is the predicate `server_init()` and the
+     *                              federation handshake already apply to a server
+     *                              name -- so this column answers "is this the
+     *                              shape of thing this node would call a server",
+     *                              using a rule that already exists rather than a
+     *                              third spelling of it. Its grammar is alnum, '-'
+     *                              and '.', so a value that passes it cannot carry
+     *                              a control byte, and this column is safe by
+     *                              construction rather than by luck.
+     *   asserted_host_bad_bytes    How many bytes were in the injection set. The
+     *                              count is measured, never the bytes, and it is
+     *                              what turns "something odd happened" into a
+     *                              number an operator can watch.
+     *
+     * WHY `417` IS NOT USED HERE, which is the third of §9's options and the one
+     * that would have been simplest. Every real client sends a servername --
+     * usually its own FQDN -- so refusing `USER` over it strands a half-registered
+     * client for a field nothing reads. That is the same argument handle_user()'s
+     * realname makes at length above, and it is why the policy for THIS field is
+     * "print less" rather than "print differently".
+     *
+     * THE COST, named: an operator can no longer read back what a client claimed
+     * it was talking to. The length, the well-formedness verdict and the bad-byte
+     * count survive; the string does not. That is the intended trade -- a
+     * diagnostic that cannot be acted on is not worth an injection vector -- and
+     * if an operator ever needs the value, the place to get it is a log line this
+     * node writes from a source it controls, not one a client dictates. */
+    asserted_len = strlen(m->params[2]);
+    asserted_ok = irc_serve_server_name_valid(m->params[2]);
+    asserted_bad = conn_text_bad_count(m->params[2]);
     printf("[observable] user: fd=%d user=%s realname_trunc=%d "
-           "asserted_host=%s host=%s host_source=observed\n",
-           c->fd, c->user, trunc_real, m->params[2], c->host);
+           "asserted_host_len=%zu asserted_host_wellformed=%d "
+           "asserted_host_bad_bytes=%zu host=%s host_source=observed\n",
+           c->fd, c->user, trunc_real, asserted_len, asserted_ok, asserted_bad,
+           c->host);
+    if (asserted_bad != 0u) {
+        printf("[observable] asserted_host: fd=%d reason=BAD_BYTES dropped=%zu "
+               "detail=SUMMARISED_ONLY\n",
+               c->fd, asserted_bad);
+    }
     if (trunc_user != 0) {
         printf("[observable] field_truncated: fd=%d field=user\n", c->fd);
     }
