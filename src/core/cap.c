@@ -334,7 +334,30 @@ size_t cap_available_list(const server_t *s, char *out, size_t cap)
             }
             out[n++] = ' ';
         }
-        if (n + klen + vlen + 1u > cap) {
+        /* THE `>=` AND NOT THE `>`, and this is an off-by-one the audit that filed
+         * #123 read as correct (#123). Every write in this loop was bounded except
+         * the last one: the loop writes the name and the value, `n` ends up at
+         * n + klen + vlen + 1, and then `out[n] = '\\0'` writes ONE MORE BYTE. A
+         * guard of `n + klen + vlen + 1 > cap` therefore admits the case where `n`
+         * ends up EXACTLY `cap`, which is a one-byte write past the end of the
+         * caller's buffer.
+         *
+         * It is not reachable from the wire today, and the reason is the
+         * arithmetic rather than a check: the real caller passes CAP_LS_MAX = 1056
+         * and the widest list this node can render is 234 bytes, so the boundary is
+         * 822 bytes away. But this function takes `cap` as a PARAMETER, the sweep in
+         * tests/protocol/test_cap_bounds.c calls it with every capacity from 1 to
+         * CAP_LS_MAX + 64, and 221 is one of them: with `sts` advertised the list
+         * is exactly 221 bytes and the terminating NUL landed on `out[221]`. A
+         * function that writes one byte past a caller-supplied buffer is the Phase-8
+         * shape whatever the current caller happens to pass, and the guard that is
+         * one too loose is worse than no guard because it reads as a bound.
+         *
+         * The `+ 1u` in the expression is the NUL, so the test is for room for the
+         * bytes AND the terminator: refuse when `n + klen + vlen + 1 >= cap`, which
+         * leaves `n <= cap - 1` on every path out of this loop and makes the final
+         * `out[n] = '\\0'` safe rather than merely usually safe. */
+        if (n + klen + vlen + 1u >= cap) {
             out[0] = '\0';
             return 0;
         }
@@ -785,21 +808,57 @@ static void cap_do_ls(server_t *s, conn_t *c, const message_t *m, int is_list)
     if (is_list) {
         /* Only what this client actually enabled. A server that answered LIST
          * with its whole table would be telling the client it may use things it
-         * did not ask for. */
-        size_t n = 0;
+         * did not ask for.
+         *
+         * THE BOUNDED APPEND, AND THIS ARM USED TO ACCUMULATE BY HAND (#123). It
+         * wrote `list[n++] = ' '`, then `memcpy(list + n, name, strlen(name))`, then
+         * `n += strlen(name)`, then `list[n] = '\0'`, with no test against
+         * `sizeof list` on any of the four. It was safe by arithmetic rather than by
+         * a check: the 17 names in `k_caps` total 186 bytes, which is 17.6% of
+         * CAP_LS_MAX. That margin is not a bound, and the derivation CAP_LS_MAX's
+         * own comment gives -- CAP_MAX_REQ * (CAP_NAME_MAX + 1) + CAP_MAX_REQ --
+         * does not even cover this arm, because `k_caps` holds 17 names and
+         * CAP_MAX_REQ is 16. The headroom came from the names being 17 bytes rather
+         * than 64, which is a property of the table rather than of the code, so the
+         * audit that filed the issue was right about this line and wrong about the
+         * other one.
+         *
+         * WHY cap_append_name() RATHER THAN A SECOND CHECK: it is already the
+         * bounded accumulator the three ACK/NAK arms use, it was written for the
+         * Phase-8 overflow this file is named for, and a second hand-rolled bound
+         * beside it is the shape of drift this file's comments keep warning about.
+         *
+         * AND IT FAILS TO EMPTY RATHER THAN TRUNCATING, which is
+         * cap_available_list()'s contract and the reason that contract exists: a
+         * `CAP LIST` with one name cut off the end is a client that believes it
+         * negotiated a capability it did not get, and the specification's answer to
+         * a list too long for one line is `CAP NEW`, which this node has no use for
+         * -- so the honest thing is an empty list and a line saying why. */
+        size_t off = 0u;
 
         list[0] = '\0';
         for (size_t i = 0; i < k_ncaps; i++) {
+            size_t want;
+            size_t got;
+
             if (cap_enabled(c, k_caps[i].name) == 0) {
                 continue;
             }
-            if (n != 0u) {
-                list[n++] = ' ';
+            want = ((off != 0u) ? 1u : 0u) + strlen(k_caps[i].name);
+            got = cap_append_name(list, sizeof list, off, k_caps[i].name);
+            if (got != want) {
+                /* A SHORT WRITE IS A REFUSAL. cap_append_name() caps what snprintf
+                 * wrote and reports the length it actually wrote, so `got != want` is
+                 * exactly "this name did not fit whole" -- and a name that did not fit
+                 * whole is a name the client must not be told it has. */
+                list[0] = '\0';
+                printf("[observable] cap_list_refused: fd=%d reason=TOO_LONG "
+                       "capacity=%u\n",
+                       c->fd, (unsigned)sizeof list);
+                break;
             }
-            memcpy(list + n, k_caps[i].name, strlen(k_caps[i].name));
-            n += strlen(k_caps[i].name);
+            off += got;
         }
-        list[n] = '\0';
     } else {
         (void)cap_available_list(s, list, sizeof list);
     }

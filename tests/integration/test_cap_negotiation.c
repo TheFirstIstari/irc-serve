@@ -32,7 +32,9 @@
  *     this wrong hangs every modern client, and a test that only asserted the
  *     positive case would pass against one.
  *  5. `CAP END` releases it, and registration completes on the spot.
- *  6. `CAP LIST` reports what THIS client negotiated, not the node's whole table.
+ *  6. `CAP LIST` reports what THIS client negotiated, not the node's whole table,
+ *     and it does so with EVERY advertised capability enabled -- which is the arm's
+ *     worst case, and the one the single-name assertion cannot reach.
  *  7. `CAP LS 302` is accepted. Every current client offers it, and refusing it
  *     makes this node unnegotiable by them.
  *  8. An UNKNOWN SUBCOMMAND is answered (410), not ignored.
@@ -49,6 +51,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/* For CAP_NAME_MAX, CAP_MAX_REQ and CAP_LS_MAX: the derived widths the new
+ * worst-case case asserts against. Named rather than reached through a transitive
+ * include, for the reason test_cap_negotiation's own neighbours state. */
+#include "core/cap.h"
 #include "harness/irc_client.h"
 #include "harness/node_fixture.h"
 #include "harness/test_util.h"
@@ -718,6 +724,290 @@ static void test_no_credential_in_the_log(char *store_path)
     tc_close(&c);
 }
 
+/* --------------------------------------------------------------------------
+ * Part 4: `CAP LIST` at its worst case -- EVERY advertised capability enabled.
+ * --------------------------------------------------------------------------
+ * The `CAP LIST` arm accumulated by hand, with no test against `sizeof list` on any
+ * of its four writes, and it was safe only because the seventeen names in the
+ * capability table total 186 bytes against CAP_LS_MAX = 1056. That is arithmetic
+ * about a table rather than a check in the code, so the claim worth asserting is
+ * the one that survives the table growing: with EVERY capability this node offers
+ * enabled, the reply names all of them, in the table's order, and nothing is cut.
+ *
+ * WHY THE WHOLE TABLE AND NOT ONE NAME. The existing case in part 1 enables
+ * `message-tags` and asserts `CAP * LIST :message-tags` -- which is a one-name
+ * reply and would pass against an accumulator that wrote one name correctly and
+ * the hundredth one wherever it liked. A single-name reply cannot reach a
+ * separator write at all, let alone the NUL, so the accumulator's whole worst case
+ * is invisible to it.
+ *
+ * AND WHY TWO REQs. `cap_split()` refuses more than CAP_MAX_REQ (16) names per
+ * request, and this node offers fifteen on a default build, so one REQ would do
+ * today -- but that is a coincidence of today's count, and a node that grew past
+ * sixteen names would need two. The case therefore requests in CAP_MAX_REQ-sized
+ * chunks from the names it read off `CAP LS`, so it keeps being the worst case
+ * whatever the table holds. It also documents the other half of the fact: a
+ * client CAN enable every name by asking more than once, because `conn_t::caps`
+ * accumulates across REQs inside one negotiation -- so seventeen names in a LIST
+ * reply is reachable from the wire, not merely from the table.
+ */
+static void test_list_worst_case(void)
+{
+    nf_node_t node;
+    test_client_t c;
+    char req[512];
+    char ls_line[2048];
+    char list_line[2048];
+    const char *at;
+    size_t off;
+    size_t advertised = 0u;
+    size_t listed = 0u;
+    size_t chunk = 0u;
+
+    tc_init(&c);
+    TF_CHECK(nf_spawn_binary(&node) == 0);
+    TF_CHECK_MSG(tc_connect(&c, node.port) == 0, "tc_connect failed");
+
+    /* WHAT THE NODE OFFERS, read off the wire rather than out of a header, so the
+     * request is built from what this build actually advertises and the case does
+     * not have to be edited when a capability is added. */
+    TF_CHECK_MSG(tc_send(&c, "CAP LS") == 0, "tc_send failed");
+    TF_CHECK_MSG(tc_expect(&c, " CAP * LS :", T_IO_MS) == 0, "no CAP LS");
+    at = strstr(tc_buffer(&c), " CAP * LS :");
+    TF_CHECK_MSG(at != NULL, "no CAP LS line to read the names out of");
+    (void)snprintf(ls_line, sizeof ls_line, "%s", at);
+    ls_line[strcspn(ls_line, "\r\n")] = '\0';
+
+    /* CAP REQ, IN CHUNKS OF CAP_MAX_REQ, over every advertised name. The chunking
+     * is the point of the second REQ being possible rather than merely allowed:
+     * `conn_t::caps` accumulates across REQs inside one negotiation, so the union
+     * of the chunks is the whole table.
+     *
+     * `ls_line` runs from the line's start, so the token walk begins at
+     * strlen(" CAP * LS :") and then takes every whitespace-separated run after
+     * it. A hand-rolled index that only reacted to separators would skip the first
+     * CHARACTER of the first name and quietly request nothing at all -- which is
+     * what the first version of this block did, and which the `advertised > 0`
+     * assertion below exists to catch rather than to describe. */
+    off = strlen(" CAP * LS :");
+    req[0] = '\0';
+    for (size_t i = off; ls_line[i] != '\0';) {
+        char name[CAP_NAME_MAX + 1];
+        size_t len = 0u;
+
+        /* SKIP THE SEPARATORS. */
+        while (ls_line[i] == ' ' || ls_line[i] == ':') {
+            i++;
+        }
+        if (ls_line[i] == '\0') {
+            break;
+        }
+        /* THEN TAKE ONE NAME. */
+        while (ls_line[i] != '\0' && ls_line[i] != ' ' && ls_line[i] != ':' &&
+               len < (size_t)CAP_NAME_MAX) {
+            name[len++] = ls_line[i++];
+        }
+        name[len] = '\0';
+        if (len == 0u) {
+            continue; /* a name at CAP_NAME_MAX, which this node has none of */
+        }
+        advertised++;
+        chunk++;
+        (void)snprintf(req + strlen(req), sizeof req - strlen(req), "%s%s",
+                       (chunk == 1u) ? "CAP REQ :" : " ", name);
+        if (chunk == (size_t)CAP_MAX_REQ) {
+            TF_CHECK_MSG(tc_send(&c, req) == 0, "tc_send failed");
+            TF_CHECK_MSG(tc_expect(&c, " CAP * ACK :", T_IO_MS) == 0,
+                         "a CAP REQ naming every advertised capability in chunks "
+                         "of CAP_MAX_REQ was not ACKed, so the case cannot get to "
+                         "the LIST that is the claim");
+            req[0] = '\0';
+            chunk = 0u;
+        }
+    }
+    if (chunk != 0u) {
+        TF_CHECK_MSG(tc_send(&c, req) == 0, "tc_send failed");
+        TF_CHECK_MSG(tc_expect(&c, " CAP * ACK :", T_IO_MS) == 0,
+                     "the last CAP REQ chunk was not ACKed");
+    }
+    TF_CHECK_MSG(advertised >= 8u,
+                 "this node offered only %zu capabilities, which is too few for this "
+                 "case to be the worst case it claims to be: a reply of one or two "
+                 "names never reaches a separator write, and the separator write is "
+                 "one of the four the audit found unbounded",
+                 advertised);
+
+    /* CAP END, so registration completes and the connection is a normal one: a
+     * LIST asked mid-negotiation is answered, but a node still holding the gate is
+     * a different arrangement than the one part 1's LIST case ran in. */
+    TF_CHECK_MSG(tc_send(&c, "CAP END") == 0, "tc_send failed");
+    TF_CHECK_MSG(tc_send(&c, "NICK alice") == 0, "tc_send failed");
+    TF_CHECK_MSG(tc_send(&c, "USER a 0 * :Alice") == 0, "tc_send failed");
+    expect_line(&c, "registration after enabling every capability", ":irc.test 001 ");
+
+    /* THE CLAIM. Every name this node advertised comes back, and the reply is a
+     * single line -- so nothing was cut to make it fit, and nothing overflowed
+     * either. `CAP * LIST :` is matched at the START of the line rather than
+     * anywhere in the buffer, because a `CAP * LS :` earlier in the buffer would
+     * satisfy a substring search for a much shorter needle. */
+    TF_CHECK_MSG(tc_send(&c, "CAP LIST") == 0, "tc_send failed");
+    /* `CAP alice` AND NOT `CAP *`, and that is the arrangement this case chose: it
+     * asks LIST after CAP END, so the connection is REGISTERED, and cap_target()
+     * answers a registered connection with the nickname. Part 1's LIST case asks
+     * mid-negotiation and gets `*`. Both are right; a needle written for one and
+     * used against the other waits out its deadline for a line this node will
+     * never send, which is how a case that can only fail gets written.
+     *
+     * The needle also starts at `CAP` rather than at the line's leading CRLF, since
+     * the line is `:irc.test CAP alice LIST :...`; the line BOUNDARY is checked
+     * separately below, which is what expect_line() exists for and what a substring
+     * search cannot do. */
+    TF_CHECK_MSG(tc_expect(&c, " CAP alice LIST :", T_IO_MS) == 0,
+                 "CAP LIST with every capability enabled did not answer with a LIST "
+                 "line of its own");
+    /* THE NEEDLE STARTS AT THE LINE FEED, not at the carriage return, and that is
+     * so the boundary test is exactly the one expect_line() does: the byte before
+     * the LF must be the CR of the line's own terminator, which is what proves the
+     * text is a complete line rather than the tail of a longer one. (A needle
+     * starting at the CR would put the test one byte off in the wrong direction --
+     * `at[-1]` would then be the last character of the PREVIOUS line, and the
+     * check would pass on any line and fail on none.)
+     *
+     * The `:irc.test` is in the needle because the line is `:irc.test CAP alice
+     * LIST :...` and the prefix is what a mid-line match would break. */
+    at = strstr(tc_buffer(&c), "\n:irc.test CAP alice LIST :");
+    if (at == NULL) {
+        TF_CHECK_MSG(strstr(tc_buffer(&c), ":irc.test CAP alice LIST :")
+                         == tc_buffer(&c),
+                     "the CAP LIST reply is not at the start of a line, so this needle "
+                     "may be matching part of a longer line. buffer=%s",
+                     tc_buffer(&c));
+        at = tc_buffer(&c);
+    } else {
+        TF_CHECK_MSG(at == tc_buffer(&c) || at[-1] == '\r',
+                     "the CAP LIST reply is not at the start of a line, so this needle "
+                     "may be matching part of a longer one");
+    }
+    (void)snprintf(list_line, sizeof list_line, "%s",
+                   (at[0] == '\n') ? at + 1 : at);
+    list_line[strcspn(list_line, "\r\n")] = '\0';
+
+    /* AND THE LENGTH, which is the number that says the arm is inside its buffer.
+     * `sizeof list` in cap.c is CAP_LS_MAX, and this is what the reply must fit
+     * in; the assertion is a real bound rather than a restatement of the constant
+     * because it is measured from the wire. */
+    TF_CHECK_MSG(strlen(list_line) < (size_t)CAP_LS_MAX,
+                 "the CAP LIST reply is %zu bytes and CAP_LS_MAX is %u, so the "
+                 "accumulator wrote past the end of its buffer",
+                 strlen(list_line), (unsigned)CAP_LS_MAX);
+
+    /* AND EVERY ADVERTISED NAME IS IN IT. Counted rather than substring-matched
+     * per name, because a name that appears as a SUBSTRING of a longer name would
+     * satisfy a search for it: the reply's names are walked as a token list and
+     * compared against the advertised list, token for token. */
+    {
+        const char *lo = strstr(list_line, "LIST :");
+        char want[2048];
+
+        TF_CHECK_MSG(lo != NULL, "the LIST line has no trailing parameter");
+        lo += strlen("LIST :");
+        (void)snprintf(want, sizeof want, "%s", lo);
+        for (size_t i = 0; want[i] != '\0'; i++) {
+            if (want[i] == ' ') {
+                want[i] = '\0';
+            }
+        }
+        for (const char *p = want; *p != '\0'; p += strlen(p) + 1u) {
+            listed++;
+        }
+        TF_CHECK_MSG(listed == advertised,
+                     "CAP LIST named %zu capabilities and CAP LS advertised %zu, so "
+                     "the accumulator dropped one -- which is the failure the audit "
+                     "that filed #123 was looking for, and a client that believes it "
+                     "negotiated a dropped capability is a client that will use it: "
+                     "LIST=%s",
+                     listed, advertised, list_line);
+    }
+
+    /* AND IT IS THE WHOLE TABLE, not a prefix of it. A reply cut at the buffer's
+     * end would name a prefix, so the last advertised name has to be present. */
+    {
+        const char *last = strrchr(ls_line, ' ');
+        char needle[CAP_NAME_MAX + 4];
+
+        TF_CHECK_MSG(last != NULL, "CAP LS named nothing");
+        /* `last` ALREADY POINTS AT THE SEPARATOR, so the needle is `last` itself
+         * (minus the colon, in the case where the last thing on the line is a
+         * single name and nothing follows it). Prefixing another space here was the
+         * first version's bug and it made the needle a name no reply could carry. */
+        (void)snprintf(needle, sizeof needle, "%s", (last[0] == ':') ? last + 1 : last);
+        TF_CHECK_MSG(strstr(list_line, needle) != NULL,
+                     "the CAP LIST reply does not carry the last capability CAP LS "
+                     "advertised (\"%s\"), so it is a prefix rather than the whole "
+                     "table. ls=[%s] list=[%s]",
+                     needle, ls_line, list_line);
+    }
+
+    /* AND THE NODE SAID WHAT IT SENT, which is the cross-check that the two halves
+     * above are the same event rather than two lines that happen to look right. */
+    TF_CHECK_MSG(nf_expect(&node, "sub=LIST", T_IO_MS) == 0,
+                 "the node never logged the LIST it answered, so the reply above may "
+                 "be something else: %s",
+                 node.out);
+
+    /* ------------------------------------------------------------------------
+     * WHY THIS PART IS A SOURCE INSPECTION, STATED BEFORE IT IS USED
+     * ------------------------------------------------------------------------
+     * Every assertion above would still pass against an UNBOUNDED accumulator,
+     * and that is not a gap in them -- it is arithmetic. This node's seventeen
+     * capability names total 186 bytes against CAP_LS_MAX = 1056, so the reply the
+     * unbounded arm would have written is 203 bytes at its widest and lands 853
+     * bytes inside the buffer. There is no capacity at which the wire can reach the
+     * boundary, which means no wire assertion can distinguish "bounded" from
+     * "unbounded" for this arm, and a test that pretended otherwise would be
+     * asserting that a number is small.
+     *
+     * The teeth run proved it rather than arguing it: with the hand-rolled
+     * `memcpy(list + n, ...)` accumulation restored, this whole function passed.
+     * Growing the table until the reply would NOT fit does not help, because the
+     * bounded arm refuses at that point too -- a refusal and an overflow look the
+     * same from outside unless the test can also see that the name was dropped
+     * honestly.
+     *
+     * So the claim is asserted where the two shapes are actually different: in the
+     * source. `cap_append_name()` is the bounded accumulator the three ACK/NAK arms
+     * already use and it is what `cap_do_ls()`'s LIST arm is now routed through; a
+     * `memcpy(list ...)` anywhere in the file is the fingerprint of the arm the
+     * audit found. This is the pattern tests/integration/test_close_sites.c and
+     * test_readiness_intent.c established for a claim about a shape rather than
+     * about an event, and it is the honest tool for this one: the alternative is
+     * no assertion at all.
+     */
+    {
+        char *code = tf_read_code("src/core/cap.c", NULL);
+
+        TF_CHECK_MSG(code != NULL, "could not read src/core/cap.c (is "
+                     "IRCSERVE_SRC_DIR set?)");
+        /* THE HELPER IS CALLED. `tf_calls()` matches on an identifier boundary, so
+         * this is the CALL and not a mention of the name in a comment or a string. */
+        TF_CHECK_MSG(tf_calls(code, "cap_append_name") != 0,
+                     "src/core/cap.c never calls cap_append_name(), so the bounded "
+                     "accumulator that exists in this very file is not used by any of "
+                     "the arms that fill a CAP_LS_MAX buffer");
+        /* AND THE FINGERPRINT OF THE UNBOUNDED ARM IS GONE. */
+        TF_CHECK_MSG(strstr(code, "memcpy(list") == NULL,
+                     "src/core/cap.c still contains a direct memcpy() into the CAP "
+                     "reply buffer, which is the hand-rolled accumulation #123 "
+                     "found: no test against sizeof on any of its writes, and the "
+                     "bound it has is arithmetic about a table rather than a check");
+        free(code);
+    }
+
+    nf_kill(&node);
+    nf_free(&node);
+    tc_close(&c);
+}
+
 int main(void)
 {
     char good_store[] = "/tmp/irc_serve_cap_good.XXXXXX";
@@ -762,6 +1052,7 @@ int main(void)
 
     test_negotiation();
     test_end_before_registration();
+    test_list_worst_case();
 
     /* The write_store() helper is used for the loose case because its mode is
      * the whole point of that case; the two well-formed stores above are created

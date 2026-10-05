@@ -310,7 +310,8 @@ size_t cap_available_list(const server_t *s, char *out, size_t cap);
 #define CAP_MAX_REQ 16
 #define CAP_NAME_MAX 64
 
-/* The worst case a CAP LS/REQ/DEL/NAK reply can occupy, DERIVED from its inputs.
+/* The worst case a CAP LS/REQ/DEL/NAK/LIST reply can occupy, DERIVED from its
+ * inputs.
  *
  * This was 256, and CodeQL was right that the accumulating snprintf calls in cap.c
  * could overflow it. cap_split() accepts up to CAP_MAX_REQ names of up to
@@ -328,7 +329,40 @@ size_t cap_available_list(const server_t *s, char *out, size_t cap);
  * 256 was a guess about how much text a reply needs rather than a function of how
  * much text can arrive, and CAP_MAX_REQ and CAP_NAME_MAX live here rather than in
  * cap.c so the derivation can see them -- a derived constant in one file reading
- * inputs in another is exactly how the two drifted apart. */
+ * inputs in another is exactly how the two drifted apart.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THIS NUMBER DOES NOT COVER, WHICH #123 FOUND (#123)
+ * ---------------------------------------------------------------------------
+ * The derivation above bounds a REPLY to a client's request: at most CAP_MAX_REQ
+ * names, each at most CAP_NAME_MAX. It does NOT bound what this node puts in a
+ * reply of its own accord, and there are two of those:
+ *
+ *   CAP LS      the whole available set, plus `sts`'s value. Bounded on every
+ *               write by cap_available_list(), which accounts for the value's
+ *               length separately and fails to empty rather than truncating.
+ *               tests/protocol/test_cap_bounds.c sweeps every capacity from 1 to
+ *               CAP_LS_MAX + 64 with a canary behind the buffer and asserts no
+ *               write escapes at any of them.
+ *
+ *   CAP LIST    the names this client enabled. Those names come from the node's own
+ *               `k_caps` table, not from the wire -- cap_enabled() matches a name
+ *               against the table -- so a client cannot make this arm long by
+ *               asking. It was, however, accumulated BY HAND with no bound on any of
+ *               its four writes, and it is now routed through the same bounded
+ *               helper the ACK/NAK arms use.
+ *
+ * AND THE TABLE IS ALREADY LARGER THAN THE DERIVATION. `k_caps` holds SEVENTEEN
+ * names and CAP_MAX_REQ is sixteen, so a reply this node composes from its own
+ * table is not covered by this derivation even in principle; what bounds it in
+ * practice is that the seventeen names total 186 bytes against 1056. A client can
+ * reach all seventeen by REQing sixteen and then one more (c->caps accumulates
+ * across REQs during a negotiation), so seventeen IS reachable from the wire --
+ * 203 bytes with separators and the NUL, 19.2% of this buffer.
+ *
+ * So this constant is not what holds either arm up, and the arithmetic above
+ * should not be read as saying it is. It is the size of the buffer; the two arms
+ * that fill it are what enforce the bound, and each is asserted separately. */
 #define CAP_LS_MAX (CAP_MAX_REQ * (CAP_NAME_MAX + 1) + CAP_MAX_REQ)
 
 /* Is the client still mid-negotiation, and therefore is registration held?
