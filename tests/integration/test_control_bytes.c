@@ -621,6 +621,19 @@ static void case_topic_stripped_for_members(void)
  */
 #define UTF8_TEXT "caf" "\303\251" " na" "\303\257ve " "\346\227\245\346\234\254"
 
+/* The three RELAYED fields' payloads, as a raw/stripped PAIR each rather than as a
+ * raw string plus an arithmetic strip. The stripped form is its own literal, which
+ * is the point: an expectation computed from the same expression that builds the
+ * payload agrees with a wrong implementation, and a hand-arithmetic byte count that
+ * is off by one turns a real assertion into a permanently red test. Every length in
+ * the three cases below is strlen() of one of these six literals. */
+#define KICK_RAW   ESC "[2J" ESC "[31mout you go " UTF8_TEXT
+#define KICK_CLEAN "[2J[31mout you go " UTF8_TEXT
+#define PART_RAW   ESC "adi" UTF8_TEXT
+#define PART_CLEAN "adi" UTF8_TEXT
+#define MASK_RAW   ESC "*!*@127.0.0.1"
+#define MASK_CLEAN "*!*@127.0.0.1"
+
 /* Build the whole line `AWAY :<esc><utf8>` into `out` and return the offset of the
  * byte to cut at, which is the MIDDLE of the first two-byte character of the UTF-8
  * text: "AWAY :" and the escape are complete, "caf" is complete, and the split falls
@@ -818,6 +831,185 @@ static void case_topic_strip_keeps_good_bytes(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * CASE 7 -- THE RELAYED PARAMETERS: KICK REASON, PART REASON, BAN MASK
+ * ---------------------------------------------------------------------------
+ * The three remaining places a `m->params[]` value reached another client's socket
+ * verbatim, and all three were found by asking the question the first pass should
+ * have asked at the start: "where else does a client parameter go out on the wire
+ * instead of the field the node stored?"
+ *
+ *   - `handle_kick()` put the client's own `<reason>` into the KICK it broadcasts
+ *     to every member. Length-bounded by CHAN_MAX_KICK_REASON and not byte-bounded.
+ *   - `chan_member_leave()` put a PART's `<reason>` on the wire to every member, and
+ *     `handle_part()`'s forward arm put the same string on the link. RFC 2812 3.3.2
+ *     gives a PART reason no limit and this node imposes none.
+ *   - `handle_mode()` put a ban MASK into the MODE echo, and `chan_ban_add()`
+ *     validated the mask's length and not its bytes -- so the mask that was STORED
+ *     and the mask that was ANNOUNCED were both the client's bytes.
+ *
+ * All three are the same class as the away message and the topic: legitimate client
+ * content, relayed to other people, so STRIPPED and ANNOUNCED. The ban mask is the
+ * one with a second copy, and it is why the case asserts the stored and the
+ * broadcast agree rather than only that the broadcast is clean: a strip applied to
+ * one of the two would leave the other raw, which is exactly the defect the topic's
+ * owned arm had.
+ *
+ * WHAT MUST SURVIVE, and it is asserted for each field rather than once: the space,
+ * the punctuation and the UTF-8. A KICK reason is a sentence a person wrote and a
+ * PART reason is usually a farewell, so "do not come back <ESC>" and "adiós" both
+ * have to arrive intact. `assert_no_controls()` is the security half;
+ * `expect_line_since()` on the EXACT line is the other half, and a strip that ate a
+ * space fails it while passing every control-byte assertion in this file.
+ */
+static void case_relayed_parameters_are_stripped(void)
+{
+    nf_node_t node;
+    test_client_t op;          /* does all three writes */
+    test_client_t witness;     /* stays; sees all three */
+    test_client_t target;      /* kicked; sees the KICK */
+    test_client_t victim;      /* proves the stored ban mask by being refused */
+    char want[256];
+    char reason[128];
+    size_t mark_w;
+    size_t mark_t;
+
+    TF_CHECK_MSG(nf_spawn_binary(&node) == 0, "could not spawn the node");
+    tc_init(&op);
+    register_as(&op, node.port, "vic", "*spoofed", NULL);
+    tc_init(&witness);
+    register_as(&witness, node.port, "bob", "*spoofed", NULL);
+    tc_init(&target);
+    register_as(&target, node.port, "zaphod", "*spoofed", NULL);
+    tc_init(&victim);
+    register_as(&victim, node.port, "mallory", "*spoofed", NULL);
+    join(&op, CHAN);
+    join(&witness, CHAN);
+    join(&target, CHAN);
+    join(&victim, CHAN);
+
+    /* vic needs +o for both KICK and MODE +b. It creates the channel on its JOIN, so
+     * it is the creator and holds +o already; asserting that is what stops the three
+     * cases below being 482s about privilege. */
+    TF_CHECK_MSG(tc_send(&op, "MODE " CHAN " +o bob") == 0, "the +o send failed");
+    drain(&op);
+    drain(&witness);
+    drain(&target);
+
+    /* --- 1. THE BAN MASK, WHOSE STORED AND ANNOUNCED COPIES MUST AGREE --- */
+    mark_w = tc_received(&witness);
+    TF_CHECK_MSG(tc_send(&op, "MODE " CHAN " +b " MASK_RAW) == 0,
+                 "the ban mask send failed");
+    (void)snprintf(want, sizeof want,
+                   ":vic!vic@" OBSERVED_HOST " MODE " CHAN " +b " MASK_CLEAN "\r\n");
+    TF_CHECK_MSG(tc_expect(&witness, want, T_IO_MS) == 0,
+                 "the member did not receive the stripped ban mask \"%s\". The mask is "
+                 "the one field here that is BOTH stored and announced, so this is the "
+                 "half of the assertion a strip on only one copy would fail.\n"
+                 "  witness saw: %s", want, tc_buffer(&witness) + mark_w);
+    assert_no_controls(&witness, mark_w, "the MODE +b echo");
+    /* THE BAN IS REAL, which is the other half and the half that cannot be faked.
+     * A mask the node printed as stripped and stored as something else would look
+     * perfect on the wire; the divergence is only visible in what the ban REFUSES.
+     *
+     * So a fourth client leaves the channel and asks to come back, and this
+     * project's answer to that is 474. The ban is per-channel -- `ch->bans` belongs
+     * to one channel -- so the client has to leave and re-join THE SAME one, which
+     * is why this is a PART followed by a JOIN and not a JOIN into a fresh channel.
+     * An earlier version of this case set the ban on #T and tested a JOIN to #B,
+     * which of course was not banned and which taught the case nothing. */
+    TF_CHECK_MSG(tc_send(&victim, "PART " CHAN) == 0,
+                 "the ban victim's PART send failed");
+    drain(&victim);
+    {
+        size_t mark_v = tc_received(&victim);
+
+        TF_CHECK_MSG(tc_send(&victim, "JOIN " CHAN) == 0,
+                     "the ban victim's re-JOIN send failed");
+        drain(&victim);
+        TF_CHECK_MSG(strstr(tc_buffer(&victim) + mark_v, " 474 ") != NULL,
+                     "the ban was not enforced -- 474 is this node's answer for a JOIN "
+                     "a ban mask refuses -- so the STORED mask is not the one that was "
+                     "announced and the two copies have diverged. A strip applied to "
+                     "the broadcast alone would print the clean mask on the wire and "
+                     "store the raw one, and this is the assertion that catches it.\n"
+                     "  victim saw: %s", tc_buffer(&victim) + mark_v);
+        assert_no_controls(&victim, mark_v, "the 474 a ban mask produced");
+    }
+    (void)snprintf(want, sizeof want, "chan_ban_mask_stripped: channel=" CHAN
+                   " by=vic in_len=%zu kept_len=%zu", strlen(MASK_RAW),
+                   strlen(MASK_CLEAN));
+    TF_CHECK_MSG(nf_expect(&node, want, T_IO_MS) == 0,
+                 "the operator log did not record the ban mask strip; expected "
+                 "\"%s\".\n  node said: %s", want, node.out);
+
+    /* --- 2. THE KICK REASON, which reaches every remaining member --- */
+    mark_w = tc_received(&witness);
+    mark_t = tc_received(&target);
+    (void)snprintf(reason, sizeof reason, "%s", KICK_RAW);
+    {
+        char line[512];
+
+        (void)snprintf(line, sizeof line, "KICK " CHAN " zaphod :%s", reason);
+        TF_CHECK_MSG(tc_send(&op, line) == 0, "the KICK send failed");
+    }
+    (void)snprintf(want, sizeof want, ":vic!vic@" OBSERVED_HOST " KICK " CHAN
+                   " zaphod :" KICK_CLEAN "\r\n");
+    TF_CHECK_MSG(tc_expect(&witness, want, T_IO_MS) == 0,
+                 "the remaining member did not receive the stripped KICK reason "
+                 "\"%s\". Written out in full, so a strip that ate a space or a UTF-8 "
+                 "continuation byte fails here while passing every control-byte "
+                 "assertion in this file.\n  witness saw: %s", want,
+                 tc_buffer(&witness) + mark_w);
+    assert_no_controls(&witness, mark_w, "the KICK broadcast");
+    /* And the kicked user sees the same stripped text: the KICK names the reason to
+     * its target, which is the only part of it most clients ever show. */
+    (void)snprintf(want, sizeof want, ":vic!vic@" OBSERVED_HOST " KICK " CHAN
+                   " zaphod :" KICK_CLEAN "\r\n");
+    TF_CHECK_MSG(tc_expect(&target, want, T_IO_MS) == 0,
+                 "the KICKED user did not receive the stripped reason \"%s\".\n"
+                 "  target saw: %s", want, tc_buffer(&target) + mark_t);
+    assert_no_controls(&target, mark_t, "the KICK as the target saw it");
+    (void)snprintf(want, sizeof want, "chan_kick_stripped: channel=" CHAN
+                   " nick=vic in_len=%zu kept_len=%zu", strlen(KICK_RAW),
+                   strlen(KICK_CLEAN));
+    TF_CHECK_MSG(nf_expect(&node, want, T_IO_MS) == 0,
+                 "the operator log did not record the KICK reason strip; expected "
+                 "\"%s\".\n  node said: %s", want, node.out);
+
+    /* --- 3. THE PART REASON, which is the one with no length bound at all --- */
+    mark_w = tc_received(&witness);
+    (void)snprintf(reason, sizeof reason, "%s", PART_RAW);
+    {
+        char line[512];
+
+        (void)snprintf(line, sizeof line, "PART " CHAN " :%s", reason);
+        TF_CHECK_MSG(tc_send(&op, line) == 0, "the PART send failed");
+    }
+    (void)snprintf(want, sizeof want, ":vic!vic@" OBSERVED_HOST " PART " CHAN
+                   " :" PART_CLEAN "\r\n");
+    TF_CHECK_MSG(tc_expect(&witness, want, T_IO_MS) == 0,
+                 "the remaining member did not receive the stripped PART reason "
+                 "\"%s\". A PART reason is the one of these three with no length bound "
+                 "in the RFC or here, so it is the case that would fail if the strip's "
+                 "buffer were sized off a field bound instead of the line cap.\n"
+                 "  witness saw: %s", want, tc_buffer(&witness) + mark_w);
+    assert_no_controls(&witness, mark_w, "the PART broadcast");
+    (void)snprintf(want, sizeof want, "chan_part_stripped: channel=" CHAN
+                   " nick=vic in_len=%zu kept_len=%zu", strlen(PART_RAW),
+                   strlen(PART_CLEAN));
+    TF_CHECK_MSG(nf_expect(&node, want, T_IO_MS) == 0,
+                 "the operator log did not record the PART reason strip; expected "
+                 "\"%s\".\n  node said: %s", want, node.out);
+
+    tc_close(&op);
+    tc_close(&witness);
+    tc_close(&target);
+    tc_close(&victim);
+    TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
+    nf_free(&node);
+}
+
+/* ---------------------------------------------------------------------------
  * CASE 6 -- THE REALNAME IS STILL REFUSED (Rule 3's regression guard)
  * ---------------------------------------------------------------------------
  * `conn_realname_check()` now asks `conn_text_bad_count()` instead of running its
@@ -919,6 +1111,7 @@ int main(void)
     case_topic_stripped_for_members();
     case_away_strip_keeps_good_bytes();
     case_topic_strip_keeps_good_bytes();
+    case_relayed_parameters_are_stripped();
     case_realname_still_refused();
 
     tf_done("control-bytes");
