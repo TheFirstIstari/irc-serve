@@ -150,21 +150,165 @@ jobs:
         run: ./scripts/check-attribution.sh "origin/${{ github.ref_name }}" HEAD
 
   # --- macOS: cannot run on the self-hosted machine -----------------------
+  # WITH_TLS IS A MATRIX DIMENSION HERE, AND UNTIL THIS COMMIT IT WAS NOT
+  # ANYWHERE ELSE ON THIS RUNNER. That was the defect: src/tls_openssl.c is 663
+  # lines and it is the entire security boundary -- every SSL_new, SSL_read,
+  # SSL_free and SSL_CTX lifetime in the project lives in that one file. Until
+  # now, NO REQUIRED CHECK COMPILED IT. ci_macos configured with no -DWITH_TLS,
+  # and WITH_TLS defaults to OFF, so every macOS cell built src/tls_none.c
+  # instead. The only job that has ever compiled the file was the advisory,
+  # continue-on-error ci_sanitizers ON cell. A required check that does not
+  # compile the code is not a gate on that code.
+  #
+  # WHY THE OPENSSL DEPENDENCY IS INSTALLED FOR ONE CELL AND NOT THE OTHER.
+  # src/CMakeLists.txt's WITH_TLS comment states the project's dependency claim:
+  # eleven phases with no third-party package, and README says so in three
+  # places. The OFF cell is what PROVES that claim, because it installs nothing
+  # and still builds and passes. An unconditional `brew install openssl` would
+  # make the OFF cell green whether or not the default build needs OpenSSL --
+  # it would delete the experiment rather than run it. So the install step is
+  # conditional on the ON cell, and the step below asserts that the OFF cell's
+  # binary does not link libssl at all.
+  #
+  # macos-latest IS ARM64 and Homebrew lives in /opt/homebrew there. openssl@3
+  # is a KEG-ONLY formula, so it is deliberately not symlinked into
+  # $(brew --prefix)/lib and FindOpenSSL does not find it on its own -- hence
+  # OPENSSL_ROOT_DIR, exported from the formula's real prefix rather than
+  # hardcoded, so the cell keeps working if the runner's prefix or the formula's
+  # version changes.
   ci_macos:
     runs-on: macos-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      # matrix.include WITH AN EXPLICIT `name` PER CELL, and the reason is
+      # operational rather than stylistic. This job's two OFF cells keep their
+      # EXACT historical check names, "ci_macos (Release)" and "ci_macos
+      # (Debug)", because those two strings are what branch protection is
+      # already configured to require. Had the name been built by
+      # interpolation -- name: ci_macos (${{ matrix.build_type }}) -- every cell
+      # would have gained a suffix, the two required contexts would stop being
+      # reported, and EVERY pull request would hang waiting for a check name
+      # that can no longer arrive. Adding two required names is a settings
+      # change the maintainer makes once; renaming the two existing ones is a
+      # broken gate until they do.
       matrix:
-        build_type: [Release, Debug]
+        include:
+          - name: ci_macos (Release)
+            build_type: Release
+            with_tls: "OFF"
+          - name: ci_macos (Debug)
+            build_type: Debug
+            with_tls: "OFF"
+          - name: ci_macos (Release) WITH_TLS=ON
+            build_type: Release
+            with_tls: "ON"
+          - name: ci_macos (Debug) WITH_TLS=ON
+            build_type: Debug
+            with_tls: "ON"
+    name: ${{ matrix.name }}
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      # ON cell only. See the job comment: unconditional installation would
+      # destroy the zero-dependency claim the OFF cell exists to prove.
+      - name: Install OpenSSL (WITH_TLS=ON only)
+        if: matrix.with_tls == 'ON'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install openssl@3
+          prefix=$(brew --prefix openssl@3)
+          echo "prefix : ${prefix}"
+          echo "openssl: $(brew --prefix openssl@3)/bin/openssl version"
+          echo "OPENSSL_ROOT_DIR=${prefix}" >> "$GITHUB_ENV"
+      - name: Toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "  host     : $(uname -srm)"
+          echo "  cmake    : $(cmake --version | head -1)"
+          echo "  compiler : $(cc --version | head -1)"
+          if [ "${{ matrix.with_tls }}" = "ON" ]; then
+            echo "  OPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR:-<unset>}"
+          else
+            echo "  OPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR:-<unset>}  (expected unset: the default"
+            echo "             build must find no OpenSSL at all)"
+          fi
+      # OPENSSL_ROOT_DIR is passed explicitly, and only for the ON cell. It is
+      # in the environment already, but FindOpenSSL reads a CACHE variable and
+      # an ENVIRONMENT variable, and being explicit means the configure line in
+      # the log says where OpenSSL came from instead of leaving it to be
+      # inferred from a passing build.
       - name: Configure
-        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DBUILD_TESTING=ON
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.with_tls }}" = "ON" ]; then
+            cmake -B build -S . -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+              -DBUILD_TESTING=ON -DWITH_TLS=ON -DOPENSSL_ROOT_DIR="${OPENSSL_ROOT_DIR}"
+          else
+            cmake -B build -S . -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+              -DBUILD_TESTING=ON -DWITH_TLS=OFF
+          fi
       - name: Build
         run: cmake --build build --parallel $(sysctl -n hw.ncpu)
+      # THIS STEP IS WHY THE MATRIX DIMENSION IS NOT DECORATIVE.
+      #
+      # WITH_TLS is opt-in, so a misspelled or ignored -D produces a build with
+      # no error anywhere that silently compiles tls_none.c in all four cells and
+      # reports four green ticks for a TLS backend that was never compiled. The
+      # object file is therefore asserted, not assumed: the two backends are
+      # selected by a generator expression in src/CMakeLists.txt and land in the
+      # static library under different names, so the archive says which one was
+      # compiled. The linked binary is asserted too, because a translation unit
+      # being compiled is weaker than the TLS actually being reachable.
+      #
+      # The OFF cell's assertion is the zero-dependency claim made executable:
+      # it asserts libssl and libcrypto are ABSENT from the shipped binary's
+      # dependencies. That is a stronger statement than "we did not install
+      # OpenSSL" -- it is a statement about what got linked.
+      - name: Assert which TLS backend was actually compiled
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=build/src/libirc_core.a
+          test -f "$archive" || { echo "::error::$archive missing" >&2; exit 1; }
+          members=$(ar t "$archive")
+          echo "TLS objects in $archive:"
+          echo "$members" | grep -i tls | sed 's/^/  /'
+          has_openssl=$(echo "$members" | grep -cx 'tls_openssl.c.o' || true)
+          has_none=$(echo "$members" | grep -cx 'tls_none.c.o' || true)
+          if [ "${{ matrix.with_tls }}" = "ON" ]; then
+            [ "$has_openssl" = "1" ] || {
+              echo "::error::WITH_TLS=ON was requested but tls_openssl.c.o is not in $archive. The OpenSSL backend was NOT compiled, so this cell proves nothing about src/tls_openssl.c." >&2
+              exit 1
+            }
+            [ "$has_none" = "0" ] || {
+              echo "::error::WITH_TLS=ON also linked tls_none.c.o; the two backends must be mutually exclusive" >&2
+              exit 1
+            }
+            otool -L build/src/irc-serve | grep -q libssl || {
+              echo "::error::build/src/irc-serve does not link libssl under WITH_TLS=ON" >&2
+              exit 1
+            }
+            echo "OK: tls_openssl.c.o compiled and libssl linked"
+          else
+            [ "$has_openssl" = "0" ] || {
+              echo "::error::WITH_TLS=OFF still compiled tls_openssl.c.o" >&2
+              exit 1
+            }
+            [ "$has_none" = "1" ] || {
+              echo "::error::WITH_TLS=OFF did not compile tls_none.c.o; expected the stub backend" >&2
+              exit 1
+            }
+            if otool -L build/src/irc-serve | grep -qE 'libssl|libcrypto'; then
+              echo "::error::WITH_TLS=OFF linked OpenSSL. The zero-dependency default build must not." >&2
+              otool -L build/src/irc-serve | grep -E 'libssl|libcrypto' | sed 's/^/  /' >&2
+              exit 1
+            fi
+            echo "OK: tls_none.c.o compiled, no OpenSSL linked (zero-dependency default holds)"
+          fi
       - name: Unit Tests
         working-directory: build
         run: ctest --output-on-failure --timeout 60 -j 2
