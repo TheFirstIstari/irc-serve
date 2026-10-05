@@ -466,6 +466,19 @@ size_t conn_text_logsafe(char *out, size_t cap, const char *s);
  *                                     and forwarded to peers, so one write is a
  *                                     long-lived injection rather than an
  *                                     immediate one.
+ *   KICK REASON                       STRIPPED. Relayed to every remaining member
+ *                                     of the channel; there is no stored copy, so
+ *                                     a strip is what "do not relay the client's
+ *                                     bytes" means here.
+ *   PART REASON                       STRIPPED. Relayed to every member AND put on
+ *                                     the link by the forward arm. The one field
+ *                                     with no length bound in the RFC or here.
+ *   BAN MASK          (MODE +b)       STRIPPED, and ONE copy: the stored mask and
+ *                                     the announced mask are the same bytes,
+ *                                     because the stored one is what
+ *                                     chan_banned() enforces and two different
+ *                                     answers to "what is this channel's ban"
+ *                                     is the defect this set exists to prevent.
  *   SERVERNAME (USER's <servername>)  NOT LOGGED AT ALL. This node ignores it --
  *                                     the host is observed -- so emitting it buys
  *                                     no diagnostic and creates the whole hazard.
@@ -474,7 +487,25 @@ size_t conn_text_logsafe(char *out, size_t cap, const char *s);
  *                                     that needs no call into this block at all.
  *
  * A field with a different consumer gets a different entry, and the entry is the
- * argument. What no field may do is print the raw value. */
+ * argument. What no field may do is print the raw value.
+ *
+ * ---------------------------------------------------------------------------
+ * AND WHAT IS *LOGGED* RATHER THAN STORED -- conn_text_logsafe(), NOT A STRIP
+ * ---------------------------------------------------------------------------
+ * A client string this node puts only into its own stdout is a different question
+ * and gets a different operation. There is no second reader to protect, so there
+ * is nothing to protect by rewriting one and a great deal to lose:
+ * `cmd_unknown: command=NICK` is the entire diagnostic, and printed with a byte
+ * removed it would name a verb the client never sent. So those are MEASURED --
+ * verbatim when every byte is printable ASCII, withheld with a length and a
+ * bad-byte count when one is not. See conn_text_logsafe()'s own block, and §9.
+ *
+ * WHAT IS NEITHER, and is named because leaving it out of this table would be the
+ * same overstatement this table exists to avoid: PRIVMSG and NOTICE text. It is
+ * relayed verbatim, because relaying a message is what the node is for and
+ * `0x01` is how CTCP works, so a deny-list would have to become an allow-list and
+ * the answer would be a decision about IRC rather than about this class. Peer
+ * strings are the other one, behind the FEDERATE secret. */
 
 /* conn_t::account -- the second axis of scoped identity (2.1), added in Phase
  * 10.1.
