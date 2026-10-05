@@ -496,52 +496,46 @@ size_t conn_text_bad_count(const char *s)
     return n;
 }
 
-/* One pass, two outputs: the kept bytes go to `dst` and the KEPT COUNT comes back
- * to the caller, which derives "how many were dropped" by subtracting the input's
- * own strlen() from it. A caller that instead called conn_text_bad_count() first
- * to get that number would walk the same client-supplied string twice to learn
- * one integer, on a path that runs once per away change rather than once per
- * packet. */
-size_t conn_text_strip(char *dst, size_t cap, const char *src)
-{
-    size_t kept = 0;
-
-    if (dst == NULL || cap == 0u) {
-        return 0;
-    }
-    if (src == NULL) {
-        dst[0] = '\0';
-        return 0;
-    }
-    for (size_t i = 0; src[i] != '\0'; i++) {
-        if (conn_byte_is_bad(src[i]) != 0) {
-            continue;
-        }
-        /* The bound is a SAFETY net rather than a policy. Every caller has already
-         * applied its field's own length bound and stripping only removes bytes,
-         * so this cannot fire -- and it is written rather than assumed because the
-         * alternative is a silent overflow of a field whose size is a protocol
-         * constant three modules deep. `cap` counts the terminator, so `kept` is
-         * always <= cap - 1 and the store above is always in bounds. */
-        if (kept + 1u >= cap) {
-            break;
-        }
-        dst[kept] = src[i];
-        kept++;
-    }
-    dst[kept] = '\0';
-    return kept;
-}
-
+/* ---------------------------------------------------------------------------
+ * conn_text_strip: A STORED VALUE, made safe to render to other people
+ * ---------------------------------------------------------------------------
+ * THE STRICT POLICY, through the same walk as the two strippers below, and this is the
+ * one that found the last live leak: a TOPIC whose stored value held a bare
+ * `0x80`-`0x9F` byte was broadcast to every member, because the old version of this
+ * function only understood `conn_byte_is_bad()` -- C0 and DEL -- and let the whole
+ * C1 range through. A raw `0x9B` is CSI on an 8-bit terminal, so a topic is exactly as
+ * dangerous as a nickname and was being filtered against a narrower set.
+ *
+ * It is the SAME set the numeric-echo filter uses (`conn_text_strip_wire()`), and they
+ * are the same function for the same reason `valid_nick()` and the nickname check share
+ * one walk: two functions answering "which bytes are dangerous" is how they come to
+ * disagree, and this tree has now been bitten by that three times.
+ *
+ * IT IS NOT `conn_text_strip_relay()`, which keeps the eight mIRC bytes. A stored topic
+ * or away message is not message text: no client renders formatting codes out of a
+ * topic, so keeping them would be keeping bytes that only look meaningful. The
+ * difference is named at the walk's own enum rather than being discovered.
+ *
+ * ONE PASS, two outputs: the kept bytes go to `dst` and the KEPT COUNT comes back to
+ * the caller, which derives "how many were dropped" by subtracting the input's own
+ * strlen() from it. A caller that instead called `conn_text_bad_count()` first to get
+ * that number would walk the same client-supplied string twice to learn one integer,
+ * on a path that runs once per away change rather than once per packet.
+ *
+ * COST: one pass over a value the caller has already bounded, on a path that runs once
+ * per stored-field write rather than once per packet. The `conn_text_bad_count()` the
+ * callers use for their log lines is still a separate pass over the ORIGINAL string,
+ * which is what makes their `bad_bytes=` figure a measurement of what the client sent
+ * rather than of what survived. */
 /* ---------------------------------------------------------------------------
  * conn_text_strip_relay: the KEEP half of the split, as a switch
  * ---------------------------------------------------------------------------
  * EIGHT BYTES, NAMED, rather than a range test -- because a range test is the
- * mistake waiting to happen here. `u >= 0x02 && u <= 0x1F` looks like the keep
- * list and is not: it would swallow 0x07 BEL and 0x1B ESC, which is the whole
- * hazard, and would return 0 for 0x01, which corrupts every CTCP. A reader who
- * wants to add a code to the keep list has to add it HERE, in the switch, where
- * the list is visible as a list.
+ * mistake waiting to happen here. `u >= 0x02 && u <= 0x1F` looks like the keep list
+ * and is not: it would swallow 0x07 BEL and 0x1B ESC, which is the whole hazard,
+ * and would return 0 for 0x01, which corrupts every CTCP. A reader who wants to add
+ * a code to the keep list has to add it HERE, in the switch, where the list is
+ * visible as a list.
  *
  * DEL is not here: it is a strip, handled by the caller below rather than here,
  * because 0x7F is not C0 and belongs to neither C0 group.
@@ -563,27 +557,65 @@ static int relay_byte_kept(unsigned char u)
     }
 }
 
+/* WHICH ASCII BYTES SURVIVE, and it is two answers rather than one because the
+ * hazard and the semantics overlap in exactly eight bytes. `connection.h` states the
+ * two policies and why they differ; this is the switch that implements the RELAY half,
+ * and the WIRE half is "none of them", which is what makes the strict policy strict
+ * rather than merely different. */
+typedef enum {
+    CONN_TEXT_WIRE = 0,  /* every C0 control goes: nothing is kept for cause */
+    CONN_TEXT_RELAY = 1  /* the eight mIRC bytes stay: they are message semantics */
+} conn_text_policy_t;
+
 /* WHAT TO DO WITH ONE BYTE. Split out of the loop so the walk below is a walk and
  * not a decision tree, and so the rule for a single byte can be read in one place. */
 enum {
-    RELAY_EMIT = 0,  /* copy it */
-    RELAY_DROP = 1   /* remove it, and `*skip` more bytes with it */
+    TEXT_EMIT = 0,  /* copy it */
+    TEXT_DROP = 1,  /* remove it, and `*skip` more bytes with it */
+    TEXT_FAULT = 2  /* report it as the string's verdict and stop (check mode) */
 };
 
-/* One step of the walk. `*need` is how many continuation bytes the sequence in
- * progress still expects and is the WHOLE of the UTF-8 state; `*skip` is how many
- * extra bytes this one verdict consumes, which is 1 for the encoded C1 pair and 0
- * for everything else. `at` points at the byte being judged, so `at[1]` is the next
- * one -- the terminator when `at` is the last byte, which is why every range tested
- * below excludes `0x00`.
+/* ---------------------------------------------------------------------------
+ * ONE UTF-8 WALK, THREE ANSWERS, AND WHY IT LIVES HERE
+ * ---------------------------------------------------------------------------
+ * WHY IT IS HERE. `conn_byte_is_bad()` -- THE log-injection predicate this file's
+ * header names as the single definition -- is here, and so are the two strip
+ * operations built on it. The walk that tells a C1 control from the second half of a
+ * Cyrillic letter is the SAME kind of thing: one definition of which bytes are
+ * dangerous, asked rather than restated. Writing a second walker for the nickname
+ * grammar in `message.c`, or a third for the numeric-echo filter in `reply.c`, is
+ * exactly the divergence this file's own comment on `conn_realname_check()` warns
+ * about -- "answering it from its own copy of `ch <= 0x1f || ch == 0x7f` is how the
+ * two come to disagree about which bytes are dangerous", in a new costume.
+ *
+ * THREE ANSWERS BECAUSE THREE CALLERS NEED THREE DIFFERENT VERDICTS:
+ *
+ *   CONN_TEXT_WIRE   strip: a byte that can control a terminal goes, everything
+ *                    else stays. Used where a value is RENDERED into a field the
+ *                    sender will read again -- a numeric that echoes the client's
+ *                    own argument back to it.
+ *   CONN_TEXT_RELAY  strip, but the eight mIRC bytes STAY, because in message text
+ *                    they are semantics rather than hazard.
+ *   `verdict`        non-NULL: report instead of strip, and stop at the first fault.
+ *                    Used where the value is STORED, so the caller can refuse rather
+ *                    than quietly rewrite. It is always the STRICT policy: a
+ *                    nickname is not message text and has no formatting to keep.
  *
  * THE ORDER IS THE DESIGN and it is the one thing a reader must not reshuffle. The
  * `*need` test comes FIRST because a continuation byte is defined by the byte before
  * it: `0x90` following a lead is the second half of a Cyrillic A and is EMITTED, and
  * the identical byte with nothing expecting it is a raw C1 and is DROPPED. Ask
  * anything about `u` on its own first and those two cases become indistinguishable,
- * which is the mistake that costs every Greek and Cyrillic message on the node. */
-static int relay_step(unsigned char u, const char *at, size_t *need, size_t *skip)
+ * which is the mistake that costs every Greek and Cyrillic message on the node --
+ * and, on the nickname side, every `ā` on the network.
+ *
+ * `*skip` is how many extra bytes this one verdict consumes, which is 1 for the
+ * encoded C1 pair and 0 for everything else. `at` points at the byte being judged,
+ * so `at[1]` is the next one -- the terminator when `at` is the last byte, which is
+ * why every range tested below excludes `0x00`.
+ */
+static int text_step(unsigned char u, const char *at, size_t *need, size_t *skip,
+                     conn_text_policy_t policy, conn_display_verdict_t *verdict)
 {
     *skip = 0;
 
@@ -591,98 +623,217 @@ static int relay_step(unsigned char u, const char *at, size_t *need, size_t *ski
     if (*need > 0u) {
         if (u >= 0x80u && u <= 0xbfu) {
             (*need)--;
-            return RELAY_EMIT;
+            return TEXT_EMIT;
         }
         /* Not a continuation after all -- a truncated or malformed sequence. The lead
          * byte was already emitted, so this byte is re-examined on its own rather than
          * swallowed. Being permissive here only ever KEEPS a byte, which is the safe
-         * direction in which to be wrong. */
+         * direction in which to be wrong -- but in CHECK mode it is a fault, because a
+         * nickname that claims a two-byte sequence and then does not finish it is
+         * malformed and the whole point of the check is to refuse malformed. */
         *need = 0;
+        if (verdict != NULL) {
+            *verdict = CONN_DISPLAY_UTF8;
+            return TEXT_FAULT;
+        }
     }
 
     /* ASCII. The deny half of the split, plus DEL. ESC and BEL arrive here. */
     if (u < 0x80u) {
-        if (u < 0x20u && relay_byte_kept(u) == 0) {
-            return RELAY_DROP;
+        if (u < 0x20u) {
+            if (policy == CONN_TEXT_RELAY && relay_byte_kept(u) != 0) {
+                return TEXT_EMIT;
+            }
+            if (verdict != NULL) {
+                *verdict = CONN_DISPLAY_CONTROL;
+                return TEXT_FAULT;
+            }
+            return TEXT_DROP;
         }
         if (u == 0x7fu) {
-            return RELAY_DROP;
+            if (verdict != NULL) {
+                *verdict = CONN_DISPLAY_CONTROL;
+                return TEXT_FAULT;
+            }
+            return TEXT_DROP;
         }
-        return RELAY_EMIT;
+        return TEXT_EMIT;
     }
 
     /* THE ENCODED C1 PAIR. `0xC2` is the only lead byte a C1 control can carry in
      * UTF-8, and `0xC2` + `0x80-0x9F` is CSI and its relatives. Both bytes go, and
      * they are recognised BEFORE `0xC2` is treated as an ordinary lead -- otherwise
      * `0xC2 0x9B` would pass as a valid sequence and the 8-bit escape would survive,
-     * which is the specific hole this case exists to close. */
+     * which is the specific hole this case exists to close.
+     *
+     * AND IT IS ALSO U+0080-U+009F, which is the other half of why the same case
+     * serves the nickname check: U+009B is CSI in Unicode, so a nickname carrying it
+     * is carrying a control sequence whatever the encoding. */
     if (u == 0xc2u && (unsigned char)at[1] >= 0x80u && (unsigned char)at[1] <= 0x9fu) {
+        if (verdict != NULL) {
+            *verdict = CONN_DISPLAY_C1;
+            return TEXT_FAULT;
+        }
         *skip = 1;
-        return RELAY_DROP;
+        return TEXT_DROP;
     }
 
     /* A RAW C1: in 0x80-0x9F with nothing expecting a continuation. On an 8-bit
      * terminal `0x9B` IS CSI, so leaving it is the hazard this function exists to
      * remove. The alternative -- dropping 0x80-0x9F unconditionally -- would eat the
      * Cyrillic, the Greek and every accented character on the node, and it is the
-     * mistake this code is most likely to be "simplified" into. */
+     * mistake this code is most likely to be "simplified" into.
+     *
+     * THE NICKNAME HALF OF THAT ARGUMENT, because it is the same trade and the
+     * nickname check has to make it deliberately rather than inherit it: `ā` is
+     * `0xC4 0x81`, and `0x81` is inside this range. A byte-range refusal would eat
+     * every accented Latin character on the network. What distinguishes them is the
+     * `*need` state above and nothing else. */
     if (u >= 0x80u && u <= 0x9fu) {
-        return RELAY_DROP;
+        if (verdict != NULL) {
+            *verdict = CONN_DISPLAY_C1;
+            return TEXT_FAULT;
+        }
+        return TEXT_DROP;
     }
 
     /* AN ORDINARY MULTI-BYTE LEAD, and the only reason the Cyrillic survives. */
     if (u >= 0xc2u && u <= 0xdfu) {
         *need = 1u;
-        return RELAY_EMIT;
+        return TEXT_EMIT;
     }
     if (u >= 0xe0u && u <= 0xefu) {
         *need = 2u;
-        return RELAY_EMIT;
+        return TEXT_EMIT;
     }
     if (u >= 0xf0u && u <= 0xf4u) {
         *need = 3u;
-        return RELAY_EMIT;
+        return TEXT_EMIT;
     }
 
     /* `0xC0` and `0xC1` can never lead a UTF-8 sequence -- they would only ever
      * encode an overlong NUL -- and `0xF5`-`0xFF` lie outside UTF-8 entirely. Neither
      * is named in the strip set and neither can move a cursor, so both are copied
-     * unchanged. This function removes what is on the list, not everything it does not
-     * recognise. */
-    return RELAY_EMIT;
+     * unchanged. This function removes what is on the list, not everything it does
+     * not recognise.
+     *
+     * IN CHECK MODE THEY ARE A FAULT, and that is the one place the two answers
+     * genuinely differ. A stripper may pass invalid bytes through -- the recipient's
+     * client is the thing that decides what to do with a byte it cannot interpret --
+     * but a nickname is STORED and re-rendered into every prefix this node emits, so
+     * invalid UTF-8 in one is a value that will be copied around the mesh forever with
+     * no way to tell what it was supposed to be. */
+    if (verdict != NULL) {
+        *verdict = CONN_DISPLAY_UTF8;
+        return TEXT_FAULT;
+    }
+    return TEXT_EMIT;
 }
 
-size_t conn_text_strip_relay(char *dst, size_t cap, const char *src)
+/* The walk, with the emit shared between the two strippers and the check. One
+ * function rather than three so that the order above cannot be got right in one
+ * place and wrong in another. */
+static size_t conn_text_walk(char *dst, size_t cap, const char *src,
+                             conn_text_policy_t policy,
+                             conn_display_verdict_t *verdict)
 {
     size_t kept = 0;
-    size_t need = 0;
+    size_t need = 0u;
+    /* CHECK MODE WRITES NOTHING. `dst` is legitimately NULL there -- the caller wants
+     * a verdict and no copy -- and the first version of this function indexed it
+     * anyway, which is a null store on the first printable byte. It aborted every
+     * registration on the node, and the symptom was fifty-six unrelated test
+     * failures rather than anything that pointed here. The mode is now decided once,
+     * from `verdict`, and the two are not allowed to disagree. */
+    const int storing = (verdict == NULL);
 
-    if (dst == NULL || cap == 0u) {
-        return 0;
-    }
     if (src == NULL) {
-        dst[0] = '\0';
+        if (storing != 0 && dst != NULL && cap > 0u) {
+            dst[0] = '\0';
+        }
         return 0;
     }
     for (size_t i = 0; src[i] != '\0'; i++) {
-        unsigned char u = (unsigned char)src[i];
-        size_t skip = 0;
+        const unsigned char u = (unsigned char)src[i];
+        size_t skip = 0u;
+        int step;
 
-        if (relay_step(u, src + i, &need, &skip) == RELAY_DROP) {
+        step = text_step(u, src + i, &need, &skip, policy, verdict);
+        if (step == TEXT_FAULT) {
+            return 0u;
+        }
+        if (step == TEXT_DROP) {
             i += skip;
             continue;
         }
-        /* The bound is a SAFETY net on the same terms as conn_text_strip()'s: the
-         * caller has already applied 3.2's line cap, and this only removes bytes, so
-         * it cannot fire in practice. */
+        if (storing == 0) {
+            continue;
+        }
+        /* The bound is a SAFETY net on the same terms as conn_text_strip()'s. Every
+         * caller has already applied its own length bound and stripping only removes
+         * bytes, so this cannot fire. */
         if (kept + 1u >= cap) {
             break;
         }
         dst[kept] = (char)u;
         kept++;
     }
-    dst[kept] = '\0';
+    if (storing != 0) {
+        dst[kept] = '\0';
+    }
     return kept;
+}
+
+size_t conn_text_strip(char *dst, size_t cap, const char *src)
+{
+    return conn_text_walk(dst, cap, src, CONN_TEXT_WIRE, NULL);
+}
+
+size_t conn_text_strip_relay(char *dst, size_t cap, const char *src)
+{
+    return conn_text_walk(dst, cap, src, CONN_TEXT_RELAY, NULL);
+}
+
+size_t conn_text_strip_wire(char *dst, size_t cap, const char *src)
+{
+    return conn_text_walk(dst, cap, src, CONN_TEXT_WIRE, NULL);
+}
+
+conn_display_verdict_t conn_text_display_check(const char *s)
+{
+    conn_display_verdict_t verdict = CONN_DISPLAY_OK;
+
+    if (s == NULL) {
+        return CONN_DISPLAY_OK;
+    }
+    /* A TRUNCATED SEQUENCE AT THE END is the one fault `text_step()` cannot see,
+     * because the terminator is not a byte it is ever asked about: the loop stops at
+     * the NUL and `*need` is still positive. That is a real fault and it is the one
+     * a nickname must not have, so the residue is checked here rather than left to
+     * be discovered as a nickname that renders differently on every hop. */
+    (void)conn_text_walk(NULL, 0u, s, CONN_TEXT_WIRE, &verdict);
+    if (verdict != CONN_DISPLAY_OK) {
+        return verdict;
+    }
+    {
+        /* The same walk, one more time, asking only about the tail. Two passes over
+         * a nickname is cheap -- a nickname is at most IRC_MAX_NICK bytes and this
+         * runs once per registration and once per NICK -- and the alternative is a
+         * third copy of the "how many continuation bytes does this sequence still
+         * expect" arithmetic, which is the thing this whole refactor exists to
+         * prevent. */
+        size_t need = 0u;
+        size_t skip = 0u;
+
+        for (size_t i = 0; s[i] != '\0'; i++) {
+            (void)text_step((unsigned char)s[i], s + i, &need, &skip, CONN_TEXT_WIRE,
+                            NULL);
+        }
+        if (need > 0u) {
+            return CONN_DISPLAY_UTF8;
+        }
+    }
+    return CONN_DISPLAY_OK;
 }
 
 /* ---------------------------------------------------------------------------

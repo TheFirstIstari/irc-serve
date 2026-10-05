@@ -374,114 +374,50 @@ static void sw_masks_init(void)
  * gets quietly switched off. */
 static int g_exc_used[SW_MAX_EXCEPTIONS];
 
-/* THE STORED-NAME ENTRIES, 0x80-0x9F ONLY.
+/* ---------------------------------------------------------------------------
+ * THE EXCEPTION LIST, AND IT IS ONE ENTRY LONG
+ * ---------------------------------------------------------------------------
+ * It was thirteen. Eleven of those were numerics echoing a client-supplied value back
+ * to the client that sent it, one was a nickname holding a bare C1 byte, and one was
+ * PONG's token -- and all thirteen are gone, because all thirteen were BUGS rather than
+ * decisions, and the honest response to "this sweep needs an exception here" is to ask
+ * why.
  *
- * `nick_char_illegal()` in `src/core/message.c` REFUSES bytes <= 0x20 and DEL and
- * ACCEPTS every byte >= 0x80, and the comment there says why: "UTF-8 nicknames are
- * ordinary and are not control characters". So `NICK a\x80z` is a legal nickname on
- * this node, `conn_t::nick` stores the byte, and every site that NAMES a member
- * prints it. The channel-name grammar makes the same decision for the same reason, so
- * `chan_join_repeat:` can carry one too.
+ *   - The eleven echoes are filtered by `emit_numeric_ex()` in reply.c, at the one
+ *     place a numeric's parameters are rendered. Bytes removed, field kept.
+ *   - The nickname is REFUSED by `valid_nick()`, which asks
+ *     `conn_text_display_check()`. There is no copy to sanitise, because a nickname
+ *     IS every copy: it is the source of every line its owner sends.
+ *   - PONG's token is kept and filtered, because RFC 2812 2.4 requires the value.
  *
- * THE WIRE IS NOT AFFECTED, which is worth knowing before this looks bigger than it
- * is: `message_format()` refuses a value it cannot represent in a non-final position,
- * so a client sees `401  sq03 :No such nick/channel` with an EMPTY field rather than
- * the byte. This class reaches an operator's terminal and not a client's.
+ * WHAT IS LEFT is the mIRC formatting bytes in RELAYED MESSAGE TEXT, which is not an
+ * exception so much as a specification. `0x01` frames a CTCP and `0x02`, `0x03`,
+ * `0x0F`, `0x11`, `0x16`, `0x1D` and `0x1F` are mIRC's colour and style codes;
+ * `relay_byte_kept()` keeps exactly those eight and drops every other C0 byte
+ * including ESC and BEL, and its comment says why it is a `switch` rather than a
+ * range: a range test would swallow the hazard and would corrupt every CTCP.
  *
- * WHY IT IS NOT FIXED HERE. It is out of scope -- this pass is two named bugs and a
- * test -- and the fix is a POLICY decision rather than a mechanical one. Narrowing
- * the grammar to refuse 0x80-0x9F would still admit 0xA0-0xFF, which is not a clean
- * split: valid UTF-8 continuation bytes run 0x80-0xBF, so U+0080-U+009F -- C1
- * control characters in Unicode, CSI among them -- encode to `\xc2\x9b` and would
- * be refused by a bare-byte rule. So the choice is between accepting bare C1 bytes,
- * refusing them and losing those Unicode characters, or refusing any non-ASCII
- * nickname at all. That is a decision about what this node accepts from clients.
+ * IT IS ONE ENTRY AND NOT TWO, and the missing one is `" NOTICE "`. `NOTICE` is the
+ * same `send_message()` as `PRIVMSG` with one flag difference -- `exclude = c`, so a
+ * NOTICE is not echoed to its sender unless `echo-message` was negotiated -- and every
+ * probe here owns the only member of its own channel, so a NOTICE has nobody to reach.
+ * An entry for a site this sweep cannot observe would be the decorative kind, and its
+ * absence is safe in the direction that matters: if NOTICE ever did put a mIRC byte on
+ * a scanned surface, the sweep goes red and somebody writes the entry then.
  *
- * `where` IS A FIELD SPELLING AND NOT A SITE, and the reason is that the SET of sites
- * is a function of connection lifecycle: `session_resume_hold:` fires when a
- * connection holding a bad nickname is closed while a resume session is held, and
- * whether it fires at all depends on how the sweep's connections interleave -- it
- * fired in four runs of one build and not in another. A test that pinned the site
- * list would be pinning something that is not stable. The FIELD is the root cause, so
- * the field is what is matched, and a site that renders the same field is covered
- * rather than needing an entry of its own.
- *
- * IT IS DELIBERATELY NOT `channel=`, which looks like the same kind of field and is
- * not. `chan_mode_refused:` also carries `channel=`, and its `reason=` field is the
- * H2 leak this sweep exists to catch -- so an entry matching the bare field would
- * excuse the bug. The channel-name grammar makes the same >= 0x80 decision the
- * nickname grammar does, but no channel name carrying a bare C1 byte was reachable in
- * this sweep, so there is nothing to except; if one becomes reachable the sweep will
- * say so and the entry can be written then, site by site. */
+ * ---------------------------------------------------------------------------
+ * AND THE TWO CHECKS THAT KEEP THE LIST HONEST
+ * ---------------------------------------------------------------------------
+ * An occurrence is excused only when its byte is in the entry's set AND its line
+ * carries that entry's `where`, so an entry cannot become a blanket amnesty for a
+ * byte. And a listed entry whose `where` never appears anywhere in the run FAILS, so
+ * the list cannot accumulate entries nobody exercises. Those two checks are what made
+ * this table shrink: when the eleven echo entries stopped matching because the echoes
+ * stopped happening, `assert_exceptions_all_used()` said so and the entries had to be
+ * DELETED rather than left looking reasonable. A test that has to notice its own
+ * allowlist going stale is the only kind that keeps one from becoming a hole.
+ */
 static const struct sw_exception k_exceptions[] = {
-    SW_EXC_ALL(":Unknown command",
-           "421 ERR_UNKNOWNCOMMAND echoes the unrecognised command word back "
-           "VERBATIM. `src/core/commands.c` argues for it in as many words -- \"The "
-           "verb is going to the client that sent it, so there is no second reader "
-           "and no hazard, and RFC 2812 3.3.4's 421 names the command precisely so a "
-           "client can match it. It is the LOG that needed the measurement, and only "
-           "the log.\" The log half was implemented; the wire half is this "
-           "decision. Reported, not re-decided here."),
-    SW_EXC_ALL(":Not enough parameters",
-           "461 ERR_NEEDMOREPARAMS echoes the verb it is refusing. Same class as the "
-           "421 echo and the same unresolved question: the value comes back to the "
-           "client that sent it and to nobody else, so the only reader is a reader "
-           "this node does not control. NOT argued in the source. Reported."),
-    SW_EXC_ALL(":No such channel",
-           "403 ERR_NOSUCHCHANNEL echoes the channel name it could not find. Same "
-           "class and same status: an unargued echo of the client's own bytes back to "
-           "itself. Reported."),
-    SW_EXC_ALL(":No such nick/channel",
-           "401 ERR_NOSUCHNICK echoes the nickname it could not find. Same class, "
-           "same status. Reported."),
-    SW_EXC_ALL(":Erroneous nickname:",
-           "432 ERR_ERRONEUSNICKNAME echoes the nickname it refused. Same class, "
-           "same status. Reported."),
-    SW_EXC_ALL(":No such server:",
-           "402 ERR_NOSUCHSERVER echoes the server mask it could not resolve. Same "
-           "class, same status. Reported."),
-    SW_EXC_ALL(":Invalid CAP subcommand:",
-           "410 ERR_INVALIDCAPSUBCOMMAND echoes the CAP subcommand twice -- once as "
-           "its own parameter and once in its text. Same class, same status. "
-           "Reported."),
-    SW_EXC_ALL(":End of WHO list",
-           "315 RPL_ENDOFWHO carries the token the client asked about. Same class, "
-           "same status. Reported."),
-    SW_EXC_ALL(":End of /WHOIS list",
-           "318 RPL_ENDOFWHOIS carries the nickname the client asked about. Same "
-           "class, same status. Reported."),
-    SW_EXC_ALL(" 302 ",
-           "The 302 numeric -- IRCv3's ISUPPORT-shaped help/feature numeric on this "
-           "build -- carries the token back as a middle parameter, twice. Same class, "
-           "same status. Reported. `where` is the numeric itself rather than its "
-           "reply text because that text is empty here and the field is what names "
-           "the site."),
-    SW_EXC_ALL(" PONG ",
-           "PONG echoes the PING token, which RFC 2812 2.4 requires it to: \"PONG "
-           "server1 server2 <token>\". So this echo is CONFORMANT and cannot be "
-           "removed without breaking the specification -- a client that sends a token "
-           "containing a control byte gets it back. That is the strongest form of the "
-           "class: a leak the specification requires. Reported."),
-    /* THE mIRC ENTRIES, and this is the exception the class was invented for: a byte
-     * that is legitimately EXPECTED in this node's output rather than merely
-     * tolerated. `PRIVMSG` and `NOTICE` text is relayed verbatim except for these
-     * eight bytes, and `connection.h`'s policy table says why in as many words --
-     * "PRIVMSG and NOTICE text. It is relayed verbatim, because relaying a message is
-     * what the node is for and `0x01` is how CTCP works". 0x01 frames a CTCP and 0x02,
-     * 0x03, 0x0F, 0x11, 0x16, 0x1D and 0x1F are mIRC's colour and style codes. A relay
-     * that removed them would break every mIRC client on the network, so this is a
-     * FEATURE and the exception is the honest description of it.
-     *
-     * ONE ENTRY, NOT TWO, and the missing one is ` NOTICE ` -- deliberately, and here
-     * is why rather than "because it did not fire". `NOTICE` is the same
-     * `send_message()` as `PRIVMSG` with one flag difference, and that difference is
-     * `exclude = c` (msg_verbs.c): a NOTICE is NOT echoed back to its sender unless
-     * the sender negotiated `echo-message`. Every probe here owns the only member of
-     * its own channel, so a NOTICE has nobody to reach and the byte cannot appear
-     * anywhere the sweep scans. An entry for a site this sweep cannot observe would
-     * be the decorative kind, and its absence is safe in the direction that matters:
-     * if NOTICE ever DID put a mIRC byte on a scanned surface, the sweep goes red and
-     * somebody writes the entry then. */
     SW_EXC_MIRC(" PRIVMSG ",
                 "A mIRC formatting byte -- 0x01 (the CTCP delimiter), 0x02 bold, 0x03 "
                 "colour, 0x0F plain, 0x11 mono, 0x16 reverse, 0x1D italic, 0x1F "
@@ -489,33 +425,10 @@ static const struct sw_exception k_exceptions[] = {
                 "src/core/connection.c keeps exactly these eight and drops every other "
                 "C0 byte including ESC and BEL, and its comment says why it is a "
                 "switch rather than a range: a range test would swallow the hazard and "
-                "would corrupt every CTCP. Relaying them is the feature. Legitimate."),
-    /* THE ONE `anywhere` ENTRY, and it is the class this whole half of the table is
-     * about. See the block above the table for why the nickname and channel-name
-     * grammars admit a bare C1 byte, and the `anywhere` field's own comment for why
-     * the byte is excused on any line rather than at named sites.
-     *
-     * IT IS MARKED AS THE MOST SERIOUS ENTRY IN THE TABLE deliberately. A stored
-     * nickname is not only this node's log: it is the SOURCE of every line that
-     * client sends, and the `<client>` field of every numeric it receives, so one
-     * client that sets `NICK a\x9bz` puts a control byte in front of everything it
-     * then says to every other channel member's terminal. That is a live
-     * CROSS-CLIENT terminal injection and it is the strongest thing this sweep found.
-     *
-     * WHY IT IS NOT FIXED HERE, stated so the entry is not mistaken for agreement:
-     * the fix is a POLICY decision about which nicknames this node accepts, it
-     * reaches the peer path's SBURST shadow, and it is routed out of this pass.
-     * SECURITY.md's not-defended list names it. */
-    SW_EXC_C1_ANY(
-           "A STORED NICKNAME OR CHANNEL NAME, which may hold a bare C1 byte because "
-           "`nick_char_illegal()` in src/core/message.c accepts every byte >= 0x80 -- "
-           "'UTF-8 nicknames are ordinary and are not control characters' -- and this "
-           "node's own byte predicate does not treat 0x80-0x9F as control either. "
-           "C1 ONLY: a C0 byte in a nickname is refused by that grammar and never "
-           "stored. THIS IS A LIVE CROSS-CLIENT TERMINAL INJECTION, because a "
-           "nickname is the SOURCE of every line its owner sends and the <client> "
-           "field of every numeric it receives; it is reported and routed, not fixed "
-           "here. See the block above the table."),
+                "would corrupt every CTCP. Relaying them is the FEATURE, not an "
+                "oversight, and it is the only reason this list is not empty. The "
+                "RELAYED path is deliberately not filtered by `emit_numeric_ex()` -- "
+                "that is what mIRC colour would look like if it were."),
     { NULL, NULL, NULL, 0, 1 } /* terminator: a real entry needs all five fields */
 };
 

@@ -78,6 +78,11 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
     /* ------------------------------------------------------------------------
      * THE RELAY STRIP, AND WHY IT IS NOT conn_text_strip()
      * ------------------------------------------------------------------------
+     * THE TWO NOW SHARE ONE UTF-8 WALK -- connection.c's `text_step()` -- and they
+     * differ in ONE thing, which is this one. Everything below about `0x01` and the
+     * mIRC codes is still the whole reason this function exists rather than being
+     * `conn_text_strip()`, and it used to be one reason of two.
+     *
      * conn_text_strip() refuses every C0 control and DEL, which is right for every
      * field this node STORES -- an away message, a topic, a kick reason. It would be
      * wrong here, because two groups of C0 bytes are IRC message semantics rather

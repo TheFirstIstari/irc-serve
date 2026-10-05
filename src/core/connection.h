@@ -384,11 +384,15 @@ size_t conn_text_strip(char *dst, size_t cap, const char *src);
  * Strip what can CONTROL A TERMINAL. Keep what is IRC MESSAGE SEMANTICS.
  *
  * This is NOT conn_text_strip() and the difference is load-bearing, so it is a
- * separate function rather than a flag. conn_text_strip() refuses every C0
- * control and DEL, which is right for an away message, a topic, a kick reason or
- * anything this node STORES. It would be wrong for a PRIVMSG, because two groups
- * of C0 bytes are how IRC has carried meaning for thirty years and every ircd
- * relays them:
+ * separate function rather than a flag. BOTH now share one UTF-8 walk -- see the
+ * block at connection.c's `text_step()` -- and they differ in exactly one thing: the
+ * eight mIRC bytes below, which message text keeps and nothing else does. They used
+ * to differ in two things: this one, and a narrower understanding of "control" that
+ * let a raw `0x80`-`0x9F` byte through BOTH of them. A stored topic holding one was
+ * broadcast to every member of its channel, which is a live cross-client injection of
+ * the same shape as the nickname one, and it was found by a sweep rather than by
+ * reading. The reason two groups of C0 bytes are kept here is that two groups of C0
+ * bytes are how IRC has carried meaning for thirty years and every ircd relays them:
  *
  *   | STRIP                                   | KEEP                            |
  *   |-----------------------------------------|---------------------------------|
@@ -479,6 +483,88 @@ size_t conn_text_strip(char *dst, size_t cap, const char *src);
 size_t conn_text_strip_relay(char *dst, size_t cap, const char *src);
 
 /* ---------------------------------------------------------------------------
+ * conn_text_strip_wire(): A VALUE RENDERED BACK INTO A FIELD ITS SENDER WILL READ
+ * ---------------------------------------------------------------------------
+ * The STRICT half of the split. Removes every C0 control, DEL, a raw C1
+ * (`0x80`-`0x9F` with nothing expecting a continuation) and the encoded C1 pair
+ * `0xC2 0x80`-`0xC2 0x9F`. Keeps every VALID multi-byte sequence, for the reason
+ * `conn_text_strip_relay()`'s own header gives at length: a filter over the range
+ * `0x80`-`0x9F` removes every accented, Greek and Cyrillic character on the node,
+ * and it does it silently.
+ *
+ * IT IS NOT `conn_text_strip_relay()`, and the difference is eight named bytes. A
+ * relayed message is IRC message text, where `0x01` is CTCP and `0x02`/`0x03`/
+ * `0x0F`/`0x11`/`0x16`/`0x1D`/`0x1F` are mIRC's colour and style codes -- removing
+ * them CORRUPTS rather than sanitises. A numeric's parameter is not message text:
+ * there is no client rendering formatting codes out of a `401`, so the strict policy
+ * is right there and the split is a real difference rather than an accident of
+ * which function somebody reached for.
+ *
+ * WHY IT EXISTS, and the argument is a POLICY rather than an observation: a value
+ * echoed back to the client that sent it is still filtered. The argument this tree
+ * used for a long time was "there is no second reader", and that argument is
+ * WRONG -- a client that writes numerics to a log file, or a bouncer relaying them
+ * to a human's terminal, is the second reader, and it is downstream of the client
+ * rather than of this node. The decisive argument is simpler and it is
+ * INFORMATION: **the echo carries nothing the sender does not already have.** The
+ * client sent the value on the line before. So filtering it costs no information at
+ * all and removes a real hazard, which makes it a decision rather than a trade-off.
+ * See `SECURITY.md`'s control-byte section for the policy in full.
+ *
+ * IT REMOVES BYTES AND KEEPS THE FIELD. A parameter that becomes empty is still a
+ * parameter, and a positional parser still finds it where the RFC says it is -- which
+ * is the whole reason this is a strip and not the placeholder substitution the `472`
+ * uses. The placeholder is a different case: there the value is a single byte that is
+ * structurally not a mode character, so there is nothing to strip and something has
+ * to stand in its place.
+ *
+ * COST: one pass over one value, on a path that runs once per numeric. The caller
+ * supplies the destination. */
+size_t conn_text_strip_wire(char *dst, size_t cap, const char *src);
+
+/* ---------------------------------------------------------------------------
+ * conn_text_display_check(): MAY THIS STRING BE STORED AND RENDERED TO OTHER PEOPLE
+ * ---------------------------------------------------------------------------
+ * The VERDICT form of the same walk, and it exists for the one field whose value is
+ * not merely rendered into a log line but becomes part of every line its owner
+ * sends: `conn_t::nick`. A nickname is the SOURCE of everything one client says and
+ * the `<client>` field of every numeric it receives, so an unsafe byte in one is a
+ * cross-client injection rather than an operator-log one.
+ *
+ * Three verdicts, and each is a different bug:
+ *
+ *   CONN_DISPLAY_CONTROL  a C0 control or DEL. `message_parse_n()` already refuses
+ *                         CR, LF and NUL, so what arrives is the rest of C0.
+ *   CONN_DISPLAY_C1       U+0080-U+009F, whether it arrived as a bare `0x80`-`0x9F`
+ *                         byte or encoded as `0xC2 0x80`-`0xC2 0x9F`. U+009B is CSI in
+ *                         Unicode, so this is a control sequence whatever the encoding
+ *                         says.
+ *   CONN_DISPLAY_UTF8     invalid or truncated UTF-8: a bare continuation byte, a
+ *                         sequence that stops early, an overlong `0xC0`/`0xC1`, or a
+ *                         lead byte outside UTF-8 entirely.
+ *
+ * AND IT IS ABOUT CODE POINTS, NOT BYTES, which is the whole subtlety. `ā` is
+ * `0xC4 0x81`, and `0x81` is inside `0x80`-`0x9F`; a range test on bytes would refuse
+ * every accented Latin character on the network and do it silently. What separates
+ * the letter from the control is only whether a sequence is in progress, which is
+ * state this function shares with the two strippers above rather than reimplementing.
+ * So `ā`, `café` and `日本` pass, a bare `0x9F` and a `0xC2 0x9B` do not, and a
+ * truncated `0xE6 0x97` does not either.
+ *
+ * COST: two passes over a string of at most `IRC_MAX_NICK` bytes, on a path that runs
+ * once at registration and once per `NICK`. The second pass is the trailing-sequence
+ * check and the comment at the call says why it exists rather than folding it into
+ * the first. */
+typedef enum {
+    CONN_DISPLAY_OK = 0,
+    CONN_DISPLAY_CONTROL = 1, /* a C0 control or DEL */
+    CONN_DISPLAY_C1 = 2,      /* U+0080-U+009F, bare or as 0xC2 0x80..0x9F */
+    CONN_DISPLAY_UTF8 = 3     /* invalid or truncated UTF-8 */
+} conn_display_verdict_t;
+
+conn_display_verdict_t conn_text_display_check(const char *s);
+
+/* ---------------------------------------------------------------------------
  * conn_text_logsafe(): RENDERING A CLIENT STRING INTO A LOG LINE
  * ---------------------------------------------------------------------------
  * Rule 1's operation, and the one the log-only fields need. Where
@@ -560,6 +646,35 @@ size_t conn_text_logsafe(char *out, size_t cap, const char *s);
  *                                     real client sends, so refusing it breaks a
  *                                     working feature; and a member's terminal is
  *                                     where it lands.
+ *
+ *   NICKNAME   (conn_t::nick)         REFUSED, and it is the only field on this
+ *                                     table with no copy to sanitise. A nickname is
+ *                                     not rendered into a log or a message: it IS
+ *                                     the source of every line its owner sends and
+ *                                     the `<client>` field of every numeric that
+ *                                     owner receives, so a byte in one is in front
+ *                                     of everything that client says to everybody.
+ *                                     `valid_nick()` asks `conn_text_display_check()`,
+ *                                     which refuses a C0 control, U+0080-U+009F in
+ *                                     either encoding, and invalid or truncated
+ *                                     UTF-8 -- and which is about CODE POINTS, not
+ *                                     bytes, so `ā` (`0xC4 0x81`) stays.
+ *
+ *   A VALUE ECHOED BACK TO ITS OWN   FILTERED, and this row is a POLICY rather than
+ *     SENDER, in a server numeric   a field. Eleven numerics echoed a client value
+ *                                     back to the client that sent it; all eleven are
+ *                                     now filtered at `emit_numeric_ex()` in
+ *                                     reply.c, the one place a numeric's parameters
+ *                                     are rendered. Bytes go, the FIELD stays, and
+ *                                     the argument is that **the echo carries no
+ *                                     information the sender does not already have**:
+ *                                     the client sent the value on the line before,
+ *                                     so filtering costs nothing and removes a
+ *                                     hazard. The argument this replaces -- "there
+ *                                     is no second reader" -- was wrong, because a
+ *                                     client that logs numerics, or a bouncer
+ *                                     relaying them to a human's terminal, is the
+ *                                     second reader.
  *   TOPIC      (chan_t::topic)        STRIPPED. Same answer for the same reason,
  *                                     and worse in exposure: a topic is stored,
  *                                     replayed to every future joiner by 332/333

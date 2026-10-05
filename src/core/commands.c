@@ -2579,8 +2579,10 @@ void commands_dispatch(server_t *s, conn_t *c, const message_t *m)
          * alternative is silence, and silence is the failure mode these
          * numerics exist to prevent. The [observable] line says which of the
          * two it was, so a log reader is not misled. */
-        /* As `cmd_unknown` above: the 421 names the verb to its own sender, the
-         * log measures it. `KILL` is the verb that reaches this branch on this
+        /* As `cmd_unknown` above, and for the same reason: the 421's <command> field
+         * is rendered by `emit_numeric_ex()` in reply.c -- the single place a
+         * numeric's parameters are filtered -- and the LOG measures the value rather
+         * than printing it raw. `KILL` is the verb that reaches this branch on this
          * build, so the line is not hypothetical. */
         char shown[CONN_LOG_FIELD_MAX + 1u];
 
