@@ -215,7 +215,14 @@ static void check_debian_changelog(const char *version)
 {
     size_t len = 0u;
     char *cl = slurp("packaging/debian/changelog", &len);
-    char want[64];
+    /* 128, NOT 64, and the reason is a compiler rather than a length: `version` is a
+     * parameter, so gcc-16 assumes it can be a char[64] and computes 63 characters
+     * plus the literal's own text against a 64-byte destination. Two clangs report
+     * nothing. This is the same "satisfy the strictest of three compilers that
+     * disagree" rule tests/integration/test_peer_tls.c's PF_PATH arithmetic follows,
+     * and the alternative -- a -Wno-format-truncation -- is a suppression that is
+     * invisible in a build log and permanent. */
+    char want[128];
     char line[512];
     const char *open_paren;
     const char *close_paren;
@@ -256,7 +263,7 @@ static void check_recorded_transcript(const char *version)
 {
     size_t len = 0u;
     char *doc = slurp("docs/SPEC_TRACKING.md", &len);
-    char want[64];
+    char want[128]; /* the same gcc-16 arithmetic as check_debian_changelog()'s */
 
     check(doc != NULL, "docs/SPEC_TRACKING.md is readable", IRCSERVE_SRC_DIR);
     if (doc == NULL) {
