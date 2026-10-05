@@ -900,6 +900,25 @@ typedef struct conn {
      * conn_pump(). */
     int         tls_active;
     int         starttls_pending;
+    /* 1 once this connection's TLS HANDSHAKE has been checked for the things that
+     * can only be checked once it is finished -- currently the peer's revocation
+     * status, in tls_openssl.c.
+     *
+     * IT IS A FIELD AND NOT A QUESTION ABOUT the SSL because there is nowhere else
+     * to keep it: the backend is reached through transport_send()/transport_recv(),
+     * which hand back three outcomes and nothing else, so a "have I checked yet"
+     * answer has to live on the connection rather than in the transport's state.
+     *
+     * WHY IT IS NEEDED AT ALL: a handshake can complete on the send path or on the
+     * read path depending on which flight arrived, and both arms must ask -- so
+     * without a latch the check would run twice on some connections and print two
+     * verdicts, and a verdict printed twice is a diagnostic nobody reads. It is
+     * set BEFORE the check runs, so a refusal cannot be reached twice either.
+     *
+     * THE COST IS ONE INT on a struct that already carries several hundred, and it
+     * is READ by one backend and by nothing else: on a plaintext connection it is
+     * 0 for ever and no code path consults it. */
+    int         tls_checked;
     /* 1 once this connection has carried a CREDENTIAL in the clear: a PASS value
      * or an AUTHENTICATE payload, offered or not.
      *

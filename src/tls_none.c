@@ -44,12 +44,15 @@ int tls_backend_available(void)
 }
 
 int tls_backend_node_init(struct tls_node **out, const char *cert,
-                          const char *key, const char *ca, int insecure)
+                          const char *key, const char *ca, int insecure,
+                          const char *staple, int staple_strict)
 {
     (void)cert;
     (void)key;
     (void)ca;
     (void)insecure;
+    (void)staple;
+    (void)staple_strict;
     printf("[observable] tls_init: state=REFUSED reason=NOT_COMPILED_IN "
            "hint=rebuild_with_-DWITH_TLS=ON\n");
     if (out != NULL) {

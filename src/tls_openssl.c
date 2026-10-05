@@ -80,11 +80,24 @@
 
 #include <openssl/bio.h>
 #include <openssl/err.h>
+#include <openssl/ocsp.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
+#include <openssl/tls1.h>
+#include <openssl/x509_vfy.h>
 #include <openssl/x509v3.h>
 
 #include "core/transport.h"
+
+/* Upper bound on a stapled response read from disk.
+ *
+ * A TLS CertificateStatus message cannot exceed the handshake message limit, which
+ * is 2^14 bytes for the record plus framing, so 64 KiB cannot reject a staple that
+ * would have fitted on the wire. It exists because the DER arm hands a length to
+ * BIO_read() and an unbounded read of an operator-supplied file is not a thing to
+ * write when the value only has to be plausible. The PEM arm does not use it: a PEM
+ * arm has no length to respect, it is read by the parser. */
+#define OCSP_STAPLE_MAX 65536
 
 /* ---------------------------------------------------------------------------
  * THE NODE'S TLS STATE
@@ -94,11 +107,46 @@ typedef struct tls_node {
     SSL_CTX *cli;   /* dialling role: peer links. See "THE CONTEXTS" above. */
     int      insecure; /* --tls-insecure: do NOT fail an unverifiable peer */
     int      have_ca;  /* a --tls-ca was loaded into cli */
+    /* --tls-ocsp-staple: the DER bytes of an OCSP response for this node's own
+     * certificate, read ONCE here and stapled on every server-role handshake.
+     *
+     * IT IS A POINTER INTO A HEAP BLOCK THIS STRUCT OWNS, not a copy per
+     * connection, and the reason is OpenSSL's ownership rule: SSL_set_tlsext_
+     * status_ocsp_resp() stores the pointer and the length rather than copying
+     * the bytes (openssl/ssl/s3_lib.c, SSL_CTRL_SET_TLSEXT_STATUS_REQ_OCSP_RESP,
+     * in 1.1.1 and 3.x; 4.x additionally d2i's it and keeps both). So the bytes
+     * must outlive every SSL created from this context, and the node outlives
+     * every SSL. One read, one block, N handshakes.
+     *
+     * THE COST, which is the whole reason this cannot be a convenience: a stale
+     * staple stays stale until an operator replaces the file and restarts. That
+     * is the deliberate trade -- see "STAPLED, NEVER FETCHED". */
+    unsigned char *staple;
+    size_t         staple_len;
+    /* THE FAILURE POLICY, one boolean, and its default is FAIL CLOSED. See
+     * "THE FAILURE POLICY, AND WHICH DIRECTION IS THE DEFAULT". */
+    int      staple_strict;
     /* What the startup line's `verify=` says. Held on the node rather than
      * recomputed at print time so there is one definition of the four states, and
      * see verify_label_for() for why there are four. */
     const char *verify_label;
 } tls_node_t;
+
+/* ---------------------------------------------------------------------------
+ * ONE FORWARD DECLARATION, and it is here because of the file's own order
+ * ---------------------------------------------------------------------------
+ * tls_after_handshake() is the revocation gate and it runs from inside the
+ * readiness translation below -- once from tls_send()'s handshake pass and once
+ * from tls_recv() -- while its definition sits further down with the rest of the
+ * revocation work. The order is deliberate rather than accidental: this file's
+ * shape is "contexts, then the SSL*, then the readiness intent", and a peer
+ * certificate's status is only knowable once the handshake is done, which is a
+ * fact about the SSL rather than about the poll loop. Moving four hundred lines
+ * of revocation code above the transport ops to avoid one declaration would make
+ * the file harder to read, not easier.
+ *
+ * It is static, so the declaration cannot widen the backend's surface. */
+static int tls_after_handshake(conn_t *c, SSL *ssl);
 
 /* ---------------------------------------------------------------------------
  * PUBLISH THE READINESS INTENT, and the ONE THING THIS FILE GOT WRONG FIRST
@@ -249,6 +297,14 @@ static ssize_t tls_recv(conn_t *c, void *buf, size_t len)
             if (SSL_pending(ssl) > 0) {
                 continue;
             }
+            /* A HANDSHAKE CAN ALSO COMPLETE ON THE READ PATH -- a server-role one
+             * does, and so does a client-role one whose last flight arrived before
+             * the loop ever asked for writability. The same gate as tls_send's, for
+             * the same reason: whichever arm noticed, the check runs once. */
+            if (tls_after_handshake(c, ssl) != 0) {
+                conn_want(c, 0, 0);
+                return TRANSPORT_FATAL;
+            }
             return n;
         }
         /* SSL_read() with len 0 is legal and returns 0, which would read as EOF.
@@ -285,6 +341,15 @@ static ssize_t tls_send(conn_t *c, const void *buf, size_t len)
         if (SSL_in_init(ssl) != 0) {
             tls_publish(c, 1, 0);
             return TRANSPORT_RETRY;
+        }
+        /* THE HANDSHAKE JUST COMPLETED HERE, which is where revocation is decided on
+         * the peer-link path -- see tls_after_handshake(). The refusal it can return
+         * is TRANSPORT_FATAL rather than TRANSPORT_RETRY on purpose: a peer whose
+         * certificate is revoked is not a peer this node should keep talking to, and
+         * retrying would re-present the same revoked staple on every poll iteration. */
+        if (tls_after_handshake(c, ssl) != 0) {
+            conn_want(c, 0, 0);
+            return TRANSPORT_FATAL;
         }
     }
     if (len == 0u) {
@@ -526,6 +591,712 @@ static int tls_peer_verify(SSL *ssl, tls_node_t *node, const char *peer_host,
 }
 
 /* ---------------------------------------------------------------------------
+ * CERTIFICATE REVOCATION, AND WHY IT IS OCSP STAPLING AND NOT A CRL FETCH
+ * ---------------------------------------------------------------------------
+ * THE GAP THIS CLOSES, in the auditor's terms: a revoked certificate that chains
+ * to the configured CA was accepted until it EXPIRED, so the blast radius of a
+ * stolen peer key was bounded only by the leaf's notAfter, and nothing logged when
+ * that window closed. Both halves are addressed below -- the check, and the
+ * notAfter line.
+ *
+ * WHY OCSP STAPLING AND NOT CRL, in one sentence: a CRL is a DISTRIBUTION POINT,
+ * and an unreachable distribution point has to be treated as revoked or the check
+ * is decorative -- which means fetching it, and 3.4 forbids a blocking call inside
+ * the event loop. A staple is bytes the peer already had, so nothing is fetched,
+ * nothing can be unreachable, and the failure policy is one boolean.
+ *
+ * ---------------------------------------------------------------------------
+ * STAPLED, NEVER FETCHED, and this is the load-bearing constraint
+ * ---------------------------------------------------------------------------
+ * NOT ONE FUNCTION BELOW OPENS A SOCKET, RESOLVES A NAME, OR READS A FILE. The
+ * staple is read ONCE in tls_backend_node_init(), which runs from main() before the
+ * loop is armed; everything after that is arithmetic over DER the peer sent and an
+ * X509_STORE this node loaded at startup. Concretely: there is no OCSP_sendreq*,
+ * no OSSL_HTTP_REQ_CTX, no BIO_new_file and no getaddrinfo in this file's
+ * revocation path, and no OCSP RESPONSE is ever issued by this process -- only
+ * OCSP_RESPONSE *verifications*. tests/integration/test_tls_revocation.c asserts
+ * the negative by reading the source with its comments stripped, which is the only
+ * way to make the claim false-able: a call added here shows up as a failing test
+ * rather than as a comment that has quietly stopped being true.
+ *
+ * THE COST, because a design with no cost is a design nobody has thought about:
+ *
+ *   1. A STALE STAPLE STAYS STALE until an operator replaces the file and restarts.
+ *      Nothing refreshes it, and that is the point: the alternative is a refresh
+ *      inside the loop. The consequence is that nextUpdate becomes a REAL deadline
+ *      rather than an advisory one -- see the freshness rule below, which refuses a
+ *      response with no nextUpdate at all -- so an operator who does not refresh
+ *      finds out on the next link attempt, with a named reason.
+ *   2. THE NODE MUST BE CONFIGURED ON BOTH ENDS. A node with no
+ *      --tls-ocsp-staple has nothing to staple, so a strict peer's handshake gets
+ *      no CertificateStatus and is refused with MISSING_STAPLE. Upgrading ONE side
+ *      of a mesh therefore breaks peer links until both sides are configured, which
+ *      is the real operational price of failing closed and the reason the startup
+ *      line prints `ocsp_staple=` and --help states the remedy.
+ *   3. THE RESPONDER'S OWN CERTIFICATE IS NOT AVAILABLE FOR CHAINING, because
+ *      OpenSSL owns the parsed staple and exposes no accessor for the extra
+ *      certificates inside it. Nothing here needs them: this is a verification and
+ *      not an OCSP client.
+ *
+ * ---------------------------------------------------------------------------
+ * ONLY THE OUTBOUND PEER-LINK PATH, and this is NOT INBOUND COVERAGE
+ * ---------------------------------------------------------------------------
+ * The check runs in the CLIENT role, once per handshake, after it completes. The
+ * client role in this tree IS the outbound peer link: server_dial_progress() is the
+ * only caller of transport_starttls_peer() with as_server == 0, and STARTTLS is
+ * answered with as_server == 1.
+ *
+ * NOTHING HERE IS A STATEMENT ABOUT INBOUND CONNECTIONS. There is no inbound
+ * client-certificate authentication to check a certificate against: the server
+ * context is SSL_VERIFY_NONE and never asks for one, so a client certificate is not
+ * verified against anything even when a client offers one. Revocation is therefore
+ * MOOT inbound, not implemented inbound -- and building inbound mTLS is deliberately
+ * NOT part of this pass, rather than being quietly implied by the word
+ * `revocation=` appearing on the startup line. An operator should read that field
+ * as exactly "revocation of a PEER's certificate on a link this node dialled" and
+ * no more than that.
+ *
+ * ---------------------------------------------------------------------------
+ * THE FAILURE POLICY, AND WHICH DIRECTION IS THE DEFAULT
+ * ---------------------------------------------------------------------------
+ * ONE BOOLEAN: staple_strict. 1 refuses the link when the status is missing, stale,
+ * unverifiable or revoked; 0 prints the reason and continues. It is
+ * `struct tls_node`'s field, the `tls_init` line's `revocation=`, and the whole of
+ * --tls-staple-permissive.
+ *
+ * STRICT IS THE DEFAULT, so the INSECURE direction is the one that requires a flag.
+ * That is a decision rather than an unexamined default, and the argument is the
+ * auditor's: "an unreachable distribution point must be treated as revoked
+ * (fail-closed) or the check is decorative." Permissive-by-default IS the decorative
+ * check -- it accepts a revoked certificate and writes a line saying so, and every
+ * operator who does not read the line believes they have revocation checking because
+ * the startup output contains the word `revocation=`. A security feature whose
+ * failure mode is a log line nobody reads is worse than a feature that is off,
+ * because it changes what people believe about the thing they are running.
+ *
+ * THE ARGUMENT AGAINST, because there is a real one and this project argues both
+ * sides in its comments rather than only the side it implemented. Permissive does
+ * not break a mesh whose peers do not staple; STRICT DOES, on the day one side is
+ * upgraded, and the operator's first symptom is a link that will not come up. That
+ * is answered rather than dismissed:
+ *
+ *   - a REFUSAL IS NOT SILENT. It names MISSING_STAPLE on the wire, it is beside
+ *     `revocation=` on the one startup line an operator reads, and --help says what
+ *     to do about it. The alternative symptom is a link that comes up, carries
+ *     traffic, and is unprotected against exactly the compromise the feature exists
+ *     for -- which is a failure nobody reports because nothing looks broken.
+ *   - the remedy is ONE option on each side, not a migration. Both nodes are this
+ *     code and both take the flag, and `openssl ocsp` (or any CA) produces the file,
+ *     so no operator needs a library this project does not have.
+ *   - THE FLAG IS NAMED FOR THE DIRECTION IT MOVES YOU. --tls-staple-permissive is
+ *     what an operator types when they mean it, which is the same rule
+ *     --tls-insecure follows and the reason it exists. Naming the option after the
+ *     strict policy would advertise a switch that changes nothing, because strict is
+ *     already what you have.
+ */
+
+/* The name this node has for the peer on the far end, for a log line.
+ *
+ * conn_t::peer_name is set by server_dial_progress() BEFORE it calls
+ * transport_starttls_peer(), so on this path it is always the link's server name --
+ * which is also what tls_peer_verify() checked the certificate against, so the two
+ * lines agree about which peer they are talking about. The fallback is for a
+ * hand-called tls_backend_starttls_peer(), which is a public entry point and may be
+ * handed a connection with no name. */
+static const char *tls_peer_name_of(const conn_t *c)
+{
+    if (c == NULL || c->peer_name == NULL || c->peer_name[0] == '\0') {
+        return "(unnamed)";
+    }
+    return c->peer_name;
+}
+
+/* THE STAPLED RESPONSE'S BYTES, through the one accessor that exists in every
+ * OpenSSL this project supports.
+ *
+ * IT IS THIS MACRO AND NOT SSL_get0_ocsp_resp() because that function was REMOVED
+ * in OpenSSL 4.0, and its replacement does not do the same job:
+ * SSL_get0_tlsext_status_ocsp_resp_ex() hands back an already-PARSED
+ * STACK_OF(OCSP_RESPONSE) * through its argument and returns the COUNT as a long, so
+ * it is not a drop-in for a (pointer, length) pair and assigning it to one is a
+ * -Wint-conversion error rather than a silent mistake. The ctrl both generations
+ * share, SSL_CTRL_GET_TLSEXT_STATUS_REQ_OCSP_RESP, has the same (pointer, length)
+ * shape in both:
+ *
+ *   1.1.1 / 3.x   *(unsigned char **)parg = sc->ext.ocsp.resp;  return resp_len;
+ *   4.x           i2d() the first parsed response into a buffer OpenSSL owns,
+ *                 writes the pointer, and returns that buffer's length.
+ *
+ * THE BUFFER IS OPENSSL'S IN BOTH, so it must NOT be freed here: it is released by
+ * SSL_free() when the transport's close op runs. Copying it would buy nothing and
+ * cost one allocation per handshake. */
+static int tls_staple_bytes(SSL *ssl, const unsigned char **out, long *len)
+{
+    unsigned char *buf = NULL;
+    long n = SSL_get_tlsext_status_ocsp_resp(ssl, &buf);
+
+    *out = NULL;
+    *len = 0L;
+    if (n <= 0L || buf == NULL) {
+        return 0;
+    }
+    *out = buf;
+    *len = n;
+    return 1;
+}
+
+/* An ASN1_TIME as ISO-8601 UTC, into `out`. Returns `out` always, so a caller can
+ * use it inline: a time this function cannot read prints as "unreadable" rather than
+ * as a number, because the question being answered is "when does my exposure window
+ * close" and a confident wrong answer is the failure mode that matters there.
+ *
+ * ASN1_TIME_to_tm() fills a struct tm whose tm_year is year-minus-1900, so the
+ * +1900 below is the conversion and not a fudge. The function is 1.1.1-era and
+ * present in 3.x and 4.x, which is the floor src/CMakeLists.txt declares. */
+static const char *tls_time_text(char *out, size_t cap, const ASN1_TIME *t)
+{
+    struct tm tm;
+
+    if (t == NULL) {
+        (void)snprintf(out, cap, "absent");
+        return out;
+    }
+    if (ASN1_TIME_to_tm(t, &tm) != 1) {
+        (void)snprintf(out, cap, "unreadable");
+        return out;
+    }
+    (void)snprintf(out, cap, "%04d-%02d-%02dT%02d:%02d:%02dZ", tm.tm_year + 1900,
+                   tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+    return out;
+}
+
+/* Seconds from NOW until `t`, as text. "unknown" when ASN1_TIME_diff() cannot answer.
+ *
+ * NULL is passed for `from`, which is the library's documented way of saying "from
+ * the current time", and real out-parameters are passed rather than NULL because
+ * OPENSSL_gmtime_diff() -- the function behind it -- has changed its mind about
+ * NULL over the versions this file is compiled against. */
+static const char *tls_seconds_text(char *out, size_t cap, const ASN1_TIME *t)
+{
+    int day = 0;
+    int sec = 0;
+
+    if (t == NULL || ASN1_TIME_diff(&day, &sec, NULL, t) != 1) {
+        (void)snprintf(out, cap, "unknown");
+        return out;
+    }
+    (void)snprintf(out, cap, "%ld", (long)day * 86400L + (long)sec);
+    return out;
+}
+
+/* ---------------------------------------------------------------------------
+ * THE CHECK. Returns 0 to let the handshake stand, -1 to refuse the link.
+ *
+ * THE ORDER OF THE STEPS IS THE ORDER OF WHAT CAN BE TRUSTED, and each one is
+ * decided only after the ones above it have been:
+ *
+ *   1. the leaf and its ISSUER, taken from the chain OpenSSL already verified and
+ *      this node's own store -- never from the staple, which is the untrusted input;
+ *   2. the RESPONSE STATUS: a responder answering "I don't know" or "try later" has
+ *      not answered, and OCSP_basic_verify() returns 1 for those, so the status is
+ *      checked explicitly rather than inferred from a successful verification;
+ *   3. the SIGNATURE and the SIGNER'S AUTHORITY, via OCSP_basic_verify() against
+ *      this node's store. This is what makes a response signed by somebody who is
+ *      not the issuer -- or by a responder the issuer never authorised -- a refusal
+ *      rather than a status;
+ *   4. the CERTID: the response must be about THIS certificate. The digest inside a
+ *      CertID is the responder's choice and OpenSSL exposes no portable accessor for
+ *      it (OCSP_SINGLERESP is opaque), so SHA-256 and SHA-1 are both tried and one
+ *      must match. That widens which responses are UNDERSTOOD, not which
+ *      certificates are ACCEPTED, because the leaf and the issuer on both sides of
+ *      the comparison are the ones this node verified for itself;
+ *   5. FRESHNESS: nextUpdate must EXIST and must not have passed. A response with no
+ *      nextUpdate is refused rather than accepted, and that is the whole reason the
+ *      check is worth anything -- OCSP_check_validity() returns 1 when nextUpdate is
+ *      absent, which would make an undated staple valid for ever and reproduce the
+ *      original gap with more steps around it;
+ *   6. the STATUS ITSELF: GOOD is the only value that passes.
+ *
+ * THE COST, once per outbound peer handshake: four digests of the issuer's name and
+ * key (two per candidate CertID algorithm), one signature verification and one
+ * chain verification of the responder's certificate. No syscall, no lock, no
+ * allocation that outlives the call. On a node with a handful of peers re-dialling
+ * every few minutes this is nothing; it is not on the message path and it is not a
+ * hot path.
+ *
+ * AND IT RUNS ONCE per connection rather than once per read: conn_t::tls_checked is
+ * the latch. The alternative -- asking after every SSL_read() -- would re-verify a
+ * signature per buffered record and print a fresh verdict every time, which is how
+ * a diagnostic becomes noise. The latch is set BEFORE the check runs, so a refusal
+ * cannot be reached twice. */
+static int tls_peer_revocation(conn_t *c, SSL *ssl, tls_node_t *node)
+{
+    X509 *leaf = NULL;
+    X509 *issuer = NULL;
+    X509_STORE *store = NULL;
+    OCSP_RESPONSE *resp = NULL;
+    OCSP_BASICRESP *bs = NULL;
+    OCSP_CERTID *cid = NULL;
+    STACK_OF(X509) *sent = NULL;
+    const OPENSSL_STACK *chain = NULL;
+    const unsigned char *raw = NULL;
+    const unsigned char *p = NULL;
+    ASN1_GENERALIZEDTIME *thisupd = NULL;
+    ASN1_GENERALIZEDTIME *nextupd = NULL;
+    long raw_len = 0L;
+    int pass;
+    int status = 0;
+    int reason_code = 0;
+    int found = 0;
+    int good = 0;
+    int rc;
+    const char *peer = tls_peer_name_of(c);
+    const char *verdict = "NO_CHECK";
+    const char *why = "";
+    const char *policy = (node->staple_strict != 0) ? "strict" : "permissive";
+    char not_after[32];
+    char not_after_in[32];
+    char this_text[32];
+    char next_text[32];
+
+    leaf = SSL_get1_peer_certificate(ssl);
+    if (leaf == NULL) {
+        /* UNREACHABLE ON A VERIFIED LINK, and refused anyway for the reason
+         * tls_peer_verify()'s no-name arm gives: a state that PROCEEDS is what the
+         * bug there was. A client-role handshake with no peer certificate means the
+         * chain was never verified, and a revocation status has nothing to be
+         * ABOUT. */
+        verdict = "NO_CERTIFICATE";
+        why = "peer sent no certificate";
+        goto done;
+    }
+    /* THE ISSUER AND THE STORE. The issuer is the SECOND certificate of the chain
+     * OpenSSL already verified, because a certificate with no issuer in its chain
+     * is a directly-trusted leaf and there is nobody who could have issued a status
+     * for it. That is a reading of the peer's own message, and it is safe to read
+     * it that way only because both uses of it are checked against things this node
+     * verified for itself: OCSP_basic_verify() below chains the signer to `store`,
+     * and OCSP_cert_to_id() below produces a CertID that matches nothing unless the
+     * certificate really was issued by the one chosen. A peer that lies about its
+     * issuer gets a CertID that matches nothing or a signer that does not chain --
+     * it cannot get a status for a certificate it does not hold.
+     *
+     * OPENSSL_sk_num()/OPENSSL_sk_value() ARE SPELLED OUT RATHER THAN THROUGH
+     * sk_X509_num()/sk_X509_value(), and this is forced rather than preferred.
+     * OpenSSL 4.0's typed stack macros expand through ossl_check_*_type() helpers
+     * that the header marks unused, so under -Weverything EVERY use of an sk_X509_*
+     * macro is `-Werror,-Wused-but-marked-unused` on clang 21, 23 and Apple's 21.
+     * The alternative the project would otherwise take -- adding
+     * -Wno-used-but-marked-unused -- is narrowing the project's own warning set to
+     * accommodate a third-party header, which is the opposite of what that set is
+     * for. The two functions below have no inline type-check wrapper, so they
+     * compile clean on all three compilers and on OpenSSL 1.1.1, 3.x and 4.x. */
+    store = SSL_CTX_get_cert_store(SSL_get_SSL_CTX(ssl));
+    sent = SSL_get_peer_cert_chain(ssl);
+    chain = (const OPENSSL_STACK *)(const void *)sent;
+    if (store == NULL || sent == NULL || OPENSSL_sk_num(chain) < 2 ||
+        (issuer = (X509 *)OPENSSL_sk_value(chain, 1)) == NULL) {
+        /* A SELF-SIGNED peer certificate -- which is what a two-node mesh of this
+         * code is configured with, each node trusting the other's leaf directly --
+         * has no separate issuer, so there is nobody who could have issued a status
+         * for it. That is a TRUE STATEMENT about the certificate rather than a
+         * failure of this check, and it is worth being precise about: a strict node
+         * refuses such a link, and the fix is a CA, not a flag. */
+        verdict = "NO_ISSUER";
+        why = "self-signed peer certificate: nobody could have issued a status for "
+              "it; give this mesh a CA";
+        goto done;
+    }
+    if (!tls_staple_bytes(ssl, &raw, &raw_len)) {
+        verdict = "MISSING_STAPLE";
+        why = "peer stapled no OCSP response";
+        goto done;
+    }
+    p = raw;
+    resp = d2i_OCSP_RESPONSE(NULL, &p, raw_len);
+    if (resp == NULL || OCSP_response_status(resp) != V_OCSP_CERTSTATUS_GOOD) {
+        /* "try later" and "unauthorized" are not certificate statuses. Treating
+         * "I could not find out" as "nothing to report" is the fail-open this whole
+         * policy exists to prevent. */
+        verdict = "BAD_RESPONSE";
+        why = "response status is not CERTSTATUS_GOOD";
+        goto done;
+    }
+    bs = OCSP_response_get1_basic(resp);
+    if (bs == NULL) {
+        verdict = "NO_BASIC_RESPONSE";
+        why = "response carried no BasicOCSPResponse";
+        goto done;
+    }
+    /* THE SIGNATURE AND THE SIGNER'S RIGHT TO SIGN. The candidates handed over are
+     * the peer's own chain, which is where a conforming issuer's certificate
+     * necessarily is, and OpenSSL also looks among the certificates embedded in the
+     * response -- so a DELEGATED responder is found and then judged rather than
+     * waved through. Zero flags is the strict choice: no OCSP_NOINTERN (the signer
+     * must be trusted, not merely asserted), no OCSP_NOVERIFY, no OCSP_TRUSTOTHER.
+     * The trust decision is ocsp_verify_signer()'s, and it builds to `store` with
+     * the OCSP_HELPER purpose -- so a response signed by anybody this node cannot
+     * chain to is refused, which is the case that matters and the one
+     * tests/integration/test_tls_revocation.c drives with a rogue responder.
+     *
+     * PASSING THE PEER'S CHAIN IS NOT A TRUST DECISION. `certs` is OpenSSL's
+     * "additional certificates to consider while finding the signer", and every
+     * certificate an attacker could put there is one they could equally have put in
+     * the Certificate message; the chain still has to terminate in this node's
+     * store. What it buys is that a peer which sends leaf + CA -- which is what
+     * --tls-cert is for, and what every real deployment has -- is verifiable without
+     * this file inventing a stack of its own. */
+    if (OCSP_basic_verify(bs, sent, store, 0) != 1) {
+        ERR_clear_error();
+        verdict = "UNVERIFIED";
+        why = "signature or signer did not verify against the configured store";
+        goto done;
+    }
+    /* THE CERTID, BOTH DIGESTS. See step 4 above. Whichever the responder chose,
+     * the response must be a status for the leaf this node verified against the
+     * issuer it resolved itself. */
+    for (pass = 0; pass < 2 && found == 0; pass++) {
+        const EVP_MD *md = (pass == 0) ? EVP_sha256() : EVP_sha1();
+
+        if (cid != NULL) {
+            OCSP_CERTID_free(cid);
+            cid = NULL;
+        }
+        cid = OCSP_cert_to_id(md, leaf, issuer);
+        if (cid == NULL) {
+            break;
+        }
+        thisupd = NULL;
+        nextupd = NULL;
+        status = 0;
+        reason_code = 0;
+        if (OCSP_resp_find_status(bs, cid, &status, &reason_code, NULL, &thisupd,
+                                  &nextupd) == 1) {
+            found = 1;
+        }
+    }
+    if (found != 1) {
+        ERR_clear_error();
+        verdict = "CERTID_NOT_FOUND";
+        why = "no status for this certificate under SHA-256 or SHA-1";
+        goto done;
+    }
+    /* FRESHNESS, AND nextUpdate IS MANDATORY. See step 5 above; that comment is the
+     * argument. The (0, -1) arguments are "no clock-skew allowance, and no maximum
+     * age beyond nextUpdate", so the responder's own deadline is the only deadline
+     * this node applies. */
+    if (nextupd == NULL) {
+        verdict = "NO_NEXT_UPDATE";
+        why = "response carries no nextUpdate, so its freshness is unbounded";
+        goto done;
+    }
+    if (OCSP_check_validity(thisupd, nextupd, 0L, -1L) != 1) {
+        ERR_clear_error();
+        verdict = "STALE";
+        why = "now is outside [thisUpdate, nextUpdate]";
+        goto done;
+    }
+    if (status != V_OCSP_CERTSTATUS_GOOD) {
+        /* A GENUINELY REVOKED CERTIFICATE. This is the case the whole feature
+         * exists for, and it is the one a response signed by the issuing CA and
+         * carrying V_OCSP_CERTSTATUS_REVOKED produces: the signature verifies, the
+         * signer is authorised, the CertID matches this leaf, and the answer is
+         * still no. tests/integration/test_tls_revocation.c builds exactly that. */
+        verdict = "REVOKED";
+        why = OCSP_crl_reason_str((long)reason_code);
+        goto done;
+    }
+    verdict = "GOOD";
+    why = "in force";
+    good = 1;
+
+done:
+    /* THE EXPOSURE WINDOW, ON EVERY LINK, GOOD OR BAD. This is the line that did
+     * not exist: notAfter is the outer bound on how long a compromised peer key is
+     * useful EVEN IF revocation never fires, so an operator who cannot read it from
+     * a log cannot answer "how long is my exposure". It prints on the refusal path
+     * too, because the two questions are independent -- a link refused for a revoked
+     * staple still says how long that certificate would have been good for, which is
+     * what tells an operator whether the revocation mattered. */
+    (void)snprintf(not_after, sizeof not_after, "%s",
+                   (leaf != NULL)
+                       ? tls_time_text(this_text, sizeof this_text,
+                                       X509_get0_notAfter(leaf))
+                       : "unknown");
+    (void)snprintf(not_after_in, sizeof not_after_in, "%s",
+                   tls_seconds_text(next_text, sizeof next_text,
+                                    (leaf != NULL) ? X509_get0_notAfter(leaf)
+                                                   : NULL));
+    printf("[observable] tls_peer_cert: fd=%d peer=%s not_after=%s not_after_in=%ss "
+           "ocsp=%s\n",
+           c->fd, peer, not_after, not_after_in, verdict);
+    rc = (good != 0 || node->staple_strict == 0) ? 0 : -1;
+    /* THE VERDICT. `action=` is what this node DID, not what it recommends, and it is
+     * decided HERE rather than by the caller so the two cannot disagree. In
+     * permissive mode this is the whole of what the insecure mode does: the link
+     * stands, the reason is on the wire, and the line above has already said how long
+     * the window is. */
+    printf("[observable] tls_peer_revocation: fd=%d peer=%s status=%s policy=%s "
+           "action=%s this_update=%s next_update=%s detail=\"%s\"\n",
+           c->fd, peer, verdict, policy, (rc == 0) ? "ACCEPT" : "REFUSE",
+           tls_time_text(this_text, sizeof this_text, (ASN1_TIME *)thisupd),
+           tls_time_text(next_text, sizeof next_text, (ASN1_TIME *)nextupd), why);
+    if (cid != NULL) {
+        OCSP_CERTID_free(cid);
+    }
+    if (resp != NULL) {
+        OCSP_RESPONSE_free(resp);
+    }
+    if (leaf != NULL) {
+        X509_free(leaf);
+    }
+    /* NEITHER `issuer` NOR `sent` IS FREED, and that is not a leak: both are
+     * BORROWED from the SSL, which owns them and releases them when the transport's
+     * close op runs SSL_free(). There is exactly one owner of every certificate in
+     * this function and it is not here. `store` belongs to the SSL_CTX and is
+     * released with it. */
+    return rc;
+}
+
+/* The post-handshake gate: 0 to carry on, -1 to refuse the link.
+ *
+ * IT IS CALLED FROM BOTH ARMS of the transport -- the handshake pass in tls_send()
+ * and the first read in tls_recv() -- because a handshake can complete on either,
+ * and whichever it was, the check runs ONCE. conn_t::tls_checked is the latch. */
+static int tls_after_handshake(conn_t *c, SSL *ssl)
+{
+    tls_node_t *node = (tls_node_t *)c->owner->tls;
+
+    if (SSL_in_init(ssl) != 0 || c->tls_checked != 0) {
+        return 0;
+    }
+    /* THE SERVER ROLE IS NOT CHECKED, and this line is the whole of "ONLY THE
+     * OUTBOUND PEER-LINK PATH" -- see the block comment above, which is where the
+     * argument lives.
+     *
+     * IT IS NOT COSMETIC, and the version without it is instructive: this gate was
+     * missing on the first run and every handshake broke, because a server-role SSL
+     * has NO peer certificate to have a status about (the server context is
+     * SSL_VERIFY_NONE and never asks for one), so the check reported NO_CERTIFICATE
+     * on every inbound connection and -- in strict mode -- closed it. The peer saw an
+     * unexplained "unexpected eof while reading" and the operator saw a revocation
+     * failure for a certificate that was never sent.
+     *
+     * So the gate also has to SILENCE the check rather than merely skip its verdict.
+     * An inbound client connection that printed `revocation=` or `status=` would be
+     * a line claiming coverage this program does not have, and
+     * tests/integration/test_tls_revocation.c asserts the absence on the accepting
+     * node -- which is the only way "inbound is not covered" can be false-able. */
+    if (SSL_is_server(ssl) != 0) {
+        return 0;
+    }
+    c->tls_checked = 1;
+    /* --tls-insecure IS AN EXEMPTION, and it is an exemption rather than an
+     * oversight because there is nothing to check: SSL_VERIFY_NONE means no chain
+     * was verified, so there is no verified issuer for a status to be ABOUT, and
+     * running the check anyway would refuse every link on a node the operator
+     * explicitly asked not to verify. It says so on the wire rather than being
+     * silent, and the startup line's revocation=none is the same fact. */
+    if (node->insecure != 0) {
+        printf("[observable] tls_peer_revocation: fd=%d peer=%s status=NOT_CHECKED "
+               "policy=none action=ACCEPT detail=\"--tls-insecure: the peer "
+               "certificate was not verified, so there is no chain for a status to "
+               "be about\"\n",
+               c->fd, tls_peer_name_of(c));
+        return 0;
+    }
+    return tls_peer_revocation(c, ssl, node);
+}
+
+/* ---------------------------------------------------------------------------
+ * STAPLING THIS NODE'S CERTIFICATE, and WHY IT NEEDS A CALLBACK
+ * ---------------------------------------------------------------------------
+ * OpenSSL does not staple a response merely because you set one. On the SERVER side
+ * three things have to be true, and only the first of them is documented in the
+ * man pages; the other two were found in the source, which is why this comment
+ * quotes it:
+ *
+ *   1. SSL_CTX_set_tlsext_status_cb() IS REGISTERED. `tls_parse_ctos_status_request()`
+ *      -- the code that reads the client's status_request extension -- begins with
+ *      "we only care about this extension if the application registered a callback",
+ *      and RETURNS WITHOUT READING ANYTHING when no callback is registered. So with
+ *      no callback a client that asks for a status is asking a node that has never
+ *      heard of the question: `openssl s_client -status` reports "OCSP responses: no
+ *      responses sent" and nothing in the handshake fails. A node that staples
+ *      nothing and a node whose staple was silently dropped are indistinguishable on
+ *      the wire, which is why this arm exists rather than an SSL_CTX_set_* call at
+ *      the accept site.
+ *   2. THE CALLBACK RETURNS SSL_TLSEXT_ERR_OK AND A RESPONSE IS ATTACHED.
+ *      `tls_handle_status_request()` sets `status_expected` only on that return AND
+ *      only if the response list is non-empty, so attaching the bytes and returning
+ *      OK are both load-bearing.
+ *   3. THE RESPONSE IS ABOUT THE CERTIFICATE BEING SENT. Since 3.x,
+ *      `ossl_get_ocsp_response()` looks the response up by matching the certificate
+ *      about to go out -- its serial number, and the hash of its issuer's name under
+ *      the digest the response itself declares -- and returns nothing when no
+ *      SingleResponse matches. So a staple that does not cover this node's own leaf
+ *      is dropped silently, which is the right behaviour and worth knowing before
+ *      spending an afternoon on it.
+ *
+ * SO THE STAPLE IS ATTACHED HERE, from the callback, rather than at accept. That is
+ * also the only correct order: the callback runs after the certificate has been
+ * chosen and after the cipher, which is when (3) above can be satisfied at all.
+ *
+ * THE COST, once per server handshake that asks for a status: one d2i of the staple
+ * under OpenSSL 4.x (which parses on set) or one pointer store under 3.x, plus the
+ * bytes going on the wire. No syscall, no allocation this file owns. */
+static int tls_status_cb(SSL *ssl, void *arg)
+{
+    tls_node_t *node = (tls_node_t *)arg;
+
+    /* NO STAPLE CONFIGURED IS AN HONEST "NO", NOT A FAILURE. SSL_TLSEXT_ERR_NOACK
+     * tells OpenSSL not to answer the status_request at all, which is exactly the
+     * state a node with no --tls-ocsp-staple is in. The alternative -- returning
+     * OK with nothing attached -- would send an empty CertificateStatus and put a
+     * malformed message on the wire. */
+    if (node == NULL || node->staple == NULL) {
+        return SSL_TLSEXT_ERR_NOACK;
+    }
+    (void)SSL_set_tlsext_status_ocsp_resp(ssl, node->staple, (long)node->staple_len);
+    return SSL_TLSEXT_ERR_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * READ THIS NODE'S OWN STAPLE, ONCE, AT STARTUP
+ * ---------------------------------------------------------------------------
+ * The file is DER or PEM; both are accepted because an operator who made one with
+ * `openssl ocsp -respin` has a .pem and an operator who sliced the bytes has a .der,
+ * and refusing one of them on a format technicality is the kind of thing that ends
+ * with a node running with revocation off.
+ *
+ * IT MUST PARSE HERE OR THE NODE DOES NOT START, and that is the certificate's own
+ * rule rather than a new one: a staple this node cannot read is a staple it cannot
+ * staple, and a node that staples nothing while its peers verify is a node whose
+ * links fail with MISSING_STAPLE naming a cause the operator cannot see from the
+ * peer end.
+ *
+ * THE BYTES ARE COPIED out of the BIO and owned by `struct tls_node`, because
+ * OpenSSL stores the pointer rather than the bytes (see the field's comment) and
+ * the BIO's buffer does not outlive this function.
+ *
+ * tests/integration/test_tls_revocation.c counts this function's callers to keep it
+ * that way: two occurrences of the name means the definition and one call site. */
+static int tls_load_staple(const char *path, unsigned char **out, size_t *outlen)
+{
+    BIO *bio = NULL;
+    BIO *mem = NULL;
+    unsigned char *raw = NULL;
+    unsigned char *base = NULL;
+    const unsigned char *scan = NULL;
+    unsigned char *der = NULL;
+    OCSP_RESPONSE *probe = NULL;
+    char *name = NULL;
+    char *hdr = NULL;
+    unsigned char *body = NULL;
+    const unsigned char *pemscan = NULL;
+    long body_len = 0L;
+    int raw_len = 0;
+    int der_len = 0;
+
+    *out = NULL;
+    *outlen = 0u;
+    /* ONE READ, BOUNDED. The file is an operator's, but an unbounded read of one is
+     * still a thing to avoid, and OCSP_STAPLE_MAX is four times the largest DER that
+     * could fit in a TLS CertificateStatus message -- so the cap cannot reject a
+     * staple that would have gone on the wire. A file that exceeds it fails to parse
+     * below and is refused by name, which is the right outcome rather than a
+     * truncation. */
+    bio = BIO_new_file(path, "rb");
+    if (bio == NULL) {
+        ERR_clear_error();
+        printf("[observable] tls_init: state=FAILED path=%s reason=ocsp_staple\n",
+               path);
+        return -1;
+    }
+    raw = (unsigned char *)OPENSSL_malloc(OCSP_STAPLE_MAX);
+    if (raw == NULL) {
+        BIO_free(bio);
+        printf("[observable] tls_init: state=FAILED path=%s reason=ocsp_staple\n",
+               path);
+        return -1;
+    }
+    raw_len = BIO_read(bio, raw, OCSP_STAPLE_MAX);
+    BIO_free(bio);
+    if (raw_len <= 0) {
+        OPENSSL_free(raw);
+        ERR_clear_error();
+        printf("[observable] tls_init: state=FAILED path=%s "
+               "reason=ocsp_staple_empty\n",
+               path);
+        return -1;
+    }
+    /* DER FIRST, THEN PEM. The order is a guess about the file rather than about
+     * the operator: an `openssl ocsp -respin` writes PEM, and a sliced response is
+     * DER, and refusing one of them on a format technicality is how a node ends up
+     * running with revocation off.
+     *
+     * PEM_read_bio() IS SPELLED OUT RATHER THAN PEM_read_bio_OCSP_RESPONSE()
+     * because the latter's macro expansion contains OpenSSL's own
+     * `d2i_of_void *` compatibility cast, which clang's -Wcast-function-type-strict
+     * reports as an error AT THIS FILE under -Weverything. PEM_read_bio() takes no
+     * function pointer and has had this signature since 1.0.0, so the block is
+     * picked out here and its bytes decoded below with the same direct d2i call the
+     * DER arm uses -- one decode path, one place where the answer can be wrong.
+     *
+     * AND THE DECODED RESPONSE IS RE-ENCODED WITH i2d_ before it is kept. That is
+     * one line more than "keep the bytes I read", and it is what makes DER and PEM
+     * the same thing to everything downstream: `staple_len` is always the length of
+     * a canonical DER encoding, and OpenSSL 4.0 -- which parses the staple when it
+     * is set -- and OpenSSL 3.x -- which stores the pointer -- both then see bytes
+     * of exactly the length declared. */
+    /* `base` IS KEPT BECAUSE d2i ADVANCES ITS POINTER past what it consumed, so
+     * `raw` is no longer the start of the buffer by the time the PEM arm wants to
+     * re-read the whole file from the beginning. */
+    base = raw;
+    scan = raw;
+    probe = d2i_OCSP_RESPONSE(NULL, &scan, (long)raw_len);
+    if (probe == NULL) {
+        ERR_clear_error();
+        mem = BIO_new_mem_buf(base, raw_len);
+        if (mem != NULL) {
+            if (PEM_read_bio(mem, &name, &hdr, &body, &body_len) == 1 &&
+                name != NULL && strcmp(name, "OCSP RESPONSE") == 0 && body != NULL) {
+                /* THROUGH A SECOND POINTER, because d2i_OCSP_RESPONSE() takes a
+                 * `const unsigned char **` and ADVANCES what it is given, while
+                 * PEM_read_bio() filled an `unsigned char *`. One const copy is
+                 * cheaper than a cast that drops it. */
+                pemscan = body;
+                probe = d2i_OCSP_RESPONSE(NULL, &pemscan, (long)body_len);
+            }
+            BIO_free(mem);
+        }
+        OPENSSL_free(name);
+        OPENSSL_free(hdr);
+        ERR_clear_error();
+    }
+    if (probe == NULL) {
+        OPENSSL_free(raw);
+        printf("[observable] tls_init: state=FAILED path=%s "
+               "reason=ocsp_staple_unreadable\n",
+               path);
+        return -1;
+    }
+    der_len = i2d_OCSP_RESPONSE(probe, &der);
+    OCSP_RESPONSE_free(probe);
+    OPENSSL_free(raw);
+    if (der == NULL || der_len <= 0) {
+        printf("[observable] tls_init: state=FAILED path=%s "
+               "reason=ocsp_staple_unencodable\n",
+               path);
+        ERR_clear_error();
+        return -1;
+    }
+    *out = der;
+    *outlen = (size_t)der_len;
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
  * NODE SETUP
  * ---------------------------------------------------------------------------
  * BOTH ENTRY POINTS FAIL LOUDLY AND REFUSE THE WHOLE CONFIGURATION. A node whose
@@ -551,6 +1322,16 @@ void tls_backend_node_free(tls_node_t *node)
     if (node->cli != NULL) {
         SSL_CTX_free(node->cli);
         node->cli = NULL;
+    }
+    /* THE STAPLE, and it is freed HERE because OpenSSL only ever held a pointer to
+     * it: SSL_set_tlsext_status_ocsp_resp() stores the address, so the bytes belong
+     * to the node and the node owns them. This is the fourth arm of the "WHERE EVERY
+     * SSL* IS FREED" accounting at the top of the file, and it is the only one of
+     * the four that is not reached through a conn_t. */
+    if (node->staple != NULL) {
+        OPENSSL_free(node->staple);
+        node->staple = NULL;
+        node->staple_len = 0u;
     }
     /* NO X509_STORE_free HERE, and that is not an oversight. This file never
      * holds an X509_STORE at all: SSL_CTX_load_verify_locations() creates one and
@@ -590,7 +1371,10 @@ void tls_backend_node_free(tls_node_t *node)
  *                                   be dialled -- which is why this label describes
  *                                   what would happen rather than what is checked.
  *
- * `revocation=none` is printed beside all four, and is the same fact in all four. */
+ * `revocation=` is printed beside all four, and is the same fact in all four -- but
+ * it is its own field and its own function (tls_revocation_label below) rather than
+ * something derived from this one, because "which peer certificate policy applies"
+ * and "what happens to a revoked one" are separate questions with separate answers. */
 static const char *verify_label_for(int have_ca, int insecure)
 {
     if (have_ca != 0) {
@@ -600,8 +1384,38 @@ static const char *verify_label_for(int have_ca, int insecure)
     return (insecure != 0) ? "NONE_INSECURE_NO_CA" : "NONE_WITHOUT_CA";
 }
 
+/* ---------------------------------------------------------------------------
+ * WHAT THIS NODE WILL DO ABOUT A REVOKED PEER, IN ONE WORD
+ * ---------------------------------------------------------------------------
+ * Three states, and each names a DIFFERENT thing rather than three spellings of
+ * the same one:
+ *
+ *   staple-strict      a peer link is REFUSED unless the peer's stapled status is
+ *                      verifiable, fresh and GOOD. The default, and the whole
+ *                      subject of "THE FAILURE POLICY, AND WHICH DIRECTION IS THE
+ *                      DEFAULT".
+ *   staple-permissive  --tls-staple-permissive: the reason is logged and the link
+ *                      stands. A revoked certificate is then accepted, which is
+ *                      why the flag has to be typed.
+ *   none               --tls-insecure: nothing is verified, so there is no chain
+ *                      for a status to be ABOUT and asking for one would be
+ *                      incoherent. `verify=NONE_INSECURE_*` on the same line says
+ *                      the same thing from the other half.
+ *
+ * IT IS A FUNCTION rather than a third copy of the boolean at the print site,
+ * because the startup line and --help have to agree and this is the one definition
+ * they can both be checked against. */
+static const char *tls_revocation_label(const tls_node_t *node)
+{
+    if (node->insecure != 0) {
+        return "none";
+    }
+    return (node->staple_strict != 0) ? "staple-strict" : "staple-permissive";
+}
+
 int tls_backend_node_init(tls_node_t **out, const char *cert, const char *key,
-                          const char *ca, int insecure)
+                          const char *ca, int insecure, const char *staple,
+                          int staple_strict)
 {
     tls_node_t *node;
 
@@ -695,13 +1509,46 @@ int tls_backend_node_init(tls_node_t **out, const char *cert, const char *key,
     }
     node->verify_label = verify_label_for(node->have_ca, node->insecure);
 
+    /* THE STAPLE, and it is loaded AFTER the certificate and the store so a node
+     * that cannot verify a peer has already refused before it reads a third file.
+     * --tls-insecure does NOT skip it: an insecure node still SERVES stapled status
+     * to peers that do verify it, and refusing to staple because this node chose
+     * not to check would break the other side of a one-directional mistake. */
+    if (staple != NULL && staple[0] != '\0') {
+        if (tls_load_staple(staple, &node->staple, &node->staple_len) != 0) {
+            tls_backend_node_free(node);
+            return -1;
+        }
+    }
+    /* THE POLICY BOOLEAN IS NORMALISED HERE rather than trusted from the caller, so
+     * that every read of node->staple_strict downstream is a comparison against a
+     * value that is either 0 or 1 and never "whatever the caller passed". */
+    node->staple_strict = (staple_strict != 0) ? 1 : 0;
+    /* THE STATUS CALLBACK, REGISTERED ON THE ACCEPT CONTEXT ONLY, and before any SSL
+     * can be created from it. Registration is what makes this node READ the client's
+     * status_request at all -- see tls_status_cb()'s comment for the three conditions
+     * and why two of them are invisible from the man pages. The argument is the node,
+     * so the callback can reach the staple, and the client context deliberately gets
+     * no callback: a dialling node is asked for nothing by this protocol.
+     *
+     * TWO CALLS, NOT ONE: SSL_CTX_set_tlsext_status_cb() takes the callback and
+     * SSL_CTX_set_tlsext_status_arg() takes its argument, which is a 1.1.1-era
+     * split that still stands in 3.x and 4.x. */
+    (void)SSL_CTX_set_tlsext_status_cb(node->srv, tls_status_cb);
+    (void)SSL_CTX_set_tlsext_status_arg(node->srv, node);
+
     *out = node;
     /* ONE LINE, THE WHOLE POLICY. `verify=` is the peer-certificate policy this
-     * node will apply, `ca=` is whether a trust anchor was configured, and
-     * `revocation=none` is the largest gap in it -- no CRL and no OCSP are
-     * consulted, so a revoked certificate is accepted until it EXPIRES. It is on
-     * this line rather than only in a comment because an operator who greps the
-     * startup output should not have to read the source to learn that.
+     * node will apply, `ca=` is whether a trust anchor was configured, `ocsp_staple=`
+     * is whether this node HAS a staple to offer its peers -- a separate fact from
+     * whether it CHECKS one, and the one an operator upgrading one side of a mesh
+     * needs to be able to read off the line -- and `revocation=` is the failure
+     * policy itself: staple-strict, staple-permissive, or none when --tls-insecure
+     * made the whole question moot.
+     *
+     * IT IS ON THIS LINE RATHER THAN ONLY IN A COMMENT because an operator who greps
+     * the startup output should not have to read the source to learn what this node
+     * will and will not refuse a peer for.
      *
      * AND `verify=` IS NOT TWO STATES, which is what it was. It read
      * NONE_WITHOUT_CA whenever the policy was not "chain and name" -- including
@@ -709,9 +1556,10 @@ int tls_backend_node_init(tls_node_t **out, const char *cert, const char *key,
      * label said "no CA configured" to anyone grepping for it on a node that had
      * one. Four states, and each names what is actually enforced. */
     printf("[observable] tls_init: state=READY ca=%s insecure=%d verify=%s "
-           "revocation=none\n",
+           "ocsp_staple=%s revocation=%s\n",
            node->have_ca ? "configured" : "none", node->insecure,
-           node->verify_label);
+           node->verify_label, (node->staple != NULL) ? "configured" : "none",
+           tls_revocation_label(node));
     return 0;
 }
 
@@ -728,6 +1576,15 @@ int tls_backend_starttls_peer(conn_t *c, int as_server, const char *peer_host)
     struct server *s;
     SSL_CTX *ctx;
     SSL *ssl;
+    /* ONE NAME FOR THE NODE'S STATE, because this function now reads it in three
+     * places and it was already being cast at each of them. The cast is from
+     * `struct tls_node *` (declared in tls_backend.h, deliberately opaque) to this
+     * file's own type; the `(void *)` in the middle is the -Wcast-qual-satisfying
+     * shape the SNI comment below describes. It is ASSIGNED after the checks rather
+     * than initialised, because at this point `c` may be NULL and `owner->tls` may
+     * be NULL, and a dereference to initialise a local would turn a refused call
+     * into a crash. */
+    tls_node_t *node = NULL;
 
     if (c == NULL) {
         return -1;
@@ -743,13 +1600,13 @@ int tls_backend_starttls_peer(conn_t *c, int as_server, const char *peer_host)
         printf("[observable] tls_unavailable: fd=%d reason=NOT_CONFIGURED\n", c->fd);
         return -1;
     }
-    /* ONE cast, and it is here rather than four times because the node's type is
+    node = (tls_node_t *)(void *)s->tls;
+    /* ONE cast, and it is here rather than three times because the node's type is
      * opaque to this file's callers but not to itself. `-Wcast-qual` is satisfied
      * because the target is NOT const -- a const SSL_CTX * would be the bug this
      * cast is here to prevent, since the handshake mutates the context's
      * per-connection state. */
-    ctx = as_server ? ((tls_node_t *)(void *)s->tls)->srv
-                    : ((tls_node_t *)(void *)s->tls)->cli;
+    ctx = as_server ? node->srv : node->cli;
     if (ctx == NULL) {
         return -1;
     }
@@ -813,10 +1670,32 @@ int tls_backend_starttls_peer(conn_t *c, int as_server, const char *peer_host)
         return -1;
     }
     if (as_server != 0) {
+        /* NO STAPLE IS SET HERE, and the absence is deliberate: this node's staple is
+         * attached by tls_status_cb() from the status callback, which OpenSSL invokes
+         * after it has chosen the certificate -- the only point at which it can know
+         * whether the response covers the certificate it is about to send. Setting it
+         * here, before any handshake byte, would be earlier than that and therefore
+         * earlier than the check that drops a response which does not match. */
         SSL_set_accept_state(ssl);
     } else {
         SSL_set_connect_state(ssl);
-        if (tls_peer_verify(ssl, (tls_node_t *)s->tls, peer_host, c->fd) != 0) {
+        /* OCSP STAPLING IS REQUESTED HERE, AND THE POSITION IS LOAD-BEARING: the
+         * `status_request` extension belongs in the ClientHello, which is written by
+         * the FIRST SSL_do_handshake() -- and for this transport that happens later,
+         * on the poll loop's schedule, in tls_send()'s handshake pass. Calling this
+         * inside that pass would send a ClientHello with no status_request in it, and
+         * the peer would never staple anything: the request is not "when did you
+         * last think about revocation" but a message this node is about to transmit.
+         *
+         * AN EMPTY `status_request` IS THE RIGHT THING TO SEND. RFC 6961 lets a
+         * client include responder-id and CertID extensions; sending none asks the
+         * peer for whatever status it has for the certificate it is about to
+         * present, which is the stapling case and the only one this node has a
+         * verifier for. A request with no extension would also be a request the
+         * server's own CertID-matching (see tls_status_cb) could not satisfy for a
+         * multi-certificate chain. */
+        (void)SSL_set_tlsext_status_type(ssl, TLSEXT_STATUSTYPE_ocsp);
+        if (tls_peer_verify(ssl, node, peer_host, c->fd) != 0) {
             /* THE SSL* IS RELEASED HERE RATHER THAN HANDED TO THE CONNECTION, and
              * this is the only place that can happen: c->t_ctx has NOT been assigned
              * yet, so nothing outside this function has ever held this pointer and

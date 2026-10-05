@@ -354,19 +354,36 @@ int main(void)
               "chain verification alone accepts a certificate for a different host "
               "signed by the same authority, so both are stated",
               nb.out);
-        /* REVOCATION, ASSERTED RATHER THAN ONLY DOCUMENTED. `revocation=none` is on
-         * the same startup line as `verify=`, so an operator who greps one line of
-         * node output gets the whole policy -- including the part this project does
-         * NOT implement. It is the only reason to put it there: the comment at
+        /* THE REVOCATION POLICY, ASSERTED RATHER THAN ONLY DOCUMENTED. It is on the
+         * same startup line as `verify=`, so an operator who greps one line of node
+         * output gets the whole policy -- including the part this project does NOT
+         * implement. It is the only reason to put it there: the comment at
          * tls_openssl.c documents the same fact and cannot be seen from a terminal.
-         * Nothing about any handshake depends on this field, which is exactly why it
-         * needs an assertion: a change that dropped it would leave every other
+         * Nothing about any handshake depends on this field, which is exactly why
+         * it needs an assertion: a change that dropped it would leave every other
          * assertion in this file green and silently remove the one line an operator
-         * reads. */
-        check(nf_expect(&nb, "revocation=none", 5000) == 0,
-              "and the same line carries revocation=none, so the LARGEST gap in peer "
-              "authentication -- no CRL, no OCSP, a revoked certificate is accepted "
-              "until it EXPIRES -- is visible at runtime and not only in the source",
+         * reads.
+         *
+         * IT USED TO READ `revocation=none`, which was TRUE of this code and is no
+         * longer: revocation is now checked on the outbound peer-link path, from the
+         * peer's stapled OCSP response. `staple-strict` is the DEFAULT and says so
+         * here, which is the only place a reader can tell that a node which has
+         * never heard of --tls-staple-permissive will REFUSE a revoked peer rather
+         * than log it. `ocsp_staple=none` beside it is the honest half of the same
+         * line: THIS mesh has no staple to offer its peers, which is why CASE 1
+         * below has to say --tls-staple-permissive out loud. A mesh with a CA and a
+         * staple on each side is what tests/integration/test_tls_revocation.c builds
+         * twice over; see the NO_ISSUER note in CASE 1 for why this one cannot. */
+        check(nf_expect(&nb, "revocation=staple-strict", 5000) == 0,
+              "and the same line carries revocation=staple-strict, so an operator "
+              "can see that a revoked PEER certificate is REFUSED rather than "
+              "logged -- the opposite of the revocation=none this line used to "
+              "carry",
+              nb.out);
+        check(nf_expect(&nb, "ocsp_staple=none", 5000) == 0,
+              "and ocsp_staple=none, which is this mesh's half of the same fact: a "
+              "node with no --tls-ocsp-staple has nothing to offer its peers, and "
+              "that is what a MISSING_STAPLE refusal on the far side is about",
               nb.out);
 
         /* A. Note the order: --peer, THEN --peer-tls. The dial hint is irc.b's
@@ -387,6 +404,24 @@ int main(void)
         ab_opt(&b, key_opt, a_key);
         ab_opt(&b, ca_opt, b_cert);
         ab_opt(&b, port_opt, zero);
+        /* --tls-staple-permissive, AND THE REASON IT IS HERE IS A FACT ABOUT THIS
+         * MESH RATHER THAN A PREFERENCE. Revocation checking needs an ISSUER: a
+         * status can only be issued by somebody other than the certificate's
+         * subject, and each node here trusts the other's SELF-SIGNED certificate
+         * directly -- which is the smallest mesh that can carry TLS at all. So the
+         * correct verdict on this link is NO_ISSUER, and under the default strict
+         * policy that refuses it. A mesh with a CA and a staple on each side does
+         * not need this flag and is what tests/integration/test_tls_revocation.c
+         * builds in every one of its cases.
+         *
+         * So this case keeps testing what it was written to test -- that a TLS peer
+         * link comes up, that each side verifies the other's certificate, and that
+         * link_tls_start precedes link_established -- and the revocation decision
+         * itself is asserted where it can be asserted properly. The cost of that
+         * split is that the DEFAULT policy is not exercised on an establishing link
+         * in THIS file; it is exercised in the other one, and the startup-line
+         * assertion above states that the default is strict here too. */
+        ab_add(&b, "--tls-staple-permissive");
         if (nf_spawn_binary_argv(&na, ab_finish(&b)) != 0) {
             check(0, "spawn irc.a with a certificate and a TLS peer", NULL);
             nf_kill(&nb);
@@ -706,6 +741,11 @@ int main(void)
             ab_opt(&b, key_opt, a_key);
             ab_opt(&b, ca_opt, digit_crt);
             ab_opt(&b, port_opt, zero);
+            /* The same NO_ISSUER reasoning as CASE 1, for the same reason: `digit`
+             * is self-signed, so nobody could have issued a status for it. This case
+             * is about the NAME CHECK and a permissive revocation policy must not
+             * turn a passing name check into a failing link. */
+            ab_add(&b, "--tls-staple-permissive");
             if (nf_spawn_binary_argv(&na, ab_finish(&b)) != 0) {
                 check(0, "spawn irc.a against the digit-named peer", NULL);
             } else {

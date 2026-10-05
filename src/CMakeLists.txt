@@ -47,6 +47,53 @@ if(WITH_TLS)
   find_package(OpenSSL 1.1.1 REQUIRED)
 endif()
 
+# ---------------------------------------------------------------------------
+# -Wno-cast-function-type-strict, SCOPED TO ONE FILE, FOR ONE THIRD-PARTY MACRO
+# ---------------------------------------------------------------------------
+# The OpenSSL backend has to register a certificate-status callback on its ACCEPT
+# context -- without it OpenSSL does not even READ a client's `status_request`
+# extension, so a node cannot staple anything (src/tls_openssl.c's tls_status_cb()
+# quotes the source). The macro that registers it is
+#
+#   #define SSL_CTX_set_tlsext_status_cb(ssl, cb)                     \
+#       SSL_CTX_callback_ctrl(ssl, SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB, \
+#           (void (*)(void))cb)
+#
+# and the cast on the last line is the diagnostic's source: an
+# `int (*)(SSL *, void *)` callback becomes a `void (*)(void)`, which is exactly
+# what -Wcast-function-type-strict exists to report. It is reported AT THIS FILE
+# rather than inside the header, because the macro expands here.
+#
+# EVERY SPELLING WARNS. Measured on clang 23 and Apple clang 21, against OpenSSL
+# 4.0.3: the macro directly; the underlying SSL_CTX_callback_ctrl() with the same
+# cast written out; and through a typedef so the cast is an implicit conversion.
+# The warning set is not the problem and the code is not the problem, so the only
+# three moves are obey, suppress globally, or suppress here.
+#
+# WHY HERE AND NOT GLOBALLY, which is the rule the top-level CMakeLists states for
+# exactly this situation: scope the THIRD-PARTY warning rather than narrow the
+# PROJECT's own set. A global -Wno-cast-function-type-strict would stop reporting a
+# real function-pointer mismatch in this project's 42,000 lines, permanently and
+# invisibly, to accommodate one macro in one file. Scoped to tls_openssl.c the cost
+# is bounded to the file that talks to OpenSSL, and that cost is stated rather than
+# assumed: a function-pointer cast in tls_openssl.c itself would now go unreported.
+# It is the smaller loss, and it is a loss.
+#
+# VERSION-GUARDED, because the diagnostic was added in Clang 16 and an unknown
+# -Wno- on an older driver is -Wunknown-warning-option, which -Werror turns into a
+# hard build failure -- so a suppression intended to keep the build green would
+# instead turn it red. Clang 15 and older simply do not have the diagnostic to
+# suppress. GCC does not have it at all, which is why the guard is Clang-only: the
+# gcc-16 sanitizer cell compiles this file with no suppression of any kind.
+if(WITH_TLS)
+  if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    if(CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 16)
+      set_source_files_properties(tls_openssl.c PROPERTIES
+        COMPILE_OPTIONS "-Wno-cast-function-type-strict")
+    endif()
+  endif()
+endif()
+
 add_library(irc_core STATIC
   protocol_parse.c
   ircv3_tags.c

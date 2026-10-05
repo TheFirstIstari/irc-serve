@@ -73,9 +73,29 @@ int tls_backend_available(void);
  *
  * THE KEY'S PERMISSIONS ARE CHECKED HERE AND A VIOLATION REFUSES THE WHOLE
  * CONFIGURATION, before anything is loaded: a node that cannot prove its private key
- * is private must not come up offering a certificate. */
+ * is private must not come up offering a certificate.
+ *
+ * ---------------------------------------------------------------------------
+ * THE TWO REVOCATION ARGUMENTS, and why they are arguments and not flags inside
+ * ---------------------------------------------------------------------------
+ * `staple` is a path to an OCSP response for THIS node's own certificate, or NULL.
+ * It is read HERE -- at startup, before the event loop is armed -- and stapled on
+ * every server-role handshake. It is never fetched and never refreshed: a staple is
+ * bytes on disk that the operator obtained out of band, and the check on the other
+ * end is what makes a stale one a refusal rather than a silent downgrade.
+ *
+ * `staple_strict` is the ONE boolean of this pass's failure policy: 1 refuses a
+ * peer link whose stapled status is missing, stale or unverifiable; 0 logs the
+ * reason and continues. The default is 1, so the INSECURE direction is the one that
+ * requires a flag. tls_openssl.c's "THE FAILURE POLICY, AND WHICH DIRECTION IS THE
+ * DEFAULT" gives the argument and names the cost of failing closed.
+ *
+ * Both are here rather than in the backend because they are OPERATOR CONFIGURATION,
+ * and node_main.c's TLS block is where configuration is decided -- the same reason
+ * key_file_is_private() lives there rather than here. */
 int tls_backend_node_init(struct tls_node **out, const char *cert,
-                          const char *key, const char *ca, int insecure);
+                          const char *key, const char *ca, int insecure,
+                          const char *staple, int staple_strict);
 
 /* Release the node's contexts. Called from server_shutdown() beside the other "a
  * module's memory, released here" arms. Safe on NULL. */

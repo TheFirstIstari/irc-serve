@@ -42,6 +42,8 @@
 #include <netinet/in.h>
 #include <openssl/bio.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/ocsp.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
@@ -196,12 +198,120 @@ static int add_ext(X509 *cert, X509 *issuer, int nid, const char *value)
     return 0;
 }
 
-int tf_tls_make_cert(const char *dir, const char *stem, const char *cn,
-                     const char *san, long not_before_offset,
-                     long not_after_offset, unsigned key_mode)
+/* Read a certificate and its private key from `dir`, by stem. `*out_cert` and
+ * `*out_key` are both set or both NULL, and every failure path frees what it got,
+ * so a caller that checks one pointer has checked both.
+ *
+ * THIS EXISTS BECAUSE THREE OF THE GENERATORS BELOW NEED A KEY ALREADY ON DISK, and
+ * each of them re-reading the file with its own PEM_read_* sequence would be three
+ * copies of a loop with three chances to leak the other one. */
+static int tf_tls_read_pair(const char *dir, const char *stem, X509 **out_cert,
+                            EVP_PKEY **out_key)
+{
+    char path[TF_PATH_MAX];
+    BIO *bio = NULL;
+    X509 *cert = NULL;
+    EVP_PKEY *key = NULL;
+
+    *out_cert = NULL;
+    *out_key = NULL;
+    snprintf(path, sizeof path, "%s/%s.crt", dir, stem);
+    bio = BIO_new_file(path, "rb");
+    if (bio == NULL) {
+        goto fail;
+    }
+    cert = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+    BIO_free(bio);
+    bio = NULL;
+    if (cert == NULL) {
+        goto fail;
+    }
+    snprintf(path, sizeof path, "%s/%s.key", dir, stem);
+    bio = BIO_new_file(path, "rb");
+    if (bio == NULL) {
+        goto fail;
+    }
+    key = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
+    BIO_free(bio);
+    bio = NULL;
+    if (key == NULL) {
+        goto fail;
+    }
+    *out_cert = cert;
+    *out_key = key;
+    return 0;
+
+fail:
+    if (bio != NULL) {
+        BIO_free(bio);
+    }
+    if (cert != NULL) {
+        X509_free(cert);
+    }
+    if (key != NULL) {
+        EVP_PKEY_free(key);
+    }
+    ERR_clear_error();
+    return -1;
+}
+
+/* Read just a certificate from `dir`, by stem. A separate function rather than
+ * tf_tls_read_pair() with a NULL key because tf_tls_read_pair() opens BOTH files
+ * and checks both outputs -- asking it for a certificate alone would try to read a
+ * private key the caller does not have. */
+static int tf_tls_read_cert(const char *dir, const char *stem, X509 **out_cert)
+{
+    char path[TF_PATH_MAX];
+    BIO *bio = NULL;
+    X509 *cert = NULL;
+
+    *out_cert = NULL;
+    snprintf(path, sizeof path, "%s/%s.crt", dir, stem);
+    bio = BIO_new_file(path, "rb");
+    if (bio != NULL) {
+        cert = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+        BIO_free(bio);
+    }
+    if (cert == NULL) {
+        ERR_clear_error();
+        return -1;
+    }
+    *out_cert = cert;
+    return 0;
+}
+
+/* THE GENERATOR, and the two shapes it makes.
+ *
+ * `issuer` is NULL for a SELF-SIGNED certificate -- subject and issuer are then the
+ * same name and the same key signs it, which is what every caller of
+ * tf_tls_make_cert() has always got -- and non-NULL for a certificate ISSUED BY
+ * another one, which is the shape a revocation test needs because a status can only
+ * be issued by somebody other than the certificate's subject.
+ *
+ * `as_ca` is what makes a certificate usable as a trust anchor AND makes its
+ * signature meaningful for a chain: basicConstraints CA:TRUE and, when `as_ca`, the
+ * key usages X509_verify_cert() insists on before it will let a certificate sign
+ * another one. A CA without them is not a CA as far as the verifier is concerned, and
+ * a fixture that produced one would fail in a way that reads like a bug in the code
+ * under test.
+ *
+ * THE ISSUER IS APPENDED TO `<stem>.crt` WHEN THERE IS ONE, and that is the half of
+ * this that matters for the revocation tests: --tls-cert loads a CHAIN, so a node
+ * configured with a CA-issued leaf must present leaf + CA or the peer has no issuer
+ * to verify against and no issuer to ask for a status of. The file is written in
+ * the order the wire wants it, leaf first. */
+static int tf_tls_make_cert_common(const char *dir, const char *stem,
+                                   const char *cn, const char *san,
+                                   const char *issuer_stem,
+                                   long not_before_offset,
+                                   long not_after_offset, unsigned key_mode,
+                                   int as_ca)
 {
     EVP_PKEY *pkey = NULL;
+    EVP_PKEY *ikey = NULL;
     X509 *cert = NULL;
+    X509 *issuer = NULL;
+    X509_NAME *iname = NULL;
     BIO *bio = NULL;
     char path[TF_PATH_MAX];
     int ok = -1;
@@ -218,6 +328,11 @@ int tf_tls_make_cert(const char *dir, const char *stem, const char *cn,
     pkey = EVP_RSA_gen(2048);
     if (pkey == NULL) {
         goto done;
+    }
+    if (issuer_stem != NULL) {
+        if (tf_tls_read_pair(dir, issuer_stem, &issuer, &ikey) != 0) {
+            goto done;
+        }
     }
     cert = X509_new();
     if (cert == NULL) {
@@ -257,35 +372,79 @@ int tf_tls_make_cert(const char *dir, const char *stem, const char *cn,
          * CA:TRUE below), so the same file serves as the leaf and as the --tls-ca
          * a test points at it. The tests that need two DIFFERENT authorities
          * generate two of these and verify one against the other. */
-        X509_NAME *name = X509_NAME_new();
-
-        if (name == NULL) {
+        iname = X509_NAME_new();
+        if (iname == NULL) {
             goto done;
         }
-        if (X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+        if (X509_NAME_add_entry_by_txt(iname, "CN", MBSTRING_ASC,
                                        (const unsigned char *)cn, -1, -1, 0) != 1) {
-            X509_NAME_free(name);
             goto done;
         }
-        if (X509_set_subject_name(cert, name) != 1 ||
-            X509_set_issuer_name(cert, name) != 1) {
-            X509_NAME_free(name);
+        if (X509_set_subject_name(cert, iname) != 1) {
             goto done;
         }
-        X509_NAME_free(name);
+        /* ISSUER: the loaded one when there is one, and the same name when there is
+         * not. Setting them separately rather than through a branch that duplicates
+         * the X509_NAME_build is what keeps "self-signed" and "issued" from being
+         * two code paths that can drift. */
+        if (X509_set_issuer_name(cert,
+                                 (issuer != NULL) ? X509_get_subject_name(issuer)
+                                                  : iname) != 1) {
+            goto done;
+        }
     }
-    if (san != NULL && add_ext(cert, cert, NID_subject_alt_name, san) != 0) {
+    if (san != NULL &&
+        add_ext(cert, (issuer != NULL) ? issuer : cert, NID_subject_alt_name, san) !=
+            0) {
         goto done;
     }
-    /* basicConstraints CA:TRUE, so the same file can serve as its own --tls-ca.
-     * Without it OpenSSL will not accept a self-signed certificate as an anchor,
-     * which would make the fixture's certificates unusable as trust roots and the
-     * whole "one self-signed cert is both the leaf and the CA" shape would not
-     * work. */
-    if (add_ext(cert, cert, NID_basic_constraints, "critical,CA:TRUE") != 0) {
-        goto done;
+    /* basicConstraints, and the value is a named variable rather than a decision
+     * buried in two calls. A self-signed certificate must be CA:TRUE to be usable as
+     * a --tls-ca at all, which is why every certificate this file generated before
+     * the revocation work had it. An issued certificate is not an anchor and does
+     * not need it -- and setting CA:TRUE on a leaf is a lie a verifier does not
+     * check for, so a test that accidentally relied on a leaf being its own CA
+     * would pass for the wrong reason. */
+    {
+        static const char *const k_bc_ca = "critical,CA:TRUE";
+        static const char *const k_bc_leaf = "critical,CA:FALSE";
+
+        if (add_ext(cert, (issuer != NULL) ? issuer : cert, NID_basic_constraints,
+                    as_ca ? k_bc_ca : k_bc_leaf) != 0) {
+            goto done;
+        }
     }
-    if (X509_sign(cert, pkey, EVP_sha256()) == 0) {
+    /* keyUsage, AND WHY THE SELF-SIGNED SHAPE CARRIES MORE BITS THAN "keyCertSign".
+     *
+     * A CA's keyUsage is what lets X509_verify_cert() accept its signature on
+     * another certificate: keyCertSign has to be present when keyUsage is present at
+     * all. But a SELF-SIGNED certificate in this fixture is BOTH an authority AND
+     * the TLS certificate a node serves, and keyUsage is a list of what the key may
+     * be used for -- so a CA that says only "keyCertSign, cRLSign" cannot do TLS, and
+     * the first version of this did exactly that. The symptom was not a fixture
+     * complaint: test_peer_tls and test_tls both failed with "certificate verify
+     * failed" and a SIGPIPE, because OpenSSL refused a peer certificate whose
+     * keyUsage did not permit a signature.
+     *
+     * So the self-signed shape lists what both roles need, and a CA that is issued
+     * rather than self-signed lists only the CA bits because nothing else will ever
+     * serve it. A generated LEAF carries no keyUsage at all, which is the shape the
+     * fixture produced before any of this and which every existing case depends on:
+     * an absent extension is unconstrained, and inventing one here would only add a
+     * way for a test to be wrong. */
+    if (as_ca) {
+        const char *ku = (issuer != NULL)
+                             ? "critical,keyCertSign,cRLSign"
+                             : "critical,digitalSignature,keyEncipherment,keyCertSign,"
+                               "cRLSign";
+
+        if (add_ext(cert, (issuer != NULL) ? issuer : cert, NID_key_usage, ku) != 0) {
+            goto done;
+        }
+    }
+    /* SIGN WITH THE ISSUER'S KEY WHEN THERE IS AN ISSUER. Self-signed means the
+     * subject's own key, which is what `ikey == NULL` means here. */
+    if (X509_sign(cert, (ikey != NULL) ? ikey : pkey, EVP_sha256()) == 0) {
         goto done;
     }
 
@@ -295,6 +454,14 @@ int tf_tls_make_cert(const char *dir, const char *stem, const char *cn,
         goto done;
     }
     if (PEM_write_bio_X509(bio, cert) != 1) {
+        goto done;
+    }
+    /* THE ISSUER GOES INTO THE SAME FILE, AFTER THE LEAF, because --tls-cert takes
+     * a chain and a node presenting only its leaf leaves the peer with no issuer.
+     * This is the one line that makes the revocation cases possible at all: without
+     * it every CA-issued leaf arrives as a bare leaf and the correct verdict would
+     * be NO_ISSUER. */
+    if (issuer != NULL && PEM_write_bio_X509(bio, issuer) != 1) {
         goto done;
     }
     BIO_free(bio);
@@ -330,11 +497,239 @@ done:
     if (bio != NULL) {
         BIO_free(bio);
     }
+    if (iname != NULL) {
+        X509_NAME_free(iname);
+    }
     if (cert != NULL) {
         X509_free(cert);
     }
     if (pkey != NULL) {
         EVP_PKEY_free(pkey);
+    }
+    if (ikey != NULL) {
+        EVP_PKEY_free(ikey);
+    }
+    if (issuer != NULL) {
+        X509_free(issuer);
+    }
+    if (ok != 0) {
+        ERR_clear_error();
+    }
+    return ok;
+}
+
+/* THE PUBLIC SHAPES, and they are wrappers rather than one function with a flag
+ * because every caller in the suite already names the one it wants:
+ * tf_tls_make_cert() is the self-signed CA:TRUE shape every Phase 12 test uses, and
+ * tf_tls_make_issued() is the CA-issued leaf the revocation tests need. */
+int tf_tls_make_cert(const char *dir, const char *stem, const char *cn,
+                     const char *san, long not_before_offset,
+                     long not_after_offset, unsigned key_mode)
+{
+    return tf_tls_make_cert_common(dir, stem, cn, san, NULL, not_before_offset,
+                                   not_after_offset, key_mode, 1);
+}
+
+int tf_tls_make_ca(const char *dir, const char *stem, const char *cn,
+                   long not_before_offset, long not_after_offset)
+{
+    return tf_tls_make_cert_common(dir, stem, cn, NULL, NULL, not_before_offset,
+                                   not_after_offset, 0600u, 1);
+}
+
+int tf_tls_make_issued(const char *dir, const char *stem, const char *cn,
+                       const char *san, const char *issuer_stem,
+                       long not_before_offset, long not_after_offset)
+{
+    return tf_tls_make_cert_common(dir, stem, cn, san, issuer_stem,
+                                   not_before_offset, not_after_offset, 0600u, 0);
+}
+
+/* ---------------------------------------------------------------------------
+ * A REAL OCSP RESPONSE, because a revoked staple has to be a real one
+ * ---------------------------------------------------------------------------
+ * This is the fixture's most important function and the reason is not tidiness.
+ * tests/integration/test_tls_revocation.c has to assert that a revoked certificate
+ * is refused, and there are two ways to do that. The dishonest one is to corrupt
+ * something and call the refusal revocation -- a staple signed by a stranger, or one
+ * with a mangled CertID -- which tests a signature check and then reports it as a
+ * revocation check. The honest one is to build what a CA actually sends:
+ *
+ *   OCSP_CERTID     (issuerNameHash, issuerKeyHash, serialNumber) for the leaf,
+ *                   over the REAL issuer -- which is what makes the response about
+ *                   one certificate and not another;
+ *   a SingleResponse whose certStatus is V_OCSP_CERTSTATUS_REVOKED, with a
+ *                   revocationTime and a reason;
+ *   thisUpdate / nextUpdate, so freshness is a fact about the response rather than
+ *                   a hope;
+ *   OCSP_basic_sign() by the ISSUING CA, which is the case a real deployment is in
+ *                   and the one the verifier's chain-building path has to accept.
+ *
+ * The result is a staple that OpenSSL's own OCSP_basic_verify() accepts, for which
+ * the only remaining answer is "revoked". `signer_stem` exists so the same generator
+ * can also produce the response a ROGUE responder would produce -- a well-formed,
+ * correctly-CertID'd status signed by somebody the issuer never authorised -- which
+ * is the case that proves the verifier is actually verifying the signer rather than
+ * only reading the status field out of the staple.
+ *
+ * THE DIGEST IS A CALLER'S DECISION rather than a constant, and it is made per
+ * caller: the verifier has to build the same CertID the responder used, and the
+ * digest is the responder's choice, so the GOOD staple here is SHA-256 and the
+ * REVOKED one is SHA-1. Both are exercised by the same suite, and a verifier that
+ * only understood one of them would fail one of the two required cases.
+ *
+ * TF_OCSP_NO_NEXT_UPDATE produces a response with no nextUpdate at all, which is
+ * legal and which the verifier must REFUSE rather than treat as "always fresh" --
+ * see OCSP_check_validity()'s behaviour in src/tls_openssl.c. */
+int tf_tls_make_ocsp(const char *dir, const char *stem, const char *issuer_stem,
+                     const char *subject_stem, const char *signer_stem,
+                     int status, int sha256_certid, long thisupd_offset,
+                     long nextupd_offset)
+{
+    X509 *issuer = NULL;
+    X509 *subject = NULL;
+    X509 *signer = NULL;
+    X509 *rogue = NULL;
+    EVP_PKEY *skey = NULL;
+    EVP_PKEY *rkey = NULL;
+    OCSP_BASICRESP *bs = NULL;
+    OCSP_RESPONSE *resp = NULL;
+    OCSP_CERTID *cid = NULL;
+    ASN1_GENERALIZEDTIME *thisupd = NULL;
+    ASN1_GENERALIZEDTIME *nextupd = NULL;
+    ASN1_GENERALIZEDTIME *revtime = NULL;
+    unsigned char *der = NULL;
+    char path[TF_PATH_MAX];
+    int der_len = 0;
+    int ok = -1;
+
+    if (dir == NULL || stem == NULL || issuer_stem == NULL ||
+        subject_stem == NULL) {
+        return -1;
+    }
+    if (tf_tls_read_pair(dir, issuer_stem, &issuer, &skey) != 0) {
+        goto done;
+    }
+    if (tf_tls_read_cert(dir, subject_stem, &subject) != 0) {
+        goto done;
+    }
+    /* THE SIGNER IS THE ISSUER UNLESS A ROGUE WAS NAMED, and the two are held in
+     * SEPARATE variables rather than by reassigning `skey`. That is the difference
+     * between a signer choice and a memory leak: overwriting the issuer's key
+     * pointer to install the rogue's would strand the first EVP_PKEY with nothing
+     * holding a reference to it, and ASan on the sanitizer cell would say so on a
+     * run that was supposed to be testing revocation. */
+    if (signer_stem != NULL && strcmp(signer_stem, issuer_stem) != 0) {
+        if (tf_tls_read_pair(dir, signer_stem, &rogue, &rkey) != 0) {
+            goto done;
+        }
+        signer = rogue;
+    } else {
+        signer = issuer;
+    }
+    bs = OCSP_BASICRESP_new();
+    if (bs == NULL) {
+        goto done;
+    }
+    cid = OCSP_cert_to_id(sha256_certid ? EVP_sha256() : EVP_sha1(), subject,
+                          issuer);
+    if (cid == NULL) {
+        goto done;
+    }
+    /* THE TIMES, from an ABSOLUTE time_t rather than from the library's
+     * day/second-offset form. ASN1_GENERALIZEDTIME_set() has taken (s, time_t) in
+     * 1.1.1, 3.x and 4.x alike; the (s, day, sec) shape belongs to
+     * ASN1_GENERALIZEDTIME_adj() and passing it here would be a two-argument call
+     * against a three-argument declaration. */
+    thisupd = ASN1_GENERALIZEDTIME_set(NULL, time(NULL) + thisupd_offset);
+    if (nextupd_offset != (long)TF_OCSP_NO_NEXT_UPDATE) {
+        nextupd = ASN1_GENERALIZEDTIME_set(NULL, time(NULL) + nextupd_offset);
+    }
+    if (thisupd == NULL) {
+        goto done;
+    }
+    /* A REVOCATION TIME, AND IT IS IN THE PAST BY DESIGN. It is not read by the
+     * verifier beyond being present -- the refusal is driven by the STATUS -- but a
+     * revoked response without one is not something a CA would send, and building
+     * the unrealistic shape would make the fixture easier to get wrong than the
+     * thing it is standing in for. */
+    if (status == TF_OCSP_REVOKED) {
+        revtime = ASN1_GENERALIZEDTIME_set(NULL, time(NULL) - 3600L);
+        if (revtime == NULL) {
+            goto done;
+        }
+    }
+    if (OCSP_basic_add1_status(bs, cid,
+                               (status == TF_OCSP_REVOKED) ? V_OCSP_CERTSTATUS_REVOKED
+                                                           : V_OCSP_CERTSTATUS_GOOD,
+                               (status == TF_OCSP_REVOKED)
+                                   ? OCSP_REVOKED_STATUS_KEYCOMPROMISE
+                                   : 0,
+                               revtime, thisupd, nextupd) == NULL) {
+        goto done;
+    }
+    /* SIGNED BY THE ISSUING CA, with no extra certificates embedded. The verifier
+     * finds the signer among the peer's verified chain and then chains it to its own
+     * store, which is the whole of what ocsp_verify_signer() does; embedding the
+     * certificate here would test a different path than a real deployment takes. */
+    if (OCSP_basic_sign(bs, signer, (rogue != NULL) ? rkey : skey, EVP_sha256(),
+                        NULL, 0) != 1) {
+        goto done;
+    }
+    resp = OCSP_response_create(V_OCSP_CERTSTATUS_GOOD, bs);
+    if (resp == NULL) {
+        goto done;
+    }
+    der_len = i2d_OCSP_RESPONSE(resp, &der);
+    if (der == NULL || der_len <= 0) {
+        goto done;
+    }
+    snprintf(path, sizeof path, "%s/%s.ocsp", dir, stem);
+    if (tf_tls_write_file(path, der, (size_t)der_len, 0600u) != 0) {
+        goto done;
+    }
+    ok = 0;
+
+done:
+    if (der != NULL) {
+        OPENSSL_free(der);
+    }
+    if (resp != NULL) {
+        OCSP_RESPONSE_free(resp);
+    }
+    if (bs != NULL) {
+        OCSP_BASICRESP_free(bs);
+    }
+    if (cid != NULL) {
+        OCSP_CERTID_free(cid);
+    }
+    if (revtime != NULL) {
+        ASN1_GENERALIZEDTIME_free(revtime);
+    }
+    if (nextupd != NULL) {
+        ASN1_GENERALIZEDTIME_free(nextupd);
+    }
+    if (thisupd != NULL) {
+        ASN1_GENERALIZEDTIME_free(thisupd);
+    }
+    /* `signer` IS ALIASED -- `issuer` or `rogue` -- and is never freed here; the two
+     * it can point at are. Freeing the alias as well would be a double free on every
+     * call, which is why there is no X509_free(signer) at all rather than one
+     * guarded by a comparison. */
+    if (rogue != NULL) {
+        X509_free(rogue);
+    }
+    if (rkey != NULL) {
+        EVP_PKEY_free(rkey);
+    }
+    if (skey != NULL) {
+        EVP_PKEY_free(skey);
+    }
+    if (subject != NULL) {
+        X509_free(subject);
+    }
+    if (issuer != NULL) {
+        X509_free(issuer);
     }
     if (ok != 0) {
         ERR_clear_error();
