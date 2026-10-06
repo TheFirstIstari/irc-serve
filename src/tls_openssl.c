@@ -429,11 +429,31 @@ static const transport_ops_t k_tls_ops = {
  *     client certificate is not verified against anything even if the client
  *     offers one. There is no client-certificate authentication in this phase at
  *     all: SASL PLAIN over TLS is what a client has.
- *   - NO CERTIFICATE REVOCATION. No CRL and no OCSP are consulted, so a revoked
- *     certificate that chains to the CA is accepted until it EXPIRES. This is the
- *     largest gap in the boundary and it is named rather than glossed -- in the
- *     `tls_init` startup line as revocation=none, and at runtime only in the sense
- *     that no line ever claims otherwise.
+ *   - CERTIFICATE REVOCATION IS CONSULTED, AND ONLY AS AN OCSP STAPLE (#135's
+ *     audit). It is NOT CRL fetching: no CRL is downloaded, no distribution point is
+ *     parsed, and `SSL_CTX_set_crl` is nowhere in this file. What IS consulted is the
+ *     OCSP RESPONSE a peer staples to the handshake (`--tls-ocsp-staple`, or one the
+ *     peer sends), verified against the CA this node loaded at startup, with the
+ *     freshness check and the `nextUpdate` comparison below. See "CERTIFICATE
+ *     REVOCATION, AND WHY IT IS OCSP STAPLING AND NOT A CRL FETCH" further down for
+ *     the whole of it, and for what it does NOT cover.
+ *
+ *     THIS BULLET USED TO SAY "NO CERTIFICATE REVOCATION. No CRL and no OCSP are
+ *     consulted", about 300 lines ABOVE the revocation code it described -- which is
+ *     the most expensive place for a stale claim to be. A reader of the file's header
+ *     would have concluded the largest gap in the boundary was unaddressed, and would
+ *     have been wrong; the whole of `tls_after_handshake()` is the gate. The claim
+ *     was found by an independent audit of the docs and the header, which is exactly
+ *     the kind of claim nothing in a build looks at. `scripts/check-docs-truth.py`
+ *     cannot reach it -- the claim is in a C file, not a document -- so this one is
+ *     fixed by hand and the honest mechanism for the next one is still a person
+ *     reading this file's header against its body.
+ *
+ *     THE PART THAT IS STILL TRUE, and is the part worth keeping: no revocation
+ *     check happens for a certificate that arrives with NO staple, and no check
+ *     reaches a certificate this node did not itself verify against its own CA store.
+ *     A revoked certificate with no staple is accepted until it expires, exactly as
+ *     before. `revocation=` on the startup line says which of the two this build has.
  *   - NO SNI / HOSTNAME GATING OF `sts`. The persistence policy is advertised on
  *     every connection to the plaintext port regardless of the hostname the client
  *     arrived with, because this node does not know a hostname for itself: it has

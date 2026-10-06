@@ -103,13 +103,71 @@ void tf_report(const char *expr, const char *file, int line)
     fflush(stdout);
 }
 
+/* ---------------------------------------------------------------------------
+ * tf_done: the exit path EVERY test takes, and until now a registry edit
+ * ---------------------------------------------------------------------------
+ * WHAT THIS WAS. A loop over the node registry calling `tf_unregister()`, which
+ * removes a node from the array and frees NOTHING -- no `nf_kill()`, no `nf_free()`,
+ * no `close()`. It read like a teardown and discharged no debt, which is how the
+ * two leaks PR #140's Linux LeakSanitizer run found got as far as the edge of this
+ * file: every test in the tree reaches this function, and every one of them reached
+ * a helper that freed nothing.
+ *
+ * WHY IT SURVIVED, and this is the part worth writing down rather than fixing.
+ * A leak in a helper SHARED BY EVERY TEST is invisible to every test that uses it,
+ * for the same reason a defect in a shared teardown helper is invisible to the suite
+ * in any language: the assertion would have to be about the process's memory, and
+ * this suite asserts on wire bytes. There is no `ctest` assertion that distinguishes
+ * "exited cleanly" from "exited cleanly having leaked", which is why the only oracle
+ * is LeakSanitizer, which runs on Linux CI and nowhere else. A test asserting
+ * anything about this locally would be a test asserting nothing.
+ *
+ * WHAT IT DOES NOW, in the order the order matters:
+ *
+ *   nf_kill() FIRST, then nf_free(). The other order would free the buffer and then
+ *   try to kill through a node whose pid field had been zeroed -- and nf_kill() is
+ *   idempotent for a node a test already stopped (it returns early on `pid <= 0`),
+ *   so calling it on a node whose nf_free() has already run is a no-op rather than a
+ *   double free. Killing first is what leaves that property available; freeing first
+ *   is what spends it.
+ *
+ *   SO A TEST THAT ALREADY TEARD DOWN ITS NODES IS UNAFFECTED. Every test in this
+ *   tree does -- the harness documents "Does NOT kill; call nf_kill() or nf_stop()
+ *   first" on nf_free() precisely because nf_free() is the wrong half -- so for a
+ *   clean run this loop does no work at all, and for a test that forgot, it does the
+ *   work the test's author meant by calling it.
+ *
+ * COST: one `kill(2)` and one `waitpid(2)` per node a test did not already reap, and
+ * one `free()` per node whose buffer is still allocated. On a clean run, nothing.
+ * NOT a fixed `sleep()` and NOT a fixed timeout: nf_kill() waits on the child's pid
+ * with `wait`, bounded by its own budget, which is the harness's existing mechanism.
+ *
+ * WHAT IT STILL DOES NOT DO, because honesty about the limit is the point: it cannot
+ * free a `test_client_t`, a `tf_tls_t` or a raw socket, because none of those is
+ * registered anywhere and a registry that had them would have had to be added when
+ * they were created. That is why `tc_init` without `tc_close` was a real LSan finding
+ * in its own right: those helpers are the test author's to pair. Adding a second
+ * registry for them is a change to every fixture in the tree and is not this
+ * function's decision to make; see scripts/audit-teardown.py, which is the sweep
+ * that found this one and says what it cannot decide.
+ */
 void tf_done(const char *name)
 {
     int i;
 
-    for (i = 0; i < g_nnodes; i++) {
-        tf_unregister(g_nodes[i]);
+    /* Iterate by index and unregister AS WE GO, because tf_unregister() does
+     * `g_nodes[i] = g_nodes[--g_nnodes]` -- it compacts the array by moving the LAST
+     * element into the hole. The previous version walked forward calling
+     * tf_unregister() on every slot, which SKIPS an element every time: with three
+     * nodes [A,B,C], unregistering index 0 moves C into it, and the loop then reads
+     * index 1 (now C) and index 2 (past the end), leaving B never released. It
+     * "worked" because the registry was not what the caller cared about; now it is,
+     * so the walk is from the end and the array is only reset once at the end. */
+    for (i = g_nnodes - 1; i >= 0; i--) {
+        nf_kill(g_nodes[i]);
+        nf_free(g_nodes[i]);
     }
+    g_nnodes = 0;
     printf("ok: %s\n", name);
     fflush(stdout);
 }
@@ -133,12 +191,21 @@ size_t tf_count(const char *hay, const char *needle)
     return n;
 }
 
-char *tf_read_code(const char *rel, size_t *len_out)
+/* THE STRIPPER, AND WHY IT IS NOW A FUNCTION RATHER THAN A LOOP.
+ *
+ * It was a loop inside `tf_read_code()` until #134's leak, and the reason it had to
+ * become one is worth stating because it is the whole of that defect: the loop was
+ * fine, but it was only reachable through a function that RETURNED ITS BUFFER, so
+ * every caller acquired an obligation and every caller had to remember it. Two of
+ * #134's five call sites forgot -- and one of them could not have been caught by
+ * reading the harness, because the obligation had left the harness.
+ *
+ * So the stripper writes into a CALLER'S buffer and owns nothing. Both entry points
+ * are thin wrappers over it, which is also why the two cannot disagree about what
+ * "stripped" means -- a second copy of a C comment stripper is what
+ * `test_close_sites.c`'s header says this one was moved here to avoid. */
+static long strip_into(char *out, size_t cap, FILE *f, size_t *len_out)
 {
-    char path[1024];
-    FILE *f;
-    char *out;
-    size_t cap = 65536;
     size_t len = 0;
     int in_block = 0;
     int in_line = 0;
@@ -146,27 +213,18 @@ char *tf_read_code(const char *rel, size_t *len_out)
     int prev = 0;
     int ch;
 
-    (void)snprintf(path, sizeof path, "%s/%s", IRCSERVE_SRC_DIR, rel);
-    f = fopen(path, "rb");
-    if (f == NULL) {
-        return NULL;
-    }
-    out = (char *)malloc(cap);
-    if (out == NULL) {
-        fclose(f);
-        return NULL;
+    if (out == NULL || cap == 0u || f == NULL) {
+        return -1;
     }
     while ((ch = fgetc(f)) != EOF) {
+        /* REFUSE RATHER THAN TRUNCATE, and the growth the heap form does is what
+         * makes that difference visible: here `cap` is the caller's, so a file that
+         * does not fit has to say so. A source check that silently examines half a
+         * file reports clean for a reason nobody can see, and that is the same
+         * failure as a leak check that silently examines none of it. */
         if (len + 2u >= cap) {
-            char *grown = (char *)realloc(out, cap * 2u);
-
-            if (grown == NULL) {
-                free(out);
-                fclose(f);
-                return NULL;
-            }
-            out = grown;
-            cap *= 2u;
+            out[0] = '\0';
+            return -1;
         }
         /* A comment opener is two characters, so the CLOSING pair is detected
          * on its second character and the previous one has to be remembered.
@@ -218,12 +276,71 @@ char *tf_read_code(const char *rel, size_t *len_out)
         out[len++] = (char)ch;
         prev = ch;
     }
-    fclose(f);
     out[len] = '\0';
     if (len_out != NULL) {
         *len_out = len;
     }
-    return out;
+    return (long)len;
+}
+
+char *tf_read_code(const char *rel, size_t *len_out)
+{
+    char path[1024];
+    FILE *f;
+    char *out;
+    size_t cap = 65536;
+    size_t len = 0;
+
+    (void)snprintf(path, sizeof path, "%s/%s", IRCSERVE_SRC_DIR, rel);
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        return NULL;
+    }
+    /* ONE PASS PER CAPACITY, growing until it fits, which is what the loop used to
+     * do in one pass and what keeps this wrapper from needing the stripper's state.
+     * The stripper REFUSES a file that does not fit `cap`, so growing is a loop
+     * here rather than a branch in there -- and the loop cannot leak the partial
+     * result, because every exit path frees before it returns. */
+    for (;;) {
+        out = (char *)malloc(cap);
+        if (out == NULL) {
+            fclose(f);
+            return NULL;
+        }
+        if (strip_into(out, cap, f, &len) >= 0) {
+            if (len_out != NULL) {
+                *len_out = len;
+            }
+            return out;
+        }
+        free(out);
+        if (len + 2u >= cap && cap < (size_t)TF_SRC_MAX * 4u) {
+            cap *= 2u;
+            continue;
+        }
+        /* Not a size problem -- `strip_into` only fails on size or a bad
+         * argument, and the arguments were checked above -- so this is a file the
+         * harness will not read rather than one it ran out of room for. Refusing is
+         * the old behaviour for an unreadable file and stays it. */
+        fclose(f);
+        return NULL;
+    }
+}
+
+long tf_read_code_into(char *dst, size_t cap, const char *rel, size_t *len_out)
+{
+    char path[1024];
+    FILE *f;
+    long n;
+
+    (void)snprintf(path, sizeof path, "%s/%s", IRCSERVE_SRC_DIR, rel);
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        return -1;
+    }
+    n = strip_into(dst, cap, f, len_out);
+    fclose(f);
+    return n;
 }
 
 int tf_calls(const char *code, const char *name)

@@ -835,15 +835,28 @@ static void case_topic_forward_strips(void)
                      (unsigned long)hits, b.out);
     }
 
-    /* 3. THE FORWARD REALLY CROSSED, and the origin discarded it -- which is 2.2's
-     * single-writer rule, not a failure of the mesh. Asserted because it is what
-     * makes claim 2 about the wire rather than about a branch nobody took: if B had
-     * not sent, A would not have ignored anything. */
-    TF_CHECK_MSG(nf_expect(&a, "fed_topic_ignored: channel=" CHAN " from=" NAME_B,
-                           T_IO_MS) == 0,
-                 "the origin never recorded discarding the forwarded topic, so the "
-                 "forward did not cross and claim 2 is about a branch that was not "
-                 "taken.\n  node said: %s", a.out);
+    /* 3. THE FORWARD REALLY CROSSED, AND THE ORIGIN APPLIED IT (#132). Asserted
+     * positively, because the line is the proof that the forward crossed: a
+     * `fed_topic:` on A can only exist if B sent a STOPIC and A cached it.
+     *
+     * THIS ASSERTION USED TO BE THE OPPOSITE, and the old one was pinning the
+     * defect rather than a design. It waited for `fed_topic_ignored: channel=#T
+     * from=irc.b` on the ORIGIN -- the origin refusing a topic forwarded to it by
+     * a node whose member set it, because fed_in_stopic() compared `link->name`
+     * against `ch->origin` and on the origin those two are "the non-owner" and
+     * "me". A topic set by a client of any node this one does not hold directly
+     * could therefore never be applied at all. The test read the discard as
+     * 2.2's single-writer rule working, and a comment said so in those words.
+     * Both the assertion and the claim were wrong: a rule that makes a topic set
+     * by most of the network unreachable is not a single-writer rule, it is a
+     * dropped message with a reassuring log line. See the two arms at the check
+     * in src/federation/verbs.c. */
+    TF_CHECK_MSG(nf_expect(&a, "fed_topic: channel=" CHAN " member=" NICK_C, T_IO_MS) == 0,
+                 "the origin never recorded applying the forwarded topic, so the "
+                 "forward did not cross or was discarded. On a mesh where the client "
+                 "that sets a topic is attached to a node the origin does not hold "
+                 "directly, this line is the only evidence the topic exists at all.\n"
+                 "  node said: %s", a.out);
 
     /* 4. NO CONTROL BYTE ON EITHER NODE. B emitted it into the forward and A
      * received it; neither may have let one into its own output. */

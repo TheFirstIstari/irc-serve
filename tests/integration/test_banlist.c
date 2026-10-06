@@ -87,6 +87,34 @@
  * case; a smaller number would make the test prove the bound is "some number". */
 #define BAN_LIST_MAX 64
 
+/* CHAN_MAX_BAN + 1, written as arithmetic rather than included from channel.h for
+ * the reason BAN_LIST_MAX is a literal: a test that reads a bound from the header
+ * cannot FAIL if the header is wrong, and section 6 below is entirely about
+ * whether that bound is where it says. 64 + 1 = 65, and the mask is built to this
+ * length by memset() rather than typed, so a constant that moved would make the
+ * case build a different mask rather than silently stop testing the edge. */
+#define TOO_LONG_MASK_LEN 65
+/* Section 6c's mask, described by its two lengths because they are different and
+ * the case is about that: RAW_MASK_LEN bytes as sent, of which ESCS are control
+ * bytes and the rest is a three-letter mask. Both are well inside CHAN_MAX_BAN --
+ * the point is that a mask needs no strip to fit, only to be CLEAN. Written as
+ * arithmetic from the two literals so that changing either shows up here as a
+ * failed length assertion rather than as a silently different mask. */
+#define ESCS 3
+#define TAIL_LEN 3
+#define RAW_MASK_LEN (ESCS + TAIL_LEN)
+/* The three LETTERS of section 6c's mask, spelled out rather than assembled from
+ * ESC and a letter at each use site -- because the whole claim of that case is
+ * that the string on the wire is these three letters and not those three ESCs,
+ * and a needle written as `ESC "ESC"` would be a claim a reader cannot check. The
+ * resemblance between this and ESC is the case's joke and also its hazard, so the
+ * name says "letters". */
+#define STRIPPED_TAIL "ESC"
+
+/* The log-injection set's named member, octal so the C grammar cannot extend the
+ * escape into what follows: "\x1b[" would be one hex escape reading as U+1B3. */
+#define ESC "\033"
+
 typedef struct {
     test_client_t c;
     char          nick[72];
@@ -399,11 +427,179 @@ int main(void)
                             "*!*@172.255.255.255");
 
     /* =======================================================================
+     * 6. THE TWO BAD-MASK CASES GET THEIR OWN NUMERICS (#133)
+     * ====================================================================
+     * `chan_ban_add()` used to return -1 for an empty mask, an over-long mask,
+     * a full list and an allocation failure, and this file's section 5 above was
+     * the only numeric any of them could produce: 478, whose RFC 2812 5.1 text
+     * is "channel :Cannot list bans, list is full". So a client that sent an
+     * empty mask -- or a 300-byte one -- was told its ban list was full, and the
+     * recovery that implies is to remove a ban it never added.
+     *
+     * These are WIRE assertions on the exact rendered line, in the same window
+     * discipline as everything above, because the numeric and its arity are the
+     * whole of the change and either could be wrong in a way a "some numeric
+     * arrived" assertion would pass.
+     */
+    /* 6a. AN EMPTY MASK. `MODE #chan +b :<ESC>` sends a parameter that is present
+     * and is one control byte; `conn_text_strip()` takes the byte out and what
+     * reaches `chan_ban_add()` is the empty string. That is the plausible client
+     * bug this issue names -- the mask arrived, it is just not a mask -- and it is
+     * 461 ERR_NEEDMOREPARAMS, which is the numeric this node already uses on this
+     * verb for a genuinely too-few-params MODE and whose text it already owns.
+     *
+     * `#empties` is used because it is EMPTY, so the assertion cannot pass because
+     * the list happened to be full -- which is the confusion being removed. */
+    client_join(&alice, EMPTY_CHAN);
+    from = drain(&alice);
+    {
+        /* Built into a buffer rather than concatenated at the call, because
+         * `strlen()` of a concatenation containing ESC is a length in bytes only
+         * by accident of the literal -- and a raw send with a length computed any
+         * other way truncates the control byte or sends past the CRLF. */
+        char line[128];
+
+        (void)snprintf(line, sizeof line, "MODE " EMPTY_CHAN " +b :%s\r\n", ESC);
+        TF_CHECK_MSG(tc_send_raw(&alice.c, line, strlen(line)) == 0,
+                     "the control-byte-mask send failed");
+    }
+    end = drain(&alice);
+    expect_in_window(&alice, from, end, "461 for an all-control-byte mask",
+                     ":" BIN_NAME " 461 alice MODE :Not enough parameters\r\n");
+    /* NOT 478, which is the assertion with teeth: the old code answered this with
+     * 478 and a test that only checked "a numeric arrived" would have passed both
+     * before and after the fix. */
+    expect_absent_in_window(&alice, from, end, "a mask that strips to nothing",
+                            " 478 ");
+    expect_absent_in_window(&alice, from, end, "a mask that strips to nothing",
+                            " 417 ");
+    /* AND THE BAN LIST IS STILL EMPTY, so the refusal is a refusal rather than a
+     * store. */
+    from = drain(&alice);
+    TF_CHECK_MSG(tc_send(&alice.c, "MODE " EMPTY_CHAN " +b") == 0, "MODE +b failed");
+    end = drain(&alice);
+    TF_CHECK_MSG(count_in_window(&alice, from, end, ":" BIN_NAME " 367 ") == 0u,
+                 "a mask that stripped to nothing was stored: %zu 367 lines",
+                 count_in_window(&alice, from, end, ":" BIN_NAME " 367 "));
+
+    /* 6b. AN OVER-LONG MASK, ON A CHANNEL WITH ROOM. `#banme` holds two masks out
+     * of BAN_LIST_MAX, so a refusal here is about the mask's length and not about
+     * the list's capacity -- which is exactly the distinction the issue says was
+     * unavailable. 417 ERR_INPUTTOOLONG is what this node already answers for an
+     * over-long KICK reason. */
+    {
+        char mask[TOO_LONG_MASK_LEN + 1u];
+        char line[TOO_LONG_MASK_LEN + 64u];
+
+        /* BUILT TO THE BOUND rather than typed, because the whole claim is
+         * "CHAN_MAX_BAN + 1 bytes" and a literal that happens to be the right
+         * length today stops being it the moment the constant moves -- which is
+         * the shape of a claim that outlives its evidence. Shaped as a plausible
+         * mask rather than as 65 letters, so the case is about the length and not
+         * about the grammar. */
+        memset(mask, 'a', TOO_LONG_MASK_LEN);
+        mask[0] = '*';
+        mask[1] = '!';
+        mask[2] = '@';
+        mask[TOO_LONG_MASK_LEN] = '\0';
+        (void)snprintf(line, sizeof line, "MODE " BAN_CHAN " +b %s", mask);
+        TF_CHECK_MSG(strlen(mask) == (size_t)TOO_LONG_MASK_LEN,
+                     "the over-long mask is %zu bytes and the case is about %d",
+                     strlen(mask), TOO_LONG_MASK_LEN);
+        from = drain(&alice);
+        TF_CHECK_MSG(tc_send(&alice.c, line) == 0, "the over-long mask send failed");
+        end = drain(&alice);
+        /* NO `<command>` FIELD, and that is not an omission in the expectation: RFC
+     * 2812 5.1 gives 417 the field list "<text> :Input line was too long" -- the
+     * command is NOT one of its parameters -- while 461's is "<command> :Not
+     * enough parameters" and reply_refused() prepends it for that one numeric
+     * specifically. The two refusals here therefore render with DIFFERENT arities
+     * from the same function, and the expectations say so. */
+    expect_in_window(&alice, from, end, "417 for an over-long mask",
+                         ":" BIN_NAME " 417 alice :Input line was too long\r\n");
+        expect_absent_in_window(&alice, from, end, "an over-long mask", " 478 ");
+        /* AND IT WAS NOT STORED. The mask has no `*` after the first byte, so a
+         * 367 line naming it would be the only evidence it took; there is none. */
+        expect_absent_in_window(&alice, from, end, "an over-long mask", " 367 ");
+    }
+
+    /* 6c. AND A MASK WHOSE RAW LENGTH IS INSIDE THE BOUND IS STORED STRIPPED, so
+     * the two new numerics are not the end of the story and the ONE-COPY rule this
+     * branch is built on is visible on the wire.
+     *
+     * THE BOUND IS ON THE RAW LENGTH, and a comment in handle_mode() argued that
+     * when it was written: a client can predict a raw length bound from the bytes
+     * it sent and cannot predict a bound on a filtered value it has never been
+     * shown. An earlier draft of this case claimed the opposite -- that a
+     * 112-byte mask of which 100 bytes are ESC strips to 12 and is accepted -- and
+     * that is false, because the over-long branch runs BEFORE the strip and so
+     * that mask is 417. So the mask here is short ENOUGH raw (12 bytes) and full of
+     * control characters, which is the direction the strip actually applies in.
+     *
+     * The assertion is on the MODE ECHO rather than on a 367, because the echo is
+     * the observable that proves the value which reached the wire is the STRIPPED
+     * one -- a store-and-announce split would show the client's own bytes here and
+     * is exactly what the one-copy rule exists to prevent. And the ESC BYTES ARE
+     * ABSENT FROM THE ECHO, which is asserted rather than assumed: a needle that
+     * stopped before them would pass a reverted strip. */
+    {
+        char mask[RAW_MASK_LEN + 1u];
+        char line[RAW_MASK_LEN + 64u];
+
+        /* ESC 'E' ESC 'S' ESC 'C': RAW_MASK_LEN bytes as sent, TAIL_LEN printable
+         * ones stored, and the three-letter tail reads as a mask rather than as a
+         * test artefact. */
+        (void)snprintf(mask, sizeof mask, ESC "E" ESC "S" ESC "C");
+        TF_CHECK_MSG(strlen(mask) == (size_t)RAW_MASK_LEN,
+                     "the strip case's mask is %zu bytes and the case is about %d",
+                     strlen(mask), RAW_MASK_LEN);
+        TF_CHECK_MSG(conn_text_bad_count(mask) == (size_t)ESCS,
+                     "the strip case's mask has %zu bad bytes and the case is about %d",
+                     conn_text_bad_count(mask), ESCS);
+        from = drain(&alice);
+        (void)snprintf(line, sizeof line, "MODE " BAN_CHAN " +b %s", mask);
+        TF_CHECK_MSG(tc_send(&alice.c, line) == 0, "the strip-case send failed");
+        end = drain(&alice);
+        /* RFC 2812 3.3.4's MODE echo is ":<source> MODE <channel> <modestring>
+         * <arguments>", so the SOURCE is the PREFIX and there is no <nick> field --
+         * which is the same shape section 1 above asserts, and asserted with the
+         * client's own hostmask because that is the prefix the node builds from the
+         * acting connection rather than from the channel. */
+        expect_in_window(&alice, from, end, "a mask stored and announced stripped",
+                         ":alice!alice@127.0.0.1 MODE #BANME +b "
+                         STRIPPED_TAIL "\r\n");
+        /* NONE OF THE THREE REFUSALS, on a mask that is 12 bytes long. */
+        expect_absent_in_window(&alice, from, end, "a short mask", " 417 ");
+        expect_absent_in_window(&alice, from, end, "a short mask", " 478 ");
+        expect_absent_in_window(&alice, from, end, "a short mask", " 461 ");
+    }
+
+    /* =======================================================================
      * The node's own accounting
      * ==================================================================== */
+    /* STILL ZERO, and for section 6 it is a much stronger claim than it was
+     * before. `n_reply_refused` is incremented by reply.c's private `refuse()`,
+     * which fires when a reply could not be DELIVERED -- reply.h calls it a bug
+     * report and says the node holds it at zero. So the zero says that all four
+     * numerics this file produced, including the two that are new, reached the
+     * client: a 461 or a 417 that this node failed to emit would show up here
+     * rather than as a silent absence. Section 6's wire assertions are what say the
+     * refusals were counted-on-something-else; this is what says they were SENT.
+     *
+     * THE READING IS DELIBERATELY A NUMBER AND NOT A LOG LINE, because the
+     * distinction this file now rests on is one a substring cannot see: a
+     * `reply_refused: ... code=461 reason=bad_args` line and a delivered
+     * `461 ERR_NEEDMOREPARAMS` are the same words in two different directions. */
     TF_CHECK_MSG(nf_stop(&node) == 0, "node did not exit cleanly");
+
+    /* AFTER THE STOP, because that is where this node publishes its counters last.
+     * Read live, this assertion would fail for a reason that has nothing to do with
+     * what it claims: the node publishes its stats line on change and on the way
+     * down, so mid-run the value may simply not be in the buffer yet, and
+     * `nf_expect_u64` would spin to its deadline on a counter that is correct. */
     TF_CHECK_MSG(nf_expect_u64(&node, "reply_refused=", 0, T_IO_MS) == 0,
-                 "reply_refused is not 0");
+                 "reply_refused is not 0: something this node tried to send could not "
+                 "be delivered, which is a bug rather than a metric");
 
     tc_close(&alice.c);
     nf_free(&node);

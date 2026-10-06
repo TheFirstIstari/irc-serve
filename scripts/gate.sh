@@ -310,6 +310,64 @@ else
     FAILED_CHECKS=$((FAILED_CHECKS + 1))
     SUMMARY="${SUMMARY}check-portability FAILED\n"
 fi
+
+# ---------------------------------------------------------------------------
+# The SECOND source-wide ratchet, and why it is here rather than in one cell
+# ---------------------------------------------------------------------------
+# Same argument as the one above and it is worth stating rather than repeating: this
+# is a property of the SOURCE, so one answer is right and thirteen agreeing with
+# themselves would only be thirteen. It is a source check rather than a build
+# property because what it watches is a text pattern -- a peer string reaching a
+# `printf` -- which no compiler and no sanitizer has an opinion about.
+#
+# It is counted as a FAILED CHECK, not as a failed cell, for the reason the
+# portability ratchet above gives: inflating the cell count would make the build
+# matrix look worse than it is, and folding it into a cell would make a source
+# problem look like a build problem.
+echo "--- teardown-helper audit (source-wide, strict) ---"
+# `--strict` and not the full enumeration, and the difference is the whole design of
+# the script: the enumeration cannot tell a helper from its caller, so gating on it
+# would gate on a question it cannot answer. `--strict` gates on the two helpers whose
+# NAME promises a whole-job release -- tf_done and tf_report -- which is a short list,
+# has no false positives, and is red when tf_done is restored to freeing nothing.
+#
+# WHAT IT IS NOT: a leak detector. It reads the BODY, so it catches the shape that
+# caused PR #140's LeakSanitizer finding and it would not catch a leak introduced any
+# other way. LeakSanitizer on the Linux CI job remains the only runtime oracle for the
+# leak itself, and nothing here changes that.
+if python3 "$root/scripts/audit-teardown.py" --strict \
+        > "$GATE_BUILD_ROOT/teardown.log" 2>&1; then
+    sed -n '1p' "$GATE_BUILD_ROOT/teardown.log" | sed 's/^/  /'
+    tail -1 "$GATE_BUILD_ROOT/teardown.log" | sed 's/^/  /'
+    SUMMARY="${SUMMARY}audit-teardown(strict) OK\n"
+else
+    printf '  %-26s %s\n' "audit-teardown.py" "FAILED"
+    sed -n '1,40p' "$GATE_BUILD_ROOT/teardown.log" | sed 's/^/      /'
+    FAILED_CHECKS=$((FAILED_CHECKS + 1))
+    SUMMARY="${SUMMARY}audit-teardown(strict) FAILED\n"
+fi
+
+echo "--- packaging truth (source-wide) ---"
+if python3 "$root/scripts/check-packaging.py" > "$GATE_BUILD_ROOT/packaging.log" 2>&1; then
+    sed -n '1p' "$GATE_BUILD_ROOT/packaging.log" | sed 's/^/  /'
+    SUMMARY="${SUMMARY}check-packaging OK\n"
+else
+    printf '  %-26s %s\n' "check-packaging.py" "FAILED"
+    sed -n '1,40p' "$GATE_BUILD_ROOT/packaging.log" | sed 's/^/      /'
+    FAILED_CHECKS=$((FAILED_CHECKS + 1))
+    SUMMARY="${SUMMARY}check-packaging FAILED\n"
+fi
+
+echo "--- peer log-site sweep (source-wide) ---"
+if python3 "$root/scripts/check-peer-log-sites.py" > "$GATE_BUILD_ROOT/peerlog.log" 2>&1; then
+    sed -n '1p' "$GATE_BUILD_ROOT/peerlog.log" | sed 's/^/  /'
+    SUMMARY="${SUMMARY}check-peer-log-sites OK\n"
+else
+    printf '  %-26s %s\n' "check-peer-log-sites.py" "FAILED"
+    sed -n '1,40p' "$GATE_BUILD_ROOT/peerlog.log" | sed 's/^/      /'
+    FAILED_CHECKS=$((FAILED_CHECKS + 1))
+    SUMMARY="${SUMMARY}check-peer-log-sites FAILED\n"
+fi
 echo
 
 # ---------------------------------------------------------------------------
@@ -492,6 +550,38 @@ if [ "$RUN_ASAN" = "1" ]; then
         FAILED_CELLS=$((FAILED_CELLS + 1))
         SUMMARY="${SUMMARY}asan+ubsan tls=ON CONFIGURE OR BUILD FAILED\n"
     fi
+fi
+
+# ---------------------------------------------------------------------------
+# The docs-truth check, AFTER the cells and not before them.
+# ---------------------------------------------------------------------------
+# IT NEEDS A BUILD TREE and it reads the tree with `ctest -N`, so WHERE IN THIS SCRIPT
+# IT RUNS IS LOAD-BEARING. The first version ran it here at the top, with the other
+# source-wide checks, and picked the alphabetically-first directory under
+# $GATE_BUILD_ROOT -- which, because `run_cell()` only `rm -rf`s the cell it is about
+# to build, is a LEFTOVER from the previous run whenever this one is interrupted or
+# the two disagree about the compiler set. It read a stale 95-test tree and reported
+# four "stale claims" that were this tree's own 98. That is the silent-substitution
+# failure the check's own header warns about, committed by the gate itself, and the
+# only thing that prevents it is that this check REFUSES to substitute a tree.
+#
+# After the cells, the first cell's directory is guaranteed to have just been
+# configured by this run.
+echo
+echo "--- docs truth (needs a build tree, so: after the cells) ---"
+# `${selected[0]}` is an INDEX into all_labels, not a label -- which is why the
+# first version of this built the path "0_Release_tlsOFF" and the check refused it.
+# The refusal was correct and the path was wrong, and that is the check working.
+DOCS_BUILD="$GATE_BUILD_ROOT/${all_labels[${selected[0]}]}_Release_tlsOFF"
+if python3 "$root/scripts/check-docs-truth.py" --build "$DOCS_BUILD" \
+        > "$GATE_BUILD_ROOT/docstruth.log" 2>&1; then
+    sed -n '1p' "$GATE_BUILD_ROOT/docstruth.log" | sed 's/^/  /'
+    SUMMARY="${SUMMARY}check-docs-truth OK\n"
+else
+    printf '  %-26s %s\n' "check-docs-truth.py" "FAILED"
+    sed -n '1,40p' "$GATE_BUILD_ROOT/docstruth.log" | sed 's/^/      /'
+    FAILED_CHECKS=$((FAILED_CHECKS + 1))
+    SUMMARY="${SUMMARY}check-docs-truth FAILED\n"
 fi
 
 # ---------------------------------------------------------------------------

@@ -1017,8 +1017,23 @@ static int apply_nick(server_t *s, server_link_t *link, const message_t *m)
     if (m->nparams != 6 || !valid_nick(m->params[0]) ||
         burst_parse_u64(m->params[4], &signon) != 0) {
         s->n_fed_malformed++;
-        printf("[observable] fed_malformed: fd=%d command=SBURSTN nick=%s\n",
-               link->fd, (m->nparams > 0) ? m->params[0] : "?");
+        /* MEASURED, AND THE REASON IS THE `nparams > 0` GUARD (#135). The nickname
+         * in the log line is `m->params[0]` precisely when the shape check FAILED,
+         * which is to say exactly when `valid_nick()` above has not run on it -- so
+         * this is the one place in this file where a peer string is printed without
+         * having been validated, and it is reachable with a single parameter whose
+         * value no predicate has touched. `fed_obs()` renders it, and the length
+         * and the bad-byte count beside it are what a reader needs in order to tell
+         * "a peer sent a nickname with a control byte in it" from "a peer sent a
+         * 400-byte nickname", which are different findings and look identical as a
+         * `nick=-`. */
+        {
+            const char *raw = (m->nparams > 0) ? m->params[0] : "?";
+
+            fed_obs("[observable] fed_malformed: fd=%d command=SBURSTN nick=%s "
+                    "nick_len=%zu nick_bad_bytes=%zu\n",
+                    link->fd, raw, strlen(raw), conn_text_bad_count(raw));
+        }
         shadow_discard(s, "BAD_NICK_RECORD", g_shadow.origin, g_shadow.nnicks,
                        g_shadow.nchans, g_shadow.nmembers);
         return -1;
@@ -1084,8 +1099,19 @@ static int apply_chan(server_t *s, server_link_t *link, const message_t *m)
         !irc_serve_server_name_valid(m->params[1]) ||
         burst_parse_u64(m->params[3], &when) != 0) {
         s->n_fed_malformed++;
-        printf("[observable] fed_malformed: fd=%d command=SBURSTC channel=%s\n",
-               link->fd, (m->nparams > 0) ? m->params[0] : "?");
+        /* The same argument as apply_nick()'s, for the same reason: this line
+         * prints `m->params[0]` on the branch where `chan_name_valid()` has NOT
+         * run, so the value is whatever the peer sent. Measured rather than
+         * withheld, because a channel name is short enough to be worth reading and
+         * a length plus a bad-byte count is what distinguishes a malformed channel
+         * name from a channel name carrying a control byte. */
+        {
+            const char *raw = (m->nparams > 0) ? m->params[0] : "?";
+
+            fed_obs("[observable] fed_malformed: fd=%d command=SBURSTC channel=%s "
+                    "channel_len=%zu channel_bad_bytes=%zu\n",
+                    link->fd, raw, strlen(raw), conn_text_bad_count(raw));
+        }
         shadow_discard(s, "BAD_CHAN_RECORD", g_shadow.origin, g_shadow.nnicks,
                        g_shadow.nchans, g_shadow.nmembers);
         return -1;
@@ -1261,8 +1287,18 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
         !valid_nick(m->params[2]) || !chan_name_valid(m->params[0]) ||
         (m->params[4][0] != '*' && account_name_wire_safe(m->params[4]) == 0)) {
         s->n_fed_malformed++;
-        printf("[observable] fed_malformed: fd=%d command=SBURSTM member=%s\n",
-               link->fd, (m->nparams > 2) ? m->params[2] : "?");
+        /* THIRD MEMBER SITE, THIRD INSTANCE OF THE SAME ARGUMENT: `m->params[2]`
+         * is the nickname and this line is on the branch where `valid_nick()` has
+         * not run. Three sites in one file printing the same unvalidated field on
+         * three different guards is what makes a sweep of the file worth having
+         * rather than a fix of whichever one a reader happened to look at. */
+        {
+            const char *raw = (m->nparams > 2) ? m->params[2] : "?";
+
+            fed_obs("[observable] fed_malformed: fd=%d command=SBURSTM member=%s "
+                    "member_len=%zu member_bad_bytes=%zu\n",
+                    link->fd, raw, strlen(raw), conn_text_bad_count(raw));
+        }
         shadow_discard(s, "BAD_MEMBER_RECORD", g_shadow.origin, g_shadow.nnicks,
                        g_shadow.nchans, g_shadow.nmembers);
         return -1;
@@ -1273,9 +1309,23 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
         (void)chan_name_upper(canonical, sizeof canonical, m->params[0]);
         if (strcmp(canonical, sc->name) != 0) {
             s->n_fed_malformed++;
-            printf("[observable] fed_malformed: fd=%d command=SBURSTM member=%s "
-                   "reason=CHANNEL_MISMATCH\n",
-                   link->fd, m->params[2]);
+            /* FILTERED EVEN THOUGH `valid_nick()` HAS ALREADY RUN on params[2],
+             * and the reason is the sweep rather than the value (#135). This arm
+             * sits BELOW the shape check, so the nickname here really has been
+             * through `valid_nick()` and a control byte cannot be in it -- which is
+             * exactly the reasoning that let the three arms ABOVE this one keep
+             * printing raw, and it was wrong there: the reason they were wrong is
+             * that they are not below the check. Once the sweep states the rule as
+             * "no `m->params[...]` in a `%s` argument anywhere in the peer path",
+             * the honest way to satisfy it here is to filter rather than to argue,
+             * because the argument a future reader has to re-derive ("is this arm
+             * really below the check?") is exactly the class of reasoning that
+             * produced the defect. One pass over at most IRC_MAX_NICK bytes on a
+             * malformed-record path. */
+            fed_obs("[observable] fed_malformed: fd=%d command=SBURSTM member=%s "
+                    "member_len=%zu member_bad_bytes=%zu reason=CHANNEL_MISMATCH\n",
+                    link->fd, m->params[2], strlen(m->params[2]),
+                    conn_text_bad_count(m->params[2]));
             shadow_discard(s, "CHANNEL_MISMATCH", g_shadow.origin, g_shadow.nnicks,
                            g_shadow.nchans, g_shadow.nmembers);
             return -1;
@@ -1886,6 +1936,16 @@ int fed_burst_apply(server_t *s, server_link_t *link, const message_t *m)
      * rather than a silent return, for the reason the guard chain's unreachable
      * arm gives: a table row with no arm is a verb this node advertises by
      * handling and does not do. */
-    printf("[observable] fed_burst_unhandled: command=%s\n", m->command);
+    /* `m->command` OFF THE WIRE, ON A BRANCH THE COMMENT ABOVE CALLS UNREACHABLE
+     * (#135), and both halves of that are why it is filtered rather than printed.
+     * The unreachability is real -- `fed_burst_verb()` is the only caller and it
+     * tests this same string against the table -- and it is exactly the situation
+     * #134 was filed about: a branch nobody can reach is a branch nobody reviews
+     * with the change that would make it reachable, and the value is a peer string
+     * that reached this point without a predicate. A filter here costs one pass on
+     * a path that does not execute, which is the cheapest possible insurance, and
+     * the alternative -- leaving a bare `%s` on a peer string in a file with
+     * twenty-seven other log lines -- is the state #135 is filed about. */
+    fed_obs("[observable] fed_burst_unhandled: command=%s\n", m->command);
     return -1;
 }

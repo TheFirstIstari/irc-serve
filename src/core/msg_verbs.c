@@ -171,19 +171,72 @@ static void send_message(server_t *s, conn_t *c, const message_t *m,
      * only reader of this line is a log reader, and for that reader one uniform
      * shape plus the reason on stdout below is worth more than a second shape
      * that is conformant on a path nothing can reach. The reasoning is recorded
-     * in docs/RFC2812_CONFORMANCE.md 6.12.
+     * in docs/RFC2812_CONFORMANCE.md 6.12, and its REACHABILITY IS CHECKED rather
+     * than asserted -- see the block immediately below this one, and
+     * tests/integration/test_hostmask_reachability.c, which is what makes this
+     * paragraph a claim the build can hold us to.
      *
      * AND WHY THE TEXT CHANGED ANYWAY. "Cannot send: unrenderable source" was
      * this node's own sentence in a field the RFC specifies, so it was a
      * deviation on every count. The reason it existed -- that the SOURCE is
      * unrenderable -- is not lost: it moves to the log line below, which is
-     * where the sibling 404 and the 417 above already put theirs, and where the
-     * RFC does not constrain what may be said. */
+     * where the sibling 404 and the 417 above already put theirs, and where
+     * the RFC does not constrain what may be said.
+     *
+     * ---------------------------------------------------------------------------
+     * AND WHY THE LINE BELOW IS FILTERED WHEN IT MAY NEVER FIRE (#134)
+     * ---------------------------------------------------------------------------
+     * This branch cannot be reached, and the claim used to be a COMMENT, which is
+     * the one form of it this project has learned three times not to accept: a
+     * comment about unreachable code is not reviewed with the change that makes it
+     * reachable, and a branch nobody can reach is a branch no test can cover,
+     * which is why this line survived a full audit of every `printf` site (#121).
+     *
+     * Two things changed, and only one of them is the injection fix:
+     *
+     *   1. `target` goes through `conn_text_logsafe()` and is reported with
+     *      `conn_text_bad_count()` and its length, per connection.h's Rule 1. A
+     *      `<msgtarget>` is the least-constrained parameter in this verb --
+     *      RFC 1459 2.3.1 lets it be a nickname, a channel, `nick@server`, or a
+     *      mask -- so "the resolver refused many shapes by the time this runs" is
+     *      a property of the resolver and not of this line, and a log site that
+     *      leans on its caller's validation is a log site that goes stale the
+     *      moment the caller changes. THE COST IS ONE PASS over a string of at most
+     *      IRC_MAX_LINE bytes on a path that runs once per refused message -- and
+     *      on a conforming tree the branch does not run at all.
+     *
+     *   2. The unreachability is now CHECKED rather than asserted in prose, by
+     *      tests/integration/test_hostmask_reachability.c. It reads
+     *      connection.h and connection.c and establishes the three things the
+     *      claim rests on: `CONN_HOSTMASK_MAX` is written as the sum of the three
+     *      field widths plus the two separators and the NUL; the three fields are
+     *      fixed-size arrays rather than pointers, so `sizeof` is a field width
+     *      and not a constant; and `conn_hostmask()`'s only format is
+     *      `"%s!%s@%s"` over exactly those fields. Widen a field, replace the
+     *      derivation with a literal, or make `host` a pointer, and that test goes
+     *      red -- which is the difference between "a comment says this cannot
+     *      happen" and "the build says it".
+     *
+     * IT IS NOT DELETED, and the reason is that "unreachable" was the wrong
+     * question. The 404 is a correct wire behaviour: a line whose source cannot be
+     * rendered must not be sent, and the alternative -- falling through with an
+     * empty prefix -- would put `:  PRIVMSG #T :hi` on the wire, which is worse
+     * than a refusal and is 3.2's "never deliver a silently shortened field"
+     * applied to the prefix. What IS true is that a log line which cannot fire is
+     * indistinguishable, to somebody scanning logs for evidence, from one that has
+     * never fired because the condition does not happen. That ambiguity is the real
+     * cost here, and it is why the line now names a reason a reader can match on
+     * and carries the measurement beside it, rather than printing a bare field.
+     */
     if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
+        char shown[CONN_LOG_FIELD_MAX + 1u];
+
         (void)reply(s, c, "404", NULL, 0, "Cannot send to channel");
+        (void)conn_text_logsafe(shown, sizeof shown, m->params[0]);
         printf("[observable] msg_refused: verb=%s nick=%s target=%s "
-               "reason=unrenderable_source\n",
-               verb, c->nick, m->params[0]);
+               "target_len=%zu target_bad_bytes=%zu reason=unrenderable_source\n",
+               verb, c->nick, shown, strlen(m->params[0]),
+               conn_text_bad_count(m->params[0]));
         return;
     }
 

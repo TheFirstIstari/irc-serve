@@ -39,7 +39,13 @@
  * wrong: the operator reading this log IS the reader, and there is no argument that an
  * operator's terminal is not one.
  *
- * SO IT IS ONE FUNCTION AND EVERY SITE SAYS `fed_obs`. A `%s` argument is rendered
+ * SO IT IS ONE FUNCTION AND EVERY SITE SAYS `fed_obs`. Since #135 it is NOT static:
+ * `federation/burst.c` is the other large peer-path logger in the node and could not
+ * reach it, which meant the policy this function documents was in force in one file
+ * out of five that logs peer data. It is declared in verbs.h, and
+ * `scripts/check-peer-log-sites.py` is the sweep that keeps every site honest --
+ * including this one, which a reader of the other four files would otherwise have
+ * no reason to believe in. A `%s` argument is rendered
  * through `conn_text_logsafe()` before it reaches stdout: kept verbatim when every
  * byte is printable ASCII, and WITHHELD as `-` when one is not, which is the tree's
  * standing convention for a log-only field (`cmd_unknown: command=-` beside a
@@ -89,13 +95,13 @@
 #define FED_OBS_SPEC "-+ #0123456789.*hlLqjzt"
 #define FED_OBS_LEN "hlLqjzt"
 
-static void fed_obs(const char *fmt, ...)
+void fed_obs(const char *fmt, ...)
 #if defined(__GNUC__)
     __attribute__((format(printf, 1, 2)))
 #endif
     ;
 
-static void fed_obs(const char *fmt, ...)
+void fed_obs(const char *fmt, ...)
 {
     /* One field buffer, 256 bytes so a whole topic (CHAN_MAX_TOPIC is 255) or a
      * hostmask fits without being withheld for length. It is ONE buffer rather than
@@ -1825,15 +1831,99 @@ static void fed_in_stopic(server_t *s, server_link_t *link, chan_t *ch,
     if (nparams != 3) {
         return;
     }
-    /* ONLY THE ORIGIN'S TOPIC IS TAKEN, and the test is the LINK, not the
-     * channel: a line that arrived on a link bearing a name other than the
-     * channel's origin is a second opinion about a field whose authority is
-     * elsewhere, and caching it is the permanent divergence 2.2's single-writer
-     * rule exists to prevent. A topic from the origin -- whether it came
-     * directly or through a relay -- is the authority and is applied. */
-    if (!chan_same_name(link->name, ch->origin)) {
-        fed_obs("[observable] fed_topic_ignored: channel=%s from=%s origin=%s\n",
-               ch->name, link->name, ch->origin);
+/* ------------------------------------------------------------------------
+     * ONLY THE ORIGIN'S TOPIC IS TAKEN (#132), AND THE SUBJECT IS READ FROM
+     * THE LINE RATHER THAN FROM THE SOCKET IT ARRIVED ON.
+     * ------------------------------------------------------------------------
+     *
+     * WHAT WAS WRONG, and it was not a narrow edge case. The test was
+     * `chan_same_name(link->name, ch->origin)`, and `link->name` is the server
+     * THIS NODE IS SPEAKING TO -- the transport -- not the server whose opinion
+     * the line carries. Those are the same name in one arrangement only:
+     *
+     *   - A client's TOPIC on the OWNING node is applied locally there and
+     *     forwarded to every peer. Each peer receives it on a link named the
+     *     origin, so the old test passed on a two-node mesh and looked right.
+     *
+     *   - A client's TOPIC on a NON-OWNING node is NOT applied locally: 2.2
+     *     makes the topic cache, and chan_verbs.c's authority_ok() answers
+     *     CHAN_VERDICT_FORWARD, so fanout.c forwards it to the origin. It arrives
+     *     at the ORIGIN on a link named the NON-OWNER, and `ch->origin` is this
+     *     node. The old test compared the sender against itself and said no. So
+     *     the origin NEVER accepted a topic set by a client of a node it does not
+     *     hold directly -- the one arrangement a federated network spends all
+     *     its time in.
+     *
+     *   - Beyond two nodes the same false negative silences the relay hop: a
+     *     node reachable only through a relay receives the origin's own topic
+     *     over a link named the RELAY, drops it, and -- because the forward is
+     *     below this `return` -- does not pass it on either, so the divergence is
+     *     permanent for everything behind it.
+     *
+* THE TEST THAT REPLACES IT, and it is ONE test with two terms rather than two
+     * tests, because the evidence about authority is the same in both
+     * topologies and only the answer differs.
+     *
+     * THE EVIDENCE IS THE SUBJECT, and it is `tags.origin` -- 2.4's
+     * `irc-serve-origin`, validated by irc_serve_tags_parse() in G4 and carried
+     * through every relay hop unchanged except for the `hops` increment (see
+     * fanout_stamp(), which mints an identity only for an ORIGINATING emission
+     * and relays one otherwise). `tags.origin` is read here rather than
+     * `link->name` for the whole of the reason above: the link is the transport
+     * and the subject is who spoke.
+     *
+     * A SUBJECT IS ENTITLED TO THE TOPIC when it is either
+     *
+     *   (a) THE CHANNEL'S ORIGIN. 2.2 reserves `topic` to the origin, so the
+     *       origin's own opinion is the authority at any distance -- this is the
+     *       case a relay hop exists for, and it is the term that makes a
+     *       three-node mesh converge.
+     *
+     *   (b) A SERVER THE CHANNEL'S ROSTER RECORDS AS HOLDING A MEMBER
+     *       (`chan_server_has()` over `servers[]`). This is the case a
+     *       non-owner forwards on a member's behalf, and it has to be allowed for
+     *       a reason that is about the WIRE rather than about trust: the forward
+     *       a non-owner sends to the origin carries the REQUESTING server's stamp,
+     *       because `fanout_stamp()` treats the emission as a relay and relays an
+     *       identity rather than re-minting one -- re-minting would be a lie about
+     *       whose line this is, and would give the far side a dedup key it has
+     *       never seen. So on the origin, the subject of a legitimate forwarded
+     *       topic is the MEMBER-SERVER, never the origin, and a rule that accepted
+     *       only term (a) would refuse every topic any client on a non-owning node
+     *       has ever set. It is also the term that stops at the next hop being a
+     *       member-server rather than the origin, which is what makes the onward
+     *       emission from the origin applyable further along the mesh.
+     *
+     * WHY THAT SECOND TERM IS NOT A HOLE THIS CHANGE OPENS, because it looks
+     * like one and the argument is worth having: 2.2's single-writer rule exists
+     * to stop two nodes holding DIFFERENT values for one field. Every value that
+     * reaches a cache under term (b) has already been accepted by the origin,
+     * because a non-owner's forward goes to `ch->origin` and nowhere else
+     * (fanout.c's `forward_channel_targets()` owned row), so the nodes agree by
+     * construction. What an authenticated peer CAN do -- forge a topic to a
+     * non-origin node naming a member-server as its subject -- is write one field
+     * on one node until the origin's next statement or the next 4.3 resync, and
+     * it costs a completed handshake and the shared secret to try. The cost of
+     * NOT having term (b) is that no topic set by any client not directly
+     * attached to the origin has ever taken effect anywhere, which is a mesh in
+     * which the topic feature does not work at all. That is a worse trade, and it
+     * is the trade the old condition made.
+     *
+     * WHAT THE REFUSAL LOGS. The old line printed `from=` and `origin=` and
+     * nothing else, so the reader had to guess which of the two names in the
+     * line was believed. `subject=` goes on the line beside them, and the reason
+     * names which of the two terms failed.
+     *
+     * COST: one call to `chan_server_has()` per STOPIC -- a linear scan of a
+     * bounded set of at most CHAN_MAX_MEMBER_SERVERS names -- plus one string
+     * comparison against `ch->origin`. Nothing is allocated, no lock is taken,
+     * and the scan is on the peer path for one verb rather than on any client's.
+     */
+    if (!chan_same_name(tags->origin, ch->origin) &&
+        !chan_server_has(ch, tags->origin)) {
+        fed_obs("[observable] fed_topic_ignored: channel=%s from=%s subject=%s "
+                "origin=%s reason=NOT_THE_ORIGIN_OR_A_MEMBER_SERVER\n",
+                ch->name, link->name, tags->origin, ch->origin);
         return;
     }
     if (chan_set_topic(ch, params[2], params[0]) != 0) {

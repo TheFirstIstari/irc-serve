@@ -179,7 +179,72 @@ run_fault needle-containing-nul-handled-with-strlen \
     nul_needle_strlen.py
 
 note ""
-note "teeth: $PASS of 11 faults caught, $FAIL not."
+# ---------------------------------------------------------------------------
+# 12. #132: THE TOPIC AUTHORITY CHECK READING THE TRANSPORT INSTEAD OF THE LINE.
+#
+# The one fault here whose test needs a THREE-NODE mesh. Every other fault in this
+# file is a filter or a predicate that a two-node suite can see; this one was
+# invisible to a suite that had two-node federation in it and green on every gate
+# cell, because on the one topology the two-node fixture builds the transport and
+# the subject are the same server. That is the reason the new test spawns a chain
+# rather than a pair, and it is why this fault names both of the test's cases: one
+# alone would prove the file has teeth and not that the test does.
+# ---------------------------------------------------------------------------
+run_fault stopic-authority-reads-the-link-not-the-line \
+    "test_fed_topic_authority test_fed_relay" \
+    stopic_link_name_instead_of_subject.py
+
+# ---------------------------------------------------------------------------
+# 13. #133: THE EMPTY-MASK BAN REFUSAL BACK ON THE CAPACITY NUMERIC.
+#
+# The second fault in this file that needs a WIRE assertion rather than a log
+# assertion: the whole claim is that the numeric on the wire is 461 and not 478,
+# so a check that counted `chan_ban_refused:` lines would pass either way. The
+# numeric is also the thing a client reads, which is why the wrong one is a defect
+# rather than a naming preference.
+# ---------------------------------------------------------------------------
+run_fault ban-empty-mask-answers-478     "test_banlist" \
+    ban_empty_mask_answers_478.py
+
+# ---------------------------------------------------------------------------
+# 14. #134: THE <msgtarget> BACK IN A printf("%s"), AND THE REACHABILITY CLAIM
+#     ABOVE IT PROVED BY A COMMENT RATHER THAN BY A TEST.
+#
+# One fault and two tests, which is the shape of #134: the injection fix and the
+# claim that made the site look safe are different defects with different fixes,
+# and the test file covers both. `test_hostmask_reachability` is the only test in
+# the tree whose SUBJECT is a comment, so this is also the only fault here whose
+# failure mode is "a paragraph in a source file went stale".
+# ---------------------------------------------------------------------------
+run_fault msg-target-printed-raw     "test_hostmask_reachability" \
+    msg_params_printed_raw.py
+
+run_fault hostmask-width-derivation-replaced-by-a-literal \
+    "test_hostmask_reachability" \
+    hostmask_width_literal.py
+
+# ---------------------------------------------------------------------------
+# 16. #135: A PEER'S <nick> BACK IN A printf("%s") ON THE BRANCH THAT REFUSED IT.
+#
+# The one fault in this file that TWO instruments have to catch, which is why it is
+# the one worth the most: the sweep says the argument is not allowed, and the wire
+# test says the byte came out. A fault caught by only one of them would mean the
+# other is decorative, and this is the fault that establishes which is which.
+#
+# `scripts/teeth.sh` runs the C test because that is what `run_fault` drives. The
+# sweep is a SOURCE check, so running it under this harness would need the mutation
+# applied to the copy rather than to this tree -- which `run_fault` does do, since
+# it stages the tree and applies the fault there. So the check named here is the
+# binary, and the sweep's half of the claim is verified separately by running
+# `python3 scripts/check-peer-log-sites.py` against the same mutated copy, which is
+# what the fault's docstring asks a reader to do.
+# ---------------------------------------------------------------------------
+run_fault burst-nick-printed-raw-on-the-refusal-branch \
+    "test_burst_malformed_log" \
+    burst_nick_printed_raw.py
+
+note ""
+note "teeth: $PASS of 16 faults caught, $FAIL not."
 if [ "$FAIL" != "0" ]; then
     note "not caught:$FAILED_LIST"
     exit 1

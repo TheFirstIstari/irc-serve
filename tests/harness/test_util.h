@@ -107,6 +107,29 @@ size_t tf_count(const char *hay, const char *needle);
  * read or allocated. The caller frees it. */
 char *tf_read_code(const char *rel, size_t *len_out);
 
+/* THE SAME READ INTO A CALLER'S BUFFER, and this is the form a NEW call site
+ * should use. #134's test read `src/core/connection.h` through `tf_read_code()`
+ * behind a one-line `read_src()` wrapper, and `check_fields_are_arrays()` forgot the
+ * `free()` that the wrapper's contract obliged it to write. Linux's LeakSanitizer
+ * found it as "Direct leak of 65536 byte(s) in 1 object(s)" -- the wrapper, not the
+ * harness, is what hid it, because the `malloc` is in `tf_read_code()` and the
+ * obligation is in the caller's frame three frames away.
+ *
+ * `tf_read_code_into(dst, cap, rel, &len)` returns the number of bytes written, or
+ * -1 if the file cannot be read OR **if it does not fit** -- it REFUSES rather than
+ * truncating, because a source check that silently examines half a file reports
+ * clean for a reason nobody can see, and that is the same failure as a leak check
+ * that silently examines none of it. There is nothing to free and nothing to
+ * forget, which is the whole reason it exists.
+ *
+ * COST: the caller provides `cap` bytes of stack. TF_SRC_MAX is the width that is
+ * comfortable for a source file in this tree -- the largest is src/core/msg_verbs.c
+ * at 84 KiB -- and a caller that wants more has to say so. `tf_read_code()` remains
+ * for the 19 existing call sites that pair their free correctly, and removing it
+ * would be a change to every one of them for no gain. */
+#define TF_SRC_MAX (256u * 1024u)
+long tf_read_code_into(char *dst, size_t cap, const char *rel, size_t *len_out);
+
 /* Is `name` called in `code`? The character before it must not be an identifier
  * character, so a search for `close` does not match conn_close( or
  * server_close_conn(. */

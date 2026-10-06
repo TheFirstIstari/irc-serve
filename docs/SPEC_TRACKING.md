@@ -16,7 +16,7 @@ command in this document was run on 2026-09-28.**
 | Step | Command |
 |---|---|
 | Build | `cmake -B <build> -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DBUILD_BENCHMARK=ON` then `cmake --build <build> --parallel 8` — clean, no warnings, no errors |
-| Test run | `ctest --timeout 60` in the build tree — **39 tests: 31 passed, 8 skipped, 0 failed** |
+| Test run | `ctest --timeout 60` in the build tree — **98 tests: 98 passed, 0 skipped, 0 failed** |
 | Behaviour | the shipped `irc-serve` binary was run on an ephemeral port and driven with a raw TCP client; the wire bytes quoted in this document are captured from that session |
 | Build membership | `src/CMakeLists.txt`, `nm` on the linked binary, and a repo-wide `grep` over every `CMakeLists.txt` |
 | Phase state | `gh issue list --milestone "Federated IRC Server v1.0" --state all` |
@@ -463,9 +463,24 @@ Design §6.4 and §7/Phase 7 have been corrected in place to say the same thing,
 `ctest --timeout 60`, Release, macOS/darwin, 2026-09-28:
 
 ```
-39 tests: 31 passed, 8 skipped, 0 failed
-Total Test time (real) = 16.57 sec
+98 tests: 98 passed, 0 skipped, 0 failed
 ```
+
+**AND THE COUNTS ABOVE ARE NOW CHECKED, which is the point of writing them down
+again.** `scripts/check-docs-truth.py` parses the census out of this file and out of
+`README.md` by pattern rather than by line number, and compares the total against
+`ctest -N`. The previous line in this block said `39 tests: 31 passed, 8 skipped, 0
+failed` and had done so since the suite had thirty-nine tests — under a heading reading
+*"Test suite as it actually stands"*, which is the last place a reader looks for a
+current number and the worst place to leave a stale one. A document that is a record of
+a past audit is not the place for a live count; the live count belongs to `README.md`
+and to `ctest`, and the check is what keeps the copy here honest.
+
+The per-label table below is **left as it was recorded**, because it is part of the
+2026-09-28 snapshot this document exists to preserve and rewriting it would destroy the
+evidence it provides. It is a different KIND of claim from the census above it, and the
+distinction is the point: a snapshot of a past run is history, and a snapshot presented
+as a present-tense fact is a lie.
 
 | Label | Tests | Passed | Skipped |
 |---|---|---|---|

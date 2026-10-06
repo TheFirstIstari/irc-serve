@@ -990,11 +990,18 @@ int chan_mode_set(chan_t *ch, char m, int on)
     return 1;
 }
 
-int chan_ban_add(chan_t *ch, const char *mask)
+chan_ban_verdict_t chan_ban_add(chan_t *ch, const char *mask)
 {
-    if (ch == NULL || mask == NULL || mask[0] == '\0' ||
-        strlen(mask) > (size_t)CHAN_MAX_BAN) {
-        return -1;
+    /* THE THREE REFUSALS ARE SEPARATE FROM HERE ON (#133), and the order of the
+     * tests is the order of the numeric the caller will answer with. An empty
+     * mask is 461 (a required parameter is absent) and an over-long one is 417
+     * (a value exceeded a bound); neither is a capacity condition and neither may
+     * be reported as one. */
+    if (ch == NULL || mask == NULL || mask[0] == '\0') {
+        return CHAN_BAN_EMPTY;
+    }
+    if (strlen(mask) > (size_t)CHAN_MAX_BAN) {
+        return CHAN_BAN_TOO_LONG;
     }
     /* THE CAP, AND IT WAS NOT HERE. Phase 11's RFC 2812 sweep found this while
      * checking whether the ban-list-full refusal was reachable at all, and it was
@@ -1020,7 +1027,7 @@ int chan_ban_add(chan_t *ch, const char *mask)
      * and the cost of NOT having it is a per-channel array that a single `MODE #c
      * +b` loop grows without limit on an operator-controlled channel. */
     if (ch->nbans >= (size_t)CHAN_MAX_BANS) {
-        return -1;
+        return CHAN_BAN_FULL;
     }
     if (ch->nbans == ch->bcap) {
         size_t want = (ch->bcap == 0) ? 4u : ch->bcap * 2u;
@@ -1028,16 +1035,22 @@ int chan_ban_add(chan_t *ch, const char *mask)
             (struct chan_ban *)realloc(ch->bans, want * sizeof *grown);
 
         if (grown == NULL) {
-            return -1;
+            return CHAN_BAN_NOMEM;
         }
         ch->bans = grown;
         ch->bcap = want;
     }
+    /* THE BOUND WAS CHECKED ABOVE, so this cannot fail -- and it is NOT `(void)`
+     * -ED for the reason chan_verbs.c's copy of the same note gives: a discarded
+     * result on a copy whose source is already validated is how a field keeps
+     * whatever the realloc left in it, with nothing on the wire or in the log to
+     * say so. If it ever does fail, the CHAN_BAN_NOMEM arm below is where that
+     * becomes visible. */
     if (!copy_bounded(ch->bans[ch->nbans].mask, sizeof ch->bans[0].mask, mask)) {
-        return -1;
+        return CHAN_BAN_NOMEM;
     }
     ch->nbans++;
-    return 0;
+    return CHAN_BAN_OK;
 }
 
 int chan_ban_remove(chan_t *ch, const char *mask)

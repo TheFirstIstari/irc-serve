@@ -1840,6 +1840,166 @@ static void mode_refusal_render(char mode, char *wire, size_t wire_cap,
 
 
 /* ---------------------------------------------------------------------------
+ * ONE REFUSAL ANSWER FOR `MODE #chan +b`, and it is a FUNCTION because there are
+ * four of them and they differ in NUMERIC, in ARITY and in REASON (#133).
+ * ---------------------------------------------------------------------------
+ *
+ * WHY FOUR AND NOT ONE. `chan_ban_add()` used to return -1 for an empty mask, an
+ * over-long mask, a full list and an allocation failure, and every one of those
+ * was answered 478 ERR_BANLISTFULL. That numeric's RFC 2812 5.1 text is
+ * "channel :Cannot list bans, list is full", so the two bad-mask cases told a
+ * client its ban list was full when the list was empty and the mask was the
+ * problem. The recovery that implies -- remove a ban -- does not exist for a
+ * client that sent nothing, which is why this is a wire behaviour and not a
+ * diagnostic nit: `MODE #chan +b` with no mask at all is a plausible client bug
+ * and it is the more likely of the two.
+ *
+ * THE NUMERICS, AND WHERE EACH ONE COMES FROM:
+ *
+ *   461 ERR_NEEDMOREPARAMS  an empty mask. RFC 2812 5.1's field list is
+ *       "<command> :Not enough parameters", and this node already answers 461
+ *       with that text on this very verb for a genuinely too-few-params MODE
+ *       (see the arity arms above). Sending the same numeric and the same text
+ *       for "you sent the parameter and it was empty" is the smallest truthful
+ *       answer available: nothing in 2812 names the empty-string case, and
+ *       inventing a numeric nobody has would be worse than reusing one this node
+ *       already means.
+ *
+ *   417 ERR_INPUTTOOLONG  an over-long mask. What chan_verbs.c already answers
+ *       for an over-long KICK reason, and what `reply_refused(..., "417", ...)`
+ *       exists for. A value past a documented bound is precisely its subject.
+ *
+ *   478 ERR_BANLISTFULL  the full list, and ONLY this. RFC 2812 3.3.4's own name
+ *       for the condition. THIS USED TO BE 696, and two things were wrong with
+ *       that: 696 is not in RFC 2812 5.1 at all (it is RPL_ENDOFMODES from the
+ *       historical MODE draft, an end-of-list marker with no meaning about
+ *       capacity, so a client holding it rendered "End of MODE list" for a
+ *       refusal to add a ban and a client not holding it showed nothing at all),
+ *       and the arity was wrong even for its own numeric -- it sent the channel
+ *       and nothing else, so the <char> the RFC's field list names was absent and
+ *       a client parsing positionally read the channel name as the mode letter.
+ *       Both are why the field list below sends the channel AND the letter.
+ *
+ *   368, NOT A NUMERIC. An allocation failure or a copy failure is not the
+ *       client's doing and is not a condition any numeric describes, so it is
+ *       answered 368 -- "Ban mask is not set on this channel" -- which is true,
+ *       actionable in the only sense that matters (the ban did not take, and the
+ *       client can retry), and is the same numeric the `-b` arm already sends for a
+ *       mask that was not there. It is the fourth distinct answer, which is the
+ *       point: collapsing it into one of the other three would put a number on the
+ *       wire that describes a condition the client cannot act on.
+ *
+ * ARITY, WHICH IS NOT THE SAME FOR ALL THREE NUMERICS, and that is checked by
+ * reply.c's own rule rather than by this function's memory of it. 478 is the only
+ * one whose RFC field list names the mode letter, so only it sends two parameters.
+ * 461 and 417 name the command and not the argument, so they send none -- sending
+ * them the mask would put a value in a field the RFC does not define, and reply.c
+ * counts rendered lines against the budget on what it is given.
+ *
+ * THE LOG, AND WHY IT NAMES A REASON RATHER THAN A COUNT -- including the answer
+ * to "what should this be counted as", which is NOBODY, and why.
+ *
+ * IT IS NOT `n_reply_refused`. That counter is incremented by reply.c's private
+ * `refuse()`, which fires when a reply this node tried to DELIVER could not be
+ * delivered at all; reply.h says so and calls it a bug report rather than a
+ * metric. `reply_refused()` -- the wrapper the 461 and 417 arms above use -- does
+ * not touch it, and this node holds it at zero. So a malformed mask is correctly
+ * absent from that counter, and the two are not in competition.
+ *
+ * IT IS NOT `n_burst_refused` either: that is the peer's burst, which has no
+ * client path into it.
+ *
+ * AND IT IS NOT A NEW COUNTER IN THIS CHANGE. This node has no counter for a
+ * client-caused refusal, which is the real gap the issue names, and adding one is
+ * not a one-line change: a counter on `server_t` is published in the single
+ * `[fixture] stats ...` line that every integration test parses and several of
+ * them assert against, so its shape is a contract with the suite rather than with
+ * this function. What this pass does instead is make the refusal OBSERVABLE on the
+ * node's own output with a `reason=` field naming which of the four conditions
+ * occurred, so an operator can tell a malformed request from a full list and a
+ * test can assert on it. That is a record rather than an aggregate, and the
+ * difference is worth being explicit about: an operator asking "how many malformed
+ * masks did this node see today" still cannot answer it.
+ *
+ * THE MASK IS MEASURED rather than printed, per connection.h's Rule 1 --
+ * `conn_text_logsafe()` and `conn_text_bad_count()`, so a mask made mostly of
+ * control characters is reportable without a control character being printed. This
+ * is the same shape as the `who:` line in msg_verbs.c, which is the other place a
+ * least-constrained client parameter is logged.
+ */
+static void ban_refusal(server_t *s, conn_t *c, chan_t *ch, const char *mask,
+                        chan_ban_verdict_t verdict)
+{
+    char shown[CONN_LOG_FIELD_MAX + 1u];
+
+    (void)conn_text_logsafe(shown, sizeof shown, mask);
+    /* SWITCHED THROUGH AN int, and that is this tree's established shape for an
+     * enum switch rather than a choice: `-Wswitch-enum` and
+     * `-Wcovered-switch-default` together forbid both "every enumerator listed"
+     * and "every enumerator listed plus a default", which between them would make
+     * an exhaustive switch on a named enum unwritable. Casting to int satisfies
+     * both and leaves `default:` covering the two values a caller must not pass --
+     * see fanout.c's fanout_deliver(), which switches the same way for the same
+     * reason. */
+    switch ((int)verdict) {
+    case CHAN_BAN_EMPTY:
+        /* `INVALID_PARAMS` and not a code of this pass's own: reply.c's map sends
+         * 461 to `NEED_MORE_PARAMS`, and an OVERRIDE wins over the table -- so an
+         * override here is a second answer for a numeric that already has one.
+         * `INVALID_PARAMS` is the IRCv3 reply-code registry's own code for a
+         * parameter this node will not accept, it is what chan_verbs.c already
+         * passes for INVITE's 461, and it is what a `standard-replies` client
+         * switches on. A code invented for this pass would be an unregistered code
+         * this node made up, which reply.c's own note says is the thing that marker
+         * exists to avoid confusing. */
+        (void)reply_refused(s, c, "MODE", "INVALID_PARAMS", "461", NULL, 0,
+                            "Not enough parameters");
+        printf("[observable] chan_ban_refused: channel=%s by=%s reason=empty_mask "
+               "mask=%s mask_len=%zu mask_bad_bytes=%zu nbans=%zu\n",
+               ch->name, c->nick, shown, strlen(mask), conn_text_bad_count(mask),
+               ch->nbans);
+        return;
+    case CHAN_BAN_TOO_LONG:
+        /* NULL override, so the map's own `ERR_INPUTTOOLONG` is used -- which is
+         * what the 417 KICK-reason arm above does, and a mask past a bound and a
+         * reason past a bound are the same condition. */
+        (void)reply_refused(s, c, "MODE", NULL, "417", NULL, 0,
+                            "Input line was too long");
+        printf("[observable] chan_ban_refused: channel=%s by=%s reason=mask_too_long "
+               "mask=%s mask_len=%zu mask_bad_bytes=%zu max_mask=%d\n",
+               ch->name, c->nick, shown, strlen(mask), conn_text_bad_count(mask),
+               CHAN_MAX_BAN);
+        return;
+    case CHAN_BAN_FULL:
+        (void)reply(s, c, "478", (const char *const[]){ ch->name, "b" }, 2,
+                    "Channel list is full");
+        printf("[observable] chan_ban_refused: channel=%s by=%s "
+               "reason=ban_list_full nbans=%zu max=%d\n",
+               ch->name, c->nick, ch->nbans, CHAN_MAX_BANS);
+        return;
+    case CHAN_BAN_NOMEM:
+        /* The store could not take the mask: the array would not grow, or a copy
+         * this function's own length bound says cannot fail did. Not the client's
+         * doing and not a condition any numeric describes. */
+    default:
+        /* CHAN_BAN_OK is in here too and NOT as a listed arm, because a caller
+         * that hands it here has a bug and this function must still be a total
+         * function. `-Wcovered-switch-default` objects to a `default` beside an
+         * exhaustive list, so the two arms a caller cannot reach are the two this
+         * one covers rather than the two it names. The comment on the enum says OK
+         * is tested by the caller; this is what happens if that ever stops being
+         * true. */
+        (void)reply(s, c, "368", (const char *const[]){ ch->name, mask }, 2,
+                    "Ban mask is not set on this channel");
+        printf("[observable] chan_ban_refused: channel=%s by=%s reason=not_stored "
+               "mask=%s mask_len=%zu mask_bad_bytes=%zu nbans=%zu\n",
+               ch->name, c->nick, shown, strlen(mask), conn_text_bad_count(mask),
+               ch->nbans);
+        return;
+    }
+}
+
+/* ---------------------------------------------------------------------------
  * 367 RPL_BANLIST and 368 RPL_ENDOFBANLIST: `MODE <channel> +b` with no mask.
  * ---------------------------------------------------------------------------
  * RFC 2812 3.3.2 names this as a QUERY and not a change, in the same sentence
@@ -2196,14 +2356,38 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
              * rather than of how long it was. An over-long mask goes to
              * `chan_ban_add()` unchanged and gets the refusal it gets today.
              *
-             * AN ALL-REFUSED MASK LANDS ON AN EXISTING BRANCH, and that is worth
-             * naming because 478's text does not fit it: a mask that strips to
-             * nothing is empty, and `chan_ban_add()` already refuses an empty mask
-             * with the same -1. The client is told the list is full for a mask this
-             * node would not store, which is imprecise -- but it is imprecise TODAY
-             * for an over-long mask as well, because the same -1 answers both. Adding
-             * a numeric for "this mask is not acceptable" is a wire change this pass
-             * is not making, and inventing one would be worse than the imprecision. */
+             * AN ALL-REFUSED MASK LANDS ON 461 NOW (#133). A mask that strips to
+             * nothing is EMPTY, and `chan_ban_add()` refuses an empty mask as
+             * CHAN_BAN_EMPTY -- which is answered 461, because a required parameter
+             * that is absent is exactly what 461 says and exactly what this node
+             * already uses it for on this very verb (see the query arm above). The
+             * comment this replaces argued that 478's text did not fit the case and
+             * that adding a numeric was "a wire change this pass is not making". An
+             * inaccurate error is a wire behaviour too, and the recovery it implies
+             * -- remove a ban you never added -- is the wrong one for a client that
+             * sent nothing. The over-long case moves with it, to 417.
+             *
+             * THE BOUND IS CHECKED ON THE RAW LENGTH, AND WHICH OF THE TWO
+             * LENGTHS THAT IS CANNOT BE OBSERVED -- so it is worth saying why
+             * rather than leaving it to whichever branch runs first.
+             *
+             * `conn_text_strip()` only ever REMOVES bytes, so a mask that is
+             * inside CHAN_MAX_BAN raw cannot become over-long stripped, and a mask
+             * that is over-long raw is refused by the branch below before the strip
+             * is ever called. The two predicates therefore coincide exactly: there
+             * is no input for which "measure after the strip" would accept what
+             * "measure before" refuses. An earlier draft of this comment claimed
+             * the opposite -- that a 300-byte mask of which 200 are control bytes
+             * strips to 100 and is accepted -- and that is FALSE, and the test that
+             * was written to pin it failed on the code rather than on the test.
+             *
+             * So the raw length is what binds, and the reason it is the RAW one is
+             * the argument the paragraph above makes: a client can predict a raw
+             * length bound from the bytes it sent, and cannot predict a bound on a
+             * filtered value it has never been shown. What the strip DOES change is
+             * the STORED value and the ANNOUNCED value, and the one-copy rule above
+             * is what keeps those two the same string.
+             */
             if (strlen(m->params[2]) > (size_t)CHAN_MAX_BAN) {
                 effective = m->params[2];
                 kept_mask = strlen(m->params[2]);
@@ -2213,41 +2397,14 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
                 effective = clean_mask;
             }
             if (plus) {
-                if (chan_ban_add(ch, effective) != 0) {
-                    /* 478 ERR_BANLISTFULL, whose RFC 2812 5.1 field list is
-                     * "<channel> <char> :Channel list is full" -- so the channel
-                     * AND the mode letter are middle parameters.
-                     *
-                     * THIS USED TO BE 696. Two things were wrong with that and the
-                     * second is the one a client can see:
-                     *
-                     *   1. 696 IS NOT THIS CONDITION. RFC 2812 5.1 has no 696 at
-                     *      all; 696 is RPL_ENDOFMODES from the historical MODE
-                     *      draft, an end-of-list marker with no meaning about
-                     *      capacity. A client holding 696 in its numeric table
-                     *      renders "End of MODE list" for a refusal to add a ban,
-                     *      and a client that does not hold it -- which is most,
-                     *      because it is not a registered code -- shows nothing
-                     *      at all. So the refusal was invisible or actively
-                     *      misleading in both cases.
-                     *   2. THE ARITY WAS WRONG EVEN FOR ITS OWN NUMERIC. It sent
-                     *      the channel and nothing else, so the <char> the RFC's
-                     *      field list names was absent; a client parsing positionally
-                     *      read the channel name as the mode character that could
-                     *      not be set.
-                     *
-                     * RFC 2812 3.3.4's own name for the condition is 478, and
-                     * every client that knows a ban list at all maps 478 to "ban
-                     * list full". Correcting it makes a cap that CHAN_MAX_BANS
-                     * has always enforced report itself as the RFC's refusal
-                     * instead of as an unexplained absence.
-                     */
-                    (void)reply(s, c, "478",
-                                (const char *const[]){ ch->name, "b" }, 2,
-                                "Channel list is full");
-                    printf("[observable] chan_ban_refused: channel=%s by=%s "
-                           "reason=ban_list_full nbans=%zu max=%d\n",
-                           ch->name, c->nick, ch->nbans, CHAN_MAX_BANS);
+                /* NOT NAMED `verdict`: handle_mode() already has a `chan_verdict_t`
+                 * verdict of its own from authority_ok(), and a second one in an
+                 * inner scope is a shadow that -Wshadow rightly complains about and
+                 * that a reader has to disambiguate. */
+                const chan_ban_verdict_t bverdict = chan_ban_add(ch, effective);
+
+                if (bverdict != CHAN_BAN_OK) {
+                    ban_refusal(s, c, ch, effective, bverdict);
                     return;
                 }
                 /* chan_ban_add() deliberately does not touch modes[]: a caller
