@@ -324,6 +324,17 @@ fi
 # portability ratchet above gives: inflating the cell count would make the build
 # matrix look worse than it is, and folding it into a cell would make a source
 # problem look like a build problem.
+echo "--- packaging truth (source-wide) ---"
+if python3 "$root/scripts/check-packaging.py" > "$GATE_BUILD_ROOT/packaging.log" 2>&1; then
+    sed -n '1p' "$GATE_BUILD_ROOT/packaging.log" | sed 's/^/  /'
+    SUMMARY="${SUMMARY}check-packaging OK\n"
+else
+    printf '  %-26s %s\n' "check-packaging.py" "FAILED"
+    sed -n '1,40p' "$GATE_BUILD_ROOT/packaging.log" | sed 's/^/      /'
+    FAILED_CHECKS=$((FAILED_CHECKS + 1))
+    SUMMARY="${SUMMARY}check-packaging FAILED\n"
+fi
+
 echo "--- peer log-site sweep (source-wide) ---"
 if python3 "$root/scripts/check-peer-log-sites.py" > "$GATE_BUILD_ROOT/peerlog.log" 2>&1; then
     sed -n '1p' "$GATE_BUILD_ROOT/peerlog.log" | sed 's/^/  /'

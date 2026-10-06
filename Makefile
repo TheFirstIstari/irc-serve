@@ -46,6 +46,7 @@ test: build
 	./scripts/check-skips.sh -b $(BUILD_DIR) $(BUILD_DIR)/ctest-make.log
 	./scripts/check-attribution.sh
 	python3 ./scripts/check-peer-log-sites.py
+	python3 ./scripts/check-packaging.py
 
 # `benchmark` mirrors CI job `ci_benchmark`.
 benchmark:
