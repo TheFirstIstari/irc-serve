@@ -87,14 +87,39 @@
 
 #include "harness/test_util.h"
 
-static char *load(const char *rel)
+/* THE BUFFER-IN FORM, and there is no defect here today.
+ *
+ * This was `load()` returning a heap buffer from `tf_read_code()`, with a `free()`
+ * beside every call. That shape is the one #134's leak shipped in: the `malloc` is
+ * inside `tf_read_code()` and the obligation to free is in the CALLER's frame, so a
+ * call site that forgot it compiled, ran, passed and leaked 64 KiB -- and only
+ * Linux's LeakSanitizer said so, because nothing else in the tree can see it.
+ *
+ * Every one of the five sites below pairs its `free()` correctly today, which is
+ * exactly why this is a symmetry change and not a fix. It is still worth making,
+ * for the reason `tf_read_code_into()`'s own header gives: a call site that CANNOT
+ * leak cannot be the site a future edit leaks in. Five `free()`s nobody has to
+ * remember are five fewer obligations, and this file has no `malloc` of its own
+ * afterwards.
+ *
+ * `TF_SRC_MAX` is the harness's bound on a source file -- the largest in this tree
+ * is src/core/msg_verbs.c at 84 KiB -- and `tf_read_code_into()` REFUSES rather than
+ * truncating when a file does not fit, so a file that grew past it is a loud failure
+ * rather than a test that quietly stopped examining the tail.
+ *
+ * `len` is unused by every assertion below (they all search the NUL-terminated
+ * buffer), so it is taken and discarded here rather than threaded through. */
+static void load_into(char *dst, size_t cap, const char *rel)
 {
     size_t len = 0;
-    char *code = tf_read_code(rel, &len);
+    long got = tf_read_code_into(dst, cap, rel, &len);
 
-    TF_CHECK_MSG(code != NULL, "could not read %s (is IRCSERVE_SRC_DIR set?)",
-                 rel);
-    return code;
+    /* -1 IS BOTH FAILURES -- unreadable, or larger than `cap` -- and they are the
+     * same answer on purpose: a source check that examined half a file reports
+     * clean for a reason nobody can see. */
+    TF_CHECK_MSG(got >= 0,
+                 "could not read %s into %zu bytes (is IRCSERVE_SRC_DIR set, and "
+                 "is the file still under TF_SRC_MAX?)", rel, cap);
 }
 
 /* Does the byte range [from, to) call `name`? */
@@ -139,14 +164,27 @@ static int calls_between(const char *name, const char *from, const char *to)
 
 int main(void)
 {
+    /* TWO BUFFERS, and not one, because `fn` and `end` below are POINTERS INTO
+     * whichever buffer held the file they were found in. One shared buffer would
+     * work today -- the single-file blocks do not straddle a use of `code` -- and
+     * "works today, because of the order" is precisely the property a later edit
+     * reorders without noticing. Two buffers cost 512 KiB of stack in a test that
+     * already holds a 64 KiB one, and buy the freedom to read any file at any
+     * point.
+     *
+     * `alt` is for the two assertions that need a file of their own while another
+     * is still live; `code` is the reused one. */
+    char code[TF_SRC_MAX];
+    char alt[TF_SRC_MAX];
+
     /* Files that must never close a descriptor. poll_loop.c is the load-bearing
      * one: 3.4 says it only marks CLOSING. connection.c is the tempting one.
      *
      * src/message_id.c was on both lists below and is not any more: it was an
      * orphan that no CMakeLists.txt ever compiled, and #86 deleted it. The entry
-     * had to go with it, because load() treats an unreadable file as a failure
-     * and this list is a list of files that exist. No assertion is weakened --
-     * every file still in either list is checked exactly as before. */
+     * had to go with it, because load_into() treats an unreadable file as a
+     * failure and this list is a list of files that exist. No assertion is
+     * weakened -- every file still in either list is checked exactly as before. */
     static const char *const never[] = {
         "src/core/connection.c",
         "src/core/poll_loop.c",
@@ -159,7 +197,6 @@ int main(void)
         "src/federation_handshake.c",
         "src/sasl_framework.c"
     };
-    char *code;
     const char *fn;
     const char *end;
     size_t i;
@@ -184,16 +221,15 @@ int main(void)
     };
 
     for (i = 0; i < sizeof never / sizeof never[0]; i++) {
-        code = load(never[i]);
+        load_into(code, sizeof code, never[i]);
         TF_CHECK_MSG(!tf_calls(code, "close"),
                      "%s calls close(). Only the reaper in server.c may close "
                      "a connection descriptor; everything else marks CLOSING "
                      "and lets the reaper do it.", never[i]);
-        free(code);
     }
 
     for (i = 0; i < sizeof no_destroy / sizeof no_destroy[0]; i++) {
-        code = load(no_destroy[i]);
+        load_into(code, sizeof code, no_destroy[i]);
         TF_CHECK_MSG(!tf_calls(code, "conn_free"),
                      "%s calls conn_free(): a registered conn_t is owned by "
                      "the registry and released by the reaper, so a free() "
@@ -203,26 +239,24 @@ int main(void)
                      "%s calls server_close_conn(): only the reaper destroys a "
                      "registered connection, so that every close happens at one "
                      "fixed point in the iteration", no_destroy[i]);
-        free(code);
     }
 
     /* connection.c: the module that owns conn_t. It may not close anything (a
      * conn_t does not know whether it is registered) and may not reach the
      * registry, but it must still define the destructor. */
     {
-        char *conn_code = load("src/core/connection.c");
+        load_into(alt, sizeof alt, "src/core/connection.c");
 
-        TF_CHECK_MSG(!tf_calls(conn_code, "server_close_conn"),
+        TF_CHECK_MSG(!tf_calls(alt, "server_close_conn"),
                      "connection.c calls server_close_conn(): a conn_t does not "
                      "know whether it is registered, so it must never decide "
                      "that a descriptor is closed");
-        TF_CHECK_MSG(tf_calls(conn_code, "conn_free"),
+        TF_CHECK_MSG(tf_calls(alt, "conn_free"),
                      "connection.c no longer defines conn_free(): something "
                      "has to be able to release a conn_t's buffers");
-        free(conn_code);
     }
 
-    code = load("src/core/server.c");
+    load_into(code, sizeof code, "src/core/server.c");
 
     /* The reaper's close must be there. Without this, "no stray close" could be
      * satisfied by deleting the legitimate one and leaving every connection
@@ -271,10 +305,10 @@ int main(void)
      * is false -- and a list entry that is false takes the file's real
      * protection with it. */
     {
-        char *link_code = load("src/federation/link.c");
         int n;
 
-        TF_CHECK_MSG(tf_calls(link_code, "close"),
+        load_into(alt, sizeof alt, "src/federation/link.c");
+        TF_CHECK_MSG(tf_calls(alt, "close"),
                      "src/federation/link.c no longer calls close() at all: "
                      "T1 has to close the descriptor of a dial that will never "
                      "complete, because a connect() to a black-holed host is "
@@ -289,7 +323,7 @@ int main(void)
          * searches for the function, which is the better target anyway, because
          * a close moved into a DIFFERENT function would then fail rather than
          * pass. */
-        fn = strstr(link_code, "fed_dial_expired(server_t");
+        fn = strstr(alt, "fed_dial_expired(server_t");
         TF_CHECK_MSG(fn != NULL,
                      "could not find fed_dial_expired() in link.c; the function "
                      "that owns the one close() this file is allowed has been "
@@ -305,17 +339,15 @@ int main(void)
         /* And nothing else in link.c does. The whole-file count plus the
          * in-function count is the pair that says both things; either alone
          * would leave room for a second close elsewhere. */
-        n = calls_between("close", link_code, link_code + strlen(link_code));
+        n = calls_between("close", alt, alt + strlen(alt));
         TF_CHECK_MSG(n == rc,
                      "src/federation/link.c has %d close() calls in total but %d "
                      "inside fed_dial_expired(): a peer link is the one place "
                      "outside the registry that touches a descriptor, so a "
                      "close anywhere else is a close path 3.4 does not have", n,
                      rc);
-        free(link_code);
     }
 
-    free(code);
     tf_done("close_sites");
     return 0;
 }
