@@ -50,6 +50,7 @@
 
 #include "core/channel.h"
 #include "core/fanout.h"
+#include "core/connection.h"
 #include "core/message.h"
 #include "core/reply.h"
 #include "federation/verbs.h"
@@ -295,6 +296,121 @@ static struct fed_rnick *nickreg_append(server_t *s)
 
 /* The shared body of the two learn functions. `server` may be "" and the
  * nick/user/host may be absent; see nickreg.h on which absences are ordinary. */
+/* ---------------------------------------------------------------------------
+ * nickreg_ident_ok(): THE RULE FOR A HOSTMASK COMPONENT, AND WHY IT IS A REFUSAL
+ * ---------------------------------------------------------------------------
+ * #142 asks whether `fed_rnick::user` and `fed_rnick::host` are STORED VALUES or
+ * IDENTIFIERS, and the answer is IDENTIFIERS, and it follows from what consumes them.
+ * They are what `fed_nickreg_render()` assembles into `nick!user@host`. Every other
+ * name this tree holds a network-supplied value in is validated at ingest and REFUSED
+ * rather than cleaned: `valid_nick()` for a nickname, `chan_name_valid()` for a channel,
+ * `irc_serve_server_name_valid()` for a server, `account_name_wire_safe()` for an
+ * account. None of them strips, because none of them can: a byte removed from a name
+ * does not make it safer, it makes it a DIFFERENT name.
+ *
+ * THE CONTRAST IS A TOPIC, and it is the whole of the decision. A topic is free text:
+ * it is stored, it is relayed, and it is rendered to every member of the channel, so
+ * `conn_text_strip()` removes the bytes a terminal would execute and the words survive
+ * -- and `chan_set_topic()` says why truncation is not available instead ("a topic cut
+ * mid-word is a different topic, and a client would have no way to tell"). A `<host>` is
+ * not free text. It is one of three NAMED slots, and a byte in it changes what the name
+ * is rather than how it looks, so the only honest answers are "the peer sent a name this
+ * node cannot render" and nothing else.
+ *
+ * THE RULE, and it is 3.2's rather than a new grammar. A MESSAGE PARAMETER can escape
+ * NOTHING: it refuses SP, HTAB, CR and LF in every position and refuses a value needing
+ * the ':' marker anywhere but the last. So a name a parameter cannot carry is a name
+ * `nick!user@host` cannot carry, and the byte test is the one `account_name_wire_safe()`
+ * already uses -- `ch <= 0x20 || ch == 0x7f` -- which is the whole of why that function
+ * and this one agree about where the edge is rather than each having its own copy.
+ *
+ * BYTE ORDER IS DELIBERATE and it is not alphabetical: DEL (0x7F) is not a control
+ * character, it is an ordinary glyph in most fonts and invisible in a log, and a name
+ * carrying one is a name two renderers disagree about rather than one that escapes
+ * anything. It is refused because it is ambiguous, not because it is dangerous, and the
+ * comment says so because the alternative reading is that DEL was forgotten.
+ *
+ * WHAT IT DOES NOT CHECK, and the limit is named rather than left: this says the bytes
+ * are renderable, not that the value is a legal host. 2.1's `<host>` is a hostname or
+ * an IP literal and this does not parse either -- the tree has no hostname grammar and
+ * inventing one here would be a larger decision than the exposure warrants. What IS
+ * checked is everything that can move a cursor or break a field, and the residue is a
+ * host that renders as the peer spelled it. That is the honest bound on a cache.
+ *
+ * COST: one pass over a value at most CONN_MAX_HOST bytes, once per burst nick record,
+ * on a path that runs once per resync rather than once per message. */
+static int nickreg_ident_ok(const char *s, size_t cap)
+{
+    size_t i;
+
+    /* An absent value is "not told", not "bad", and that is why the callers test
+     * `s[0] != '\0'` themselves rather than this returning 0 for it: an empty host
+     * is a normal state and reporting it as a refusal would be a false finding on
+     * every record that omits one. */
+    if (s == NULL || s[0] == '\0' || cap == 0u) {
+        return 0;
+    }
+    /* AND THE WIDTH, which is the second half of the rule and was `nickreg_copy()`'s
+     * whole job until now. A value that does not FIT is one this node cannot hold,
+     * whatever it is made of -- and `nickreg_copy()` TRUNCATES, so without this a
+     * 400-byte host would become a 63-byte host under a name the peer will never be
+     * asked about again, which is 3.2's "never deliver a silently shortened
+     * parameter" arriving by a different road. `account_name_wire_safe()` binds the
+     * same way with ACCOUNT_MAX_NAME hard-wired, because its callers all share one
+     * field width; here the caller supplies it, because `user` and `host` are two
+     * different fields and a caller that passed the wrong one would get a value
+     * truncated to a width nobody declared. */
+    if (strlen(s) >= cap) {
+        return 0;
+    }
+    for (i = 0; s[i] != '\0'; i++) {
+        const unsigned char ch = (unsigned char)s[i];
+
+        if (ch <= 0x20u || ch == 0x7fu) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* nickreg_ident_refused(): THE REPORT, AND WHY IT IS AN OBSERVABLE RATHER THAN A
+ * COUNTER.
+ *
+ * #142 asked which counter. `n_fed_malformed` is for a line this node cannot PARSE and
+ * this is a field this node will not STORE, so it would make that counter mean two
+ * incompatible things. The alternative -- a new `server_t` counter -- is the gap #133
+ * found and left open for a decision, and the reason it was left open is a real one: a
+ * `server_t` counter is published in the single `[fixture] stats` line every integration
+ * test parses, so adding one is a change to every test's ground truth rather than to
+ * one file. So the answer is the mechanism `apply_chan()` already established for the
+ * same class of event: refuse the field, keep the record, and SAY SO on a line an
+ * operator reads.
+ *
+ * THE PEER IS TOLD BY THE EXISTING COUNT and not by anything new, which answers #142's
+ * third sub-question. The burst terminator's `dropped=` already carries a record whose
+ * fields this node could not hold, so a refusal here is visible to the peer through the
+ * count it already reads -- the same answer `apply_chan()` gives for `<topic>`, and for
+ * the same reason: the 4.3 burst format has no field-refusal report, and inventing one
+ * would be a wire change this pass has no reason to make.
+ *
+ * THE VALUE IS MEASURED, NEVER PRINTED. `field=` names which of the two components was
+ * refused -- a fixed literal at both call sites -- and the peer-chosen value appears
+ * only as a length and a bad-byte count, which is `connection.h`'s Rule 1 and what
+ * every other peer field on this node does. Printing it would put whatever the peer
+ * sent into an operator's terminal, which is the very class this predicate exists to
+ * keep out of the fields. */
+static void nickreg_ident_refused(const server_t *s, const char *nick,
+                                  const char *field, const char *value)
+{
+    if (value == NULL) {
+        return;
+    }
+    (void)s;
+    printf("[observable] fed_nickreg_field_refused: nick=%s field=%s len=%zu "
+           "bad_bytes=%zu reason=NOT_A_PARAMETER_BYTE\n",
+           nick, field, strlen(value), conn_text_bad_count(value));
+}
+
 static void nickreg_learn(server_t *s, const char *nick, const char *server,
                           const char *user, const char *host, uint64_t signon,
                           uint64_t now_ms)
@@ -324,10 +440,21 @@ static void nickreg_learn(server_t *s, const char *nick, const char *server,
             (void)nickreg_copy(e->server, sizeof e->server, server);
         }
         if (user != NULL && user[0] != '\0') {
-            (void)nickreg_copy(e->user, sizeof e->user, user);
+            /* IDENTIFIERS, REFUSED NOT SANITISED (#142). See the predicate's own
+             * comment for the policy and for why the answer here is "refuse the
+             * field" rather than "strip it" or "store it and hope". */
+            if (nickreg_ident_ok(user, sizeof e->user)) {
+                (void)nickreg_copy(e->user, sizeof e->user, user);
+            } else {
+                nickreg_ident_refused(s, nick, "user", user);
+            }
         }
         if (host != NULL && host[0] != '\0') {
-            (void)nickreg_copy(e->host, sizeof e->host, host);
+            if (nickreg_ident_ok(host, sizeof e->host)) {
+                (void)nickreg_copy(e->host, sizeof e->host, host);
+            } else {
+                nickreg_ident_refused(s, nick, "host", host);
+            }
         }
         /* signon is only overwritten when the report carries one, for the same
          * reason: an absent field is "not told", not "zero", and 0 is a value 2.4
@@ -349,8 +476,22 @@ static void nickreg_learn(server_t *s, const char *nick, const char *server,
     memset(e, 0, sizeof *e);
     have = nickreg_copy(e->nick, sizeof e->nick, nick);
     (void)nickreg_copy(e->server, sizeof e->server, server);
-    (void)nickreg_copy(e->user, sizeof e->user, user);
-    (void)nickreg_copy(e->host, sizeof e->host, host);
+    /* The two hostmask components go through the SAME predicate as the refresh arm
+     * above, and the reason it is one function rather than two checks written at the
+     * two call sites is the one this file has been bitten by twice: two answers to
+     * "which bytes may this field carry" is how they come to disagree, and a slot
+     * filled on the append path and refused on the refresh path is a registry whose
+     * contents depend on the order the same nickname was reported in. */
+    if (user != NULL && nickreg_ident_ok(user, sizeof e->user)) {
+        (void)nickreg_copy(e->user, sizeof e->user, user);
+    } else if (user != NULL && user[0] != '\0') {
+        nickreg_ident_refused(s, nick, "user", user);
+    }
+    if (host != NULL && nickreg_ident_ok(host, sizeof e->host)) {
+        (void)nickreg_copy(e->host, sizeof e->host, host);
+    } else if (host != NULL && host[0] != '\0') {
+        nickreg_ident_refused(s, nick, "host", host);
+    }
     e->signon = signon;
     e->seen_ms = now_ms;
     if (have == 0) {

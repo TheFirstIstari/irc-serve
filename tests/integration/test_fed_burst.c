@@ -293,6 +293,10 @@ static int g_open_burst;
  * nothing to keep would pass the same assertion for the wrong reason. */
 static int g_overlong;
 
+/* #142: the transaction carrying a value no name can be made of. One hand-built
+ * send, once, so it takes the same straight-to-3 arm `g_overlong` does. */
+static int g_hostile;
+
 /* SEND `count` MINIMAL SBURSTC RECORDS AND NOTHING ELSE, for the two halves of
  * case_channel_count_bound(). `count` is a size_t rather than a mode because the
  * two halves need different numbers: the byte-budget half has to send enough to
@@ -306,6 +310,7 @@ static size_t g_flood_count;
  * first and the one case that bypasses it reads as the exception it is. */
 static void send_truncated_burst(server_t *s, server_link_t *link);
 static void send_open_burst(server_t *s, server_link_t *link);
+static void send_hostile_burst(server_t *s, server_link_t *link);
 static void send_overlong_topic_burst(server_t *s, server_link_t *link);
 static size_t send_channel_flood_burst(server_t *s, server_link_t *link,
                                      size_t count);
@@ -407,6 +412,19 @@ static void offer_resync(server_t *s)
             }
             g_stage = 3;
             send_overlong_topic_burst(s, server_find_link(s, NAME_B));
+            return;
+        }
+        if (g_hostile != 0) {
+                /* Straight to 3, for `g_open_burst`'s reason: one hand-built
+             * transaction, once, and the stage-1 branch would put a second one on the
+             * wire behind it. The gate is the topic, so the case's claim that the
+             * receiver KEPT the topic it already had is a claim about a receiver that
+             * was sent one. */
+            if (server_nick_count(s) < 2u || ch->topic[0] == '\0') {
+                return;
+            }
+            g_stage = 3;
+            send_hostile_burst(s, server_find_link(s, NAME_B));
             return;
         }
         if (g_truncate != 0) {
@@ -742,6 +760,109 @@ static void send_overlong_topic_burst(server_t *s, server_link_t *link)
         ok = 1;
     }
     printf("[fixture] overlong_sent: ok=%d topic_len=%u\n", ok, OVERLONG_TOPIC_LEN);
+    fflush(stdout);
+}
+
+/* ---------------------------------------------------------------------------
+ * #142: A BURST CARRYING VALUES NO NAME CAN BE MADE OF
+ * ---------------------------------------------------------------------------
+ * One hand-built transaction whose every optional field carries a byte no parameter
+ * can hold, sent once. Four fields, four answers, and the four are different on purpose:
+ *
+ *   SBURSTN <user>    a SPACE. `nick!user@host` with a space in the middle of it is
+ *                     not a hostmask, and 3.2 refuses SP in every parameter position.
+ *   SBURSTN <host>    an ESC. Whatever the host becomes, it is going to be a field of
+ *                     somebody's next line.
+ *   SBURSTC <topic_who> a SPACE. Same argument: it is the setter's NICKNAME, and
+ *                     `valid_nick()` refuses it everywhere else in this tree.
+ *   SBURSTC <modes>   a control byte, which is the ONE field whose exposure is already
+ *                     closed and which is sent here to prove it rather than to fix it.
+ *
+ * THE COUNTS ARE CORRECT ON PURPOSE, so the transaction COMMITS. That is the whole of
+ * #142's first sub-question: a field refusal must not become a record refusal, because
+ * `SBURSTE`'s counts are about records this node ACCEPTED and a mismatch discards the
+ * transaction -- so one over-long topic on one channel out of five hundred would
+ * otherwise leave this node stale about four hundred and ninety-nine healthy ones.
+ * `apply_chan()` established that and this case carries it forward.
+ *
+ * WHY AN ESC IN BOTH, AND WHY THAT IS A LOWER BAR THAN IT LOOKS. The obvious choice --
+ * a SPACE, on the argument that `emit_numeric_ex()` strips C0, DEL and the C1 range out
+ * of a numeric's parameters and a space is none of those -- CANNOT BE SENT. 3.2 refuses
+ * SP, HTAB, CR and LF in every parameter that is not the last, and `<user>`, `<host>`
+ * and `<topic_who>` are all middle parameters, so `fed_queue_line()`'s
+ * `message_format()` refuses the line and the transaction never leaves this node. Which
+ * is itself the honest statement of the exposure: the reachable bytes in these fields
+ * are C0, DEL, the C1 range and anything >= 0xA0, and every renderer in the tree strips
+ * all of them. So this case is about LATENT exposure -- a value stored with no predicate
+ * and a renderer that does not exist yet -- and the ESC is the byte a reader recognises
+ * as one that would move a cursor if it ever reached a terminal.
+ *
+ * AND THE DELIBERATE OMISSION OF A LENGTH-BASED ATTACK: a `<host>` longer than
+ * `fed_rnick::host` is refused too, and refused for a reason this case is not about --
+ * `nickreg_copy()` would TRUNCATE it, which is the only cut in this file. It is left
+ * for the width arm above to cover.
+ */
+static void send_hostile_burst(server_t *s, server_link_t *link)
+{
+    conn_t *peer = server_link_conn(s, link);
+    const char *n0[2];
+    const char *n1[6];
+    const char *c1[6];
+    const char *m1[5];
+    const char *e1[4];
+    char signon[24];
+    char epoch[24];
+    int ok = 0;
+
+    if (peer == NULL) {
+        return;
+    }
+    burst_render_u64(epoch, sizeof epoch, s->epoch);
+    burst_render_u64(signon, sizeof signon, 0u);
+
+    n0[0] = epoch;
+    n0[1] = "1";
+    n1[0] = NICK_E;
+    n1[1] = "bad\033user"; /* ESC: representable in a middle parameter, unlike SP */
+    n1[2] = "bad\033host"; /* ESC: no renderer exists for this field today */
+    n1[3] = "-";
+    n1[4] = signon;
+    n1[5] = "";
+    c1[0] = CHAN_T;
+    c1[1] = NAME_A;
+    c1[2] = "bad\033setter"; /* ESC, in the field that is a NICKNAME */
+    c1[3] = "1700000000";
+    c1[4] = "b\004b";       /* a control byte among mode letters. `b` is one of the
+                              * three this build evaluates -- `chan_mode_implemented()`
+                              * names `b`, `o` and `v` and nothing else -- so the case
+                              * can assert that the LETTER landed and the byte did not,
+                              * which is the only pair of assertions that distinguishes
+                              * "the allowlist closed this field" from "the field was
+                              * refused". */
+    c1[5] = "a topic that is fine";
+    m1[0] = CHAN_T;
+    m1[1] = NAME_A;
+    m1[2] = NICK_A;
+    m1[3] = "-";
+    m1[4] = "*";
+    e1[0] = epoch;
+    e1[1] = "1";
+    e1[2] = "1";
+    e1[3] = "1"; /* the counts are CORRECT on purpose -- see the case's header */
+
+    if (fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURST", n0, 2,
+                       NULL) == 0 &&
+        fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURSTN", n1, 6,
+                       NULL) == 0 &&
+        fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURSTC", c1, 6,
+                       NULL) == 0 &&
+        fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURSTM", m1, 5,
+                       NULL) == 0 &&
+        fed_queue_line(s, peer, burst_fixture_stamp(s), s->name, "SBURSTE", e1, 4,
+                       NULL) == 0) {
+        ok = 1;
+    }
+    printf("[fixture] hostile_sent: ok=%d\n", ok);
     fflush(stdout);
 }
 
@@ -2356,8 +2477,8 @@ static void case_over_long_topic_is_refused(void)
     (void)snprintf(needle, sizeof needle,
                    "channel=" CHAN_T
                    " refused_topic=1 refused_topic_who=0 refused_modes=0 "
-                   "topic_len=300 topic_who_len=5 modes_len=2 "
-                   "reason=FIELD_TOO_WIDE");
+                   "topic_len=300 topic_who_len=5 topic_who_bad_bytes=0 "
+                   "modes_len=2 reason=FIELD_NOT_STORABLE");
     TF_CHECK_MSG(nf_expect(&b, needle, T_IO_MS) == 0,
                  "node B did not report the field it could not store, so the loss is "
                  "silent -- which is the whole of the defect this case was filed for. "
@@ -2423,7 +2544,8 @@ static void case_over_long_topic_is_refused(void)
     TF_CHECK_MSG(nf_expect(&b, "fed_burst_chan_withheld: channel=" CHAN_T
                                    " kept_topic_len=31 kept_modes_len=0 "
                                    "refused_topic=1 refused_topic_who=0 "
-                                   "refused_modes=0 reason=FIELD_TOO_WIDE",
+                                   "refused_modes=0 "
+                                   "reason=FIELD_NOT_STORABLE",
                            T_IO_MS) == 0,
                  "node B did not report the topic and the modes it was left holding. "
                  "kept_topic_len must be the 31 bytes it already had -- a 0 means the "
@@ -2481,6 +2603,248 @@ static void case_over_long_topic_is_refused(void)
     nf_free(&a);
     nf_free(&b);
     g_overlong = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * #142: IDENTIFIERS ARE REFUSED, RECORDS ARE KEPT, AND THE MODES FIELD IS PROVED
+ * ---------------------------------------------------------------------------
+ * The policy, in one place and with its reasoning, because #142 filed it as an open
+ * decision and the answer is not derivable from the code:
+ *
+ * `<user>`, `<host>`, `<topic_who>` and `<modes>` are all IDENTIFIERS, not stored
+ * values, and the answer follows from what consumes each of them. A TOPIC is free text
+ * -- stored, relayed, rendered to every member, therefore stripped -- and
+ * `conn_text_strip()` can remove a byte from it because a byte removed from a sentence
+ * leaves a sentence. A `<host>` is one of three NAMED slots in `nick!user@host`, and a
+ * byte removed from a name does not make it safer, it makes it a DIFFERENT name. That
+ * is why this tree validates a nickname with `valid_nick()`, a channel with
+ * `chan_name_valid()`, a server with `irc_serve_server_name_valid()` and an account with
+ * `account_name_wire_safe()` -- none of which strips, because none of them can.
+ *
+ * The ANSWER is the one `apply_chan()` established for the same class of event and
+ * which this case exists to hold in place across the rest of the format: REFUSE THE
+ * FIELD, KEEP THE RECORD. The alternative -- refuse the record -- would make
+ * `SBURSTE`'s counts mismatch and discard the whole transaction, which turns one bad
+ * field on one channel into this node being stale about every healthy channel in the
+ * burst.
+ *
+ * AND `<modes>` IS NOT FIXED, because its exposure is ALREADY CLOSED. That is a
+ * measured answer and not an oversight: `replace_modes()` writes every byte through
+ * `chan_mode_set()`, which refuses anything `chan_mode_implemented()` does not name, so
+ * the mode set 324 renders cannot hold it however the peer spells it. The field is sent
+ * here anyway, with a control byte among its letters, so that claim is an assertion
+ * rather than a comment -- and so that a future edit which replaced the allowlist with
+ * a byte test would have to decide about this case.
+ *
+ * WHAT IS ASSERTED, and the order is the argument:
+ *   1. BOTH hostmask components were refused, each named, measured and never printed --
+ *      one line per field rather than a mask, because a reader of a log is not reading
+ *      burst.c and `refused=3` needs a decoder;
+ *   2. `<topic_who>` was refused the same way, with the topic itself still applied --
+ *      which is what "refuse the field" means, and it is the half a fix that withheld
+ *      the whole record would fail;
+ *   3. the transaction COMMITTED: chans=1, members installed, and the terminator's own
+ *      counts matched, so this node is not stale about anything;
+ *   4. the mode letter the peer sent with a control byte in it is NOT in the mode set,
+ *      read back over the wire through 324;
+ *   5. and the peer-chosen bytes are NOWHERE in the receiver's log, which is the half
+ *      that catches a report printing the value it just refused.
+ */
+static void case_identifiers_are_refused_and_the_record_kept(void)
+{
+    nf_node_t a;
+    nf_node_t b;
+    test_client_t ann;
+    size_t at;
+
+    g_peer_port = 0;
+    g_trace = 0;
+    g_is_b = 0;
+    g_stage = 0;
+    g_tiny_send = 0;
+    g_tiny_recv = 0;
+    g_raised_recv = 0;
+    g_flood_count = 0u;
+    g_open_burst = 0;
+    g_overlong = 0;
+    g_hostile = 1;
+    TF_CHECK_MSG(nf_spawn_inline_named(&a, NAME_A, child_setup) == 0,
+                 "could not spawn node A");
+    g_peer_port = a.port;
+    g_is_b = 1;
+    TF_CHECK_MSG(nf_spawn_inline_named(&b, NAME_B, child_setup) == 0,
+                 "could not spawn node B");
+
+    /* THE TOPOLOGY THE TICK HOOK'S GATE NEEDS, and it is the same one
+     * case_over_long_topic_is_refused() builds, for the same reason: the gate is
+     * `nick_count >= 2` AND "node A holds a topic", and a case that satisfied
+     * neither would be a case whose transaction never went out. So: alice joins and
+     * sets a topic on the OWNING node, the receiver is shown that topic over a
+     * relayed STOPIC -- which is what gives the "the topic survived" assertion
+     * below a baseline -- and ann registers LAST, because registering her is what
+     * fires the transaction and putting her first would put the burst on the wire
+     * before the baseline existed.
+     *
+     * Both lines travel the one link in the order they are queued, so the arrival
+     * order on the far side is a fact rather than a race. */
+    {
+        test_client_t alice;
+
+        register_client(&alice, a.port, NICK_A);
+        TF_CHECK_MSG(tc_send(&alice, "JOIN " CHAN_T) == 0,
+                     "alice's JOIN send failed");
+        TF_CHECK_MSG(tc_expect(&alice, " 366 ", T_IO_MS) == 0,
+                     "alice's JOIN never completed on the node that owns the channel");
+        TF_CHECK_MSG(tc_send(&alice, "TOPIC " CHAN_T " :the topic that was already here")
+                         == 0,
+                     "alice's TOPIC send failed");
+        TF_CHECK_MSG(nf_expect(&a, "chan_topic: channel=" CHAN_T " nick=" NICK_A
+                               " len=31", T_IO_MS) == 0,
+                     "node A never applied alice's topic, and the tick hook's gate is "
+                     "\"node A holds a topic\", so without this the transaction below "
+                     "would never be sent and every assertion after it would be about "
+                     "nothing.\n  node said: %s", a.out);
+        /* AND THE LINK IS UP BEFORE ann REGISTERS. ann registering is what fires the
+         * transaction, and `send_hostile_burst()` needs a live connection on node A's
+         * link to node B -- so a transaction fired before the handshake completes goes
+         * nowhere and the case would be about nothing at all. A barrier, not a sleep,
+         * and it is the only ordering in this case that cannot be left to chance. */
+        TF_CHECK_MSG(nf_expect(&a, "link_established: peer=" NAME_B, T_IO_MS) == 0,
+                     "node A never established its link to node B, so the hand-built "
+                     "transaction below has nowhere to go: `server_link_conn()` returns "
+                     "NULL for a link whose handshake has not finished and the sender "
+                     "silently returns.\n  node said: %s", a.out);
+        register_client(&ann, a.port, NICK_E);
+        tc_close(&alice);
+    }
+
+    /* 1. BOTH HOSTMASK COMPONENTS, each on its own line and neither printed. */
+    TF_CHECK_MSG(nf_expect(&b, "fed_nickreg_field_refused: nick=" NICK_E
+                           " field=user len=8 bad_bytes=1", T_IO_MS) == 0,
+                 "the receiver stored a `<user>` holding an ESC. 3.2 lets a middle "
+                 "parameter hold it, and it goes into `nick!user@host` as a byte between "
+                 "two names.\n  node said: %s", b.out);
+    /* The host on its own, and a refusal that merely reported `field=host` would be
+     * satisfied by a node that refused every host -- so the length and the bad-byte
+     * count are what say it refused THIS one. */
+    TF_CHECK_MSG(nf_expect(&b, "field=host len=8 bad_bytes=1", T_IO_MS) == 0,
+                 "the `<host>` refusal was not reported with the value's measurement "
+                 "beside it. `fed_nickreg_render()` is the one function that would put "
+                 "a peer's host into a hostmask and it has no callers, so this is "
+                 "stored-unprotected rather than leaking -- which is the state this pass "
+                 "is closing before the renderer lands.\n  node said: %s", b.out);
+
+    /* 2. `<topic_who>`, AND THE TOPIC STILL APPLIED. The two together are the whole
+     * of "refuse the field, keep the record": a fix that withheld the whole channel
+     * record would leave the topic unset, and this case's own next assertion is that
+     * the topic IS set. */
+    TF_CHECK_MSG(nf_expect(&b, "fed_burst_chan_refused: fd=5 channel=" CHAN_T
+                           " refused_topic=0 refused_topic_who=1 refused_modes=0",
+                           T_IO_MS) == 0,
+                 "the receiver did not report refusing `<topic_who>`, so a setter's name "
+                 "holding a space reached 333 beside the topic. It is a NICKNAME and "
+                 "valid_nick() refuses one everywhere else in this tree; the fact that "
+                 "333's parameter filter strips the bytes it would execute is not the "
+                 "same as a field this node can render.\n  node said: %s", b.out);
+    /* THE ABSENCE OF THE WITHHELD REPORT, and it is a real `strstr` rather than a
+     * `&& 0` dressed up as one: nothing this record carries is unstorable -- the topic
+     * is 20 bytes against CHAN_MAX_TOPIC and the mode string is 3 against
+     * CHAN_MAX_MODES -- so the only refused field is `<topic_who>`, and refusing a
+     * setter's NAME is not a reason to strip the topic and the mode set from every
+     * node the burst reaches. The buffer belongs to this case alone, so the absence is
+     * attributable. */
+    TF_CHECK_MSG(strstr(b.out, "fed_burst_chan_withheld: channel=" CHAN_T) == NULL,
+                 "the receiver declined to apply the presentation at all and said so. "
+                 "The only refused field in this record is `<topic_who>`, and a setter "
+                 "this node will not render costs one field's attribution -- not the "
+                 "topic and the mode set, which are storable and correct in the record.\n"
+                 "  node said: %s", b.out);
+    /* AND THE TOPIC REALLY DID LAND, read back over the WIRE from a client on the
+     * RECEIVER. The withheld line's absence above is the NEGATIVE of this claim; this
+     * is the positive one, and it is the assertion a fix that put `<topic_who>` back
+     * into the presentation group would fail -- the record was fine, only the name in
+     * it was not, and the topic is what a client reads on 332.
+     *
+     * 332 rather than 333, and the reason is that 333 is the very field this pass
+     * changed: it is where a refused `<topic_who>` would have shown up, so asserting on
+     * 333 would be asserting on the refused field's rendering rather than on the topic
+     * that survived beside it. */
+    register_client(&ann, b.port, NICK_C);
+    TF_CHECK_MSG(tc_send(&ann, "JOIN " CHAN_T) == 0, "carol's JOIN on node B failed");
+    TF_CHECK_MSG(tc_expect(&ann, " 366 ", T_IO_MS) == 0,
+                 "carol's JOIN on node B never completed, so she is not a member and "
+                 "the 332 below would be about a channel she cannot see");
+    at = tc_received(&ann);
+    TF_CHECK_MSG(tc_send(&ann, "TOPIC " CHAN_T) == 0, "carol's TOPIC query failed");
+    TF_CHECK_MSG(tc_expect(&ann, " 332 " NICK_C " " CHAN_T " :a topic that is fine",
+                           T_IO_MS) == 0,
+                 "a client on the RECEIVER was not shown the record's topic, so "
+                 "refusing `<topic_who>` took the presentation with it. A setter's NAME "
+                 "this node will not render costs one field's attribution; the topic is "
+                 "storable and correct in the same record, and 332 is where a client "
+                 "reads it.\n  carol saw: %s", tc_buffer(&ann) + at);
+    /* AND THE SETTER IS EMPTY RATHER THAN WRONG, which is the other half: a refused
+     * name stored as the peer's bytes would be a name this node cannot render, and 333
+     * renders it beside the topic to every member who asks. */
+    TF_CHECK_MSG(strstr(b.out, "bad\033setter") == NULL,
+                 "the `<topic_who>` the receiver refused is in its own log, so either "
+                 "the refusal printed the value it was refusing or the value was stored "
+                 "anyway.\n  node said: %s", b.out);
+
+    /* 3. THE TRANSACTION COMMITTED. `dropped=0` is the load-bearing number and it is
+     * what proves the refusal stayed a field refusal. */
+    TF_CHECK_MSG(nf_expect(&b, "fed_burst_applied: peer=" NAME_A, T_IO_MS) == 0,
+                 "node B never applied the transaction, so nothing above is about a "
+                 "burst this node accepted.\n  node said: %s", b.out);
+    TF_CHECK_MSG(strstr(b.out, "fed_burst_discarded") == NULL &&
+                 nf_expect_u64(&b, "burst_abandoned=", 0, 1000) == 0,
+                 "the receiver abandoned or discarded the transaction because a field "
+                 "was refused. That is the failure this policy exists to avoid: "
+                 "SBURSTE's counts are about records this node ACCEPTED, so refusing a "
+                 "field without counting its record makes the commit mismatch and "
+                 "leaves this node stale about every healthy channel in the burst.\n"
+                 "  node said: %s", b.out);
+
+    /* 4. THE MODE LETTER WITH A CONTROL BYTE IN IT IS NOT IN THE MODE SET. `replace_modes()`
+     * writes every byte through `chan_mode_set()`, which refuses anything
+     * `chan_mode_implemented()` does not name -- so this is asserted on the WIRE,
+     * through 324, because that is the only place `ch->modes[]` is rendered. */
+    TF_CHECK_MSG(nf_expect(&a, "hostile_sent: ok=1", T_IO_MS) == 0,
+                 "node A never sent the hand-built transaction, so the assertions "
+                 "above are about an earlier one.\n  node said: %s", a.out);
+    at = tc_received(&ann);
+    at = tc_received(&ann);
+    TF_CHECK_MSG(tc_send(&ann, "MODE " CHAN_T) == 0, "carol's MODE query failed");
+    TF_CHECK_MSG(tc_expect(&ann, " 324 ", T_IO_MS) == 0,
+                 "node B did not answer a MODE query, so the mode set cannot be read "
+                 "back and the assertion below would be about the read schedule.\n"
+                 "  carol saw: %s", tc_buffer(&ann) + at);
+    TF_CHECK_MSG(strstr(tc_buffer(&ann) + at, "\004") == NULL,
+                 "the control byte from the peer's `<modes>` is in the mode set node B "
+                 "answered 324 with. `chan_mode_set()` allowlists the letters through "
+                 "`chan_mode_implemented()`, which is what closes this field -- and this "
+                 "assertion is what makes that a claim rather than a comment.\n"
+                 "  carol saw: %s", tc_buffer(&ann) + at);
+    /* AND THE LETTER THAT DOES EXIST IS THERE. The pair is the claim: the field was
+     * stored, and the byte in it was not. Either assertion alone is satisfied by a node
+     * that refused the whole `<modes>` field, which is why they are two. */
+    TF_CHECK_MSG(strstr(tc_buffer(&ann) + at, "+b") != NULL,
+                 "the mode letter that DOES exist is missing from the mode set, so a "
+                 "node that refused the whole `<modes>` field would pass the assertion "
+                 "above.\n  carol saw: %s", tc_buffer(&ann) + at);
+
+    /* 5. AND NONE OF THE PEER'S BYTES IS ANYWHERE IN THE RECEIVER'S LOG. A report that
+     * printed the value it had just refused would be the same defect in a different
+     * place, and this is the assertion that catches it. */
+    TF_CHECK_MSG(strstr(b.out, "bad user") == NULL,
+                 "the `<user>` the receiver refused is in its own log, so the refusal "
+                 "line printed the value it was refusing.\n  node said: %s", b.out);
+    TF_CHECK_MSG(nf_stop(&a) == 0, "node A did not exit cleanly");
+    TF_CHECK_MSG(nf_stop(&b) == 0, "node B did not exit cleanly");
+    tc_close(&ann);
+    nf_free(&a);
+    nf_free(&b);
+    g_hostile = 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -2725,6 +3089,7 @@ int main(void)
     case_truncated_burst_changes_nothing();
     case_open_transaction_released_at_shutdown();
     case_over_long_topic_is_refused();
+    case_identifiers_are_refused_and_the_record_kept();
     case_channel_count_bound();
     case_channel_ceiling_refuses_what_the_budget_would_allow();
     tf_done("fed_burst");

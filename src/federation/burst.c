@@ -141,6 +141,32 @@ enum {
     BURST_CHAN_REFUSED_MODES     = 1u << 2
 };
 
+/* THE FIELDS WHOSE REFUSAL WITHHOLDS THE WHOLE PRESENTATION, and it is TWO of the
+ * three rather than three of the three (#142).
+ *
+ * `apply_end()` refuses to `apply_topic()` or `replace_modes()` a channel whose record
+ * carried a field this node could not hold, and the reasoning is that the origin's
+ * presentation of a channel is ONE record rather than three fields: `replace_modes()`
+ * clears through the old value before setting the new one, so handing it the zeroed
+ * field a refusal leaves behind would strip the channel of every mode letter it has.
+ *
+ * `<topic_who>` IS NOT ONE OF THEM, and it was in the group by accident of the mask
+ * being written before anything refused it. Nothing is CLEARED through it: the setter
+ * is not a mode, and an EMPTY setter is already a legal state -- `chan_set_topic()`
+ * produces one whenever a topic is stored with no recorded setter, and 333 renders it
+ * as a bare `:`. So a peer whose setter name this node will not hold loses one field's
+ * attribution, which is what `apply_chan()`'s own comment calls "a wrong value", and
+ * the trade it made was to withhold rather than to hold something wrong.
+ *
+ * WHAT A SPACE IN THE SETTER NAME WOULD OTHERWISE COST, and this is the reason the
+ * group is two fields and not three: with it in the group, one peer whose
+ * `<topic_who>` holds a space would strip the topic AND the mode set from every node
+ * that received its burst. The topic itself is storable and correct in that record.
+ * That is a worse outcome than the one the refusal was introduced to prevent, and it
+ * is why this is a separate constant rather than a comment on the bit. */
+#define BURST_CHAN_PRESENTATION_MASK                                     \
+    ((unsigned)(BURST_CHAN_REFUSED_TOPIC | BURST_CHAN_REFUSED_MODES))
+
 typedef struct {
     int             open;  /* a BEGIN has arrived and no COMMIT has           */
     char            origin[IRC_MAX_SERVER_NAME + 1];
@@ -1208,10 +1234,57 @@ static int apply_chan(server_t *s, server_link_t *link, const message_t *m)
     if (!burst_copy(sc->topic, sizeof sc->topic, m->params[5])) {
         sc->refused |= BURST_CHAN_REFUSED_TOPIC;
     }
-    if (!burst_copy(sc->topic_who, sizeof sc->topic_who,
-                    ((m->params[2][0] == '-') ? "" : m->params[2]))) {
-        sc->refused |= BURST_CHAN_REFUSED_TOPIC_WHO;
+    /* THE `<topic_who>` BYTE RULE, AND IT IS A DIFFERENT RULE FROM THE TOPIC'S (#142).
+     *
+     * `<topic>` above is free text: stored, relayed, rendered to every member, and
+     * therefore stripped. `<topic_who>` is the setter's NICKNAME, and a nickname is an
+     * IDENTIFIER -- it is validated with 2.1's charset everywhere else in this tree
+     * (`valid_nick()` at registration, `valid_nick()` again in `fed_in_sjoin()`, and
+     * again in `nickreg_learn()`) precisely because a name this node could not
+     * qualify, compare or render is a name nothing can use. 333 renders this field
+     * beside the topic, so a space in it would break the numeric's field list and a
+     * control byte in it would reach every member who asks for the topic.
+     *
+     * `emit_numeric_ex()` does strip a C0/DEL/C1 out of a 333 parameter before it goes
+     * on the wire, so this is not an open injection today -- it is the same class as
+     * `<host>` in #142: a value that every renderer in the tree would MUTATE, stored
+     * because nothing had asked. A space is the byte that survives all of them, and a
+     * space is a field separator.
+     *
+     * THE COST, named rather than assumed: a peer whose topic-setter name fails 2.1's
+     * charset gets the topic applied with an EMPTY `topic_who` rather than with the
+     * name. 333 still answers, the topic still reaches every member, and what is lost
+     * is one field's attribution -- which is the same trade `chan_set_topic()` makes
+     * when it refuses an over-long topic, and for the same reason: a wrong value is
+     * worse than an absent one, because a client can tell the difference.
+     */
+    {
+        const char *who = (m->params[2][0] == '-') ? "" : m->params[2];
+
+        if (!burst_copy(sc->topic_who, sizeof sc->topic_who, who) ||
+            (who[0] != '\0' && !valid_nick(who))) {
+            sc->refused |= BURST_CHAN_REFUSED_TOPIC_WHO;
+            sc->topic_who[0] = '\0';
+        }
     }
+    /* `<modes>` IS A WIDTH BOUND AND DELIBERATELY NOTHING MORE, and that is a
+     * DECISION this pass reached by measurement rather than by adding a rule.
+     *
+     * #142 asks about it alongside `<user>` and `<host>`, and the honest answer is that
+     * its exposure is ALREADY CLOSED, by a predicate that is not this file's:
+     * `replace_modes()` writes every byte through `chan_mode_set()`, which refuses
+     * anything `chan_mode_implemented()` does not name. A peer sending
+     * `SBURSTC ... +` gets the letter dropped at the only place the value is
+     * turned into channel state, and `ch->modes[]` -- which is what 324 renders -- can
+     * therefore never hold it. The shadow copy is bounded by `burst_copy()` and the
+     * only other thing this file does with it is `strlen()` it for the withheld report,
+     * so it never reaches a terminal either.
+     *
+     * A second rule here would be the decorative kind: it would change no observable
+     * and would be one more answer to "which bytes may this field carry" for a field
+     * that already has one downstream. `tests/integration/test_fed_burst.c` carries the
+     * assertion that the allowlist is what closes it, so the claim is a check rather
+     * than a comment. */
     if (!burst_copy(sc->modes, sizeof sc->modes,
                     ((m->params[4][0] == '-') ? "" : m->params[4]))) {
         sc->refused |= BURST_CHAN_REFUSED_MODES;
@@ -1225,15 +1298,24 @@ static int apply_chan(server_t *s, server_link_t *link, const message_t *m)
          * with a 255-byte cache is a peer whose sender does not check its own
          * bound -- which is a thing an operator can act on and a bare flag is
          * not. */
+        /* `reason=FIELD_TOO_WIDE` WAS WRONG ONCE `<topic_who>` COULD BE REFUSED FOR
+         * ITS BYTES (#142), and a line whose reason is a LIE is worse than a line with
+         * no reason: a reader seeing `refused_topic_who=1` and `topic_who_len=10`
+         * against a 63-byte bound would conclude the field was too long, and it was
+         * not. So the reason names the class both refusals belong to and the setter's
+         * bad-byte count is printed beside its length -- which is what lets the reader
+         * tell "too wide for my field" from "carries a byte no parameter can hold",
+         * and those are two different things about two different peers. */
         printf("[observable] fed_burst_chan_refused: fd=%d channel=%s "
                "refused_topic=%d refused_topic_who=%d refused_modes=%d "
-               "topic_len=%zu topic_who_len=%zu modes_len=%zu "
-               "reason=FIELD_TOO_WIDE\n",
+               "topic_len=%zu topic_who_len=%zu topic_who_bad_bytes=%zu "
+               "modes_len=%zu reason=FIELD_NOT_STORABLE\n",
                link->fd, sc->name,
                (sc->refused & BURST_CHAN_REFUSED_TOPIC) != 0u ? 1 : 0,
                (sc->refused & BURST_CHAN_REFUSED_TOPIC_WHO) != 0u ? 1 : 0,
                (sc->refused & BURST_CHAN_REFUSED_MODES) != 0u ? 1 : 0,
-               strlen(m->params[5]), strlen(m->params[2]), strlen(m->params[4]));
+               strlen(m->params[5]), strlen(m->params[2]),
+               conn_text_bad_count(m->params[2]), strlen(m->params[4]));
     }
     sc->topic_when = when;
     g_shadow.cur = sc;
@@ -1767,7 +1849,7 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
              * topic the receiver could not keep says nothing about who is on the
              * channel. `dropped` counts the record so the loss is in the number an
              * operator reads rather than only in the log line above. */
-            if (sc->refused == 0u) {
+            if ((sc->refused & BURST_CHAN_PRESENTATION_MASK) == 0u) {
                 apply_topic(ch, sc);
                 replace_modes(ch, sc->modes);
             } else {
@@ -1793,7 +1875,8 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
                  * read would be reporting half a channel from half a record. */
                 printf("[observable] fed_burst_chan_withheld: channel=%s "
                        "kept_topic_len=%zu kept_modes_len=%zu refused_topic=%d "
-                       "refused_topic_who=%d refused_modes=%d reason=FIELD_TOO_WIDE\n",
+                       "refused_topic_who=%d refused_modes=%d "
+                       "reason=FIELD_NOT_STORABLE\n",
                        ch->name, strlen(ch->topic), strlen(ch->modes),
                        (sc->refused & BURST_CHAN_REFUSED_TOPIC) != 0u ? 1 : 0,
                        (sc->refused & BURST_CHAN_REFUSED_TOPIC_WHO) != 0u ? 1 : 0,

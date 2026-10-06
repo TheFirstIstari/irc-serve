@@ -94,6 +94,8 @@ ALLOWED = {
     "fed_queue_why_name": "a fixed table key",
     "fed_federate_reason": "a fixed table key",
     "reason": "a fixed literal at every call site",
+    "field": "which of two named fields a refusal is about -- \"user\" or \"host\", "
+             "a fixed literal at both call sites (nickreg_ident_refused)",
     "why": "a fixed literal at every call site (a shadow_discard() or report reason)",
     "which": "this node's own enum index",
     "verb": "a table lookup, never the wire's command word",
