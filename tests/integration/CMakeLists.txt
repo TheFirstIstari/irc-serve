@@ -456,6 +456,12 @@ irc_add_integration_test(test_fed_loop test_fed_loop.c)
 # channel's SPRIVMSG to the owner.
 irc_add_integration_test(test_fed_relay test_fed_relay.c)
 
+# #132: WHO IS ALLOWED TO SET A CHANNEL'S TOPIC. Three cases and a third node
+# between them, because the rule has three arms and the one that needed three
+# nodes is the one whose absence let the defect survive a suite that already had
+# two-node federation in it.
+irc_add_integration_test(test_fed_topic_authority test_fed_topic_authority.c)
+
 # 4.3 / 7/Phase 6 acceptance criterion 2: the FULL 353 CONTENTS on BOTH nodes
 # after a resync, in the Phase 4 order and terminated by a 366 -- and the
 # replace-never-merge property the resync exists for, which needs three bursts

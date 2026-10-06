@@ -179,7 +179,23 @@ run_fault needle-containing-nul-handled-with-strlen \
     nul_needle_strlen.py
 
 note ""
-note "teeth: $PASS of 11 faults caught, $FAIL not."
+# ---------------------------------------------------------------------------
+# 12. #132: THE TOPIC AUTHORITY CHECK READING THE TRANSPORT INSTEAD OF THE LINE.
+#
+# The one fault here whose test needs a THREE-NODE mesh. Every other fault in this
+# file is a filter or a predicate that a two-node suite can see; this one was
+# invisible to a suite that had two-node federation in it and green on every gate
+# cell, because on the one topology the two-node fixture builds the transport and
+# the subject are the same server. That is the reason the new test spawns a chain
+# rather than a pair, and it is why this fault names both of the test's cases: one
+# alone would prove the file has teeth and not that the test does.
+# ---------------------------------------------------------------------------
+run_fault stopic-authority-reads-the-link-not-the-line \
+    "test_fed_topic_authority test_fed_relay" \
+    stopic_link_name_instead_of_subject.py
+
+note ""
+note "teeth: $PASS of 12 faults caught, $FAIL not."
 if [ "$FAIL" != "0" ]; then
     note "not caught:$FAILED_LIST"
     exit 1
