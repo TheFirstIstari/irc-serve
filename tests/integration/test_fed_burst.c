@@ -2738,7 +2738,12 @@ static void case_identifiers_are_refused_and_the_record_kept(void)
      * of "refuse the field, keep the record": a fix that withheld the whole channel
      * record would leave the topic unset, and this case's own next assertion is that
      * the topic IS set. */
-    TF_CHECK_MSG(nf_expect(&b, "fed_burst_chan_refused: fd=5 channel=" CHAN_T
+    /* THE NEEDLE STARTS AT `channel=` AND NOT AT `fd=`, and this file already says why
+     * in so many words above: the descriptor is allocated by the receiver and its value
+     * is not a property of the behaviour under test. The first version of this needle
+     * pinned `fd=5` and passed on macOS and failed on Linux -- this project's sixth
+     * instance of that pattern, and the reason the rule is written down. */
+    TF_CHECK_MSG(nf_expect(&b, "channel=" CHAN_T
                            " refused_topic=0 refused_topic_who=1 refused_modes=0",
                            T_IO_MS) == 0,
                  "the receiver did not report refusing `<topic_who>`, so a setter's name "
