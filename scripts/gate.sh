@@ -324,6 +324,29 @@ fi
 # portability ratchet above gives: inflating the cell count would make the build
 # matrix look worse than it is, and folding it into a cell would make a source
 # problem look like a build problem.
+echo "--- teardown-helper audit (source-wide, strict) ---"
+# `--strict` and not the full enumeration, and the difference is the whole design of
+# the script: the enumeration cannot tell a helper from its caller, so gating on it
+# would gate on a question it cannot answer. `--strict` gates on the two helpers whose
+# NAME promises a whole-job release -- tf_done and tf_report -- which is a short list,
+# has no false positives, and is red when tf_done is restored to freeing nothing.
+#
+# WHAT IT IS NOT: a leak detector. It reads the BODY, so it catches the shape that
+# caused PR #140's LeakSanitizer finding and it would not catch a leak introduced any
+# other way. LeakSanitizer on the Linux CI job remains the only runtime oracle for the
+# leak itself, and nothing here changes that.
+if python3 "$root/scripts/audit-teardown.py" --strict \
+        > "$GATE_BUILD_ROOT/teardown.log" 2>&1; then
+    sed -n '1p' "$GATE_BUILD_ROOT/teardown.log" | sed 's/^/  /'
+    tail -1 "$GATE_BUILD_ROOT/teardown.log" | sed 's/^/  /'
+    SUMMARY="${SUMMARY}audit-teardown(strict) OK\n"
+else
+    printf '  %-26s %s\n' "audit-teardown.py" "FAILED"
+    sed -n '1,40p' "$GATE_BUILD_ROOT/teardown.log" | sed 's/^/      /'
+    FAILED_CHECKS=$((FAILED_CHECKS + 1))
+    SUMMARY="${SUMMARY}audit-teardown(strict) FAILED\n"
+fi
+
 echo "--- packaging truth (source-wide) ---"
 if python3 "$root/scripts/check-packaging.py" > "$GATE_BUILD_ROOT/packaging.log" 2>&1; then
     sed -n '1p' "$GATE_BUILD_ROOT/packaging.log" | sed 's/^/  /'

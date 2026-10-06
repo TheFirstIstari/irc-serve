@@ -47,6 +47,7 @@ test: build
 	./scripts/check-attribution.sh
 	python3 ./scripts/check-peer-log-sites.py
 	python3 ./scripts/check-packaging.py
+	python3 ./scripts/audit-teardown.py --strict
 
 # `benchmark` mirrors CI job `ci_benchmark`.
 benchmark:

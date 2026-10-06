@@ -103,13 +103,71 @@ void tf_report(const char *expr, const char *file, int line)
     fflush(stdout);
 }
 
+/* ---------------------------------------------------------------------------
+ * tf_done: the exit path EVERY test takes, and until now a registry edit
+ * ---------------------------------------------------------------------------
+ * WHAT THIS WAS. A loop over the node registry calling `tf_unregister()`, which
+ * removes a node from the array and frees NOTHING -- no `nf_kill()`, no `nf_free()`,
+ * no `close()`. It read like a teardown and discharged no debt, which is how the
+ * two leaks PR #140's Linux LeakSanitizer run found got as far as the edge of this
+ * file: every test in the tree reaches this function, and every one of them reached
+ * a helper that freed nothing.
+ *
+ * WHY IT SURVIVED, and this is the part worth writing down rather than fixing.
+ * A leak in a helper SHARED BY EVERY TEST is invisible to every test that uses it,
+ * for the same reason a defect in a shared teardown helper is invisible to the suite
+ * in any language: the assertion would have to be about the process's memory, and
+ * this suite asserts on wire bytes. There is no `ctest` assertion that distinguishes
+ * "exited cleanly" from "exited cleanly having leaked", which is why the only oracle
+ * is LeakSanitizer, which runs on Linux CI and nowhere else. A test asserting
+ * anything about this locally would be a test asserting nothing.
+ *
+ * WHAT IT DOES NOW, in the order the order matters:
+ *
+ *   nf_kill() FIRST, then nf_free(). The other order would free the buffer and then
+ *   try to kill through a node whose pid field had been zeroed -- and nf_kill() is
+ *   idempotent for a node a test already stopped (it returns early on `pid <= 0`),
+ *   so calling it on a node whose nf_free() has already run is a no-op rather than a
+ *   double free. Killing first is what leaves that property available; freeing first
+ *   is what spends it.
+ *
+ *   SO A TEST THAT ALREADY TEARD DOWN ITS NODES IS UNAFFECTED. Every test in this
+ *   tree does -- the harness documents "Does NOT kill; call nf_kill() or nf_stop()
+ *   first" on nf_free() precisely because nf_free() is the wrong half -- so for a
+ *   clean run this loop does no work at all, and for a test that forgot, it does the
+ *   work the test's author meant by calling it.
+ *
+ * COST: one `kill(2)` and one `waitpid(2)` per node a test did not already reap, and
+ * one `free()` per node whose buffer is still allocated. On a clean run, nothing.
+ * NOT a fixed `sleep()` and NOT a fixed timeout: nf_kill() waits on the child's pid
+ * with `wait`, bounded by its own budget, which is the harness's existing mechanism.
+ *
+ * WHAT IT STILL DOES NOT DO, because honesty about the limit is the point: it cannot
+ * free a `test_client_t`, a `tf_tls_t` or a raw socket, because none of those is
+ * registered anywhere and a registry that had them would have had to be added when
+ * they were created. That is why `tc_init` without `tc_close` was a real LSan finding
+ * in its own right: those helpers are the test author's to pair. Adding a second
+ * registry for them is a change to every fixture in the tree and is not this
+ * function's decision to make; see scripts/audit-teardown.py, which is the sweep
+ * that found this one and says what it cannot decide.
+ */
 void tf_done(const char *name)
 {
     int i;
 
-    for (i = 0; i < g_nnodes; i++) {
-        tf_unregister(g_nodes[i]);
+    /* Iterate by index and unregister AS WE GO, because tf_unregister() does
+     * `g_nodes[i] = g_nodes[--g_nnodes]` -- it compacts the array by moving the LAST
+     * element into the hole. The previous version walked forward calling
+     * tf_unregister() on every slot, which SKIPS an element every time: with three
+     * nodes [A,B,C], unregistering index 0 moves C into it, and the loop then reads
+     * index 1 (now C) and index 2 (past the end), leaving B never released. It
+     * "worked" because the registry was not what the caller cared about; now it is,
+     * so the walk is from the end and the array is only reset once at the end. */
+    for (i = g_nnodes - 1; i >= 0; i--) {
+        nf_kill(g_nodes[i]);
+        nf_free(g_nodes[i]);
     }
+    g_nnodes = 0;
     printf("ok: %s\n", name);
     fflush(stdout);
 }
