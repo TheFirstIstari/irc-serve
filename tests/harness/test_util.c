@@ -191,12 +191,21 @@ size_t tf_count(const char *hay, const char *needle)
     return n;
 }
 
-char *tf_read_code(const char *rel, size_t *len_out)
+/* THE STRIPPER, AND WHY IT IS NOW A FUNCTION RATHER THAN A LOOP.
+ *
+ * It was a loop inside `tf_read_code()` until #134's leak, and the reason it had to
+ * become one is worth stating because it is the whole of that defect: the loop was
+ * fine, but it was only reachable through a function that RETURNED ITS BUFFER, so
+ * every caller acquired an obligation and every caller had to remember it. Two of
+ * #134's five call sites forgot -- and one of them could not have been caught by
+ * reading the harness, because the obligation had left the harness.
+ *
+ * So the stripper writes into a CALLER'S buffer and owns nothing. Both entry points
+ * are thin wrappers over it, which is also why the two cannot disagree about what
+ * "stripped" means -- a second copy of a C comment stripper is what
+ * `test_close_sites.c`'s header says this one was moved here to avoid. */
+static long strip_into(char *out, size_t cap, FILE *f, size_t *len_out)
 {
-    char path[1024];
-    FILE *f;
-    char *out;
-    size_t cap = 65536;
     size_t len = 0;
     int in_block = 0;
     int in_line = 0;
@@ -204,27 +213,18 @@ char *tf_read_code(const char *rel, size_t *len_out)
     int prev = 0;
     int ch;
 
-    (void)snprintf(path, sizeof path, "%s/%s", IRCSERVE_SRC_DIR, rel);
-    f = fopen(path, "rb");
-    if (f == NULL) {
-        return NULL;
-    }
-    out = (char *)malloc(cap);
-    if (out == NULL) {
-        fclose(f);
-        return NULL;
+    if (out == NULL || cap == 0u || f == NULL) {
+        return -1;
     }
     while ((ch = fgetc(f)) != EOF) {
+        /* REFUSE RATHER THAN TRUNCATE, and the growth the heap form does is what
+         * makes that difference visible: here `cap` is the caller's, so a file that
+         * does not fit has to say so. A source check that silently examines half a
+         * file reports clean for a reason nobody can see, and that is the same
+         * failure as a leak check that silently examines none of it. */
         if (len + 2u >= cap) {
-            char *grown = (char *)realloc(out, cap * 2u);
-
-            if (grown == NULL) {
-                free(out);
-                fclose(f);
-                return NULL;
-            }
-            out = grown;
-            cap *= 2u;
+            out[0] = '\0';
+            return -1;
         }
         /* A comment opener is two characters, so the CLOSING pair is detected
          * on its second character and the previous one has to be remembered.
@@ -276,12 +276,71 @@ char *tf_read_code(const char *rel, size_t *len_out)
         out[len++] = (char)ch;
         prev = ch;
     }
-    fclose(f);
     out[len] = '\0';
     if (len_out != NULL) {
         *len_out = len;
     }
-    return out;
+    return (long)len;
+}
+
+char *tf_read_code(const char *rel, size_t *len_out)
+{
+    char path[1024];
+    FILE *f;
+    char *out;
+    size_t cap = 65536;
+    size_t len = 0;
+
+    (void)snprintf(path, sizeof path, "%s/%s", IRCSERVE_SRC_DIR, rel);
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        return NULL;
+    }
+    /* ONE PASS PER CAPACITY, growing until it fits, which is what the loop used to
+     * do in one pass and what keeps this wrapper from needing the stripper's state.
+     * The stripper REFUSES a file that does not fit `cap`, so growing is a loop
+     * here rather than a branch in there -- and the loop cannot leak the partial
+     * result, because every exit path frees before it returns. */
+    for (;;) {
+        out = (char *)malloc(cap);
+        if (out == NULL) {
+            fclose(f);
+            return NULL;
+        }
+        if (strip_into(out, cap, f, &len) >= 0) {
+            if (len_out != NULL) {
+                *len_out = len;
+            }
+            return out;
+        }
+        free(out);
+        if (len + 2u >= cap && cap < (size_t)TF_SRC_MAX * 4u) {
+            cap *= 2u;
+            continue;
+        }
+        /* Not a size problem -- `strip_into` only fails on size or a bad
+         * argument, and the arguments were checked above -- so this is a file the
+         * harness will not read rather than one it ran out of room for. Refusing is
+         * the old behaviour for an unreadable file and stays it. */
+        fclose(f);
+        return NULL;
+    }
+}
+
+long tf_read_code_into(char *dst, size_t cap, const char *rel, size_t *len_out)
+{
+    char path[1024];
+    FILE *f;
+    long n;
+
+    (void)snprintf(path, sizeof path, "%s/%s", IRCSERVE_SRC_DIR, rel);
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        return -1;
+    }
+    n = strip_into(dst, cap, f, len_out);
+    fclose(f);
+    return n;
 }
 
 int tf_calls(const char *code, const char *name)

@@ -99,19 +99,45 @@
 
 #include "harness/test_util.h"
 
-/* Read one source file with comments and string literals stripped. A NULL result
- * is a hard failure here rather than something each caller re-checks, because
- * every use below would otherwise have to carry its own "did the file open?"
- * assertion and a missing file would read as "the pattern was absent", which is
- * the exact vacuous-pass this file exists to avoid. */
-static char *read_src(const char *rel)
+/* Read one source file with comments and string literals stripped, INTO A CALLER'S
+ * BUFFER, and this signature is the fix for the leak this file shipped with.
+ *
+ * THE FIRST VERSION returned a `char *` from `tf_read_code()` and every caller had to
+ * `free()` it. Linux's LeakSanitizer found the one that did not:
+ *
+ *     Direct leak of 65536 byte(s) in 1 object(s)
+ *     SUMMARY: AddressSanitizer: 65536 byte(s) leaked
+ *
+ * 65536 is `tf_read_code()`'s initial `cap`, so the trace names the harness function
+ * and not the test -- and that is the shape of the defect. The obligation had left
+ * the harness through a one-line wrapper, so no reading of the harness could have
+ * found it and no sweep of the harness's OWN callers could see it either, because the
+ * caller of the wrapper is not a caller of the harness. That is `audit-teardown.py`'s
+ * stated limitation ("it cannot tell a helper from its caller") arriving as a real
+ * leak rather than as a caveat.
+ *
+ * SO THERE IS NO BUFFER TO FORGET NOW. `dst` is the caller's, the function owns
+ * nothing, and no path through this file can leak -- including the assertion-failure
+ * paths, which is the other half of why this was invisible: `TF_CHECK_MSG` calls
+ * `exit(1)`, and a heap buffer was still live at that point. A caller-provided
+ * buffer is correct on every exit path, which is the property a returned pointer
+ * does not have.
+ *
+ * A failure to read is a hard error here rather than something each caller
+ * re-checks, because every use below would otherwise have to carry its own "did the
+ * file open?" assertion and a missing file would read as "the pattern was absent" --
+ * the exact vacuous-pass this file exists to avoid. The buffer is NOT silently
+ * truncated when a file is too large; `tf_read_code_into()` refuses, and that is said
+ * here so the next reader does not assume otherwise. */
+static void read_src(char *dst, size_t cap, const char *rel)
 {
-    char *code = tf_read_code(rel, NULL);
+    const long n = tf_read_code_into(dst, cap, rel, NULL);
 
-    TF_CHECK_MSG(code != NULL,
-                 "could not read %s -- every check below would pass vacuously if a "
-                 "source file it inspects cannot be opened", rel);
-    return code;
+    TF_CHECK_MSG(n >= 0,
+                 "could not read %s into %lu bytes -- every check below would pass "
+                 "vacuously if a source file it inspects cannot be read, and a source "
+                 "check that silently examines half a file reports clean for a reason "
+                 "nobody can see", rel, (unsigned long)cap);
 }
 
 /* Does `hay` contain `needle`? A named wrapper rather than strstr at each call
@@ -170,7 +196,9 @@ static void squash(char *s)
  */
 static void check_width_is_derived(void)
 {
-    char *hdr = read_src("src/core/connection.h");
+    char hdr[TF_SRC_MAX];
+
+    read_src(hdr, sizeof hdr, "src/core/connection.h");
 
     TF_CHECK_MSG(has(hdr, "CONN_HOSTMASK_MAX"),
                  "connection.h no longer defines CONN_HOSTMASK_MAX at all. Every "
@@ -197,7 +225,6 @@ static void check_width_is_derived(void)
                  "three widths is exactly one byte short of the string "
                  "conn_hostmask() builds -- and 'exactly one byte short' is the "
                  "condition that makes the 404 branch reachable.");
-    free(hdr);
 }
 
 /* ---------------------------------------------------------------------------
@@ -215,7 +242,14 @@ static void check_width_is_derived(void)
  */
 static void check_fields_are_arrays(void)
 {
-    char *hdr = read_src("src/core/connection.h");
+    char hdr[TF_SRC_MAX];
+
+    /* THE FUNCTION THAT LEAKED, and the line above is the whole of the change: it
+     * used to be `char *hdr = read_src(...)` with no `free()` anywhere below, and
+     * this was the only leak Linux's LeakSanitizer reported in 98 tests. Nothing
+     * else in this file leaked, which `leaks --atExit` over all 98 binaries confirms
+     * -- see the header. */
+    read_src(hdr, sizeof hdr, "src/core/connection.h");
 
     squash(hdr);
 
@@ -305,8 +339,11 @@ static void check_render_is_three_fields(void)
  */
 static void check_no_raw_params_in_printf(void)
 {
-    char *code = read_src("src/core/msg_verbs.c");
-    const char *at = code;
+    char code[TF_SRC_MAX];
+    const char *at;
+
+    read_src(code, sizeof code, "src/core/msg_verbs.c");
+    at = code;
 
     while (at != NULL && *at != '\0') {
         const char *call = strstr(at, "printf(");
@@ -381,7 +418,6 @@ static void check_no_raw_params_in_printf(void)
         }
         at = stmt_end + 1;
     }
-    free(code);
 }
 
 int main(void)
@@ -413,7 +449,9 @@ int main(void)
          * file still uses the log policy P4's rule points at. Both are
          * liveness checks, not correctness checks, and the four above are the
          * correctness ones. */
-        char *mv = read_src("src/core/msg_verbs.c");
+        char mv[TF_SRC_MAX];
+
+        read_src(mv, sizeof mv, "src/core/msg_verbs.c");
 
         TF_CHECK_MSG(has(mv, "conn_hostmask("),
                      "msg_verbs.c no longer calls conn_hostmask(). P1 derives a "
@@ -425,7 +463,6 @@ int main(void)
                      "msg_verbs.c no longer calls conn_text_logsafe() anywhere. The "
                      "rule above is then enforcing nothing in this file, and every "
                      "log line here prints a client string raw.");
-        free(mv);
     }
 
     tf_done("hostmask_reachability");

@@ -51,8 +51,43 @@ Exit 0 always, UNLESS `--strict` is passed, in which case a teardown-shaped help
 with no release call in its body is a failure -- and even then only for the ones whose
 NAME says the whole job, which is a much shorter list and is the `--strict` list below.
 
-THE `--strict` LIST, AND WHY IT IS SHORT
------------------------------------------
+THE SECOND RULE, ADDED AFTER THE REAL LEAK, AND ITS LIMIT IS THE POINT
+---------------------------------------------------------------------
+#134's test read a source through `tf_read_code()` behind a one-line `read_src()`
+wrapper, and the function that used the wrapper forgot the `free()`. Linux's
+LeakSanitizer reported it as `Direct leak of 65536 byte(s) in 1 object(s)` -- one
+object, which is `tf_read_code()`'s initial `cap`, so the trace names the HARNESS and
+not the test.
+
+That is the first rule's stated limitation arriving as a real defect rather than as a
+caveat: the obligation had left the harness through the wrapper, so no reading of the
+harness could have found it and no sweep of the harness's own call sites could see it
+either -- the caller of the wrapper is not a caller of the harness.
+
+RULE 2 IS THEREFORE ABOUT ACQUIRE-WITHOUT-RELEASE **IN THE SAME FUNCTION**, and it is
+gated:
+
+    var = <one of tf_read_code( strdup( strndup( malloc( calloc( )>
+        => var must be the operand of a free() in the SAME function
+
+WHAT IT DOES NOT SEE, stated here rather than discovered later: **it does not see
+through a wrapper.** The leak it was written for went through one, so rule 2 would not
+have caught it as shipped -- which is exactly why the FIX was to remove the
+possibility rather than to add the rule. `test_hostmask_reachability.c`'s `read_src()`
+now takes a CALLER-PROVIDED buffer and owns nothing, so there is no pointer to lose;
+the other 19 direct `tf_read_code()` sites pair correctly and were never at risk.
+`realloc` is EXCLUDED on purpose: it frees the old block itself, so a `p = realloc(p,
+n)` needs no separate `free()` and flagging it would be a false positive on correct
+code.
+
+THE HONEST SUMMARY OF THE TWO RULES: rule 1 asks "does this teardown-shaped helper
+release anything", rule 2 asks "is this pointer released where it was acquired". Both
+are decidable from the text. Neither can answer "was the right thing acquired on this
+path at all", which is the question a leak check actually asks and the reason Linux CI
+remains the only oracle for the thing itself.
+
+THE `--strict` LIST FOR RULE 1, AND WHY IT IS SHORT
+--------------------------------------------------
 The names for which "no release call in the body" IS a finding, because the name
 itself promises the release and nothing else would:
 
@@ -90,18 +125,94 @@ RELEASE = re.compile(
     r"|\bshutdown\s*\("
     r"|\b[A-Za-z_][A-Za-z0-9_]*_(free|close|release|destroy|kill)\s*\(")
 
-# A C function definition at the start of a line, for top-level functions. The tree
-# puts return types on their own line, so both shapes are matched.
+# RULE 2: the acquire shapes whose RESULT is heap the caller owns. Narrow on purpose --
+# a list that grew to "anything named *_read" would flag a helper that returns an
+# int, and a check that flags correct code is the six-false-positives failure again.
+# `realloc` is absent because it releases the block it replaces.
+# NOT anchored to the start of a line: this tree indents assignments and wraps them
+# across lines, and a needle that only matched one of those layouts would report
+# clean on the majority of the code it exists to check. The `= ACQUIRE(` shape is
+# specific enough on its own -- a comparison (`==`) or a compound assignment cannot
+# match it, because `==` is not `= ` and `+=` is not `=`.
+ACQUIRE = re.compile(
+    r"\b(\w+)\s*=\s*(?:tf_read_code|strdup|strndup|malloc|calloc)\s*\(")
+
+FREE = re.compile(r"\bfree\s*\(\s*(?:&|\(\s*\w+\s*\*\s*\)\s*)?")
+
+# A C function definition, for NAMING the enumeration. Not used for body boundaries --
+# see `top_level_bodies()` for why, and that is the third version of this and the
+# first two were wrong.
 FUNC_DEF = re.compile(
     r'^(?:static\s+|extern\s+)?(?:const\s+|unsigned\s+|signed\s+|struct\s+\w+\s*\*?'
     r'|void\s+|int\s+|size_t\s+|char\s+|uint\d+_t\s+|long\s+)?\w[\w\s\*]*?'
     r'\b(\w+)\s*\([^;]*\)\s*\n\{', re.M)
+
+# TOP-LEVEL FUNCTION BODIES, and this is the version that is right.
+#
+# The tree indents EVERY nested brace -- an `if` body, a loop body, a compound
+# literal, an initialiser -- and opens a function body at column 0. So a `{` at the
+# start of a line with nothing before it IS a function body, and brace-matching from
+# it gives the whole body without needing to parse the signature at all.
+#
+# THE TWO VERSIONS THIS REPLACES, and both reported three FALSE POSITIVES on the
+# shipped tree by ending a "function body" before the `free()` that was really there:
+#   * matching definitions by signature -- `FUNC_DEF` does not match every shape this
+#     tree writes, and one unmatched definition means the next match's brace count
+#     is taken from the wrong place;
+#   * a hand-rolled "same function" scan.
+# A rule built on a boundary this script cannot find reliably is a rule that flags
+# correct code, and a check that flags correct code gets deleted.
+def top_level_bodies(clean):
+    bodies = []
+    lines = clean.split("\n")
+    offs = []
+    off = 0
+    for ln in lines:
+        offs.append(off)
+        off += len(ln) + 1
+    for i, ln in enumerate(lines):
+        if not ln.startswith("{"):
+            continue
+        start = offs[i]
+        depth = 0
+        j = start
+        while j < len(clean):
+            if clean[j] == "{":
+                depth += 1
+            elif clean[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    bodies.append((i + 1, clean[start:j + 1]))
+                    break
+            j += 1
+    return bodies
 
 # A call site anywhere: `foo_done(` not preceded by a word character.
 CALL = None  # built per-function
 
 
 def strip_comments(src):
+    """Blank comments AND string/character literals, keeping every byte offset.
+
+    WHY LITERALS ARE BLANKED HERE, and it is a bug this script had twice.
+
+    `top_level_bodies()` brace-matches to find function bodies, and a brace inside a
+    STRING LITERAL unbalances the count. `tests/integration/test_disconnect_nick.c`
+    has `fn_end = strstr(fn, "\n}\n");` -- a literal `}` at line 384 -- and naive
+    matching ended `main()`'s body at line 412 instead of 443, so the `free(code)` at
+    line 431 fell outside the "function" and rule 2 reported two false positives on
+    correct code. The function-scoped rule on a signature-matching boundary had already
+    reported three. Two wrong versions, both for the same reason: the parser was
+    counting braces that were not syntax.
+
+    WHY COMMENTS ARE BLANKED, which is the reason `check-portability.sh` strips before
+    it matches: this check's own argument list and docstring name `m->params[...]` and
+    `m->command` many times, and a checker that matched itself would be a checker that
+    could only ever fail.
+
+    WHY SPACES AND NOT REMOVAL, for both: every byte offset has to survive, so a
+    reported line number refers to the real file.
+    """
     out = []
     i = 0
     n = len(src)
@@ -115,6 +226,19 @@ def strip_comments(src):
         elif c == "/" and i + 1 < n and src[i + 1] == "/":
             j = src.find("\n", i)
             j = n if j < 0 else j
+            out.append(re.sub(r"[^\n]", " ", src[i:j]))
+            i = j
+        elif c in "\"'":
+            q = c
+            j = i + 1
+            while j < n:
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == q:
+                    j += 1
+                    break
+                j += 1
             out.append(re.sub(r"[^\n]", " ", src[i:j]))
             i = j
         else:
@@ -149,6 +273,7 @@ def main():
         return 1
 
     rows = []
+    rows2 = []
     for path in files:
         rel = os.path.relpath(path, ROOT)
         raw = open(path, "r", encoding="utf-8", errors="replace").read()
@@ -192,6 +317,53 @@ def main():
         print("  %-28s %-20s %-9s %5d%s"
               % (name, "%s:%d" % (rel, lineno), mark, nlines, flag))
 
+    # RULE 2: an owning pointer acquired and NEVER FREED IN THE SAME FUNCTION.
+    # Function-scoped, because that is the rule that would have caught #134's leak:
+    # `check_fields_are_arrays()` acquired `hdr` and did not free it, while
+    # `check_width_is_derived()` in the same file acquired and freed a variable of the
+    # SAME NAME. A file-scoped version passes that, which is why the first version was
+    # file-scoped and is not any more.
+    acquires = 0
+    for path in files:
+        rel = os.path.relpath(path, ROOT)
+        raw = open(path, "r", encoding="utf-8", errors="replace").read()
+        clean = strip_comments(raw)
+        for lineno, body in top_level_bodies(clean):
+            for am in ACQUIRE.finditer(body):
+                var = am.group(1)
+                acquires += 1
+                if re.search(
+                        r"\bfree\s*\(\s*(?:&|\(\s*\w+\s*\*\s*\)\s*)?"
+                        + re.escape(var) + r"\s*\)", body):
+                    continue
+                # A FUNCTION THAT RETURNS THE POINTER IS FORWARDING OWNERSHIP, not
+                # leaking it, and this rule cannot judge the obligation because the
+                # obligation is now in the caller. `tests/integration/
+                # test_close_sites.c`'s `load()` is exactly that shape and it is
+                # CORRECT -- three call sites free it, which macOS `leaks(1)` over
+                # all 98 binaries confirms -- so flagging it would be the sixth false
+                # positive this audit has produced and it would have earned the check
+                # the deletion its first five nearly earned.
+                #
+                # #134's leak went through a wrapper of this shape too, and the
+                # wrapper's CALLER is where the free was missing. So this exemption
+                # is also the precise statement of what rule 2 cannot do: see the
+                # output below, which says it in those words rather than implying it.
+                if re.search(r"\breturn\s+(?:\(\s*\w+\s*\*\s*\)\s*)?"
+                             + re.escape(var) + r"\s*;", body):
+                    continue
+                rows2.append((rel, lineno, var, am.group(0).strip()))
+
+    print()
+    print("RULE 2 -- AN OWNING POINTER ACQUIRED AND NEVER FREED IN THE SAME "
+          "FUNCTION. %d acquisition(s) in %d top-level function(s) across src/ and "
+          "tests/." % (acquires, sum(len(top_level_bodies(strip_comments(
+              open(p, "r", encoding="utf-8", errors="replace").read())))
+              for p in files)))
+    if rows2:
+        print("    %d of them are never freed where they were acquired." % len(rows2))
+    for rel, lineno, var, stmt in rows2:
+        print("    %-46s %s" % (rel + ":" + str(lineno), stmt))
     print()
     print("WHAT THOSE TWO COLUMNS DO AND DO NOT TELL YOU, which is the finding:")
     print("  * `RELEASES? yes` is NOT evidence the helper releases everything it owns.")
@@ -207,6 +379,37 @@ def main():
     print("    owner is frequently its CALLER: nf_kill() is documented \"does NOT")
     print("    free; call nf_free() first\", so whether a test leaked depends on the")
     print("    caller's NEXT LINE and no reading of the helper settles it.")
+    print()
+    print("RULE 2 IS FUNCTION-SCOPED, and it took two wrong versions to get there.")
+    print("The first was file-scoped -- `hdr` is freed elsewhere in the same file, so")
+    print("the file-scoped rule PASSED the leak it was written for. The second was")
+    print("function-scoped on a signature-matching boundary, and it reported THREE")
+    print("false positives on the shipped tree because the pattern did not match")
+    print("every signature shape this tree writes. The third matches the boundary by")
+    print("COLUMN -- a `{` at the start of a line is a function body, because every")
+    print("nested brace in this tree is indented -- and has zero findings.")
+    print("THE LIMIT, which is the cost of that choice, and it is EXACTLY the shape of")
+    print("the leak rule 2 was written for. A pointer acquired in one function and")
+    print("freed in ANOTHER is not seen: a function that RETURNS the acquire is")
+    print("forwarding ownership and is exempted, because the obligation is now in a")
+    print("function this rule cannot reason about. `test_close_sites.c`'s `load()` is")
+    print("that shape and is correct today -- three call sites free it, and macOS")
+    print("`leaks(1)` over all 98 binaries confirms it. #134's leak went through a")
+    print("wrapper of the same shape, so RULE 2 WOULD NOT HAVE CAUGHT IT AS SHIPPED.")
+    print("What caught it was Linux CI, and what stops it recurring is that the")
+    print("test's wrapper now reads into a CALLER-PROVIDED BUFFER and owns nothing,")
+    print("so there is no pointer left to lose. Rule 2 is the guard rail for the")
+    print("DIRECT shape; the API change is the fix.")
+    print()
+    print("RULE 2 DOES NOT SEE THROUGH A WRAPPER, and that is not a caveat -- it is how")
+    print("the leak it was written for got past every earlier version of this file.")
+    print("#134's test read a source through `read_src()`, a one-line wrapper around")
+    print("`tf_read_code()`, and the FUNCTION THAT CALLED THE WRAPPER forgot the free.")
+    print("Rule 2 would not have caught that as shipped. The fix was therefore to")
+    print("remove the possibility rather than to add the rule:")
+    print("`tf_read_code_into(dst, cap, rel, ...)` reads into a CALLER-PROVIDED buffer")
+    print("and the test's `read_src()` now owns nothing, so there is no pointer to")
+    print("lose. Rule 2 is what keeps the other 19 direct sites paired.")
     print()
     print("THE ANSWER THIS AUDIT CAN GIVE, stated plainly: it cannot tell a helper")
     print("from its caller, and an earlier attempt at it produced six false positives.")
@@ -229,11 +432,19 @@ def main():
         bad = [r for r in rows if r[4] and not r[3]]
         if bad:
             sys.stderr.write("audit-teardown --strict: FAIL: %d strict helper(s) with "
-                             "no release call in the body:\n" % len(bad))
+                             "no release call in the body (RULE 1):\n" % len(bad))
             for rel, lineno, name, _h, _s, _n in bad:
                 sys.stderr.write("    %s:%d: %s\n" % (rel, lineno, name))
+        if rows2:
+            sys.stderr.write("audit-teardown --strict: FAIL: %d owning pointer(s) "
+                             "acquired and never freed in the same function "
+                             "(RULE 2):\n" % len(rows2))
+            for rel, lineno, var, stmt in rows2:
+                sys.stderr.write("    %s:%d: %s\n" % (rel, lineno, stmt))
+        if bad or rows2:
             return 1
-        print("audit-teardown --strict: OK (2 strict helpers, both release).")
+        print("audit-teardown --strict: OK (2 strict helpers both release; %d "
+              "acquisition(s) all paired)." % acquires)
     return 0
 
 
