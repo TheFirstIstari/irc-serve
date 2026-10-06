@@ -1221,7 +1221,15 @@ static void case_mode_472_refusal_is_measured(void)
      * missing, so it is here with the reason. */
     tc_close(&c);
     TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
-    tf_unregister(&node);
+    /* `nf_free()`, NOT `tf_unregister()`. Every other case in this file ends here, and
+     * the two are not interchangeable: `tf_unregister()` only removes the node from the
+     * registry `tf_done()` walks, and `nf_free()` is what frees `node->out` and closes
+     * the output pipe. LeakSanitizer found the difference -- a second leak in this
+     * same case, in `out_append()` at node_fixture.c:181 -- and ONLY on Linux again,
+     * because macOS's AddressSanitizer has no LeakSanitizer. Two leaks, two different
+     * helpers, one case that a thirteen-cell local gate reported clean four times
+     * running. */
+    nf_free(&node);
 }
 
 int main(void)

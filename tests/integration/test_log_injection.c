@@ -617,7 +617,12 @@ static void case_batch_no_sign_is_measured(void)
     tc_close(&c);
     TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
     assert_log_clean(&node, "the pre-registration BATCH refusal, including QUIT");
-    tf_unregister(&node);
+    /* `nf_free()`, NOT `tf_unregister()`: the earlier case in this file ends with
+     * `nf_free()` and this one did not, and `tf_unregister()` frees nothing -- it only
+     * removes the node from the registry. LeakSanitizer's second finding in this same
+     * case was `out_append()` at node_fixture.c:181, which is the node's output
+     * buffer, and it is the mirror image of the client buffer above. */
+    nf_free(&node);
 }
 
 int main(void)
