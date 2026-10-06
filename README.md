@@ -31,30 +31,39 @@ into a temporary one that clears on the next resync.
 
 ## Status
 
-**A working server. 92 tests, 0 skipped, 0 code-scanning alerts, 0 required
+**A working server. 98 tests, 0 skipped, 0 code-scanning alerts, 0 required
 third-party dependencies.**
 
 There is no release. `irc-serve --help` prints the version — one definition, in
 `src/core/server.h`, which CMake, the packaging and every report of it read; the
-tree's newest tag is `v0.7.0-messaging`, a **per-phase** tag rather than a release.
+tree's newest tag is `safety-net` (`72c0192`), which is a **safety marker** rather
+than a release. The newest *phase* tag is `v0.7.0-messaging`, and the newest *release*
+is nothing, because there has never been one.
 
 | | |
 |---|---|
-| Tests | **92 passing, 0 skipped**, 0 failing |
+| Tests | **98 passing, 0 skipped**, 0 failing |
 | Warnings | **0**, on gcc-16, upstream Clang 23 and Apple clang 21 (`-Weverything`), Release **and** Debug |
 | Fortify cell | `-D_FORTIFY_SOURCE=2` (`IRC_FORTIFY=1 ./local-ci.sh`) — a **no-op on macOS**, see below |
 | Sanitizers | ASan + UBSan clean locally; **LeakSanitizer clean** on the Linux CI job |
 | Code scanning | **0 open alerts** (CodeQL) |
 | Language | strict C11, **no required third-party libraries**; TLS (`-DWITH_TLS=ON`) adds the optional one |
-| Size | ~43,800 lines of C |
+| Size | ~45,400 lines of C (`src/` only) |
 
 Every test that was ever a CTest skip is now a real test and
-`tests/known_skips.txt` is **empty** — so a green suite means the whole
-implemented surface is covered, which was true at no earlier version.
+`tests/known_skips.txt` is **empty**. What that buys is a bound on **behaviour**: a
+green suite means every registered test did what it says it does, on three compilers,
+two configurations each, with and without TLS. It is **not** a statement about
+coverage — 14 of the registered tests are unit-style, they exercise functions rather
+than the wire, and no green run can distinguish "the wire path is covered" from "the
+wire path is untested and nothing noticed". Reading this table as a coverage claim is
+the error this paragraph used to make, and it is worth naming because a status table
+is exactly where a reader goes looking for one.
 
 **What this status does and does not mean, precisely.** The wire contract is
-frozen and documented, the suite covers all of it, and the tree is clean under
-three compilers and three sanitizers. It does **not** mean hardened for the open
+frozen and documented, and the tree is clean under three compilers and three
+sanitizers. Whether the suite covers *all* of that contract is a question about the
+tests rather than about their result, and it has no answer in this table. It does **not** mean hardened for the open
 internet — see the limits below and [SECURITY.md](SECURITY.md).
 
 **And it used to claim `v1.0.0`, which was not true.** That claim was deliberate
