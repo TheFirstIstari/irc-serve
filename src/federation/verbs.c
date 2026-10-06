@@ -1945,16 +1945,82 @@ static void fed_in_smodes(server_t *s, server_link_t *link, chan_t *ch,
     if (nparams < 3 || nparams > 4) {
         return;
     }
-    /* 2.2: a non-owner's modes[] is a CACHE, and only the origin evaluates
-     * +b/+e/+I. The frozen shape names the node that EVALUATED the change as its
-     * first field, so a cache update is taken from a line claiming this node's
-     * origin -- not from one that merely arrived here. */
-    if (!chan_same_name(params[0], ch->origin)) {
-        fed_obs("[observable] fed_modes_ignored: channel=%s from=%s origin=%s\n",
-               ch->name, params[0], ch->origin);
+    /* ------------------------------------------------------------------------
+     * WHO IS ENTITLED TO SET A MODE, READ FROM THE LINE (#141), AND IT IS THE
+     * SAME TWO TERMS `fed_in_stopic()` ASKS (#132).
+     * ------------------------------------------------------------------------
+     *
+     * WHAT WAS WRONG. The test was `chan_same_name(params[0], ch->origin)` alone --
+     * "the evaluating server is the origin" -- and `MODE #chan +b mask` is one of the
+     * three fields 2.2 reserves to the origin, so a ban set by an operator on a node
+     * that does not own the channel never took effect anywhere. It is #132's defect
+     * in the opposite half: there, a field that does not carry the authority was
+     * read as if it did; here, the field that DOES carry the authority was read as
+     * the whole of it.
+     *
+     * THE SUBJECT IS `params[0]`, and the reason is the one the issue asked about:
+     * 4.3's frozen SMODES shape DOES carry the evaluating server, unlike STOPIC,
+     * and that makes the fix simpler than #132's in one way and exposes a different
+     * question in another.
+     *
+     * SIMPLER, because there is no transport standing in for the subject. STOPIC had
+     * to read `tags->origin`, the 2.4 stamp, because the line carries no field naming
+     * who acted and `link->name` -- the socket -- was the only other candidate and
+     * was wrong. SMODES carries the answer in its own first parameter, which is what
+     * the field is FOR, so the test reads the line rather than the wire.
+     *
+     * AND THAT EXPOSES THE QUESTION #132 HAD TO ANSWER BY ARGUMENT: a subject is
+     * entitled when it is
+     *
+     *   (a) THE CHANNEL'S ORIGIN. 2.2 reserves the three mask modes to the origin,
+     *       so the origin's own opinion is the authority at any distance -- the case a
+     *       relay hop exists for.
+     *
+     *   (b) A SERVER THE ROSTER RECORDS AS HOLDING A MEMBER
+     *       (`chan_server_has()`). This is the case a non-owner forwards in, and it
+     *       is the term that was missing. `fed_sverb_params()` stamps
+     *       `params[0] = self`, so a non-owner forwarding a member's `+b` names
+     *       ITSELF, and the origin compared that against itself and said no.
+     *
+     * TERM (b) IS NOT A HOLE, for #132's reason and because the argument is the
+     * same one: every value that reaches a cache under (b) has already been accepted
+     * by the origin, because a non-owner's forward goes to `ch->origin` and nowhere
+     * else (fanout.c's owned row), so the nodes agree by construction. What an
+     * authenticated peer can do -- forge an SMODES naming a member-server as its
+     * subject -- is write one mode letter on one node until the origin's next
+     * statement or the next 4.3 resync, at the cost of a completed handshake and the
+     * shared secret. The cost of NOT having (b) is that no `MODE +b` set by any
+     * operator on any node but the origin's has ever taken effect anywhere, which is
+     * the trade the old condition made and the one #141 exists to reverse.
+     *
+     * COST: one `chan_server_has()` per SMODES -- a linear scan of a bounded set of
+     * at most CHAN_MAX_MEMBER_SERVERS names -- plus one comparison against
+     * `ch->origin`. Nothing allocated, no lock, and it is on the peer path for one
+     * verb rather than on any client's. */
+    if (!chan_same_name(params[0], ch->origin) &&
+        !chan_server_has(ch, params[0])) {
+        char subj[CONN_LOG_FIELD_MAX + 1u];
+
+        /* THE SUBJECT IS A PEER-CHOSEN STRING AND IT IS PRINTED MEASURED. `by=`
+         * below has always printed this field raw, and `params[0]` is on
+         * check-peer-log-sites.py's allowlist -- for the SQUIT `<server>`, which this
+         * node builds from its own name and which therefore cannot carry a byte a
+         * peer chose. SMODES' first field is not that field: it is whatever the peer
+         * put in the `<server>` slot, and nothing between the socket and this printf
+         * has looked at it. A peer that sends `SMODES <ESC>[2J #chan +o carol` puts
+         * a CSI sequence in an operator's terminal, which is the whole of #135's log
+         * half in a verb the sweep's SMODES row never puts its marker in. So both
+         * lines go through `conn_text_logsafe()` and carry the count beside them,
+         * which is connection.h's Rule 1 and what every other peer-chosen field on
+         * this node does. */
+        (void)conn_text_logsafe(subj, sizeof subj, params[0]);
+        fed_obs("[observable] fed_modes_ignored: channel=%s from=%s subject=%s "
+                "subject_len=%zu subject_bad_bytes=%zu origin=%s "
+                "reason=NOT_THE_ORIGIN_OR_A_MEMBER_SERVER\n",
+                ch->name, link->name, subj, strlen(params[0]),
+                conn_text_bad_count(params[0]), ch->origin);
         return;
     }
-    (void)link;
     /* THE MODE STRING IS WALKED TWICE AND THAT IS NOT REDUNDANT.
      *
      * ONCE TO DECIDE, and the decision is `chan_mode_implemented()` -- the SAME
@@ -1984,7 +2050,14 @@ static void fed_in_smodes(server_t *s, server_link_t *link, chan_t *ch,
         size_t nrefused = 0u;
         int on = 1;
         char shown[CONN_LOG_FIELD_MAX + 1u];
+        /* The `<server>` field, measured ONCE and printed through one buffer, for the
+         * reason the refusal line above gives: `params[0]` is a peer-chosen string and
+         * `check-peer-log-sites.py` allowlists it for the SQUIT field, which is a
+         * different field with a different provenance. Four sites below print it, so
+         * four copies of that reasoning would be four places to forget one. */
+        char shown_by[CONN_LOG_FIELD_MAX + 1u];
 
+        (void)conn_text_logsafe(shown_by, sizeof shown_by, params[0]);
         applied[0] = '\0';
         refused[0] = '\0';
         for (size_t i = 0; params[2][i] != '\0'; i++) {
@@ -2013,14 +2086,102 @@ static void fed_in_smodes(server_t *s, server_link_t *link, chan_t *ch,
                 applied[napplied++] = m;
                 applied[napplied] = '\0';
             }
+            /* ----------------------------------------------------------------
+             * THE BAN LIST, AND ONLY WHERE 2.2 SAYS IT LIVES.
+             * ----------------------------------------------------------------
+             *
+             * WITHOUT THIS the fix above is cosmetic. `+b` is a MASK mode: 2.2
+             * gives the origin a ban LIST, not a letter in `ch->modes[]`, and
+             * `chan_mode_set()` writes the letter. So with the entitlement test
+             * widened and nothing else changed, a non-owner's operator's `+b` would
+             * set a letter on the origin's cache and the origin's ban list would
+             * still be empty -- which is not a ban, and 367 would tell the origin's
+             * own clients there is none.
+             *
+             * WHY ONLY WHEN THIS NODE IS THE ORIGIN. A cache records the letter and
+             * nothing more: `modes[]` is what a non-owner is entitled to hold, and a
+             * node that enforced a ban out of its own cache would be applying a state
+             * change 2.2 reserves to the origin -- the same local-write the
+             * forward arm above refuses to do. The mask is still forwarded below, so
+             * every cache converges on the origin's list rather than deriving one.
+             *
+             * THE MASK IS THE FOURTH PARAMETER, `params[3]`, and its absence is
+             * ordinary rather than an error: `SMODES +b` with no argument is a
+             * letter change on a channel that has bans, which is legal and is what
+             * `ch->modes[]` alone can express. So a missing or empty mask applies the
+             * letter and touches no list, and the refusal below is the one the
+             * client path already answers with 478/461/417.
+             *
+             * COST: one `chan_origin_is_self()` per SMODES and, at the origin, one
+             * bounded copy plus one list operation for a `+b`/`-b`. */
+            if (m == 'b') {
+                const char *mask = (nparams == 4) ? params[3] : NULL;
+
+                if (mask != NULL && mask[0] != '\0' &&
+                    !chan_origin_is_self(s, ch)) {
+                    /* A CACHE, AND IT IS WORTH SAYING SO OUT LOUD. This is the
+                     * single place the ban-list policy is decided, and the decision
+                     * has a half that produces no observable at all: a cache that
+                     * correctly declines to enforce a ban is indistinguishable from a
+                     * cache that never received one. So the refusal is recorded, with
+                     * the mask measured, rather than left as the absence of a line.
+                     *
+                     * It is one line per `+b`/`-b` a cache is told about, which is a
+                     * mode change rather than a message, so the rate is the mesh's mode
+                     * rate and not anything higher. */
+                    char shown_mask[CONN_LOG_FIELD_MAX + 1u];
+
+                    (void)conn_text_logsafe(shown_mask, sizeof shown_mask, mask);
+                    fed_obs("[observable] fed_modes_ban_cached: channel=%s "
+                            "subject=%s mask=%s mask_len=%zu mask_bad_bytes=%zu "
+                            "on=%d origin=%s\n",
+                            ch->name, shown_by, shown_mask, strlen(mask),
+                            conn_text_bad_count(mask), on, ch->origin);
+                } else if (mask != NULL && mask[0] != '\0') {
+                    char clean[CHAN_MAX_BAN + 1u];
+                    const char *effective = mask;
+                    size_t mask_kept = 0;
+
+                    if (strlen(mask) <= (size_t)CHAN_MAX_BAN) {
+                        mask_kept = conn_text_strip(clean, sizeof clean, mask);
+                        effective = clean;
+                    }
+                    /* The raw length binds, exactly as the client path's does: a
+                     * mask the origin would refuse must not become one this node
+                     * shortened into its bound. */
+                    if (strlen(mask) > (size_t)CHAN_MAX_BAN) {
+                        fed_obs("[observable] fed_modes_ban_ignored: channel=%s "
+                                "subject=%s reason=MASK_TOO_LONG len=%zu\n",
+                                ch->name, shown_by, strlen(mask));
+                    } else if (on) {
+                        const chan_ban_verdict_t bv = chan_ban_add(ch, effective);
+
+                        if (bv != CHAN_BAN_OK) {
+                            fed_obs("[observable] fed_modes_ban_ignored: "
+                                    "channel=%s subject=%s verdict=%d\n", ch->name,
+                                    shown_by, (int)bv);
+                        } else if (mask_kept != strlen(mask)) {
+                            fed_obs("[observable] fed_modes_ban_mask_stripped: "
+                                    "channel=%s subject=%s in_len=%zu kept_len=%zu\n",
+                                    ch->name, shown_by, strlen(mask), mask_kept);
+                        }
+                    } else if (chan_ban_remove(ch, effective) == 0) {
+                        fed_obs("[observable] fed_modes_ban_ignored: channel=%s "
+                                "subject=%s reason=NOT_BANNED\n",
+                                ch->name, shown_by);
+                    }
+                }
+            }
         }
         /* MEASURED, NOT PRINTED: `modes=` is the peer's own string and the line's
          * subject is what an operator needs to see. `refused=` is the hex list above,
          * which is a rendering of the same value that cannot be executed. */
         (void)conn_text_logsafe(shown, sizeof shown, params[2]);
-        fed_obs("[observable] fed_modes: channel=%s by=%s modes=%s modes_len=%zu "
+        fed_obs("[observable] fed_modes: channel=%s by=%s by_len=%zu "
+               "by_bad_bytes=%zu modes=%s modes_len=%zu "
                "modes_bad_bytes=%zu applied=%s refused=%s cached=%s\n",
-               ch->name, params[0], shown, strlen(params[2]),
+               ch->name, shown_by, strlen(params[0]),
+               conn_text_bad_count(params[0]), shown, strlen(params[2]),
                conn_text_bad_count(params[2]),
                (applied[0] != '\0') ? applied : "-",
                (refused[0] != '\0') ? refused : "-", ch->modes);
@@ -2751,8 +2912,94 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
         for (int i = 0; i < m->nparams - 1; i++) {
             sp[i] = m->params[i + 1];
         }
-        fed_in_message(s, &t, m->prefix, &tags, INBOUND[idx].client_verb, sp,
-                       m->nparams - 1);
+        /* ------------------------------------------------------------------
+         * THE INBOUND HALF OF fed_relay_clean(), AND THE PEER SWEEP FOUND IT.
+         * ------------------------------------------------------------------
+         *
+         * WHAT WAS MISSING, and it is a whole half of one line's journey. Three
+         * filters already existed and none of them is on this path:
+         *
+         *   - `msg_verbs.c` filters a CLIENT's message text before fanning it out,
+         *     with `conn_text_strip_relay()`;
+         *   - `fed_relay_clean()` below `fed_queue_line()` filters the same text
+         *     again on the way to a PEER, with the same function;
+         *   - `write_to_members()` -> `send_line_tagged()` filters NOTHING, and it
+         *     is what writes to a local client.
+         *
+         * So a message a PEER originated went peer -> this node -> a person's
+         * terminal with its bytes untouched, while the identical message a client
+         * on this same node originated was stripped. `test_peer_terminal_sweep`
+         * found it on Linux as `:irc.b PRIVMSG #P549 :marker \x9f text` -- a bare
+         * C1 control, which on an 8-bit terminal IS CSI -- and macOS reported the
+         * same sweep clean, which turned out to be the sweep's own blind spot
+         * rather than a platform difference (it drained the client buffer once per
+         * marker and then swept only what arrived after the last drain).
+         *
+         * WHY HERE AND NOT IN `fed_in_message()`. Same reason `fed_relay_clean()`
+         * sits below the verb table rather than in each verb: this is BELOW G9's
+         * arity check, so a message verb added to INBOUND later cannot forget it,
+         * and a table row that knows a verb's parameter layout is a site that can
+         * be written wrong -- which the sweep has already caught once, with the
+         * channel in the wrong slot of an SMODES row.
+         *
+         * WHICH POLICY, and it is the SAME one for the same reason the outbound
+         * table uses it: this field is RELAYED MESSAGE TEXT, and the eight mIRC
+         * formatting bytes in it are semantics a client renders rather than hazard.
+         * The stored-value policy (`conn_text_strip()`, used for a topic or a kick
+         * reason) would strip a colour code off every message on the network. So
+         * the call below and the row above it name the same function, and a change
+         * to the rules is a change to both halves.
+         *
+         * WHY THE STATE VERBS ARE NOT HERE. `STOPIC`, `SKICK` and `SMODES` reach a
+         * local client only through `fanout_forward_channel_sverb()`, which writes
+         * to PEERS and does not emit locally at all -- the gap `fed_dispatch`'s own
+         * header names. So the peer->client exposure this fix closes is the message
+         * path, and the state verbs' exposure is the forward path, which
+         * `fed_relay_clean()` already covers. That is worth stating because the
+         * difference is invisible from the table: the two halves of INBOUND look
+         * identical and are filtered by different functions for that reason.
+         *
+         * THE MEASUREMENT IS REPORTED, for `fed_relay_clean()`'s reason: stripping
+         * a peer's text is invisible on the wire -- the far side sees a shorter
+         * field and cannot tell anything happened -- so a node that silently
+         * shortened relayed text would be indistinguishable from one that mangled
+         * it. `n_msg_stripped` is the same counter the client path increments,
+         * because it is the same decision about the same field; the line below it
+         * says which half of the node did it.
+         *
+         * COST: one extra pass over the text and one bounded copy, on the peer path
+         * for the two message verbs, and only when the peer's line was accepted.
+         * The 8 KiB arena is scoped to this block so it is not held for the state
+         * verbs below, and it is `IRC_MAX_LINE` because the line is already bounded
+         * by the framing layer -- stripping only removes bytes, so the filtered
+         * value always fits in what the unfiltered one occupied.
+         *
+         * AND THE DELIVERY IS INSIDE THE BLOCK, which the first version of this was
+         * NOT and which the sanitizer cell caught as a stack-use-after-scope. `sp[0]`
+         * is a POINTER, and it was left pointing at `clean` while the closing brace
+         * ended `clean`'s lifetime; `fed_in_message()` then read it back through
+         * `message_build()` and got whatever the frame had become. It passed all
+         * twelve build cells and every local test, because a dead stack read is only a
+         * wrong answer when the reused bytes are not the right ones -- which is the
+         * same reason this project's leak and use-after-free work keeps coming back to
+         * Linux. The arena's scope and the pointer's scope are now the same scope, and
+         * that is stated here because "the block ends after the call" is the kind of
+         * thing a later edit tidies away. */
+        {
+            char clean[IRC_MAX_LINE];
+            const size_t in_len = strlen(sp[0]);
+            const size_t kept = conn_text_strip_relay(clean, sizeof clean, sp[0]);
+
+            sp[0] = clean;
+            if (kept != in_len) {
+                s->n_msg_stripped++;
+                fed_obs("[observable] fed_message_stripped: verb=%s kept=%zu "
+                       "removed=%zu\n",
+                       m->command, kept, in_len - kept);
+            }
+            fed_in_message(s, &t, m->prefix, &tags, INBOUND[idx].client_verb, sp,
+                           m->nparams - 1);
+        }
         return;
     }
     {

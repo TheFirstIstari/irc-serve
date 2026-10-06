@@ -94,12 +94,22 @@ ALLOWED = {
     "fed_queue_why_name": "a fixed table key",
     "fed_federate_reason": "a fixed table key",
     "reason": "a fixed literal at every call site",
+    "field": "which of two named fields a refusal is about -- \"user\" or \"host\", "
+             "a fixed literal at both call sites (nickreg_ident_refused)",
     "why": "a fixed literal at every call site (a shadow_discard() or report reason)",
     "which": "this node's own enum index",
     "verb": "a table lookup, never the wire's command word",
     "origin": "a local copy of link->name, or of g_shadow.origin which is one",
     "g_shadow.origin": "burst_copy() of link->name",
-    "params[0]": "the SQUIT <server> this node built from its own name",
+    # NOT this node's own name in general. `params[0]` is the SQUIT `<server>` there,
+    # which fed_in_squit() builds from `s->name`, so it cannot carry a peer-chosen
+    # byte -- and it is ALSO SKICK's `<member>` and SMODES' `<server>`, which are
+    # whatever the peer put in that slot. Both of those now print through
+    # `conn_text_logsafe()` with the count beside them; this entry is the SQUIT site,
+    # and it was being read as a blanket exemption for the other two until #141 made
+    # one of them a value an operator reads on a refusal line.
+    "params[0]": "fed_in_squit()'s <server>, built from this node's own name; the "
+                 "SKICK and SMODES uses of params[0] go through conn_text_logsafe()",
     "holder": "the best remote holder from fed_nickreg_best_holder(): a copy of "
               "fed_rnick::server, which is written only from g_shadow.origin (a "
               "burst_copy of link->name) or from an irc_serve_server_name_valid()",
@@ -117,7 +127,7 @@ def strip_comments(src):
 
       * this check's own argument list and docstring name `m->params[...]` and
         `m->command` many times, and a checker that matched itself would be a checker
-        that could only ever fail -- the reason check-portability.sh strips first;
+        that could only ever fail -- the reason check-portability.py strips first;
       * a `[observable]` LINE is recognised by its string literal, so the literals
         cannot be blanked. Comments are replaced by spaces rather than removed so
         that every offset -- and therefore every reported line number -- still

@@ -250,9 +250,29 @@ struct ps_exception {
 };
 static const struct ps_exception k_exceptions[] = {
     { sws_mask_mirc,
-      "mIRC formatting bytes in RELAYED MESSAGE TEXT, which relay_byte_kept() "
-      "keeps by design",
-      " SPRIVMSG " }
+      "mIRC formatting bytes in RELAYED MESSAGE TEXT on the PEER link, which "
+      "relay_byte_kept() keeps by design",
+      " SPRIVMSG " },
+    /* THE SAME BYTES ON THE CLIENT SOCKET, and this entry existed in the file's
+     * HEADER before it existed in this table -- which is the honest description of
+     * what happened: the header said "a client socket can legitimately be sent a
+     * mIRC colour byte in relayed message text" and the list excused only the peer
+     * link, because the client surface was not being swept and so nothing on it
+     * ever needed excusing. The eight bytes are exactly the eight
+     * `relay_byte_kept()` names, and they are exactly the ones it is supposed to
+     * keep: `\001ACTION waves\001` is ONE message BECAUSE of its two delimiters,
+     * and a mIRC client renders the other seven and strips them before display.
+     *
+     * It is scoped to ` PRIVMSG ` -- with a SPACE before the P, which is what makes
+     * it a CLIENT verb -- so it cannot excuse the same byte in a topic, a kick
+     * reason, a mode string, a server name or an advertised name. Those are stored
+     * or operational values and they go through the stricter stored-value policy,
+     * and an entry wide enough to cover them would be a blanket amnesty for
+     * exactly the bytes this sweep exists to find. */
+    { sws_mask_mirc,
+      "mIRC formatting bytes in RELAYED MESSAGE TEXT delivered to a client, which "
+      "is the same relay_byte_kept() decision on the other side of the fanout",
+      " PRIVMSG " }
 };
 #define PS_EXCEPTIONS ((int)(sizeof k_exceptions / sizeof k_exceptions[0]))
 static int g_exc_used[PS_EXCEPTIONS];
@@ -270,6 +290,29 @@ static int span_has(const char *hay, size_t len, const char *needle)
         }
     }
     return 0;
+}
+
+/* How many ` PRIVMSG ` lines are in this buffer. Counted HERE, in the loop, because
+ * the buffer is emptied by the drain and the standing check runs after the last
+ * drain -- so a check that read `tc_buffer()` there would count the bytes that
+ * arrived after the final drain, which is precisely the 25-byte PONG that let this
+ * file report clean for 61 markers.
+ *
+ * ` PRIVMSG ` with a leading space, so it matches the CLIENT verb and not the peer's
+ * `SPRIVMSG`: the two differ by one byte and getting it wrong would count the peer
+ * surface's lines. */
+static unsigned ps_count_privmsgs(const char *buf, size_t len)
+{
+    static const char needle[] = " PRIVMSG ";
+    const size_t nlen = sizeof needle - 1u;
+    unsigned n = 0u;
+
+    for (size_t i = 0; i + nlen <= len; i++) {
+        if (memcmp(buf + i, needle, nlen) == 0) {
+            n++;
+        }
+    }
+    return n;
 }
 
 static int ps_excuse(unsigned char ch, const char *line, size_t len, void *ctx)
@@ -872,6 +915,51 @@ static int wait_for_pong(nf_node_t *node, test_client_t *client, const char *nee
     }
 }
 
+/* ps_sweep_client(): SWEEP THE CLIENT SOCKET FOR ONE MARKER, AND ONLY THEN CLEAR IT.
+ *
+ * WHY IT RUNS HERE AND NOT INSIDE THE SHAPE LOOP. The node queues a client's bytes
+ * and prints its own verdict for the same probe, and stdout is line-buffered while
+ * the socket is not: the node's line can be readable before the write to the client
+ * has left the writeq. So a read taken at the end of the last shape is a read that
+ * can miss that marker's lines. The PING/PONG below fixes the ordering without a
+ * sleep, because the PONG is produced by the same write queue as everything queued
+ * before it: when the PONG is in hand, every byte the node wrote for this marker is
+ * in hand too. That is also what makes the scan complete rather than lucky, and it
+ * is the reason this file's own liveness assertion and its sweep are the same wait.
+ *
+ * WHY THE ORDER INSIDE IS READ, SCAN, COUNT, CLEAR. `tc_drain()` empties the buffer
+ * AS it reads -- it memmoves the remainder to the front and sets `len` to 0 on the
+ * first turn of its loop -- so a drain that reads past the first batch throws away
+ * exactly the bytes it fetched and this surface is the one place in the file where
+ * losing bytes silently loses findings. So the read is `tc_read_available()` (which
+ * appends and never clears) and the clear is a `tc_drain()` with a ZERO timeout,
+ * which returns as soon as it has emptied the buffer and never selects.
+ *
+ * WHAT THIS FIXES, stated because the class of it has appeared three times in this
+ * file. The old code called `tc_drain(&client, 1, NULL)` once per marker and swept
+ * the client surface at the very end, so 61 of the 62 markers' client bytes were
+ * discarded having never been looked at and the surface labelled "a client socket"
+ * was swept with whatever arrived after the LAST drain: on macOS, 25 bytes holding
+ * one PONG and no PRIVMSG at all. That is why this file was green locally and red on
+ * Linux, and it was not a platform difference in the product -- Linux's read schedule
+ * left the final probe's PRIVMSG in the buffer after the final drain and macOS's did
+ * not. Underneath the sweep's own bookkeeping race, a bare C1 byte was reaching a
+ * person's terminal the whole time.
+ */
+static void ps_sweep_client(sws_scan *surface, test_client_t *client,
+                            size_t *scanned, unsigned *privmsgs)
+{
+    int eof = 0;
+
+    (void)tc_read_available(client, &eof);
+    *scanned += tc_received(client);
+    if (tc_received(client) > 0u) {
+        sws_scan_bytes(surface, tc_buffer(client), tc_received(client));
+        *privmsgs += ps_count_privmsgs(tc_buffer(client), tc_received(client));
+    }
+    (void)tc_drain(client, 0, NULL);
+}
+
 /* Substitute `\x01` with `mark`, `\x02` with the probe's channel, and send.
  *
  * THE TEMPLATES CARRY NO CRLF, because `pf_send_line()` appends one. The first
@@ -914,7 +1002,21 @@ int main(void)
     nf_node_t node;
     test_client_t client;
     pf_peer_t peer;
+    /* THE THREE SURFACES, EACH ITS OWN ACCUMULATOR. `scan` below is the RUN TOTAL
+     * and never sees a byte; these three do, and they are declared here rather than
+     * inside the final block because the peer link and the client socket are scanned
+     * as they are read -- see the loop. */
+    sws_scan node_surface;
+    sws_scan peer_surface;
+    sws_scan client_surface;
     sws_scan scan;
+    /* How many client bytes were handed to the scanner, printed below so that "the
+     * client surface carried no marker byte" and "the client surface carried
+     * nothing" do not read the same. */
+    size_t client_scanned = 0u;
+    /* Relayed PRIVMSGs the client was actually shown. See ps_count_privmsgs() for
+     * why this is counted in the loop and not read off the buffer afterwards. */
+    unsigned client_privmsgs = 0u;
     char peer_rx[65536];
     long peer_rx_len = 0;
     char chan[16];
@@ -956,6 +1058,9 @@ int main(void)
     ps_needles_are_per_probe();
     ps_assert_no_inverted_assertions();
     sws_scan_begin(&scan, "the peer path", ps_excuse, NULL);
+    sws_scan_begin(&node_surface, "the node's own stdout", ps_excuse, NULL);
+    sws_scan_begin(&peer_surface, "the peer link", ps_excuse, NULL);
+    sws_scan_begin(&client_surface, "a client socket", ps_excuse, NULL);
 
     pf_peer_init(&peer);
     tc_init(&client);
@@ -1057,17 +1162,23 @@ int main(void)
                          "a bare ` 366 `, so a stale answer from an earlier probe "
                          "cannot satisfy it.", chan);
 
-            TF_CHECK_MSG(send_shape(peer.fd, k_shapes[i].tmpl, (unsigned char)b,
-                                    (unsigned)probes) == 0,
-                         "the test could not send shape %d with marker 0x%02x",
-                         i, (unsigned)b);
             /* THE ANSWER. No sleep anywhere in this file, and no assumption about
              * ordering between probes: the needle is searched over everything the
              * node has printed, which is what `nf_expect()` does over its buffer.
              * A probe whose needle never appears is a FAILURE, because it means the
-             * node did nothing with the line and the probe proved nothing. */
-            /* FROM BEFORE THE PROBE IS SENT, because everything after this point is
-             * a claim about THIS probe and nothing else. */
+             * node did nothing with the line and the probe proved nothing.
+             *
+             * FROM BEFORE THE PROBE IS SENT, because everything after this point is
+             * a claim about THIS probe and nothing else.
+             *
+             * ONE SEND PER PROBE. This loop sent the line TWICE -- once before
+             * `from` was taken and once after -- so every probe emitted two
+             * identical lines and a report said "2 unmarked byte(s) at 1 site(s)"
+             * for what is one shape sent once. The copy sent before `from` was also
+             * outside every window `ps_expect_withheld()` and `ps_expect_verdict()`
+             * read, so those checks were reasoning about the second copy while the
+             * number in the report invited the reading that two probes were
+             * involved. */
             from = node.out_len;
             TF_CHECK_MSG(send_shape(peer.fd, k_shapes[i].tmpl, (unsigned char)b,
                                     (unsigned)probes) == 0,
@@ -1084,9 +1195,24 @@ int main(void)
                               (size_t)i);
             probes++;
 
-            /* Drain the peer's socket, non-blocking. A peer socket nobody reads
-             * eventually stops the node, and a stopped node makes every later probe
-             * vacuous -- so this is a liveness requirement, not tidiness. */
+            /* Read the peer's socket, non-blocking, and SCAN WHAT COMES BACK
+             * BEFORE IT IS DROPPED. A peer socket nobody reads eventually stops the
+             * node, and a stopped node makes every later probe vacuous -- so reading
+             * it is a liveness requirement, not tidiness.
+             *
+             * AND THE SCAN IS THE POINT, and it is the fix for the blind spot this
+             * file had. `peer_rx` is 64 KiB and the run produces several times that,
+             * so the old code stopped draining once the buffer was nearly full and
+             * swept whatever had arrived in the first few hundred probes: the C1
+             * markers, which are at the END of the marker order, were never read off
+             * this surface at all. A surface that is only the first N bytes of a run
+             * is not a surface, and the fact that it reported clean was not evidence
+             * of anything -- `sweep_scan.h` says so in its own header and the code
+             * did not do it.
+             *
+             * Scanning per marker rather than accumulating is what makes the bound
+             * a bound: the buffer is reused, so its SIZE is a memory decision and
+             * not a coverage one. */
             if (peer_rx_len < (long)sizeof peer_rx - 4096) {
                 long got = pf_drain(peer.fd, peer_rx + peer_rx_len,
                                     sizeof peer_rx - 1u - (size_t)peer_rx_len);
@@ -1096,8 +1222,16 @@ int main(void)
                     peer_rx[peer_rx_len] = '\0';
                 }
             }
+            if (peer_rx_len > 0) {
+                sws_scan_bytes(&peer_surface, peer_rx, (size_t)peer_rx_len);
+                peer_rx_len = 0;
+            }
         }
-        (void)tc_drain(&client, 1, NULL);
+        /* The CLIENT SOCKET is swept just below, AFTER this marker's PONG -- see
+         * `ps_sweep_client()`. Reading it here would be wrong twice over: the node
+         * may not have flushed the write yet, and `tc_drain()` empties the buffer
+         * as it reads, so anything it picked up past the first read would be
+         * discarded unexamined. */
 
         /* THE NODE IS STILL SERVING, ONCE PER MARKER.
          *
@@ -1135,6 +1269,9 @@ int main(void)
                          "PONG, so it stopped serving and every later probe in "
                          "this sweep would be vacuous", (unsigned)b, PEER);
         }
+        /* THE CLIENT SOCKET, SWEPT NOW THAT THE PONG PROVES THE WRITES LANDED. */
+        ps_sweep_client(&client_surface, &client, &client_scanned,
+                        &client_privmsgs);
     }
 
     /* The byte count, asserted rather than assumed: a marker set that quietly lost
@@ -1159,44 +1296,96 @@ int main(void)
      * --------------------------------------------------------------------- */
     TF_CHECK_MSG(nf_stop(&node) == 0, "node A did not exit cleanly");
 
-    /* ONE SCAN PER SURFACE, and each is LABELLED, because a finding that cannot say
-     * which surface it is on cannot be acted on. The first version of this file
-     * scanned all three into one accumulator and left `who` empty, and it found a
-     * real marker byte whose report read "in the peer path ()" -- which is the
-     * difference between a finding and a rumour. Three scans of the same instrument
-     * is also what makes the three surfaces comparable: the same marker byte on two
-     * of them is a different defect from the same byte on one. */
+    /* THE LAST OF EACH BOUNDED SURFACE, then the node's own stdout in one piece.
+     *
+     * The peer link and the client socket are scanned INSIDE the marker loop, as
+     * they are read, because both are bounded buffers and a bounded buffer that is
+     * only scanned at the end is a surface covering a prefix of the run rather than
+     * the run. What is left in each at this point is whatever arrived since its last
+     * read, and it is scanned here so the tail is not missed either.
+     *
+     * The node's own stdout is NOT bounded in the same way -- `nf_stop()` has run,
+     * so it is complete -- and scanning it in one piece means one report rather than
+     * sixty-two. That is the whole difference between this block and the loop's:
+     * when a surface is complete, one scan of it is right; when it is bounded, one
+     * scan per read is.
+     *
+     * EACH IS LABELLED, because a finding that cannot say which surface it is on
+     * cannot be acted on. The first version of this file scanned all three into one
+     * accumulator and left `who` empty, and it found a real marker byte whose report
+     * read "in the peer path ()" -- which is the difference between a finding and a
+     * rumour. */
     {
         struct {
-            const char *name;
+            sws_scan *s;
             const char *buf;
             size_t len;
-        } surfaces[3];
+        } tails[2];
 
-        surfaces[0].name = "the node's own stdout";
-        surfaces[0].buf = node.out;
-        surfaces[0].len = node.out_len;
-        surfaces[1].name = "the peer link";
-        surfaces[1].buf = peer_rx;
-        surfaces[1].len = (size_t)peer_rx_len;
-        surfaces[2].name = "a client socket";
-        surfaces[2].buf = tc_buffer(&client);
-        surfaces[2].len = tc_received(&client);
+        tails[0].s = &peer_surface;
+        tails[0].buf = peer_rx;
+        tails[0].len = (size_t)peer_rx_len;
+        tails[1].s = &client_surface;
+        tails[1].buf = tc_buffer(&client);
+        tails[1].len = tc_received(&client);
+        for (size_t i = 0; i < sizeof tails / sizeof tails[0]; i++) {
+            if (tails[i].len > 0u) {
+                sws_scan_bytes(tails[i].s, tails[i].buf, tails[i].len);
+            }
+        }
+        sws_scan_bytes(&node_surface, node.out, node.out_len);
+    }
+    {
+        sws_scan *surfaces[3];
 
+        surfaces[0] = &node_surface;
+        surfaces[1] = &peer_surface;
+        surfaces[2] = &client_surface;
         for (size_t i = 0; i < sizeof surfaces / sizeof surfaces[0]; i++) {
-            sws_scan one;
-
-            sws_scan_begin(&one, surfaces[i].name, ps_excuse, NULL);
-            sws_scan_bytes(&one, surfaces[i].buf, surfaces[i].len);
-            if (sws_scan_clean(&one) == 0) {
-                (void)sws_scan_report(&one);
+            if (sws_scan_clean(surfaces[i]) == 0) {
+                (void)sws_scan_report(surfaces[i]);
                 found_surfaces++;
             }
             /* Folded into the whole-run total so the count below is a statement
              * about every surface together, which is the number a reader wants. */
-            scan.total += one.total;
-            scan.nfound += one.nfound;
+            scan.total += surfaces[i]->total;
+            scan.nfound += surfaces[i]->nfound;
         }
+    }
+
+    /* ---------------------------------------------------------------------------
+     * CHECK 5, WHICH IS THE ONE THAT MATTERS MOST: THE CLIENT SURFACE WAS NOT EMPTY.
+     * ---------------------------------------------------------------------------
+     * A sweep that finds nothing is not proof, and `sweep_scan.h` says so where it is
+     * read. This is that sentence made into a check for the surface where it was
+     * false: for 61 of the 62 markers this file threw the client's bytes away
+     * before scanning them, so "the client socket carried no marker byte" was
+     * indistinguishable from "the client socket was never looked at" -- and the
+     * second was the truth on every platform.
+     *
+     * The number is the relayed PRIVMSGs this client must have received: one per
+     * `SPRIVMSG` probe on a channel it is in, for every marker except 0x00, which
+     * the framing layer refuses before it is ever a line. Both rows of the shape
+     * table that carry message text are counted, so the floor is two per marker.
+     *
+     * It is a FLOOR rather than an equality on purpose. If a future change stopped
+     * delivering relayed messages to a local member, the exact count would move and
+     * the test would fail for a reason that is not about filtering; the floor fails
+     * only when the surface stops carrying the probes at all, which is precisely the
+     * condition under which its cleanliness means nothing.
+     */
+    {
+        const unsigned relayed = client_privmsgs;
+
+        TF_CHECK_MSG(relayed >= SWS_MARKER_COUNT - 1u,
+                     "this client received %u relayed PRIVMSG line(s) and the shape "
+                     "table says it should have received at least %lu -- one per "
+                     "marker the framing layer will carry. "
+                     "So the surface this sweep calls \"a client socket\" was not "
+                     "swept for most of the run, and a clean result on it is not a "
+                     "result. Check that the per-marker read-and-scan is still in the "
+                     "loop and that the client's buffer is drained AFTER the scan.",
+                     relayed, (unsigned long)(SWS_MARKER_COUNT - 1u));
     }
 
     if (sws_scan_clean(&scan) == 0) {
@@ -1221,13 +1410,20 @@ int main(void)
                      k_exceptions[e].where, k_exceptions[e].why);
     }
 
-    fprintf(stderr,
-            "ok: peer sweep -- %u markers x %d shapes, %lu probes, three scanned "
-            "surfaces, %d exception entries, %d of them exercised\n",
-            (unsigned)SWS_MARKER_COUNT, SH_COUNT, (unsigned long)probes,
-            PS_EXCEPTIONS, g_exc_used[0]);
-    fprintf(stderr, "ok: %d of 3 surfaces carried an unmarked byte\n",
-            found_surfaces);
+    {
+        int used = 0;
+
+        for (int e = 0; e < PS_EXCEPTIONS; e++) {
+            used += (g_exc_used[e] != 0) ? 1 : 0;
+        }
+        fprintf(stderr,
+                "ok: peer sweep -- %u markers x %d shapes, %lu probes, three "
+                "scanned surfaces, %d exception entries, %d of them exercised\n",
+                (unsigned)SWS_MARKER_COUNT, SH_COUNT, (unsigned long)probes,
+                PS_EXCEPTIONS, used);
+    }
+    fprintf(stderr, "ok: %d of 3 surfaces carried an unmarked byte; the client "
+            "socket was swept over %zu byte(s)\n", found_surfaces, client_scanned);
 
     tc_close(&client);
     if (peer.fd >= 0) {
