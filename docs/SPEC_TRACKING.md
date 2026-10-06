@@ -16,7 +16,7 @@ command in this document was run on 2026-09-28.**
 | Step | Command |
 |---|---|
 | Build | `cmake -B <build> -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DBUILD_BENCHMARK=ON` then `cmake --build <build> --parallel 8` — clean, no warnings, no errors |
-| Test run | `ctest --timeout 60` in the build tree — **98 tests: 98 passed, 0 skipped, 0 failed** |
+| Test run | `ctest --timeout 60` in the build tree — **99 tests: 99 passed, 0 skipped, 0 failed** |
 | Behaviour | the shipped `irc-serve` binary was run on an ephemeral port and driven with a raw TCP client; the wire bytes quoted in this document are captured from that session |
 | Build membership | `src/CMakeLists.txt`, `nm` on the linked binary, and a repo-wide `grep` over every `CMakeLists.txt` |
 | Phase state | `gh issue list --milestone "Federated IRC Server v1.0" --state all` |
@@ -463,7 +463,7 @@ Design §6.4 and §7/Phase 7 have been corrected in place to say the same thing,
 `ctest --timeout 60`, Release, macOS/darwin, 2026-09-28:
 
 ```
-98 tests: 98 passed, 0 skipped, 0 failed
+99 tests: 99 passed, 0 skipped, 0 failed
 ```
 
 **AND THE COUNTS ABOVE ARE NOW CHECKED, which is the point of writing them down

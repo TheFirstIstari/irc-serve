@@ -31,7 +31,7 @@ into a temporary one that clears on the next resync.
 
 ## Status
 
-**A working server. 98 tests, 0 skipped, 0 code-scanning alerts, 0 required
+**A working server. 99 tests, 0 skipped, 0 code-scanning alerts, 0 required
 third-party dependencies.**
 
 There is no release. `irc-serve --help` prints the version — one definition, in
@@ -42,7 +42,7 @@ is nothing, because there has never been one.
 
 | | |
 |---|---|
-| Tests | **98 passing, 0 skipped**, 0 failing |
+| Tests | **99 passing, 0 skipped**, 0 failing |
 | Warnings | **0**, on gcc-16, upstream Clang 23 and Apple clang 21 (`-Weverything`), Release **and** Debug |
 | Fortify cell | `-D_FORTIFY_SOURCE=2` (`IRC_FORTIFY=1 ./local-ci.sh`) — a **no-op on macOS**, see below |
 | Sanitizers | ASan + UBSan clean locally; **LeakSanitizer clean** on the Linux CI job |

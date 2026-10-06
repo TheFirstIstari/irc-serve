@@ -2972,7 +2972,19 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
          * The 8 KiB arena is scoped to this block so it is not held for the state
          * verbs below, and it is `IRC_MAX_LINE` because the line is already bounded
          * by the framing layer -- stripping only removes bytes, so the filtered
-         * value always fits in what the unfiltered one occupied. */
+         * value always fits in what the unfiltered one occupied.
+         *
+         * AND THE DELIVERY IS INSIDE THE BLOCK, which the first version of this was
+         * NOT and which the sanitizer cell caught as a stack-use-after-scope. `sp[0]`
+         * is a POINTER, and it was left pointing at `clean` while the closing brace
+         * ended `clean`'s lifetime; `fed_in_message()` then read it back through
+         * `message_build()` and got whatever the frame had become. It passed all
+         * twelve build cells and every local test, because a dead stack read is only a
+         * wrong answer when the reused bytes are not the right ones -- which is the
+         * same reason this project's leak and use-after-free work keeps coming back to
+         * Linux. The arena's scope and the pointer's scope are now the same scope, and
+         * that is stated here because "the block ends after the call" is the kind of
+         * thing a later edit tidies away. */
         {
             char clean[IRC_MAX_LINE];
             const size_t in_len = strlen(sp[0]);
@@ -2985,9 +2997,9 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
                        "removed=%zu\n",
                        m->command, kept, in_len - kept);
             }
+            fed_in_message(s, &t, m->prefix, &tags, INBOUND[idx].client_verb, sp,
+                           m->nparams - 1);
         }
-        fed_in_message(s, &t, m->prefix, &tags, INBOUND[idx].client_verb, sp,
-                       m->nparams - 1);
         return;
     }
     {
