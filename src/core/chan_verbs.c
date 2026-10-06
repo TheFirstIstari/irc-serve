@@ -44,6 +44,10 @@
 #include "core/cap.h"
 #include "core/channel.h"
 #include "core/account.h"
+/* For conn_text_logsafe(), conn_text_bad_count() and CONN_LOG_FIELD_MAX -- the 472s
+ * render a client-supplied mode CHARACTER, which has no consumer beyond the line it
+ * appears on, so it is measured rather than filtered. See mode_refusal_render(). */
+#include "core/connection.h"
 #include "core/fanout.h"
 #include "core/reply.h"
 
@@ -1752,6 +1756,90 @@ void handle_kick(server_t *s, conn_t *c, const message_t *m)
  * prevent. 472 says "that mode character means nothing to me", which is true.
  */
 /* ---------------------------------------------------------------------------
+ * ONE RENDERING OF A REFUSED MODE CHARACTER, shared by both 472 sites
+ * ---------------------------------------------------------------------------
+ * The two 472s below print the character they refused twice: once as the numeric's
+ * `<char>` parameter and once in the observable line's `reason=` field. Both copies
+ * used to be the client's raw byte, and both had to change together -- which is the
+ * argument for this helper rather than two copies of the same four lines. The field
+ * list and the placeholder MUST NOT VARY between the two sites (see each site's
+ * comment for why the field list matters), and the only way to make two copies of a
+ * rule agree is not to have two copies.
+ *
+ * WHY A HELPER AND NOT A FLAG, since the previous version's comment argued the two
+ * sites should stay separate: that argument was about the CHARACTER being a
+ * different expression at each site (the mode string's first byte up there, one byte
+ * of a mode string here) and it is still true. It was never about the rendering.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THE CLIENT GETS, and why it is `?`
+ * ---------------------------------------------------------------------------
+ * `?` -- one byte, printable ASCII, and not a mode character this node knows.
+ *
+ *   - ONE BYTE, because the field is the RFC's `<char>` and a client that parses 472
+ *     by position reads exactly one character out of it. A two-character placeholder
+ *     would move every field after it, and an empty one would remove it.
+ *   - PRINTABLE, because the whole point is that a terminal must never see the byte.
+ *   - NOT `+` OR `-`, because those are the two characters whose meaning the mode
+ *     grammar gives, and a client reading `472 <client> -` would conclude the node
+ *     rejected a sign rather than a mode.
+ *   - NOT IN `004`/`005`'s CHANMODES, so a client that compares the refused
+ *     character against what this node advertises finds nothing it claims to
+ *     understand -- which is the truth. The branch is reached BECAUSE the character
+ *     is not a mode this node evaluates, so no character it could print here would
+ *     name a mode this node knows.
+ *
+ * The cost, stated rather than assumed: a client that sent a printable mode this node
+ * does not evaluate is answered with that character, exactly as before, and a client
+ * that sent a control byte is answered with `?` and cannot tell from the wire WHICH
+ * byte it was. That is deliberate -- the byte is not going back onto a terminal, and
+ * the log is where the diagnosis belongs.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THE OPERATOR GETS: Rule 1, MEASURED
+ * ---------------------------------------------------------------------------
+ * `conn_text_logsafe()` and `conn_text_bad_count()` on the one-byte string, and the
+ * length beside them. The value has no consumer beyond the line itself, so it is
+ * WITHHELD rather than filtered: `reason=-` says "there was a value and it was not
+ * safe to print", `reason_len=1` says how long it was, and `reason_byte=0x..` says
+ * which byte it was -- all three printable, and all three needed to tell the three
+ * withheld cases apart (`-` also means absent, and also means too long for the
+ * field).
+ *
+ * COST: one pass over one byte, on a path that runs once per refused mode character.
+ */
+static char mode_refusal_wire(char mode)
+{
+    const unsigned char u = (unsigned char)mode;
+
+    /* `conn_byte_is_bad()` alone would be enough for 0x00-0x1f and DEL, but the
+     * placeholder also has to be printable in the sense the wire cares about, which
+     * excludes 0x7f and the 0x80-0xff range -- and a byte above 0x7e is exactly what
+     * `conn_text_logsafe()` refuses. One range, stated once, rather than the
+     * predicate plus a second opinion about DEL. */
+    return ((u >= 0x21u && u <= 0x7eu)) ? mode : '?';
+}
+
+static void mode_refusal_render(char mode, char *wire, size_t wire_cap,
+                                char *shown, size_t shown_cap, size_t *len_out,
+                                size_t *bad_out)
+{
+    char raw[2];
+
+    raw[0] = mode;
+    raw[1] = '\0';
+    (void)snprintf(wire, wire_cap, "%c", mode_refusal_wire(mode));
+    (void)conn_text_logsafe(shown, shown_cap, raw);
+    if (len_out != NULL) {
+        *len_out = strlen(raw);
+    }
+    if (bad_out != NULL) {
+        *bad_out = conn_text_bad_count(raw);
+    }
+}
+
+
+/* ---------------------------------------------------------------------------
  * 367 RPL_BANLIST and 368 RPL_ENDOFBANLIST: `MODE <channel> +b` with no mask.
  * ---------------------------------------------------------------------------
  * RFC 2812 3.3.2 names this as a QUERY and not a change, in the same sentence
@@ -1908,14 +1996,21 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
          * the end of an object rather than a NUL-terminated string. The character
          * here is params[1][0] -- the mode string's first byte -- because that is
          * the byte that is not '+' or '-', which is the whole condition. */
-        char unknown[2];
+        char wire[2];
+        char shown[CONN_LOG_FIELD_MAX + 1u];
+        size_t len;
+        size_t bad;
 
-        unknown[0] = m->params[1][0];
-        unknown[1] = '\0';
-        (void)reply(s, c, "472", (const char *const[]){ unknown }, 1,
+        /* THE MEASUREMENT IS TAKEN FIRST, because the byte is the client's and this
+         * block is about to stop referring to it. Everything below prints `wire` or
+         * `shown`, and neither of them can carry a control byte. */
+        mode_refusal_render(m->params[1][0], wire, sizeof wire, shown, sizeof shown,
+                            &len, &bad);
+        (void)reply(s, c, "472", (const char *const[]){ wire }, 1,
                     "is unknown mode char to me for channel %s", ch->name);
-        printf("[observable] chan_mode_refused: channel=%s nick=%s reason=%s\n",
-               ch->name, c->nick, unknown);
+        printf("[observable] chan_mode_refused: channel=%s nick=%s reason=%s "
+               "reason_len=%zu reason_byte=0x%02x reason_bad_bytes=%zu\n",
+               ch->name, c->nick, shown, len, (unsigned char)m->params[1][0], bad);
         return;
     }
     if (m->params[1][1] == '\0') {
@@ -1968,6 +2063,38 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
     for (size_t i = 1; m->params[1][i] != '\0'; i++) {
         char mode = m->params[1][i];
         char rendered[4];
+
+        /* THE ALLOWLIST IS ASKED, NOT FALLEN THROUGH TO.
+         *
+         * This loop's shape has always been "act on `b`, act on `o`/`v`, and answer
+         * 472 for whatever is left", and the 472 at the bottom was the fall-through.
+         * That is a rule expressed as an ABSENCE, and an absence is not something a
+         * second path can ask the same question of -- which is exactly how the peer
+         * `SMODES` path came to have no such rule at all and how a peer ended up able
+         * to write a control byte into `ch->modes[]`.
+         *
+         * So it is asked now, here, at the top of the loop. The answer is
+         * non-deterministic from this loop's point of view -- the arms below still
+         * decide what `b` does -- so it is asked as a GATE rather than as a dispatch,
+         * and a letter this node does not implement leaves the loop by the 472 arm at
+         * the bottom instead of by reaching it. One predicate, three callers
+         * (`SMODES`, `chan_mode_set()` and here) and a test that the client path
+         * refuses exactly its complement. */
+        if (chan_mode_implemented(mode) == 0) {
+            char wire[2];
+            char shown[CONN_LOG_FIELD_MAX + 1u];
+            size_t len;
+            size_t bad;
+
+            mode_refusal_render(mode, wire, sizeof wire, shown, sizeof shown, &len,
+                                &bad);
+            (void)reply(s, c, "472", (const char *const[]){ wire }, 1,
+                        "is unknown mode char to me for channel %s", ch->name);
+            printf("[observable] chan_mode_refused: channel=%s nick=%s reason=%s "
+                   "reason_len=%zu reason_byte=0x%02x reason_bad_bytes=%zu\n",
+                   ch->name, c->nick, shown, len, (unsigned char)mode, bad);
+            return;
+        }
 
         if (chan_mode_is_origin_only(mode) && !chan_origin_is_self(s, ch)) {
             /* Unreachable while authority_ok() gates every state change, and
@@ -2160,6 +2287,13 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
          * not act on would have a 324 that disagrees with its behaviour, so the
          * unevaluated ones are refused by name.
          *
+         * IT IS `chan_mode_implemented()` THAT GOT HERE, not a `switch` arm that
+         * happened not to match. `SMODES` asks the same predicate on the peer path --
+         * see channel.c -- and the point of it being a function rather than a
+         * fall-through is that the two paths cannot drift: a mode letter this node
+         * does not evaluate is a 472 for a client and a refusal for a peer, and both
+         * answers come from one switch. `test_fed_guards.c` asserts they agree.
+         *
          * THE SAME FIELD LIST AS THE OTHER 472 ABOVE, and for the same reasons:
          * RFC 2812 5.2 is "<client> <char> :is unknown mode char to me for
          * <channel>", so the middle parameter is the CHARACTER the client asked
@@ -2174,14 +2308,21 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
          * first byte. Sharing a helper would need both passed in, and the one thing
          * that must not vary between them is the field list -- which is why both
          * carry the same comment rather than a shared function. */
-        char unknown[2];
+        char wire[2];
+        char shown[CONN_LOG_FIELD_MAX + 1u];
+        size_t len;
+        size_t bad;
 
-        unknown[0] = mode;
-        unknown[1] = '\0';
-        (void)reply(s, c, "472", (const char *const[]){ unknown }, 1,
+        /* The same rendering as the 472 above, through the same helper, and for the
+         * same reason: the field list and the placeholder must not be able to differ
+         * between two sites that answer the same numeric. */
+        mode_refusal_render(mode, wire, sizeof wire, shown, sizeof shown, &len, &bad);
+        (void)reply(s, c, "472", (const char *const[]){ wire }, 1,
                     "is unknown mode char to me for channel %s", ch->name);
-        printf("[observable] chan_mode_refused: channel=%s nick=%s reason=%s\n",
-               ch->name, c->nick, unknown);
+        (void)chan_mode_implemented(mode); /* the predicate that routed us here */
+        printf("[observable] chan_mode_refused: channel=%s nick=%s reason=%s "
+               "reason_len=%zu reason_byte=0x%02x reason_bad_bytes=%zu\n",
+               ch->name, c->nick, shown, len, (unsigned char)mode, bad);
         return;
     }
 }

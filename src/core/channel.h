@@ -861,6 +861,20 @@ chan_remote_t *chan_remote_at(const chan_t *ch, size_t i);
  * letter from a peer is recognised. */
 int chan_mode_is_origin_only(char m);
 
+/* Does this node EVALUATE this channel-mode letter at all?
+ *
+ * ONE PREDICATE, ASKED BY BOTH PATHS, and it exists because they disagreed. The client
+ * `MODE` path has always refused an unimplemented letter with a 472; the peer `SMODES`
+ * path did not check at all, and wrote whatever the peer sent into `ch->modes[]` --
+ * which reaches 324, the SBURST shadow and every other node on the mesh.
+ *
+ * `handle_mode()` asks it where it used to fall through to the 472, `SMODES` asks it
+ * before applying a letter, and `chan_mode_set()` asks it again because it is the
+ * function that writes the array. Two callers assert that the client path refuses
+ * exactly the complement of this set, because "they ask the same function" is a claim
+ * about the source and the agreement is a claim about behaviour. */
+int chan_mode_implemented(char m);
+
 /* Is `m` currently set on this channel? */
 int chan_mode_has(const chan_t *ch, char m);
 

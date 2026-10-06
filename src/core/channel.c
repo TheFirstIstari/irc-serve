@@ -891,6 +891,51 @@ int chan_mode_is_origin_only(char m)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * chan_mode_implemented: THE LETTERS THIS NODE EVALUATES, AND BOTH PATHS ASK
+ * ---------------------------------------------------------------------------
+ * The server's own rule for the client path was always "reject a mode letter you do
+ * not implement", and 4.4's numerics exist so that a client is told: the 472 at the
+ * bottom of `handle_mode()`'s loop is the fall-through for anything this switch does
+ * not act on. The PEER path did not apply that rule -- `SMODES` looped over the
+ * peer's mode string and called `chan_mode_set()` on every byte that was not a sign,
+ * so a peer could write a control byte into `ch->modes[]` and have it propagate
+ * through 324, the SBURST shadow and the whole mesh.
+ *
+ * THAT IS WHY THIS IS A FUNCTION AND NOT A COMMENT. An inconsistency between two
+ * paths is not fixed by describing it; it is fixed by giving both paths one predicate
+ * to ask, and the two calls are one line each. `test_fed_guards.c` and
+ * `test_nick_rule.c` carry the assertion that the two agree, because "they ask the
+ * same function" is a claim about the source and the agreement is a claim about
+ * behaviour.
+ *
+ * `o` and `v` ARE HERE because the client path EVALUATES them -- they are prefix
+ * modes, applied to a member named by the third parameter -- and the peer path's rule
+ * has to be the same rule rather than a stricter one. They are a little awkward in
+ * `ch->modes[]`, which holds origin-only channel modes and which the client path
+ * never puts a prefix mode into; a peer that sends `SMODES +o` therefore gets its `o`
+ * cached where a client's `+o` would only set a membership flag. That is pre-existing
+ * behaviour made explicit rather than a new hazard, and it is named here rather than
+ * left to be discovered as a `+o` in a 324.
+ *
+ * THREE LETTERS, and the absences are the interesting half: `k` and `l` are advertised
+ * in 004 and evaluated by nothing, `i` is a user mode and `s` and `p` and `n` and `t`
+ * and `m` have no implementation behind them. A peer sending any of them is told
+ * nothing was applied, which is the honest answer and the same one a client gets.
+ */
+int chan_mode_implemented(char m)
+{
+    switch (m) {
+    case 'b': /* the one channel mode this node evaluates, and the one 004's CHANMODES
+               * agrees with */
+    case 'o': /* prefix, applied to the member the third parameter names */
+    case 'v': /* prefix, likewise */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 int chan_mode_has(const chan_t *ch, char m)
 {
     if (ch == NULL) {
@@ -910,6 +955,19 @@ int chan_mode_set(chan_t *ch, char m, int on)
     size_t n;
 
     if (ch == NULL || m == '\0') {
+        return -1;
+    }
+    /* THE ALLOWLIST, HERE AS WELL AS AT THE CALLER, and the double check is not
+     * redundancy for its own sake. `SMODES` asks the same predicate before it calls
+     * this, and a second caller added tomorrow might not -- so the function that
+     * WRITES the array is the last place that can refuse, and `ch->modes[]` is copied
+     * into 324, into the SBURST shadow and onto every peer, which makes "somebody
+     * remembered to check" a poor place to leave a security property.
+     *
+     * It costs one switch on a path that runs once per mode letter per MODE or
+     * SMODES, and it is the difference between a peer that CANNOT write a control byte
+     * into the node's channel state and a peer that can. */
+    if (chan_mode_implemented(m) == 0) {
         return -1;
     }
     n = strlen(ch->modes);

@@ -12,6 +12,10 @@
 /* The ONE escape table in this tree. message_tag_escape()/message_tag_unescape()
  * below delegate here rather than carrying their own switch; see the comments on
  * those two wrappers for why, and ircv3_tags.h for the table itself. */
+/* For conn_text_display_check() -- valid_nick() asks it the half of the nickname
+ * grammar that no single byte can answer, rather than keeping a second copy of the
+ * walk. See the two comments at valid_nick() and nick_char_illegal(). */
+#include "core/connection.h"
 #include "ircv3_tags.h"
 
 /* Longest decimal we read or write for a uint64_t: UINT64_MAX is 20 digits.
@@ -1042,8 +1046,23 @@ static int nick_char_illegal(char c)
         return 1;
     }
     /* Space and control characters, including DEL. A nickname containing a
-     * space would also break tokenization at every hop. Bytes >= 0x80 are
-     * accepted: UTF-8 nicknames are ordinary and are not control characters. */
+     * space would also break tokenization at every hop.
+     *
+     * BYTES >= 0x80 ARE NOT DECIDED HERE, and that is the whole point of this
+     * function's shape: they cannot be. `ā` is 0xC4 0x81, and 0x81 is inside the
+     * C1 range -- so a byte-range test would refuse every accented Latin
+     * character on the network, and would refuse it SILENTLY, which is worse
+     * than the injection it prevents. What separates the letter from the
+     * control is whether a UTF-8 sequence is in progress, and that is state
+     * across a whole string rather than a property of one byte.
+     *
+     * So the per-character grammar ends here and `valid_nick()` asks
+     * `conn_text_display_check()` for the rest. Two consequences worth naming:
+     * this function is no longer the whole of `valid_nick()`, and a reader who
+     * wants to know what a nickname may contain has to read BOTH -- which is
+     * why `valid_nick()` below is written so the two answers sit next to each
+     * other in one loop.
+     */
     const unsigned char u = (unsigned char)c;
     return (u <= 0x20u || u == 0x7fu) ? 1 : 0;
 }
@@ -1082,6 +1101,32 @@ int valid_nick(const char *nick)
         if (nick_char_illegal(nick[i]) != 0) {
             return 0;
         }
+    }
+    /* AND THEN THE PART A BYTE CANNOT ANSWER, asked once for the whole string.
+     *
+     * WHY IT IS A SEPARATE CALL AND NOT INSIDE THE LOOP ABOVE. The loop is a
+     * per-character grammar: it answers "is THIS byte allowed in this position".
+     * The three things `conn_text_display_check()` refuses are not per-character at
+     * all -- a continuation byte is legal as the second half of a sequence and fatal
+     * as the first, `0xC2 0x9B` is two perfectly ordinary bytes that together are
+     * U+009B, and a sequence that stops at the end of the string is only visible once
+     * the string has ended. Answering them a byte at a time is not possible without
+     * carrying the sequence state through this loop and reimplementing the walk,
+     * which is precisely the second copy of the rule that this call exists to avoid.
+     *
+     * WHY IT MATTERS HERE AND NOT ONLY IN A LOG LINE. A nickname is not a log field:
+     * it is the SOURCE of every line its owner sends and the `<client>` field of every
+     * numeric that owner receives, so a bare `0x9F` in one is a control byte in front
+     * of everything that client says to every other channel member's terminal. That is
+     * a cross-client injection, which is why this is a REFUSAL and not a strip: there
+     * is no copy of the nickname to sanitise, because every copy IS the original.
+     *
+     * `valid_nick()` IS THE ENFORCEMENT POINT, and it and the nickname STORAGE must
+     * not come to disagree -- which is the same store/validate divergence
+     * `handle_topic()`'s comment describes for the topic, in a different field. The
+     * writers are `conn_nick_set()` and the registration path; both run this. */
+    if (conn_text_display_check(nick) != CONN_DISPLAY_OK) {
+        return 0;
     }
     return 1;
 }

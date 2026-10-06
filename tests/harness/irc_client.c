@@ -147,6 +147,7 @@ static int read_once(test_client_t *c, uint64_t deadline, int *eof)
         if (eof != NULL) {
             *eof = 1;
         }
+        c->closed = 1;
         return 0;
     }
     if (n < 0) {
@@ -686,6 +687,55 @@ void tc_close(test_client_t *c)
  *
  * Returns 0 if nothing was read before the deadline, 1 if bytes were appended,
  * -1 on a hard error, and sets `*eof` when the peer closed. */
+int tc_closed(const test_client_t *c)
+{
+    return (c != NULL) ? c->closed : 0;
+}
+
+/* See irc_client.h's block for why the other two read paths cannot serve a caller
+ * that needs to keep the whole accumulated buffer AND must not block. The
+ * implementation is `recv()` with MSG_DONTWAIT in a loop, appending through the same
+ * `append()` every other read here uses -- so the buffer this grows is the one
+ * `tc_buffer()` and `tc_received()` already describe, and no caller has to know that
+ * a second path exists. */
+int tc_read_available(test_client_t *c, int *eof)
+{
+    char chunk[16384];
+    int total = 0;
+
+    if (c == NULL || c->fd < 0) {
+        return -1;
+    }
+    for (;;) {
+        ssize_t n = recv(c->fd, chunk, sizeof chunk, MSG_DONTWAIT);
+
+        if (n > 0) {
+            if (append(c, chunk, (size_t)n) != 0) {
+                return -1;
+            }
+            total += (int)n;
+            continue;
+        }
+        if (n == 0) {
+            if (eof != NULL) {
+                *eof = 1;
+            }
+            c->closed = 1;
+            return total;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        /* EAGAIN/EWOULDBLOCK is the ordinary answer: the kernel has nothing more.
+         * Anything else is a real error and the caller is told so rather than being
+         * handed a short count it would read as "nothing arrived". */
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return total;
+        }
+        return -1;
+    }
+}
+
 int tc_drain(test_client_t *c, int timeout_ms, int *eof)
 {
     uint64_t deadline;

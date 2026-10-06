@@ -53,6 +53,7 @@
 #include "core/server.h"
 #include "federation/link.h"
 #include "harness/irc_client.h"
+#include "harness/peer_fixture.h"
 #include "harness/node_fixture.h"
 #include "harness/test_util.h"
 
@@ -66,6 +67,63 @@
 #define PEER   "irc.b"
 #define CHAN   "#T"
 #define NICK_C "carol"
+
+
+/* Read until `needle` has appeared in what has arrived, or the deadline passes.
+ * All the needles in ONE call rather than one call each: the buffer is local, so
+ * a second call starts from nothing and can never see the bytes the first
+ * consumed. */
+
+
+/* ---------------------------------------------------------------------------
+ * G1 AND G3: A LINE THAT ARRIVES BEFORE THE HANDSHAKE
+ * ---------------------------------------------------------------------------
+ * The first guard, and the one with a cost: the line is dropped and counted, and
+ * THE LINK IS NOT TORN DOWN.
+ *
+ * IT IS REACHED FROM THE DIALING SIDE, and that is not incidental. A connection
+ * only becomes CONN_SERVER when fed_link_established() runs, so a line that
+ * arrives on a link still in HANDSHAKE_SENT is a line a peer sent BEFORE it said
+ * hello -- and on this side of the handshake that is the only shape the case has.
+ * A client connection is not it at all: commands_dispatch() answers a client line
+ * from the client table and never calls the guard chain, which is 3's "one path
+ * for local and remote input" doing its job.
+ *
+ * "NOT TORN DOWN" IS ASSERTED BY WHAT HAPPENS NEXT, which is the honest way to
+ * assert it: the very next line this test sends is the FEDERATE, and the link
+ * reaches ESTABLISHED. A guard that closed the connection would make a peer that
+ * speaks before it says hello permanently unconnectable, and the handshake FSM has
+ * no way to recover from that -- so the sequence below is the assertion, and a
+ * separate observable would only be a report of it. */
+static void case_preauth_drop(nf_node_t *node, int *peer_fd)
+{
+    char line[512];
+    size_t before = tf_count(node->out, "fed_preauth_drop:");
+
+    /* No tag block, a server prefix, and a verb that would otherwise be acted on
+     * -- everything a real pre-auth line looks like. The channel does not exist
+     * on this node, so an accepted line would be a malformed-target drop rather
+     * than a delivery, and the pre-auth counter is the property under test
+     * anyway. */
+    (void)snprintf(line, sizeof line, ":" PEER " SPRIVMSG " CHAN " :toosoon\r\n");
+    TF_CHECK_MSG(pf_send_line(*peer_fd, line) == 0,
+                 "the test could not send the pre-auth line");
+    TF_CHECK_MSG(nf_expect(node, "fed_preauth_drop: ", T_IO_MS) == 0,
+                 "a line that arrived before the handshake was not dropped and "
+                 "counted. A pre-auth line is a stranger talking, and the answer "
+                 "to a stranger is the handshake rather than a closed socket: %s",
+                 node->out);
+    TF_CHECK_MSG(tf_count(node->out, "fed_preauth_drop:") > before,
+                 "the pre-auth drop was reported but not counted, so an operator "
+                 "reading the counters cannot see a stranger talking to the node: "
+                 "%s",
+                 node->out);
+    /* The line named no one, so nothing was applied and nothing was forwarded:
+     * the drop has to be a drop and not a deferral. */
+    TF_CHECK_MSG(strstr(node->out, "toosoon") == NULL,
+                 "the pre-auth line was acted on rather than dropped: %s",
+                 node->out);
+}
 
 /* ---------------------------------------------------------------------------
  * The child
@@ -116,196 +174,6 @@ static void child_setup(server_t *s)
 }
 
 /* ---------------------------------------------------------------------------
- * Local socket helpers
- * ---------------------------------------------------------------------------
- * Two, and both because this test is the SERVER half of a peer connection and
- * harness/irc_client.h is the client half. They are deadline waits over select()
- * for the same reason everything else here is.
- */
-static uint64_t now_ms(void)
-{
-    struct timespec ts;
-
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
-        return 0;
-    }
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000L);
-}
-
-static int listen_loopback(int *port_out)
-{
-    struct sockaddr_in sa;
-    socklen_t len = sizeof sa;
-    int one = 1;
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-
-    if (fd < 0) {
-        return -1;
-    }
-    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    sa.sin_port = 0;
-    if (bind(fd, (struct sockaddr *)&sa, sizeof sa) != 0 ||
-        listen(fd, 8) != 0 ||
-        getsockname(fd, (struct sockaddr *)&sa, &len) != 0) {
-        close(fd);
-        return -1;
-    }
-    *port_out = (int)ntohs(sa.sin_port);
-    return fd;
-}
-
-static int accept_deadline(int listen_fd, int timeout_ms)
-{
-    uint64_t deadline = now_ms() + (uint64_t)timeout_ms;
-    fd_set rfds;
-    int rc;
-
-    for (;;) {
-        struct timeval tv;
-        uint64_t left = (deadline > now_ms()) ? deadline - now_ms() : 0;
-
-        FD_ZERO(&rfds);
-        FD_SET(listen_fd, &rfds);
-        tv.tv_sec = (time_t)(left / 1000u);
-        tv.tv_usec = (suseconds_t)((left % 1000u) * 1000u);
-        rc = select(listen_fd + 1, &rfds, NULL, NULL, &tv);
-        if (rc < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return -1;
-        }
-        if (rc == 0) {
-            return -1;
-        }
-        return accept(listen_fd, NULL, NULL);
-    }
-}
-
-/* Read until `needle` has appeared in what has arrived, or the deadline passes.
- * All the needles in ONE call rather than one call each: the buffer is local, so
- * a second call starts from nothing and can never see the bytes the first
- * consumed. */
-static int read_until(int fd, const char *const *needles, size_t nneedles,
-                      int timeout_ms)
-{
-    char buf[4096];
-    char seen[8192];
-    size_t used = 0;
-    size_t got_all = 0;
-    uint64_t deadline = now_ms() + (uint64_t)timeout_ms;
-
-    for (;;) {
-        struct timeval tv;
-        uint64_t left = (deadline > now_ms()) ? deadline - now_ms() : 0;
-        fd_set rfds;
-        ssize_t got;
-        int rc;
-
-        if (got_all == nneedles) {
-            return 0;
-        }
-        if (used >= sizeof seen - 1u) {
-            break;
-        }
-        FD_ZERO(&rfds);
-        FD_SET(fd, &rfds);
-        tv.tv_sec = (time_t)(left / 1000u);
-        tv.tv_usec = (suseconds_t)((left % 1000u) * 1000u);
-        rc = select(fd + 1, &rfds, NULL, NULL, &tv);
-        if (rc <= 0) {
-            break;
-        }
-        got = read(fd, buf, sizeof buf);
-        if (got <= 0) {
-            break;
-        }
-        if ((size_t)got >= sizeof seen - 1u - used) {
-            got = (ssize_t)(sizeof seen - 1u - used);
-        }
-        memcpy(seen + used, buf, (size_t)got);
-        used += (size_t)got;
-        seen[used] = '\0';
-        got_all = 0;
-        for (size_t i = 0; i < nneedles; i++) {
-            if (strstr(seen, needles[i]) != NULL) {
-                got_all++;
-            }
-        }
-    }
-    return (got_all == nneedles) ? 0 : -1;
-}
-
-static int send_line(int fd, const char *line)
-{
-    size_t n = strlen(line);
-    size_t off = 0;
-
-    while (off < n) {
-        ssize_t got = write(fd, line + off, n - off);
-
-        if (got <= 0) {
-            return -1;
-        }
-        off += (size_t)got;
-    }
-    return 0;
-}
-
-/* ---------------------------------------------------------------------------
- * G1 AND G3: A LINE THAT ARRIVES BEFORE THE HANDSHAKE
- * ---------------------------------------------------------------------------
- * The first guard, and the one with a cost: the line is dropped and counted, and
- * THE LINK IS NOT TORN DOWN.
- *
- * IT IS REACHED FROM THE DIALING SIDE, and that is not incidental. A connection
- * only becomes CONN_SERVER when fed_link_established() runs, so a line that
- * arrives on a link still in HANDSHAKE_SENT is a line a peer sent BEFORE it said
- * hello -- and on this side of the handshake that is the only shape the case has.
- * A client connection is not it at all: commands_dispatch() answers a client line
- * from the client table and never calls the guard chain, which is 3's "one path
- * for local and remote input" doing its job.
- *
- * "NOT TORN DOWN" IS ASSERTED BY WHAT HAPPENS NEXT, which is the honest way to
- * assert it: the very next line this test sends is the FEDERATE, and the link
- * reaches ESTABLISHED. A guard that closed the connection would make a peer that
- * speaks before it says hello permanently unconnectable, and the handshake FSM has
- * no way to recover from that -- so the sequence below is the assertion, and a
- * separate observable would only be a report of it. */
-static void case_preauth_drop(nf_node_t *node, int *peer_fd)
-{
-    char line[512];
-    size_t before = tf_count(node->out, "fed_preauth_drop:");
-
-    /* No tag block, a server prefix, and a verb that would otherwise be acted on
-     * -- everything a real pre-auth line looks like. The channel does not exist
-     * on this node, so an accepted line would be a malformed-target drop rather
-     * than a delivery, and the pre-auth counter is the property under test
-     * anyway. */
-    (void)snprintf(line, sizeof line, ":" PEER " SPRIVMSG " CHAN " :toosoon\r\n");
-    TF_CHECK_MSG(send_line(*peer_fd, line) == 0,
-                 "the test could not send the pre-auth line");
-    TF_CHECK_MSG(nf_expect(node, "fed_preauth_drop: ", T_IO_MS) == 0,
-                 "a line that arrived before the handshake was not dropped and "
-                 "counted. A pre-auth line is a stranger talking, and the answer "
-                 "to a stranger is the handshake rather than a closed socket: %s",
-                 node->out);
-    TF_CHECK_MSG(tf_count(node->out, "fed_preauth_drop:") > before,
-                 "the pre-auth drop was reported but not counted, so an operator "
-                 "reading the counters cannot see a stranger talking to the node: "
-                 "%s",
-                 node->out);
-    /* The line named no one, so nothing was applied and nothing was forwarded:
-     * the drop has to be a drop and not a deferral. */
-    TF_CHECK_MSG(strstr(node->out, "toosoon") == NULL,
-                 "the pre-auth line was acted on rather than dropped: %s",
-                 node->out);
-}
-
-/* ---------------------------------------------------------------------------
  * The peer, established
  * ---------------------------------------------------------------------------
  * `line` is the FIRST thing this test puts on the link, and every case after it
@@ -334,14 +202,14 @@ static void peer_open(hostile_peer_t *p, nf_node_t *node, test_client_t *client,
         " " SECRET " " IRC_SERVE_VERSION "\r\n"
     };
 
-    listen_fd = listen_loopback(&p->port);
+    listen_fd = pf_listen_loopback(&p->port);
     TF_CHECK_MSG(listen_fd >= 0, "the test could not open a listening socket");
     g_peer_port = p->port;
     g_trace = 0;
     TF_CHECK_MSG(nf_spawn_inline_named(node, NAME_A, child_setup) == 0,
                  "could not spawn node A");
 
-    p->fd = accept_deadline(listen_fd, T_IO_MS);
+    p->fd = pf_accept_deadline(listen_fd, T_IO_MS);
     /* The listener is the test's own and there is only ever one peer, so it is
      * closed here rather than at the end: leaving it open would mean a second
      * dial could be accepted by accident and the "one link" the cases below rest
@@ -352,7 +220,7 @@ static void peer_open(hostile_peer_t *p, nf_node_t *node, test_client_t *client,
     /* Read A's claim first, for the reason test_fed_handshake.c gives: without
      * it, "A established a link" would be satisfied by a node that never sent a
      * handshake. Pinned on both sides of the epoch, which is a clock reading. */
-    TF_CHECK_MSG(read_until(p->fd, needles, sizeof needles / sizeof needles[0],
+    TF_CHECK_MSG(pf_read_until(p->fd, needles, sizeof needles / sizeof needles[0],
                             T_IO_MS) == 0,
                  "node A never sent a FEDERATE naming itself with the configured "
                  "secret, so nothing after this could mean anything");
@@ -367,7 +235,7 @@ static void peer_open(hostile_peer_t *p, nf_node_t *node, test_client_t *client,
      * a property anything wants. */
     (void)snprintf(reply, sizeof reply, ":" PEER " FEDERATE " PEER " 1700000000 %s %s\r\n",
                    SECRET, IRC_SERVE_VERSION);
-    TF_CHECK_MSG(send_line(p->fd, reply) == 0,
+    TF_CHECK_MSG(pf_send_line(p->fd, reply) == 0,
                  "the test could not answer with a FEDERATE");
     TF_CHECK_MSG(nf_expect(node, "link_established: peer=" PEER, T_IO_MS) == 0,
                  "node A never established its link, so the guards below are "
@@ -406,18 +274,6 @@ static void peer_close(hostile_peer_t *p, nf_node_t *node, test_client_t *client
 /* How many times `needle` appears in everything the client has received. The
  * needle is a single word with no spaces, so the count is a count of DELIVERIES
  * and not of words. */
-static size_t times_seen(const test_client_t *c, const char *needle)
-{
-    const char *p = tc_buffer(c);
-    size_t n = 0;
-    size_t len = strlen(needle);
-
-    while ((p = strstr(p, needle)) != NULL) {
-        n++;
-        p += len;
-    }
-    return n;
-}
 
 /* The 2.4 stamp, rendered by the test rather than read from the node, because
  * the point of every case below is what the node does with a stamp the node did
@@ -453,7 +309,7 @@ static void case_hop_ceiling(nf_node_t *node, test_client_t *client, int *peer_f
     (void)snprintf(line, sizeof line, "%s:" NICK_C "!u@1.2.3.4 SPRIVMSG " CHAN
                                     " :atthelimit\r\n",
                    block);
-    TF_CHECK_MSG(send_line(*peer_fd, line) == 0, "the test could not send the line");
+    TF_CHECK_MSG(pf_send_line(*peer_fd, line) == 0, "the test could not send the line");
 
     TF_CHECK_MSG(nf_expect(node, "fed_hop_drop: ", T_IO_MS) == 0,
                  "a message with hops=10 was not reported as past the hop "
@@ -491,7 +347,7 @@ static void case_own_origin(nf_node_t *node, test_client_t *client, int *peer_fd
     (void)snprintf(line, sizeof line, "%s:" NICK_C "!u@1.2.3.4 SPRIVMSG " CHAN
                                     " :ownorigin\r\n",
                    block);
-    TF_CHECK_MSG(send_line(*peer_fd, line) == 0, "the test could not send the line");
+    TF_CHECK_MSG(pf_send_line(*peer_fd, line) == 0, "the test could not send the line");
 
     TF_CHECK_MSG(nf_expect(node, "fed_own_origin_drop: ", T_IO_MS) == 0,
                  "a message whose origin is THIS node was not dropped. The stamp "
@@ -527,7 +383,7 @@ static void case_duplicate_dropped(nf_node_t *node, test_client_t *client,
     (void)snprintf(line, sizeof line, "%s:" NICK_C "!u@1.2.3.4 SPRIVMSG " CHAN
                                     " :onlyonce\r\n",
                    block);
-    TF_CHECK_MSG(send_line(*peer_fd, line) == 0, "the test could not send the line");
+    TF_CHECK_MSG(pf_send_line(*peer_fd, line) == 0, "the test could not send the line");
     /* The first one is acted on. Waiting for it is what makes the count below a
      * statement about the SECOND copy rather than about a node that delivered
      * neither. */
@@ -536,17 +392,17 @@ static void case_duplicate_dropped(nf_node_t *node, test_client_t *client,
                  "so the duplicate case below would be satisfied by a node that "
                  "delivers nothing: %s",
                  tc_buffer(client));
-    TF_CHECK_MSG(send_line(*peer_fd, line) == 0,
+    TF_CHECK_MSG(pf_send_line(*peer_fd, line) == 0,
                  "the test could not send the second copy");
 
     TF_CHECK_MSG(nf_expect(node, "fed_duplicate: ", T_IO_MS) == 0,
                  "the same (origin, epoch, id) was accepted twice. 2.4's key is "
                  "that triple and a second copy of it is a message this node has "
                  "already been sent.");
-    TF_CHECK_MSG(times_seen(client, "onlyonce") == 1,
+    TF_CHECK_MSG(pf_times_seen(tc_buffer(client), "onlyonce") == 1,
                  "the client's client saw a duplicated message %lu times; 2.4's "
                  "whole point is that a second copy is dropped, not re-delivered",
-                 (unsigned long)times_seen(client, "onlyonce"));
+                 (unsigned long)pf_times_seen(tc_buffer(client), "onlyonce"));
     /* The two counters are the same event at two levels, and a difference
      * between them would be a bug in the chain rather than a number nobody
      * looked at. */
@@ -590,7 +446,7 @@ static void case_untagged_relay_refused(nf_node_t *node, test_client_t *client,
      * tag at all here -- that is the whole of the case. */
     (void)snprintf(line, sizeof line,
                    ":mallory!u@example.org SPRIVMSG " CHAN " :relayeduntagged\r\n");
-    TF_CHECK_MSG(send_line(*peer_fd, line) == 0, "the test could not send the line");
+    TF_CHECK_MSG(pf_send_line(*peer_fd, line) == 0, "the test could not send the line");
 
     TF_CHECK_MSG(nf_expect(node, "fed_untagged: fd=", T_IO_MS) == 0,
                  "an untagged line whose prefix names another server was not "
@@ -632,7 +488,7 @@ static void case_untagged_origin_accepted(nf_node_t *node, test_client_t *client
     char line[512];
 
     (void)snprintf(line, sizeof line, ":" PEER " SPRIVMSG " CHAN " :originated\r\n");
-    TF_CHECK_MSG(send_line(*peer_fd, line) == 0, "the test could not send the line");
+    TF_CHECK_MSG(pf_send_line(*peer_fd, line) == 0, "the test could not send the line");
     TF_CHECK_MSG(tc_expect(client, " PRIVMSG " CHAN " originated\r\n", T_IO_MS) == 0,
                  "an untagged line whose prefix names the link's OWN server was "
                  "not delivered. The node cannot tell a peer originating a line "
@@ -663,7 +519,7 @@ static void case_verb_and_field_checks(nf_node_t *node, int *peer_fd)
     before = (int)tf_count(node->out, "fed_unknown_verb:");
     stamp(block, sizeof block, "irc.z", 1700000004UL, 601UL, 1UL);
     (void)snprintf(line, sizeof line, "%s:" PEER " SNAMES " CHAN "\r\n", block);
-    TF_CHECK_MSG(send_line(*peer_fd, line) == 0, "the test could not send the line");
+    TF_CHECK_MSG(pf_send_line(*peer_fd, line) == 0, "the test could not send the line");
     TF_CHECK_MSG(nf_expect(node, "fed_verb_deferred: ", T_IO_MS) == 0,
                  "a 4.3 verb this build does not implement was not reported as "
                  "deferred: %s",
@@ -672,7 +528,7 @@ static void case_verb_and_field_checks(nf_node_t *node, int *peer_fd)
     /* A word that is not in 4.3 at all. */
     stamp(block, sizeof block, "irc.z", 1700000005UL, 602UL, 1UL);
     (void)snprintf(line, sizeof line, "%s:" PEER " NOSUCHVERB " CHAN "\r\n", block);
-    TF_CHECK_MSG(send_line(*peer_fd, line) == 0, "the test could not send the line");
+    TF_CHECK_MSG(pf_send_line(*peer_fd, line) == 0, "the test could not send the line");
     TF_CHECK_MSG(nf_expect(node, "fed_unknown_verb: ", T_IO_MS) == 0,
                  "a verb that is not in 4.3's list was not reported as unknown: %s",
                  node->out);
@@ -691,7 +547,7 @@ static void case_verb_and_field_checks(nf_node_t *node, int *peer_fd)
      * because it is the one that was already here. */
     stamp(block, sizeof block, "irc.z", 1700000006UL, 603UL, 1UL);
     (void)snprintf(line, sizeof line, "%s:" PEER " SJOIN " CHAN " mallory\r\n", block);
-    TF_CHECK_MSG(send_line(*peer_fd, line) == 0, "the test could not send the line");
+    TF_CHECK_MSG(pf_send_line(*peer_fd, line) == 0, "the test could not send the line");
     TF_CHECK_MSG(nf_expect(node, "fed_malformed: ", T_IO_MS) == 0,
                  "an SJOIN with two parameters was accepted. The frozen shape is "
                  "three, and a node that reads the third out of a two-parameter "
@@ -708,7 +564,7 @@ static void case_verb_and_field_checks(nf_node_t *node, int *peer_fd)
     stamp(block, sizeof block, "irc.z", 1700000007UL, 604UL, 1UL);
     (void)snprintf(line, sizeof line,
                    "%s:" PEER " SJOIN " CHAN " bad@nick - *\r\n", block);
-    TF_CHECK_MSG(send_line(*peer_fd, line) == 0, "the test could not send the line");
+    TF_CHECK_MSG(pf_send_line(*peer_fd, line) == 0, "the test could not send the line");
     TF_CHECK_MSG(nf_expect(node, "fed_sjoin_reject: ", T_IO_MS) == 0,
                  "an SJOIN whose member is not a legal nickname was recorded in "
                  "the roster. 2.1's charset rule is what makes nick@server "
@@ -721,7 +577,7 @@ static void case_verb_and_field_checks(nf_node_t *node, int *peer_fd)
     stamp(block, sizeof block, "irc.z", 1700000008UL, 605UL, 1UL);
     (void)snprintf(line, sizeof line, "%s:" PEER " SJOIN " CHAN " mallory - *\r\n",
                    block);
-    TF_CHECK_MSG(send_line(*peer_fd, line) == 0, "the test could not send the line");
+    TF_CHECK_MSG(pf_send_line(*peer_fd, line) == 0, "the test could not send the line");
     TF_CHECK_MSG(nf_expect(node, "fed_sjoin: channel=" CHAN " member=mallory", T_IO_MS) ==
                      0,
                  "an SJOIN with a legal nickname was not recorded either, so the "

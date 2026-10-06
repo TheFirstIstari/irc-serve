@@ -522,6 +522,30 @@ void handle_batch(server_t *s, conn_t *c, const message_t *m)
      * says so. */
     (void)reply_refused(s, c, "BATCH", NULL, "462", NULL, 0,
                         "Batch reference must begin with '+' or '-'");
-    printf("[observable] batch_refused: fd=%d reason=NO_SIGN first=%c\n", c->fd,
-           arg[0]);
+    /* Rule 1, and this is the LOWEST-PRIVILEGE instance of the class in the tree:
+     * `BATCH` is `pre_reg`, so this line is reachable from a socket that has never
+     * registered and has never joined anything. One line on a socket was enough to
+     * put a control byte in an operator's terminal, and `%c` is why -- the format
+     * reads as harmless in a list of printf sites, and a byte walked into it by the
+     * caller is invisible there.
+     *
+     * `conn_text_logsafe()` WITHHOLDS rather than filters: `first=-` says there was a
+     * value and it was not safe to print, and the three measurements beside it say
+     * which. The hex byte is the one that matters, because `first_len=1` alone does
+     * not distinguish ESC from BEL from a NUL and an operator reading this line wants
+     * to know which control byte a client sent at it.
+     *
+     * COST: one pass over one byte, on a path that runs once per malformed reference. */
+    {
+        char raw[2];
+        char shown[CONN_LOG_FIELD_MAX + 1u];
+
+        raw[0] = arg[0];
+        raw[1] = '\0';
+        (void)conn_text_logsafe(shown, sizeof shown, raw);
+        printf("[observable] batch_refused: fd=%d reason=NO_SIGN first=%s first_byte=0x%02x "
+               "first_len=%zu first_bad_bytes=%zu\n",
+               c->fd, shown, (unsigned char)arg[0], strlen(raw),
+               conn_text_bad_count(raw));
+    }
 }

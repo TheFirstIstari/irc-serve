@@ -2,11 +2,19 @@
  * them and the guard chain that decides whether an inbound one may act. */
 #include "federation/verbs.h"
 
+/* For fed_obs() below, which is printf for a log line whose %s arguments are peer
+ * strings and has to walk a format string and a va_list to do it. */
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "account_store.h"
 #include "core/account.h"
+/* For conn_text_logsafe() and conn_text_bad_count() -- a peer string this node
+ * PRINTS is log-only and is therefore measured rather than filtered, for the same reason a
+ * client string printed on this node's stdout is. A peer string this node STORES goes
+ * through the field's own policy, and SMODES through chan_mode_implemented(). */
+#include "core/connection.h"
 #include "core/channel.h"
 #include "core/fanout.h"
 #include "federation/burst.h"
@@ -18,6 +26,172 @@
 #include <stdlib.h>
 
 #include "federation/nickreg.h"
+
+/* ---------------------------------------------------------------------------
+ * fed_obs: printf for a log line whose %s arguments are PEER strings
+ * ---------------------------------------------------------------------------
+ * WHY IT EXISTS, and it is the same argument reply.c's `emit_numeric_ex()` makes for
+ * numerics. This file had thirty-odd `[observable]` lines and most of them printed a
+ * value the peer chose -- a member name, a mode string, a reason, an advertised host
+ * -- with a bare `%s` and no filter between the socket and an operator's terminal. A
+ * policy with thirty enforcement points is a policy with twenty-nine chances to be
+ * forgotten, and the one this tree already wrote ("there is no second reader") was
+ * wrong: the operator reading this log IS the reader, and there is no argument that an
+ * operator's terminal is not one.
+ *
+ * SO IT IS ONE FUNCTION AND EVERY SITE SAYS `fed_obs`. A `%s` argument is rendered
+ * through `conn_text_logsafe()` before it reaches stdout: kept verbatim when every
+ * byte is printable ASCII, and WITHHELD as `-` when one is not, which is the tree's
+ * standing convention for a log-only field (`cmd_unknown: command=-` beside a
+ * `command_len=`). Every other conversion -- `%d`, `%zu`, `%llu`, `%02x`, `%c` --
+ * is passed straight through, because a length or a count is this node's own number and
+ * filtering it would make the line lie.
+ *
+ * WHAT IT DOES NOT DO, and the two things a caller still owns:
+ *
+ *   - IT DOES NOT MEASURE. `conn_text_logsafe()` withholds and the caller decides
+ *     whether the line also carries `len=` and `bad_bytes=`. A site that is reporting
+ *     a refusal wants the measurement -- `fed_advertise_refused:` and `fed_modes:`
+ *     below print it, because an operator reading "this peer was refused" needs to
+ *     know what it sent -- and a site that is reporting progress does not.
+ *   - IT DOES NOT FILTER STORED STATE. A peer string this node STORES goes through
+ *     that field's own policy: a roster name through `valid_nick()`, a topic through
+ *     `chan_set_topic()`, a mode letter through `chan_mode_implemented()`. This
+ *     function is about what this node PRINTS, and the distinction is the same one
+ *     connection.h's policy table draws between a field that is stored and a field that
+ *     is only logged.
+ *
+* THE FIELD BUFFER IS ONE 256-BYTE BUFFER, reused per field, because each field is
+* written out before the next one is read and nothing here outlives its own `fputs()`.
+* A peer string longer than the buffer prints `-`, which is a loss of text and never a
+* loss of safety -- and the sites whose values can be long print a length beside them.
+*
+ * COST: one pass per `%s` argument, on a path that runs once per peer line. The
+ * walker is a format-string scan rather than a `printf`, so it is not the libc's
+ * formatter and does not inherit its behaviour. Every conversion is pulled off the
+ * va_list BY THIS FUNCTION and rendered with `snprintf()`, and that is a correctness
+ * requirement rather than a style preference: an earlier version handed the built spec
+ * to `vfprintf()` for the non-`%s` conversions and read the `%s` ones with `va_arg()`.
+ * Mixing the two on one `va_list` compiled, passed the format attribute at every call
+ * site, and then had `vfprintf()` consume NOTHING at -O2 -- so every `%s` after a `%d`
+ * on the same line read the *previous* argument. It surfaced as a segfault in
+ * `conn_text_logsafe()` on `fd=%d command=%s state=%s`, which is the luckiest possible
+ * symptom: it faulted rather than printing a number where a string belonged. So there
+ * is no `vfprintf()` here, and the closed set of conversions below is what makes that
+ * safe -- `%s`, `%d`, `%i`, `%u`, `%o`, `%x`, `%X`, `%c`, and `%%`, with `h`, `l`, `ll`
+ * and `z` honoured for width. Anything else ends the line instead of guessing.
+ */
+#define FED_OBS_FIELD 256
+/* The characters that may sit between the `%` and the conversion letter, split into the
+ * ones that only shape the output and the ones that decide the argument's WIDTH. Kept as
+ * two lists because conflating them is how a format walker ends up reading a `size_t` as
+ * an `int`. */
+#define FED_OBS_SPEC "-+ #0123456789.*hlLqjzt"
+#define FED_OBS_LEN "hlLqjzt"
+
+static void fed_obs(const char *fmt, ...)
+#if defined(__GNUC__)
+    __attribute__((format(printf, 1, 2)))
+#endif
+    ;
+
+static void fed_obs(const char *fmt, ...)
+{
+    /* One field buffer, 256 bytes so a whole topic (CHAN_MAX_TOPIC is 255) or a
+     * hostmask fits without being withheld for length. It is ONE buffer rather than
+     * one per field because every field is written out before the next one is read:
+     * nothing here outlives its own fputs(). The first version kept four slots and
+     * held each rendered field until the line was done, which made a line with five
+     * CONVERSIONS -- not five `%s`, five, `fed_advertise:`'s `load=%u` and
+     * `fed_shutdown:`'s `relayed=%d` among them -- print `-` for everything past the
+     * fourth. A separate array per field was the wrong shape for a writer that never
+     * reads a field twice. */
+    char out[FED_OBS_FIELD];
+    const char *q;
+    char len[3];
+    va_list ap;
+    size_t nlen;
+
+    if (fmt == NULL) {
+        return;
+    }
+    va_start(ap, fmt);
+    for (const char *p = fmt; *p != '\0'; p++) {
+        if (*p != '%') {
+            (void)fputc((int)*p, stdout);
+            continue;
+        }
+        if (p[1] == '%') {
+            (void)fputc('%', stdout);
+            p++;
+            continue;
+        }
+        /* Split the spec into "flags and width" and "length modifiers", because the
+         * length modifier is what decides how WIDE the argument is, and reading the
+         * wrong width off a va_list is undefined rather than merely wrong. `z` and `ll`
+         * and `l` are the three in use here and are checked by name below. */
+        nlen = 0u;
+        q = p + 1;
+        while (*q != '\0' && strchr(FED_OBS_SPEC, *q) != NULL) {
+            if (strchr(FED_OBS_LEN, *q) != NULL && nlen + 1u < sizeof len) {
+                len[nlen++] = *q;
+            }
+            q++;
+        }
+        len[nlen] = '\0';
+
+        /* `%s` IS THE POINT OF THE FUNCTION. */
+        if (*q == 's') {
+            const char *v = va_arg(ap, const char *);
+
+            (void)conn_text_logsafe(out, sizeof out, v);
+        } else if (*q == 'd' || *q == 'i') {
+            long long v = (strchr(len, 'z') != NULL)   ? (long long)va_arg(ap, size_t)
+                          : (nlen >= 2u && len[0] == 'l' && len[1] == 'l')
+                              ? va_arg(ap, long long)
+                              : (len[0] == 'l') ? (long long)va_arg(ap, long)
+                                                 : (long long)va_arg(ap, int);
+
+            (void)snprintf(out, sizeof out, "%lld", v);
+        } else if (*q == 'u' || *q == 'o' || *q == 'x' || *q == 'X') {
+            unsigned long long v = (strchr(len, 'z') != NULL)
+                                       ? (unsigned long long)va_arg(ap, size_t)
+                                   : (nlen >= 2u && len[0] == 'l' && len[1] == 'l')
+                                       ? va_arg(ap, unsigned long long)
+                                   : (len[0] == 'l') ? (unsigned long long)va_arg(ap, unsigned long)
+                                                      : (unsigned long long)va_arg(ap, unsigned int);
+
+            (void)snprintf(out, sizeof out, (len[0] == 'h') ? "%llx" : "%llu", v);
+        } else if (*q == 'c') {
+            unsigned char v = (unsigned char)va_arg(ap, int);
+
+            /* A peer byte is NOT printed here even as a character: `cmd_unknown:` prints
+             * `command_len=` and `bad_bytes=` for that, and this exists for the one
+             * ASCII control the logsafe helper itself reports. */
+            if (v < 0x20u || v > 0x7eu) {
+                (void)snprintf(out, sizeof out, "-");
+            } else {
+                (void)snprintf(out, sizeof out, "%c", (int)v);
+            }
+        } else {
+            /* NOT A CONVERSION THIS FUNCTION KNOWS. The line ends here rather than
+             * continuing, because a conversion that was not pulled off the va_list has
+             * left it misaligned and every later field would name the wrong argument.
+             * The `printf` attribute above means no call site in the tree can reach this,
+             * so the branch is a statement about what happens if one ever does -- a
+             * terminated line with a withheld field is a readable defect; a line whose
+             * fields name the wrong values is not. */
+            (void)fputc('-', stdout);
+            (void)fputc('\n', stdout);
+            va_end(ap);
+            return;
+        }
+        (void)fputs(out, stdout);
+        p = q;
+    }
+    va_end(ap);
+}
+
 
 /* The map, once, in the order 4.3 lists the client verbs rather than in the
  * order of the S-verbs, so that a reader comparing this against the design does
@@ -99,7 +273,7 @@ const char *fed_queue_why_name(fed_queue_why_t why)
         /* Unreachable while fed_queue_why_t is closed and every member is
          * listed. A BUG REPORT if it is ever reached, so it says so rather than
          * returning a name that does not correspond to anything. */
-        printf("[observable] fed_queue_unknown: why=%d\n", which);
+        fed_obs("[observable] fed_queue_unknown: why=%d\n", which);
         return "UNKNOWN";
     }
 }
@@ -116,6 +290,135 @@ static int fed_queue_refuse(fed_queue_why_t *why_out, fed_queue_why_t why)
         *why_out = why;
     }
     return -1;
+}
+
+/* ---------------------------------------------------------------------------
+ * fed_relay_clean(): THE ONE PLACE A PEER-BOUND LINE IS FILTERED
+ * ---------------------------------------------------------------------------
+ * WHY IT EXISTS. `conn_text_strip` appeared NOWHERE in this file, in
+ * federation/link.c or in core/fanout.c: a message a peer sent arrived on one link
+ * and was written to another with its bytes untouched. The peer-path sweep found
+ * it -- 64 marker bytes reaching a peer socket on one run, from
+ * `: irc.b SPRIVMSG #P19 :marker \x04 text` -- and `relay_byte_kept()` is what
+ * should have removed that `0x04`, because it keeps exactly the eight mIRC bytes
+ * and drops every other C0 byte including ESC and BEL.
+ *
+ * WHY IT IS HERE AND NOT AT EACH VERB. Three reasons, and the first two are the
+ * whole of it:
+ *
+ *   1. IT IS BELOW THE VERB TABLE, so a verb added later cannot forget it. Every
+ *      other site that could have filtered this is a site that knows a verb's
+ *      parameter layout, and the peer sweep has already caught one row written with
+ *      the channel in the wrong slot -- a generator bug that a filter's withholding
+ *      then disguised as a pass.
+ *   2. IT IS BESIDE `fed_queue_line()`, which is the ONLY place a peer-bound line is
+ *      built. One call site is one thing to check; a filter per verb is N things to
+ *      keep in step, and this file has now shipped two divergences from exactly
+ *      that cause: SMODES applying modes the client path refuses, and the log
+ *      values bypassing `fed_obs()`.
+ *   3. IT NAMES `conn_text_strip_relay()` AND `conn_text_strip()` IN THE TABLE
+ *      rather than reimplementing either. Those two ARE the single implementations
+ *      of "what a relayed message may contain" and "what a stored value may
+ *      contain"; the client relay path in core/msg_verbs.c calls the first for
+ *      PRIVMSG text. This table is a statement about WHICH FIELD and WHICH POLICY,
+ *      and nothing else -- the byte rules live in one place per policy and a change
+ *      to either is a change to both surfaces.
+ *
+ * WHY TWO POLICIES IN ONE TABLE. Because the client path has two, and a peer relay
+ * carries both kinds of field. A message's text is RELAYED, and `relay_byte_kept()`
+ * keeps the mIRC formatting bytes a mIRC client renders and dropping them would
+ * break. A topic, a kick reason and a mode string are STORED VALUES by the node
+ * that receives them, and they go through the stricter stored-value policy -- which
+ * is the same split core/msg_verbs.c makes, for the same reason.
+ *
+ * THE FIELD COUNT AND EVERY POSITION ARE PRESERVED. A stripped parameter becomes an
+ * EMPTY parameter, never a missing one: `needs_colon()` puts the `:` marker on an
+ * empty final parameter, so a positional parser on the far side finds the field
+ * exactly where 4.3 says it is. A relay that dropped the parameter instead would
+ * shift every field after it, which is a protocol divergence rather than a filter.
+ *
+ * COST: one extra pass over the parameters and, when a row matches, one copy of the
+ * bytes that were kept. The arena is IRC_MAX_LINE, the same bound the render below
+ * it works within, so a value that cannot fit is one `message_format()` would have
+ * refused anyway -- and it is reported rather than truncated, because a truncated
+ * parameter is a lie about what the peer sent.
+ */
+typedef size_t (*fed_clean_fn)(char *dst, size_t cap, const char *src);
+
+static const struct {
+    const char *verb;
+    int at;             /* which parameter carries the text */
+    fed_clean_fn clean; /* WHICH policy, named as the function that owns it */
+} OUTBOUND_TEXT[] = {
+    /* The two message verbs: index 1 is the text, and it is the same field and the
+     * same policy as PRIVMSG's on the client relay path. */
+    { "SPRIVMSG", 1, conn_text_strip_relay },
+    { "SNOTICE",  1, conn_text_strip_relay },
+    /* The state verbs' free-text fields, all of which the receiving node STORES or
+     * renders to clients rather than relays. 4.3's frozen shapes put the channel in
+     * the second slot for all three and the evaluating server in the first, which is
+     * why these indices are what they are -- and why getting one wrong is a field
+     * read from the wrong place rather than a visible error. */
+    { "STOPIC",   2, conn_text_strip },
+    { "SKICK",    3, conn_text_strip },
+    { "SMODES",   2, conn_text_strip }
+};
+#define OUTBOUND_TEXT_COUNT \
+    ((int)(sizeof OUTBOUND_TEXT / sizeof OUTBOUND_TEXT[0]))
+
+/* Replace the one text parameter of `verb` with a filtered copy of itself.
+ *
+ * `cleaned` is an array of `IRC_MAX_PARAMS` pointers that the CALLER owns, and
+ * only one slot of it ever changes: the field count and every position are
+ * preserved, and that is what "the field count is preserved" means in code. A
+ * relay that dropped the parameter instead would shift every field after it,
+ * which is a protocol divergence rather than a filter.
+ *
+ * THREE ANSWERS, and the third is the interesting one:
+ *
+ *   0  NOTHING TO DO. No row for this verb, or the verb's shape has no such
+ *      parameter. NOT a refusal: arity belongs to the verb's own table, and a
+ *      second arity check here would be one more thing that can disagree with it.
+ *   1  `cleaned` IS THE ARRAY TO BUILD FROM. Exactly one slot points into `arena`;
+ *      every other slot is the caller's own pointer, copied across unchanged.
+ *   -1 THE VALUE CANNOT BE REPRESENTED, and the caller refuses. That this is not a
+ *      behaviour change is the point: `strlen(src) + 1 > cap` with cap ==
+ *      IRC_MAX_LINE means the rendered line cannot fit either, so
+ *      `message_format()` was going to refuse it anyway. Refusing here rather than
+ *      truncating the value is the difference between a line that was never
+ *      deliverable and a line that lies about what the peer sent.
+ */
+static int fed_relay_clean(const char *verb, const char *const *params,
+                           int nparams, char *arena, size_t cap,
+                           const char **cleaned, size_t *src_len,
+                           size_t *kept_len)
+{
+    *src_len = 0u;
+    *kept_len = 0u;
+    for (int i = 0; i < OUTBOUND_TEXT_COUNT; i++) {
+        const char *src;
+
+        if (strcmp(verb, OUTBOUND_TEXT[i].verb) != 0) {
+            continue;
+        }
+        if (OUTBOUND_TEXT[i].at >= nparams ||
+            params[OUTBOUND_TEXT[i].at] == NULL) {
+            return 0;
+        }
+        src = params[OUTBOUND_TEXT[i].at];
+        *src_len = strlen(src);
+        if (*src_len + 1u > cap) {
+            *src_len = 0u;
+            return -1;
+        }
+        for (int k = 0; k < nparams; k++) {
+            cleaned[k] = params[k];
+        }
+        *kept_len = OUTBOUND_TEXT[i].clean(arena, cap, src);
+        cleaned[OUTBOUND_TEXT[i].at] = arena;
+        return 1;
+    }
+    return 0;
 }
 
 /* The stamp, the build, the render, the terminator and the queue, in that
@@ -135,6 +438,17 @@ int fed_queue_line(server_t *s, conn_t *peer, const irc_serve_tags_t *tags,
 {
     char block[IRC_MAX_TAG_OVERHEAD];
     char line[IRC_MAX_LINE + 2];
+    /* The arena `fed_relay_clean()` filters into. IRC_MAX_LINE rather than a
+     * per-field bound because it is the bound that matters: a filtered value has
+     * to fit inside a line the render below cannot exceed, so anything larger was
+     * never deliverable. It is a third buffer and that is the cost -- named here
+     * rather than left for a reader to notice. */
+    char arena[IRC_MAX_LINE];
+    const char *cleaned[IRC_MAX_PARAMS];
+    const char *const *use = params;
+    size_t src_len = 0u;
+    size_t kept_len = 0u;
+    int filter_rc;
     message_t m;
     size_t blen;
     size_t len;
@@ -169,7 +483,37 @@ int fed_queue_line(server_t *s, conn_t *peer, const irc_serve_tags_t *tags,
     if (blen == 0u) {
         return fed_queue_refuse(why_out, FED_QUEUE_TAG_TOO_LONG);
     }
-    if (message_build(&m, block, prefix, verb, params, nparams) != 0) {
+    /* THE FILTER, AND IT IS ABOVE THE BUILD so that what gets rendered is what
+     * was filtered. Below the argument checks and below the stamp, and above
+     * `message_build()` -- which is the whole of "one place a peer-bound line is
+     * filtered": there is no path from a parameter to a peer socket in this file
+     * that does not pass through these six lines.
+     *
+     * AND THE MEASUREMENT IS REPORTED. Stripping a value a peer sent is invisible
+     * on the wire -- the far side sees a shorter field and cannot tell that
+     * anything happened -- so a node that silently shortened relayed text would be
+     * indistinguishable from one that mangled it. The line is the same shape as
+     * every other measurement in this tree: what was kept, how many bytes came
+     * off, and how many of those were in the strip set. */
+    filter_rc = fed_relay_clean(verb, params, nparams, arena, sizeof arena,
+                                cleaned, &src_len, &kept_len);
+    if (filter_rc < 0) {
+        return fed_queue_refuse(why_out, FED_QUEUE_UNRENDERABLE);
+    }
+    if (filter_rc > 0) {
+        use = cleaned;
+        /* REPORTED ONLY WHEN SOMETHING CAME OFF, because a line for every relayed
+         * message would put this node's log rate under the mesh's message rate, and
+         * a log that cannot be read is not a measurement. The count is what an
+         * operator needs: a peer whose text is arriving shortened is either a peer
+         * with a broken client or a peer doing this on purpose. */
+        if (kept_len < src_len) {
+            fed_obs("[observable] fed_relay_stripped: verb=%s kept=%zu "
+                   "removed=%zu\n",
+                   verb, kept_len, src_len - kept_len);
+        }
+    }
+    if (message_build(&m, block, prefix, verb, use, nparams) != 0) {
         return fed_queue_refuse(why_out, FED_QUEUE_UNBUILDABLE);
     }
     len = message_format(&m, line, sizeof line - 2u);
@@ -209,7 +553,7 @@ int fed_send_sverb(server_t *s, conn_t *peer, const irc_serve_tags_t *tags,
      * like a node whose peers were silent, and the two have opposite fixes. */
     if (s == NULL || peer == NULL || client_verb == NULL || prefix == NULL ||
         (params == NULL && nparams != 0)) {
-        printf("[observable] fed_sverb_refused: verb=%s reason=bad_args\n",
+        fed_obs("[observable] fed_sverb_refused: verb=%s reason=bad_args\n",
                (client_verb != NULL) ? client_verb : "?");
         return -1;
     }
@@ -221,7 +565,7 @@ int fed_send_sverb(server_t *s, conn_t *peer, const irc_serve_tags_t *tags,
      * (fanout_forward_sverb(), relaying) calls fed_queue_line() directly. */
     sverb = fed_sverb_for(client_verb);
     if (sverb == NULL) {
-        printf("[observable] fed_sverb_refused: verb=%s target=%s "
+        fed_obs("[observable] fed_sverb_refused: verb=%s target=%s "
                "reason=NO_SVERB\n",
                client_verb, target);
         return -1;
@@ -232,7 +576,7 @@ int fed_send_sverb(server_t *s, conn_t *peer, const irc_serve_tags_t *tags,
      * not an S-verb and reports under a different [observable] line. See
      * fed_queue_line() in verbs.h. */
     if (fed_queue_line(s, peer, tags, prefix, sverb, params, nparams, &why) != 0) {
-        printf("[observable] fed_sverb_refused: verb=%s target=%s "
+        fed_obs("[observable] fed_sverb_refused: verb=%s target=%s "
                "reason=%s\n",
                client_verb, target, fed_queue_why_name(why));
         return -1;
@@ -706,7 +1050,7 @@ static chan_t *fed_in_channel(server_t *s, server_link_t *link, const char *name
             chan_free(ch);
             return NULL;
         }
-        printf("[observable] chan_create: channel=%s origin=%s epoch=%llu "
+        fed_obs("[observable] chan_create: channel=%s origin=%s epoch=%llu "
                "creator=%s\n",
                ch->name, ch->origin, (unsigned long long)ch->origin_epoch,
                link->name);
@@ -763,7 +1107,7 @@ static void fed_in_message(server_t *s, fanout_target_t *t, const char *prefix,
      * It is also the countable line a loop shows up in: a message that keeps
      * circulating prints this again, so "delivered exactly once" can be
      * asserted from the node as well as from the client. */
-    printf("[observable] fed_message: channel=%s from=%s delivered=%d "
+    fed_obs("[observable] fed_message: channel=%s from=%s delivered=%d "
            "origin=%s hops=%lu\n",
            t->name, (prefix != NULL) ? prefix : "?", delivered, tags->origin,
            (unsigned long)tags->hops);
@@ -791,7 +1135,7 @@ static void fed_in_sjoin(server_t *s, server_link_t *link, chan_t *ch,
          * why the BURST format grew a <server> field and this one has not. See
          * channel.h's chan_remote_t for the two-server split. */
         chan_remote_add(ch, link->name, link->name, params[1], params[3], flags) != 0) {
-        printf("[observable] fed_sjoin_reject: channel=%s member=%s server=%s\n",
+        fed_obs("[observable] fed_sjoin_reject: channel=%s member=%s server=%s\n",
                ch->name, (nparams > 1) ? params[1] : "?", link->name);
         return;
     }
@@ -814,7 +1158,7 @@ static void fed_in_sjoin(server_t *s, server_link_t *link, chan_t *ch,
      * the convergence fed_nickreg_local_loses() exists to make possible. */
     (void)fed_nickreg_resolve_local(s, params[1], server_now_ms());
     fed_touch_server(ch, link->name, 1);
-    printf("[observable] fed_sjoin: channel=%s member=%s server=%s flags=%u "
+    fed_obs("[observable] fed_sjoin: channel=%s member=%s server=%s flags=%u "
            "local=%zu remote=%zu origin=%s owned=%d\n",
            ch->name, params[1], link->name, flags, ch->nmembers, ch->nremotes,
            ch->origin, chan_origin_is_self(s, ch));
@@ -871,7 +1215,7 @@ static void fed_in_snick(server_t *s, server_link_t *link, const char *prefix,
     (void)prefix;
 
     fed_nickreg_rename(s, link->name, params[0], params[1], server_now_ms());
-    printf("[observable] fed_nickreg_rename: server=%s from=%s to=%s\n", link->name,
+    fed_obs("[observable] fed_nickreg_rename: server=%s from=%s to=%s\n", link->name,
            params[0], params[1]);
 
     /* THE ROSTERS, one channel at a time. There is no index from nickname to
@@ -903,10 +1247,10 @@ static void fed_in_snick(server_t *s, server_link_t *link, const char *prefix,
          * connected but not in any channel this node knows about -- the common
          * case on a relay. The registry is still updated above, and a rename
          * that reaches nobody is not a failure: there was nothing to tell. */
-        printf("[observable] fed_snick: server=%s from=%s to=%s rosters=0\n",
+        fed_obs("[observable] fed_snick: server=%s from=%s to=%s rosters=0\n",
                link->name, params[0], params[1]);
     } else {
-        printf("[observable] fed_snick: server=%s from=%s to=%s rosters=%d\n",
+        fed_obs("[observable] fed_snick: server=%s from=%s to=%s rosters=%d\n",
                link->name, params[0], params[1], renamed);
     }
 }
@@ -977,7 +1321,7 @@ static struct fed_advert *advert_table(server_t *s)
              * than a store that silently did not record: an operator looking at
              * `advert_known=0` on a mesh that is advertising would otherwise have
              * no way to tell a quiet node from a broken one. */
-            printf("[observable] fed_advert_alloc_failed\n");
+            fed_obs("[observable] fed_advert_alloc_failed\n");
             return NULL;
         }
     }
@@ -1074,14 +1418,14 @@ static void fed_in_advertise(server_t *s, server_link_t *link, const char *prefi
      * that it does not interpret fragments of a wire format it invented. */
     if (nparams != 1 && nparams != 4) {
         s->n_fed_advertise_bad++;
-        printf("[observable] fed_advertise_refused: peer=%s reason=ARITY "
+        fed_obs("[observable] fed_advertise_refused: peer=%s reason=ARITY "
                "nparams=%d\n",
                link->name, nparams);
         return;
     }
     if (strlen(params[0]) >= sizeof loadbuf) {
         s->n_fed_advertise_bad++;
-        printf("[observable] fed_advertise_refused: peer=%s reason=LOAD_LONG\n",
+        fed_obs("[observable] fed_advertise_refused: peer=%s reason=LOAD_LONG\n",
                link->name);
         return;
     }
@@ -1093,7 +1437,7 @@ static void fed_in_advertise(server_t *s, server_link_t *link, const char *prefi
     for (const char *c = loadbuf; *c != '\0'; c++) {
         if (*c < '0' || *c > '9') {
             s->n_fed_advertise_bad++;
-            printf("[observable] fed_advertise_refused: peer=%s reason=LOAD_NOT_NUML "
+            fed_obs("[observable] fed_advertise_refused: peer=%s reason=LOAD_NOT_NUML "
                    "value=%s\n",
                    link->name, loadbuf);
             return;
@@ -1101,7 +1445,7 @@ static void fed_in_advertise(server_t *s, server_link_t *link, const char *prefi
         load = (load * 10u) + (unsigned long)(*c - '0');
         if (load > 100u) {
             s->n_fed_advertise_bad++;
-            printf("[observable] fed_advertise_refused: peer=%s reason=LOAD_RANGE "
+            fed_obs("[observable] fed_advertise_refused: peer=%s reason=LOAD_RANGE "
                    "value=%s\n",
                    link->name, loadbuf);
             return;
@@ -1109,7 +1453,7 @@ static void fed_in_advertise(server_t *s, server_link_t *link, const char *prefi
     }
     if (loadbuf[0] == '\0') {
         s->n_fed_advertise_bad++;
-        printf("[observable] fed_advertise_refused: peer=%s reason=LOAD_EMPTY\n",
+        fed_obs("[observable] fed_advertise_refused: peer=%s reason=LOAD_EMPTY\n",
                link->name);
         return;
     }
@@ -1120,14 +1464,14 @@ static void fed_in_advertise(server_t *s, server_link_t *link, const char *prefi
         hinted = 1;
         if (!irc_serve_server_name_valid(params[1])) {
             s->n_fed_advertise_bad++;
-            printf("[observable] fed_advertise_refused: peer=%s reason=NAME_INVALID "
+            fed_obs("[observable] fed_advertise_refused: peer=%s reason=NAME_INVALID "
                    "name=%s\n",
                    link->name, params[1]);
             return;
         }
         if (params[2][0] == '\0' || strlen(params[2]) >= CONN_HOST_MAX + 1u) {
             s->n_fed_advertise_bad++;
-            printf("[observable] fed_advertise_refused: peer=%s reason=HOST_INVALID\n",
+            fed_obs("[observable] fed_advertise_refused: peer=%s reason=HOST_INVALID\n",
                    link->name);
             return;
         }
@@ -1141,7 +1485,7 @@ static void fed_in_advertise(server_t *s, server_link_t *link, const char *prefi
                  * safely. It is NOT a hostname syntax check: 3.4 resolves names
                  * once at startup, and this store never resolves anything. */
                 s->n_fed_advertise_bad++;
-                printf("[observable] fed_advertise_refused: peer=%s "
+                fed_obs("[observable] fed_advertise_refused: peer=%s "
                        "reason=HOST_UNPRINTABLE\n",
                        link->name);
                 return;
@@ -1150,7 +1494,7 @@ static void fed_in_advertise(server_t *s, server_link_t *link, const char *prefi
         for (const char *c = params[3]; *c != '\0'; c++) {
             if (*c < '0' || *c > '9') {
                 s->n_fed_advertise_bad++;
-                printf("[observable] fed_advertise_refused: peer=%s reason=PORT_NOT_NUML "
+                fed_obs("[observable] fed_advertise_refused: peer=%s reason=PORT_NOT_NUML "
                        "value=%s\n",
                        link->name, params[3]);
                 return;
@@ -1160,7 +1504,7 @@ static void fed_in_advertise(server_t *s, server_link_t *link, const char *prefi
         }
         if (digits == 0 || port == 0u || port > 65535u) {
             s->n_fed_advertise_bad++;
-            printf("[observable] fed_advertise_refused: peer=%s reason=PORT_RANGE "
+            fed_obs("[observable] fed_advertise_refused: peer=%s reason=PORT_RANGE "
                    "value=%s\n",
                    link->name, params[3]);
             return;
@@ -1190,7 +1534,7 @@ static void fed_in_advertise(server_t *s, server_link_t *link, const char *prefi
              * asserted because a table that dropped an advertisement because it
              * was full would be a store that reports a smaller mesh than it has. */
             s->n_fed_advertise_bad++;
-            printf("[observable] fed_advertise_refused: peer=%s reason=STORE_FULL "
+            fed_obs("[observable] fed_advertise_refused: peer=%s reason=STORE_FULL "
                    "bound=%zu\n",
                    link->name, IRC_FED_MAX_ADVERTISED);
             return;
@@ -1252,21 +1596,21 @@ static void fed_in_advertise(server_t *s, server_link_t *link, const char *prefi
      * is a relay and an operator may want to know. */
     if (hinted != 0) {
         if (chan_same_name(slot->name, s->name)) {
-            printf("[observable] fed_advertise: peer=%s name=%s host=%s port=%u "
+            fed_obs("[observable] fed_advertise: peer=%s name=%s host=%s port=%u "
                    "load=%u%% detail=SELF_NAME\n",
                    link->name, slot->name, slot->host, slot->port, slot->load_pct);
         } else if (advert_name_is_held(s, slot->name)) {
             s->n_fed_advertise_collision++;
-            printf("[observable] fed_advertise_collision: peer=%s advertised=%s "
+            fed_obs("[observable] fed_advertise_collision: peer=%s advertised=%s "
                    "held_by=this_node\n",
                    link->name, slot->name);
         } else {
-            printf("[observable] fed_advertise: peer=%s name=%s host=%s port=%u "
+            fed_obs("[observable] fed_advertise: peer=%s name=%s host=%s port=%u "
                    "load=%u%% dialed=NO\n",
                    link->name, slot->name, slot->host, slot->port, slot->load_pct);
         }
     } else {
-        printf("[observable] fed_advertise: peer=%s load=%u%% dialed=NO\n",
+        fed_obs("[observable] fed_advertise: peer=%s load=%u%% dialed=NO\n",
                link->name, slot->load_pct);
     }
 }
@@ -1328,7 +1672,7 @@ void fed_advert_close(server_t *s)
      * on Darwin, so the only local evidence that a store was released is a line a
      * test can assert on, and the Linux CI job reads the same line beside its own
      * LSan run. */
-    printf("[observable] fed_advert_close: table=%s known=%zu\n",
+    fed_obs("[observable] fed_advert_close: table=%s known=%zu\n",
            (s->advs != NULL) ? "OPEN" : "NONE", s->nadv);
     free(s->advs);
     s->advs = NULL;
@@ -1390,7 +1734,7 @@ static void fed_in_shutdown(server_t *s, server_link_t *link, const char *prefix
 
     if (nparams != 0 && nparams != 1) {
         s->n_fed_shutdown_refused++;
-        printf("[observable] fed_shutdown_refused: peer=%s reason=ARITY nparams=%d\n",
+        fed_obs("[observable] fed_shutdown_refused: peer=%s reason=ARITY nparams=%d\n",
                link->name, nparams);
         return;
     }
@@ -1438,7 +1782,7 @@ static void fed_in_shutdown(server_t *s, server_link_t *link, const char *prefix
     if (relayed > 0) {
         s->n_fed_shutdown_relayed++;
     }
-    printf("[observable] fed_shutdown: peer=%s reason=%s chans=%zu purged=%zu "
+    fed_obs("[observable] fed_shutdown: peer=%s reason=%s chans=%zu purged=%zu "
            "relayed=%d clean_leave=1 retried=0\n",
            link->name, reason, chans, purged, relayed);
     /* AND THE LINK ITSELF IS CLOSED, because a peer that said it is leaving and
@@ -1466,7 +1810,7 @@ static void fed_in_spart(server_t *s, server_link_t *link, chan_t *ch,
     }
     (void)chan_remote_remove(ch, link->name, params[0]);
     fed_touch_server(ch, link->name, 0);
-    printf("[observable] fed_spart: channel=%s member=%s server=%s remote=%zu\n",
+    fed_obs("[observable] fed_spart: channel=%s member=%s server=%s remote=%zu\n",
            ch->name, params[0], link->name, ch->nremotes);
     (void)fanout_forward_channel_sverb(s, ch, FANOUT_STATE_CHANGE, "SPART", prefix,
                                        params, nparams, tags);
@@ -1488,16 +1832,16 @@ static void fed_in_stopic(server_t *s, server_link_t *link, chan_t *ch,
      * rule exists to prevent. A topic from the origin -- whether it came
      * directly or through a relay -- is the authority and is applied. */
     if (!chan_same_name(link->name, ch->origin)) {
-        printf("[observable] fed_topic_ignored: channel=%s from=%s origin=%s\n",
+        fed_obs("[observable] fed_topic_ignored: channel=%s from=%s origin=%s\n",
                ch->name, link->name, ch->origin);
         return;
     }
     if (chan_set_topic(ch, params[2], params[0]) != 0) {
-        printf("[observable] fed_topic_ignored: channel=%s reason=too_long\n",
+        fed_obs("[observable] fed_topic_ignored: channel=%s reason=too_long\n",
                ch->name);
         return;
     }
-    printf("[observable] fed_topic: channel=%s member=%s len=%zu\n", ch->name,
+    fed_obs("[observable] fed_topic: channel=%s member=%s len=%zu\n", ch->name,
            params[0], strlen(ch->topic));
     (void)fanout_forward_channel_sverb(s, ch, FANOUT_STATE_CHANGE, "STOPIC", prefix,
                                        params, nparams, tags);
@@ -1516,22 +1860,81 @@ static void fed_in_smodes(server_t *s, server_link_t *link, chan_t *ch,
      * first field, so a cache update is taken from a line claiming this node's
      * origin -- not from one that merely arrived here. */
     if (!chan_same_name(params[0], ch->origin)) {
-        printf("[observable] fed_modes_ignored: channel=%s from=%s origin=%s\n",
+        fed_obs("[observable] fed_modes_ignored: channel=%s from=%s origin=%s\n",
                ch->name, params[0], ch->origin);
         return;
     }
     (void)link;
-    for (size_t i = 0; params[2][i] != '\0'; i++) {
-        char m = params[2][i];
-        int on = (m != '-');
+    /* THE MODE STRING IS WALKED TWICE AND THAT IS NOT REDUNDANT.
+     *
+     * ONCE TO DECIDE, and the decision is `chan_mode_implemented()` -- the SAME
+     * predicate the client `MODE` path asks, which answers 472 for a letter this node
+     * does not evaluate. That predicate is the whole of this handler's change: before
+     * it, this loop called `chan_mode_set()` on every byte that was not a sign, so a
+     * peer could put a control byte into `ch->modes[]` and have it reach 324, the
+     * SBURST shadow and every other node on the mesh. The client's rule was always
+     * "reject a mode letter you do not implement" and the peer's was nothing, and an
+     * inconsistency between two paths is not fixed by describing it.
+     *
+     * ONCE TO APPLY, and only over the letters that passed. Applying in the same pass
+     * would have meant a mode string whose FOURTH letter is unimplemented had already
+     * written its first three into the cache before the refusal -- and a partial
+     * application is harder to reason about than either applying or refusing, because
+     * the peer's next SMODES would have to mean "and also this".
+     *
+     * WHAT IS FORWARDED. The forward below carries `params` unchanged, so an
+     * unimplemented letter still reaches the NEXT node -- which is correct, because
+     * this node's opinion about which modes exist is not the next node's, and 4.3's
+     * shape has no room for a per-node verdict. What does not happen is this node
+     * STORING it, which is the part that was a hazard. */
+    {
+        char applied[CHAN_MAX_MODES + 1u];
+        char refused[CHAN_MAX_MODES + 1u];
+        size_t napplied = 0u;
+        size_t nrefused = 0u;
+        int on = 1;
+        char shown[CONN_LOG_FIELD_MAX + 1u];
 
-        if (m == '+' || m == '-') {
-            continue; /* the sign, not a mode */
+        applied[0] = '\0';
+        refused[0] = '\0';
+        for (size_t i = 0; params[2][i] != '\0'; i++) {
+            const char m = params[2][i];
+            int verdict;
+
+            if (m == '+' || m == '-') {
+                on = (m == '+');
+                continue; /* the sign, not a mode */
+            }
+            verdict = chan_mode_implemented(m);
+            if (verdict == 0) {
+                /* NAMED BY BYTE, IN HEX, and that is the whole diagnostic. The letter
+                 * itself is the peer's byte and cannot be printed: a peer's mode
+                 * string is unvalidated text and this is an operator's terminal, which
+                 * is the same reason every other log-only client or peer field on this
+                 * node goes through conn_text_logsafe(). */
+                if (nrefused + 3u < sizeof refused) {
+                    (void)snprintf(refused + nrefused, sizeof refused - nrefused,
+                                   "%02x", (unsigned char)m);
+                    nrefused += 2u;
+                }
+                continue;
+            }
+            if (chan_mode_set(ch, m, on) > 0 && napplied + 1u < sizeof applied) {
+                applied[napplied++] = m;
+                applied[napplied] = '\0';
+            }
         }
-        (void)chan_mode_set(ch, m, on);
+        /* MEASURED, NOT PRINTED: `modes=` is the peer's own string and the line's
+         * subject is what an operator needs to see. `refused=` is the hex list above,
+         * which is a rendering of the same value that cannot be executed. */
+        (void)conn_text_logsafe(shown, sizeof shown, params[2]);
+        fed_obs("[observable] fed_modes: channel=%s by=%s modes=%s modes_len=%zu "
+               "modes_bad_bytes=%zu applied=%s refused=%s cached=%s\n",
+               ch->name, params[0], shown, strlen(params[2]),
+               conn_text_bad_count(params[2]),
+               (applied[0] != '\0') ? applied : "-",
+               (refused[0] != '\0') ? refused : "-", ch->modes);
     }
-    printf("[observable] fed_modes: channel=%s by=%s modes=%s cached=%s\n",
-           ch->name, params[0], params[2], ch->modes);
     (void)fanout_forward_channel_sverb(s, ch, FANOUT_STATE_CHANGE, "SMODES", prefix,
                                        params, nparams, tags);
 }
@@ -1546,7 +1949,7 @@ static void fed_in_skick(server_t *s, server_link_t *link, chan_t *ch,
     }
     (void)chan_remote_remove(ch, link->name, params[2]);
     fed_touch_server(ch, link->name, 0);
-    printf("[observable] fed_skick: channel=%s by=%s target=%s\n", ch->name,
+    fed_obs("[observable] fed_skick: channel=%s by=%s target=%s\n", ch->name,
            params[0], params[2]);
     (void)fanout_forward_channel_sverb(s, ch, FANOUT_STATE_CHANGE, "SKICK", prefix,
                                        params, nparams, tags);
@@ -1606,7 +2009,7 @@ static void fed_in_squit(server_t *s, server_link_t *link,
      * running a different format and is refused rather than guessed at. */
     if (nparams < 1 || nparams > 2) {
         s->n_fed_malformed++;
-        printf("[observable] fed_malformed: command=SQUIT field=arity nparams=%d "
+        fed_obs("[observable] fed_malformed: command=SQUIT field=arity nparams=%d "
                "want=1..2\n",
                nparams);
         return;
@@ -1631,7 +2034,7 @@ static void fed_in_squit(server_t *s, server_link_t *link,
      * longer exists. The first is a version fact and the second is a finding. */
     if (chan_same_name(gone, s->name)) {
         s->n_fed_squit_self++;
-        printf("[observable] fed_squit_refused: fd=%d peer=%s server=%s self=%s "
+        fed_obs("[observable] fed_squit_refused: fd=%d peer=%s server=%s self=%s "
                "reason=SELF_NOT_GONE\n",
                (link != NULL) ? link->fd : -1, (link != NULL) ? link->name : "?",
                gone, s->name);
@@ -1697,7 +2100,7 @@ static void fed_in_squit(server_t *s, server_link_t *link,
             i++;
         }
     }
-    printf("[observable] fed_squit: server=%s chans=%zu purged=%zu remote=%zu\n", gone,
+    fed_obs("[observable] fed_squit: server=%s chans=%zu purged=%zu remote=%zu\n", gone,
            chans, purged, (size_t)server_chan_count(s));
 
     /* 3.1's non-owner row: apply here, forward onward. "Onward" for a
@@ -1888,7 +2291,7 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
          * being spoken to by something that is not a peer, and that is a finding
          * rather than a statistic. */
         s->n_fed_preauth_drop++;
-        printf("[observable] fed_preauth_drop: fd=%d command=%s state=%s\n", c->fd,
+        fed_obs("[observable] fed_preauth_drop: fd=%d command=%s state=%s\n", c->fd,
                m->command,
                (link != NULL) ? ((link->state == (int)ESTABLISHED) ? "ESTABLISHED"
                                                                      : "PENDING")
@@ -1914,7 +2317,7 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
          * disagree. A counted return rather than a silent one, so an edit that
          * reorders G1 and G3 leaves a number behind instead of a hole. */
         s->n_fed_preauth_drop++;
-        printf("[observable] fed_preauth_drop: fd=%d command=%s state=UNREACHABLE\n",
+        fed_obs("[observable] fed_preauth_drop: fd=%d command=%s state=UNREACHABLE\n",
                c->fd, m->command);
         return;
     }
@@ -1932,7 +2335,7 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
              * misbehaving in a specific way when the line is simply not a line
              * this node can reason about. */
             s->n_fed_malformed++;
-            printf("[observable] fed_untagged: fd=%d peer=%s command=%s "
+            fed_obs("[observable] fed_untagged: fd=%d peer=%s command=%s "
                    "prefix=%s reason=BAD_PREFIX\n",
                    c->fd, link->name, m->command,
                    (m->prefix != NULL) ? m->prefix : "(none)");
@@ -1945,7 +2348,7 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
              * the resync verbs is a version fact, and calling it an untagged
              * relay would send the operator looking for a loop. */
             s->n_fed_verb_deferred++;
-            printf("[observable] fed_verb_deferred: fd=%d peer=%s command=%s\n",
+            fed_obs("[observable] fed_verb_deferred: fd=%d peer=%s command=%s\n",
                    c->fd, link->name, m->command);
             return;
         }
@@ -1966,7 +2369,7 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
              * not relaying somebody else's burst, it is sending a burst it did
              * not stamp. */
             s->n_fed_malformed++;
-            printf("[observable] fed_untagged: fd=%d peer=%s command=%s "
+            fed_obs("[observable] fed_untagged: fd=%d peer=%s command=%s "
                    "reason=BURST_UNTAGGED\n",
                    c->fd, link->name, m->command);
             return;
@@ -1991,7 +2394,7 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
              * verb would accept exactly the dangerous case and refuse the
              * harmless one. */
             s->n_fed_untagged_relay++;
-            printf("[observable] fed_untagged: fd=%d peer=%s command=%s prefix=%s "
+            fed_obs("[observable] fed_untagged: fd=%d peer=%s command=%s prefix=%s "
                    "reason=RELAY_UNTAGGED\n",
                    c->fd, link->name, m->command, pserver);
             return;
@@ -2035,7 +2438,7 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
         tags.epoch = link->epoch;
         tags.id = server_next_msg_id(s);
         tags.hops = 0u;
-        printf("[observable] fed_untagged: fd=%d peer=%s command=%s origin=%s "
+        fed_obs("[observable] fed_untagged: fd=%d peer=%s command=%s origin=%s "
                "epoch=%llu id=%llu reason=ORIGINATED_UNTAGGED\n",
                c->fd, link->name, m->command, tags.origin,
                (unsigned long long)tags.epoch, (unsigned long long)tags.id);
@@ -2050,7 +2453,7 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
          * arrived at it. A node that only checked at forward time would apply a
          * message that some other node had already decided to stop. */
         s->n_fed_hop_drop++;
-        printf("[observable] fed_hop_drop: fd=%d peer=%s command=%s hops=%lu "
+        fed_obs("[observable] fed_hop_drop: fd=%d peer=%s command=%s hops=%lu "
                "ceiling=%d\n",
                c->fd, link->name, m->command, (unsigned long)tags.hops, IRC_MAX_HOPS);
         return;
@@ -2081,7 +2484,7 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
          * dropped, and the hop ceiling is the second belt rather than the first:
          * it bounds the damage, it does not stop the loop. */
         s->n_fed_own_origin++;
-        printf("[observable] fed_own_origin_drop: fd=%d peer=%s command=%s "
+        fed_obs("[observable] fed_own_origin_drop: fd=%d peer=%s command=%s "
                "origin=%s self=%s hops=%lu\n",
                c->fd, link->name, m->command, tags.origin, s->name,
                (unsigned long)tags.hops);
@@ -2110,7 +2513,7 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
          * than a number nobody looked at. */
         s->n_fed_dup_drop++;
         s->n_fed_dedup_dup++;
-        printf("[observable] fed_duplicate: fd=%d peer=%s command=%s origin=%s "
+        fed_obs("[observable] fed_duplicate: fd=%d peer=%s command=%s origin=%s "
                "epoch=%llu id=%llu hops=%lu\n",
                c->fd, link->name, m->command, tags.origin,
                (unsigned long long)tags.epoch, (unsigned long long)tags.id,
@@ -2209,12 +2612,12 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
     if (idx < 0) {
         if (is_deferred(m->command) != 0) {
             s->n_fed_verb_deferred++;
-            printf("[observable] fed_verb_deferred: fd=%d peer=%s command=%s\n",
+            fed_obs("[observable] fed_verb_deferred: fd=%d peer=%s command=%s\n",
                    c->fd, link->name, m->command);
             return;
         }
         s->n_fed_unknown_verb++;
-        printf("[observable] fed_unknown_verb: fd=%d command=%s peer=%s\n", c->fd,
+        fed_obs("[observable] fed_unknown_verb: fd=%d command=%s peer=%s\n", c->fd,
                m->command, link->name);
         return;
     }
@@ -2228,7 +2631,7 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
      * could not qualify or render. */
     if (m->nparams < INBOUND[idx].min || m->nparams > INBOUND[idx].max) {
         s->n_fed_malformed++;
-        printf("[observable] fed_malformed: fd=%d command=%s field=arity "
+        fed_obs("[observable] fed_malformed: fd=%d command=%s field=arity "
                "nparams=%d want=%d..%d\n",
                c->fd, m->command, m->nparams, INBOUND[idx].min, INBOUND[idx].max);
         return;
@@ -2248,7 +2651,7 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
          * one resolver, and `t.vclass` is still what it decides the row from. */
         if (fanout_resolve(s, NULL, m->params[0], FANOUT_MESSAGE, &t) == 0) {
             s->n_fed_malformed++;
-            printf("[observable] fed_malformed: fd=%d command=%s field=target "
+            fed_obs("[observable] fed_malformed: fd=%d command=%s field=target "
                    "target=%s reason=NO_SUCH_TARGET\n",
                    c->fd, m->command, m->params[0]);
             return;
@@ -2275,7 +2678,7 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
 
         if (ch == NULL) {
             s->n_fed_malformed++;
-            printf("[observable] fed_malformed: fd=%d command=%s field=channel "
+            fed_obs("[observable] fed_malformed: fd=%d command=%s field=channel "
                    "channel=%s\n",
                    c->fd, m->command, m->params[at]);
             return;
@@ -2298,7 +2701,7 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
              * G8 is the only way here. It is a BUG REPORT rather than a silent
              * return, because a table row with no arm is a verb this node
              * advertises by handling and does not do. */
-            printf("[observable] fed_unhandled_verb: command=%s\n", m->command);
+            fed_obs("[observable] fed_unhandled_verb: command=%s\n", m->command);
         }
     }
 }

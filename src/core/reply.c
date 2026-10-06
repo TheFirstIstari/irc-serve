@@ -241,6 +241,117 @@ static int emit_built_ex(server_t *s, conn_t *c, const char *code,
     return emit_to_client(s, c, code, line, len + 2u);
 }
 
+/* ---------------------------------------------------------------------------
+ * emit_numeric_ex(): THE ONE PLACE A SERVER NUMERIC'S PARAMETERS ARE FILTERED
+ * ---------------------------------------------------------------------------
+ * Every numeric this node sends -- through `reply()`, `reply_colon()`,
+ * `reply_std()`, `reply_refused()` and `send_pong()` -- arrives here first, and every
+ * one of them has its parameters filtered before `emit_built_ex()` renders a byte of
+ * them. That is the whole of the argument for it being here rather than at the call
+ * sites: the eleven sites that echo a client-supplied value are eleven *renderings* of
+ * one policy, and a policy with eleven enforcement points is a policy with ten chances
+ * to be forgotten. `reply.c`'s own header already makes this argument about the
+ * `batch=` tag ("applied at the emitters, it would be applied to whichever emitters
+ * somebody remembered and silently absent from the rest"), and this is the same
+ * failure with a terminal at the end of it.
+ *
+ * ---------------------------------------------------------------------------
+ * THE POLICY, in one place, because the other ten sites refer to THIS
+ * ---------------------------------------------------------------------------
+ * A value echoed back to the client that sent it IS FILTERED.
+ *
+ * THE ARGUMENT THIS TREE USED, and why it was wrong: "the verb is going to the client
+ * that sent it, so there is no second reader and no hazard". There is a second
+ * reader. A client that writes numerics to a log file, or a bouncer relaying them to
+ * a human's terminal, is downstream of the client rather than of this node, and it
+ * is exactly where a terminal-injection payload wants to land. "No second reader" and
+ * "no reader" are not the same statement, and only the first was ever defensible.
+ *
+ * THE ARGUMENT THAT REPLACES IT, and it is not a trade-off: **the echo carries
+ * nothing the sender does not already have.** The client sent the value on the line
+ * before, so filtering it costs no information whatsoever -- a client that wants to
+ * match the refusal to its own request matches on the numeric and the field position,
+ * both of which are preserved here -- and it removes a real hazard. There is no side
+ * being traded against, which is why this is a decision and not a judgement call.
+ *
+ * IT REMOVES BYTES AND KEEPS THE FIELD. A parameter that becomes empty is STILL A
+ * PARAMETER: `needs_colon()` puts the ':' marker on an empty final parameter, so a
+ * positional parser finds the field exactly where the RFC says it is. This is why
+ * this is a strip and not the placeholder substitution the `472` uses -- there the
+ * value is a single byte that is structurally not a mode character, so there is
+ * nothing to strip and something has to stand in. Here there is always something to
+ * keep, and keeping the field is worth more than keeping the byte.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY `send_line()` DOES NOT COME HERE, and it is not an oversight
+ * ---------------------------------------------------------------------------
+ * `send_line()`, `send_line_colon()` and `send_line_tagged()` are the RELAYED path:
+ * a client's own PRIVMSG, a STOPIC a peer forwarded, an SJOIN. Their content is user
+ * text, already filtered by the policy its consumer calls for -- relayed message text
+ * through `conn_text_strip_relay()`, which keeps the eight mIRC bytes because in
+ * message text they are semantics and removing them corrupts a CTCP. Running the
+ * STRICT filter over relayed text would strip a colour code off every message on the
+ * network, so the two paths are deliberately different and the difference is named
+ * here rather than left to be discovered as a missing colour.
+ *
+ * THE ARENA, and its size is a bound rather than a guess. The sum of a numeric's
+ * parameter bytes cannot exceed `IRC_MAX_LINE`, because a line that would exceed it is
+ * refused by `message_format_ex()` as unrepresentable; and stripping only removes
+ * bytes, so the filtered sum is smaller still. `IRC_MAX_LINE` is therefore always
+ * enough, and the exhaustion arm below is unreachable for any line that could have
+ * been delivered. It is written rather than assumed, and it refuses with the SAME
+ * reason the over-long line would have, so the counter and the diagnostic are the ones
+ * that already exist.
+ *
+ * COST: one `conn_text_display_check()`-free pass per parameter, so one pass over each
+ * value, on a path that runs once per numeric. The arena is 8 KiB of stack for the
+ * duration of the call and the frame is not recursive; `msg_verbs.c`'s `send_message()`
+ * already holds an `IRC_MAX_LINE` buffer on a hotter path, so this is within what the
+ * tree already does. A parameter that needs no filtering -- a channel name, a
+ * validated nickname, a string literal -- is detected and passed through by POINTER,
+ * so the common case copies nothing and touches only the scan. */
+static int emit_numeric_ex(server_t *s, conn_t *c, const char *code,
+                           const char *const *params, int nparams,
+                           int force_colon, const char *tags)
+{
+    const char *clean[IRC_MAX_PARAMS];
+    char arena[IRC_MAX_LINE];
+    size_t used = 0u;
+
+    if (params == NULL || nparams < 0 || nparams > IRC_MAX_PARAMS) {
+        return refuse(s, c, code, "bad_args");
+    }
+    for (int i = 0; i < nparams; i++) {
+        const char *v = params[i];
+        size_t room;
+        size_t kept;
+
+        if (v == NULL) {
+            return refuse(s, c, code, "bad_param");
+        }
+        if (conn_text_display_check(v) == CONN_DISPLAY_OK) {
+            clean[i] = v; /* the common case: a validated value, copied nowhere */
+            continue;
+        }
+        /* `+1u` is the terminator, and the bound above is why `room` cannot be zero
+         * for a line that could have been delivered at all. */
+        room = sizeof arena - used;
+        if (room < 2u) {
+            return refuse(s, c, code, "unrepresentable");
+        }
+        kept = conn_text_strip_wire(arena + used, room, v);
+        if (kept + 1u > room) {
+            return refuse(s, c, code, "unrepresentable");
+        }
+        clean[i] = arena + used;
+        used += kept + 1u;
+    }
+    return emit_built_ex(s, c, code, NULL, clean, nparams, force_colon, tags);
+}
+
+/* The RELAYED path's own front end, deliberately not the numeric one. See the block
+ * above for why the two differ; the short version is that a relayed message keeps the
+ * mIRC bytes and a numeric's parameters must not. */
 static int emit_built(server_t *s, conn_t *c, const char *code,
                       const char *prefix,
                       const char *const *params, int nparams)
@@ -325,7 +436,7 @@ static int reply_va(server_t *s, conn_t *src, const char *code,
     }
     params[n++] = text;
 
-    return emit_built_ex(s, src, code, NULL, params, want, force, NULL);
+    return emit_numeric_ex(s, src, code, params, (int)want, force, NULL);
 }
 
 int reply(server_t *s, conn_t *src, const char *code, const char *const *mid,
@@ -485,7 +596,7 @@ int reply_std(server_t *s, conn_t *src, const char *type, const char *command,
      * gets its colon from the same code that colons a `461`'s, so the two shapes
      * agree about when a trailing parameter is marked rather than each having an
      * opinion. */
-    return emit_built(s, src, type, NULL, params, (int)n);
+    return emit_numeric_ex(s, src, type, params, (int)n, 0, NULL);
 }
 
 /* Is `numeric` the one legacy code whose RFC 2812 5.2 field list carries a
@@ -770,5 +881,26 @@ int send_pong(server_t *s, conn_t *src, const char *token)
     body = (token != NULL && token[0] != '\0') ? token : s->name;
     params[0] = s->name;
     params[1] = body;
-    return emit_built(s, src, "PONG", NULL, params, 2);
+    /* THE TOKEN IS ECHOED AND FILTERED, and both halves of that are load-bearing.
+     *
+     * RFC 2812 2.4 requires the echo: "PONG server1 server2 <token>", where the
+     * token is whatever the PING carried. So the VALUE is kept -- a conformant client
+     * that sent `PING :abc123` must read `abc123` back, and dropping it would break
+     * every liveness check on the network.
+     *
+     * What is filtered is the token's BYTES, by `emit_numeric_ex()` above like every
+     * other numeric parameter, and that is not a contradiction of the RFC: the
+     * specification requires the token be echoed, and says nothing about a client
+     * sending control bytes inside one. A client that requires a BYTE-EXACT echo of a
+     * token containing a control byte is not a real client -- it is a client whose
+     * liveness check is a string comparison against bytes it chose to put on the
+     * wire in the first place, and the echo it would be demanding is precisely the
+     * injection this removes. Stated here rather than left implicit, because the
+     * alternative -- an exception for PONG in the numeric filter -- would be a hole
+     * with a good reason attached, and this project has already had one of those.
+     *
+     * A token that is entirely control bytes therefore comes back EMPTY, still in its
+     * field, which `message_format_ex()` renders as a bare ':'. An empty token is
+     * still a field, and that is the same answer every other numeric gives. */
+    return emit_numeric_ex(s, src, "PONG", params, 2, 0, NULL);
 }
