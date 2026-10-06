@@ -58,13 +58,20 @@
  * `tc_expect()` searches the ACCUMULATED buffer.
  * ---------------------------------------------------------------------------
  */
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
+#include "core/commands.h"
 #include "core/connection.h"
+#include "core/server.h"
+#include "federation/link.h"
 #include "harness/irc_client.h"
 #include "harness/node_fixture.h"
+#include "harness/peer_fixture.h"
 #include "harness/test_util.h"
 
 #define T_IO_MS 15000
@@ -371,6 +378,78 @@ static void case_relay_text(void)
         assert_window_clean(&rcpt, mark, "the split CTCP");
     }
 
+    /* --- 4b. A UTF-8 SEQUENCE SPLIT ACROSS TWO READS, WHICH IS THE SAME CASE --- */
+    /* The CTCP above is split on a BOUNDARY. This one is split INSIDE a sequence, so
+     * the byte boundary the filter would have to reason about is not a character
+     * boundary: `0xC4` is the lead half of `ā` and `0x81` is the other half, and if
+     * anything looked at them independently the first would look like a lead with no
+     * continuation and the second like a bare C1. The strip never sees a half,
+     * because the framing layer assembles the line before any field is filtered --
+     * which is the property worth asserting rather than assuming.
+     *
+     * The barrier is the same `drain()` the split CTCP uses, and for the same
+     * reason: two `tc_send_raw()` calls back to back usually arrive in ONE recv(), so
+     * without the drain the "split" would be a fiction and this case would test
+     * nothing. */
+    {
+        const char *first = "PRIVMSG " CHAN " :caf\304";
+        const char *second = "\201 na\303\257ve\r\n";
+
+        mark = tc_received(&rcpt);
+        TF_CHECK_MSG(tc_send_raw(&sender, first, strlen(first)) == 0,
+                     "the first half of the split sequence failed to send");
+        drain(&rcpt);
+        TF_CHECK_MSG(tc_send_raw(&sender, second, strlen(second)) == 0,
+                     "the second half of the split sequence failed to send");
+        (void)snprintf(want, sizeof want, ":vic!vic@" OBSERVED_HOST " PRIVMSG " CHAN
+                       " :caf\304\201 na\303\257ve\r\n");
+        TF_CHECK_MSG(tc_expect(&rcpt, want, T_IO_MS) == 0,
+                     "a UTF-8 sequence split across two writes did not arrive whole; "
+                     "expected \"%s\". `0xC4` ended one write and `0x81` began the "
+                     "next, so anything judging the halves independently would either "
+                     "drop the lead or drop the continuation -- and would drop the "
+                     "second as a bare C1, which is exactly the byte #1's peer-path "
+                     "hole was about.\n  recipient saw: %s", want,
+                     tc_buffer(&rcpt) + mark);
+        assert_window_clean(&rcpt, mark, "the split sequence");
+    }
+
+    /* --- 4c. A BARE C1, AND THE TWO VALID SEQUENCES, ON THE CLIENT PATH --- */
+    /* The client path's half of the two-direction claim, asserted on the wire rather
+     * than on the function, because the function's half is `case_the_two_groups()`
+     * and a filter can be correct in isolation and absent from a path. */
+    {
+        mark = tc_received(&rcpt);
+        (void)snprintf(line, sizeof line,
+                       "PRIVMSG " CHAN " :before \237 after");
+        TF_CHECK_MSG(tc_send(&sender, line) == 0,
+                     "the bare-C1 PRIVMSG send failed");
+        (void)snprintf(want, sizeof want, ":vic!vic@" OBSERVED_HOST " PRIVMSG " CHAN
+                       " :before  after\r\n");
+        TF_CHECK_MSG(tc_expect(&rcpt, want, T_IO_MS) == 0,
+                     "a bare 0x9F did not arrive removed; expected \"%s\". On an "
+                     "8-bit terminal 0x9F IS CSI, so it is the same injection the "
+                     "ESC case above covers, one encoding down.\n  recipient saw: %s",
+                     want, tc_buffer(&rcpt) + mark);
+        assert_window_clean(&rcpt, mark, "the bare-C1 message");
+
+        mark = tc_received(&rcpt);
+        (void)snprintf(line, sizeof line,
+                       "PRIVMSG " CHAN " :caf\304\201 \346\227\245");
+        TF_CHECK_MSG(tc_send(&sender, line) == 0,
+                     "the valid-sequence PRIVMSG send failed");
+        (void)snprintf(want, sizeof want, ":vic!vic@" OBSERVED_HOST " PRIVMSG " CHAN
+                       " :caf\304\201 \346\227\245\r\n");
+        TF_CHECK_MSG(tc_expect(&rcpt, want, T_IO_MS) == 0,
+                     "the valid sequences did not arrive byte for byte; expected "
+                     "\"%s\". Both carry continuation bytes inside the C1 range, so "
+                     "this is the half of the claim a strip widened to deny that "
+                     "range byte-wise would fail -- and it would fail SILENTLY, "
+                     "because the recipient gets text that merely looks wrong.\n"
+                     "  recipient saw: %s", want, tc_buffer(&rcpt) + mark);
+        assert_window_clean(&rcpt, mark, "the valid-sequence message");
+    }
+
     /* --- 5. A SECOND HOSTILE MESSAGE, WITH A SINGLE BYTE IN IT --- */
     /* One removable byte rather than five, so if the count were ever read as a byte
      * count the two messages here would disagree with each other: 5 and 1. */
@@ -404,24 +483,29 @@ static void case_relay_text(void)
      * claim rather than a weaker one, because it covers every message this test sent
      * rather than one message's span. The arithmetic it asserts:
      *
-     *     7 messages sent   -- hostile, mIRC+UTF-8, ACTION, VERSION, DCC, split CTCP,
-     *                           second hostile
-     *     2 hostile         -- the two carrying a byte the strip removes
-     *     => msg_stripped=2
+     *    10 messages sent   -- hostile, mIRC+UTF-8, ACTION, VERSION, DCC,
+     *                          split CTCP, split sequence, bare C1, valid sequences,
+     *                          second hostile
+     *     3 hostile         -- the three carrying a byte the relay strip removes
+     *     => msg_stripped=3
      *
      * That single number carries three claims at once, and the reason to want them
      * together is that they fail DIFFERENTLY. It is an EVENT count, not a byte count:
-     * the two hostile messages held five removable bytes and one, so a byte counter
-     * would read 6. It did not fire on ordinary traffic: five of the seven messages
-     * were colour, CTCPs and UTF-8, and any strip that had widened into the keep list
-     * would have pushed this past 2. And it did fire: a relay path with no strip at
-     * all reports 0. */
-    TF_CHECK_MSG(nf_expect_u64(&node, "msg_stripped=", 2u, T_IO_MS) == 0,
-                 "the node did not publish msg_stripped=2 at shutdown. Seven messages "
-                 "were sent and exactly two carried a byte the relay strip removes, so "
-                 "the count must be 2: a byte count would read 6 (five removable bytes "
-                 "in the first hostile message, one in the second), and 0 means the "
-                 "strip never ran.");
+     * the three hostile messages held five removable bytes, then one each, so a byte
+     * counter would read 7. It did not fire on ordinary traffic: seven of the ten
+     * messages were colour, CTCPs, UTF-8 and a sequence split across two reads, and
+     * any strip that had widened into the keep list would have pushed this past 3 --
+     * which is what a fix that denied every byte in 0x80-0x9F would do to the two
+     * valid-sequence messages, and why those are on this path and not only in the
+     * predicate case. And it did fire: a relay path with no strip at all reports 0. */
+    TF_CHECK_MSG(nf_expect_u64(&node, "msg_stripped=", 3u, T_IO_MS) == 0,
+                 "the node did not publish msg_stripped=3 at shutdown. Ten messages "
+                 "were sent and exactly three carried a byte the relay strip removes, "
+                 "so the count must be 3: a byte count would read 7 (five removable "
+                 "bytes in the first hostile message, then one each in the bare-C1 "
+                 "message and the second hostile one), and 0 means the strip never "
+                 "ran. A count ABOVE 3 means the strip has widened into the keep "
+                 "list, which is the silent failure this file is for.");
     nf_free(&node);
 }
 
@@ -693,6 +777,59 @@ static void case_the_two_groups(void)
                      "node.", out);
     }
 
+    /* THE TWO SEQUENCES THIS PASS NAMED, and they are named here rather than left
+     * to the ranges above for a reason the ranges cannot express: both are VALID
+     * UTF-8 whose continuation bytes land inside 0x80-0x9F, and the assertion that
+     * matters is that they survive WHOLE. A strip widened to deny every byte in
+     * 0x80-0x9F passes the 255-value battery (a bare 0x81 must be denied, and it
+     * would be) and the `0xD0 0x80`-`0xD0 0xBF` loop (which would also pass, since
+     * the lead is 0xD0) and the emoji (which would NOT) -- so it is caught, but only
+     * by the four-byte case, and a strip that got this wrong in the other direction
+     * would be caught by neither.
+     *
+     * `ā` is `C4 81`: TWO bytes, and the second is a byte the table above denies on
+     * its own. `日` is `E6 97 A5`: THREE, the second of which is 0x97 -- also denied
+     * alone -- so this is a count of two expected continuations and not a flag.
+     *
+     * The assertion is byte-for-byte AND count, because a strip that returned the
+     * right bytes with the wrong count would leave every `kept < src_len` measurement
+     * on this node wrong while producing the right string. That is a silent fault,
+     * which is the class this file exists to prevent.
+     *
+     * WHY OCTAL AND NOT `\xNN` IN THE LITERAL. `\x` in C is greedy: `"\xc4\x81"` is
+     * fine because each escape ends at the backslash, but `"\xc481"` is ONE escape
+     * with the value 0xC481 and the compiler rejects it. The battery above already
+     * uses octal for this reason; these two are spelled the same way so a reader
+     * comparing the cases is not comparing two escape dialects. */
+    {
+        static const struct {
+            const char *name;
+            const char *bytes;
+            size_t len;
+        } named[] = {
+            { "a-macron (C4 81), whose second byte is denied alone",
+              "\304\201", 2u },
+            { "riyou (E6 97 A5), whose second byte is 0x97 and which needs a COUNT "
+              "of two continuations",
+              "\346\227\245", 3u }
+        };
+
+        for (size_t i = 0; i < sizeof named / sizeof named[0]; i++) {
+            char out[16];
+            size_t n = conn_text_strip_relay(out, sizeof out, named[i].bytes);
+
+            TF_CHECK_MSG(n == named[i].len && memcmp(out, named[i].bytes, n) == 0,
+                         "%s came back as %lu byte(s) rather than %lu intact. This is "
+                         "a VALID sequence whose continuation bytes lie inside the C1 "
+                         "range, so a strip that denied that range byte-wise would "
+                         "destroy every accented Latin and every CJK character on the "
+                         "node -- silently, because the recipient gets text that "
+                         "merely looks wrong.",
+                         named[i].name, (unsigned long)n,
+                         (unsigned long)named[i].len);
+        }
+    }
+
     /* AND THE ORDER OF A WHOLE STRING IS PRESERVED, which is what "not truncation"
      * means here: the strip removes bytes and never reorders or rewrites what it
      * keeps.
@@ -717,10 +854,235 @@ static void case_the_two_groups(void)
     }
 }
 
+
+/* ---------------------------------------------------------------------------
+ * 7. THE PEER PATH, WHICH IS WHERE #1's HOLE WAS
+ * ---------------------------------------------------------------------------
+ * WHY THIS CASE EXISTS AND WHY IT NEEDS ITS OWN FIXTURE.
+ *
+ * `case_relay_text()` above is entirely CLIENT-ORIGINATED, and it passed while a
+ * message a PEER originated reached a person's terminal with a bare 0x9F in it.
+ * Three filters existed and none of them was on that path:
+ *
+ *   - `msg_verbs.c` filters a client's message text before fanning it out;
+ *   - `fed_relay_clean()` filters it again on the way to a peer;
+ *   - `write_to_members()` -> `send_line_tagged()`, which is what writes to a local
+ *     client, filtered NOTHING.
+ *
+ * So peer -> this node -> a person's screen was unfiltered while client -> this node
+ * -> the same screen was filtered. The peer sweep found it (on Linux, with the macOS
+ * run green -- the sweep was not looking at its own client surface, which is the other
+ * half of that fix), and a sweep is an instrument rather than a specification: the
+ * fix belongs to a case that says what the rule IS, in both directions, on the path
+ * it applies to.
+ *
+ * THE FIXTURE IS A RAW SOCKET, and that is forced rather than chosen. Every other
+ * federation case in the tree links two of its own nodes, and two of this node's
+ * nodes cannot produce the input: A's client path strips, and A's peer path strips
+ * before it queues, so a hostile byte would have to arrive from something that is not
+ * this node. A raw socket standing in for the other end of the link is the only way to
+ * put one there, and `test_peer_terminal_sweep.c` is the precedent for exactly this.
+ *
+ * THE THREE ASSERTIONS, and they are the three the fix has to satisfy:
+ *
+ *   1. A BARE C1 IS REMOVED. `0x9F` with nothing expecting a continuation, on an
+ *      8-bit terminal CSI.
+ *   2. A VALID SEQUENCE SURVIVES WHOLE. `ā` (C4 81) and `日` (E6 97 A5), whose
+ *      continuation bytes are inside the C1 range. A strip widened to deny that range
+ *      byte-wise would pass assertion 1 and mangle every accented Latin and CJK
+ *      character on the node -- silently, which is worse than the bug it fixes.
+ *   3. THE SEQUENCE SPLIT ACROSS TWO WRITES ARRIVES WHOLE. `0xC4` ends one write and
+ *      `0x81` begins the next, so the boundary is inside a character rather than
+ *      between two. The barrier is the PING/PONG, which proves the node read the
+ *      first half before the second went out; that is what makes the split real
+ *      rather than probable, and it is why there is no sleep in this case.
+ *
+ * `assert_window_clean()` is applied to each window, so this case also inherits the
+ * paired-C1 check: an ENCODED C1 (`C2 9B`) reaching this client is refused too.
+ */
+#define FED_SECRET "irc-serve-federation-secret-c"
+#define FED_NAME_A "irc.a"
+#define FED_PEER  "irc.b"
+
+static int g_fed_peer_port;
+
+static void fed_child_tick(server_t *s, uint64_t now_ms)
+{
+    fed_tick(s, now_ms);
+}
+
+/* The client surface BEFORE fed_open(), for the reason `fed_open()` replaces the
+ * dispatch: a commands_dispatch installed afterwards becomes the node's whole
+ * dispatch and the peer path is never reached. Every assertion in this case is about
+ * a line that arrived on a peer link. */
+static void fed_child_setup(server_t *s)
+{
+    struct sockaddr_in sa;
+
+    s->dispatch = commands_dispatch;
+    TF_CHECK_MSG(fed_open(s, FED_SECRET) == 0,
+                 "fed_open() failed in the child; a node with an unopenable "
+                 "federation module cannot reach any assertion in this case");
+    s->on_tick = fed_child_tick;
+    /* RAISED, not the shipped values: this case sends a handful of lines and the
+     * shipped 5 s keepalive against a 30 s dead threshold is a real schedule, but
+     * nothing here waits on it and raising it only removes a source of flake. */
+    fed_set_timeouts(2000, 60000, 30000, 600000);
+
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = htons((unsigned short)g_fed_peer_port);
+    TF_CHECK_MSG(fed_link_configure(s, FED_PEER, (const struct sockaddr *)&sa,
+                                    (socklen_t)sizeof sa) != NULL,
+                 "the child could not configure peer " FED_PEER);
+}
+
+static void case_peer_message_text(void)
+{
+    nf_node_t node;
+    pf_peer_t peer;
+    test_client_t rcpt;
+    const char *const claim[] = {
+        ":" FED_NAME_A " FEDERATE " FED_NAME_A " ",
+        " " FED_SECRET " " IRC_SERVE_VERSION ""
+    };
+    char want[256];
+    size_t mark;
+    int listen_fd;
+
+    pf_peer_init(&peer);
+    tc_init(&rcpt);
+    listen_fd = pf_listen_loopback(&peer.port);
+    TF_CHECK_MSG(listen_fd >= 0, "the test could not open a listening socket");
+    g_fed_peer_port = peer.port;
+    TF_CHECK_MSG(nf_spawn_inline_named(&node, FED_NAME_A, fed_child_setup) == 0,
+                 "could not spawn node A");
+
+    peer.fd = pf_accept_deadline(listen_fd, T_IO_MS);
+    (void)close(listen_fd);
+    TF_CHECK_MSG(peer.fd >= 0, "node A never dialled the socket this case owns");
+    TF_CHECK_MSG(pf_read_until(peer.fd, claim,
+                               sizeof claim / sizeof claim[0], T_IO_MS) == 0,
+                 "node A never sent a FEDERATE, so nothing below could mean "
+                 "anything");
+    TF_CHECK_MSG(pf_send_line(peer.fd, ":" FED_PEER " FEDERATE " FED_PEER
+                             " 1700000000 " FED_SECRET " " IRC_SERVE_VERSION) == 0,
+                 "the test could not answer with a FEDERATE");
+    TF_CHECK_MSG(nf_expect(&node, "link_established: peer=" FED_PEER, T_IO_MS) == 0,
+                 "node A never established its link, so every assertion in this case "
+                 "would be vacuous");
+
+    register_as(&rcpt, node.port, "bob");
+    join(&rcpt);
+
+    /* --- 1. A BARE C1 IS REMOVED --- */
+    mark = tc_received(&rcpt);
+    TF_CHECK_MSG(pf_send_line(peer.fd, ":" FED_PEER " SPRIVMSG " CHAN
+                             " :before \237 after") == 0,
+                 "the bare-C1 SPRIVMSG send failed");
+    (void)snprintf(want, sizeof want, ":" FED_PEER " PRIVMSG " CHAN
+                   " :before  after\r\n");
+    TF_CHECK_MSG(tc_expect(&rcpt, want, T_IO_MS) == 0,
+                 "a bare 0x9F from a PEER reached a client's socket; expected "
+                 "\"%s\". The relay strip runs on this path now -- and \"now\" is the "
+                 "whole content of this case: before it, the same byte from a client "
+                 "was removed and the same byte from a peer was not.\n"
+                 "  recipient saw: %s", want, tc_buffer(&rcpt) + mark);
+    assert_window_clean(&rcpt, mark, "the peer's bare-C1 message");
+    drain(&rcpt);
+
+    /* --- 2. AND A VALID SEQUENCE SURVIVES WHOLE, ON THE SAME PATH --- */
+    /* Same connection, same link, immediately after: so a strip that denied the C1
+     * range byte-wise would fail THIS assertion on the very next line, having passed
+     * the one above. That pairing is the reason they are adjacent. */
+    mark = tc_received(&rcpt);
+    TF_CHECK_MSG(pf_send_line(peer.fd, ":" FED_PEER " SPRIVMSG " CHAN
+                             " :caf\304\201 \346\227\245") == 0,
+                 "the valid-sequence SPRIVMSG send failed");
+    (void)snprintf(want, sizeof want, ":" FED_PEER " PRIVMSG " CHAN
+                   " :caf\304\201 \346\227\245\r\n");
+    TF_CHECK_MSG(tc_expect(&rcpt, want, T_IO_MS) == 0,
+                 "valid UTF-8 from a peer did not arrive byte for byte; expected "
+                 "\"%s\". Both sequences carry continuation bytes inside the C1 range, "
+                 "so this is the assertion a strip widened to deny that range byte-wise "
+                 "would fail -- and it fails SILENTLY, because the recipient gets text "
+                 "that merely looks wrong.\n  recipient saw: %s", want,
+                 tc_buffer(&rcpt) + mark);
+    assert_window_clean(&rcpt, mark, "the peer's valid-sequence message");
+    drain(&rcpt);
+
+    /* --- 3. AND A SEQUENCE SPLIT ACROSS TWO WRITES IS NOT CORRUPTED --- */
+    {
+        const char *first = ":" FED_PEER " SPRIVMSG " CHAN " :caf\304";
+        const char *second = "\201 na\303\257ve\r\n";
+        char token[64];
+        char ping[64];
+        int w;
+
+        mark = tc_received(&rcpt);
+        TF_CHECK_MSG(pf_send_raw(peer.fd, first, strlen(first)) == 0,
+                     "the first half of the split sequence failed to send");
+        /* THE BARRIER, and it is what makes the split real. Two `pf_send_raw()`
+         * calls back to back usually arrive in ONE recv(), so the split would be a
+         * fiction and this assertion would be testing nothing. A PING on the same
+         * socket, answered by the node only after it has read the first half, is an
+         * OBSERVABLE BARRIER and not a sleep -- so the constraint against fixed
+         * sleeps holds and the split is guaranteed rather than probable. */
+        w = snprintf(token, sizeof token, "pf%u", g_drain_seq);
+        TF_CHECK_MSG(w > 0 && (size_t)w < sizeof token,
+                     "the barrier token could not be built");
+        w = snprintf(ping, sizeof ping, "PING :%s", token);
+        TF_CHECK_MSG(w > 0 && (size_t)w < sizeof ping,
+                     "the barrier PING could not be built");
+        TF_CHECK_MSG(tc_send(&rcpt, ping) == 0,
+                     "the barrier PING could not be sent to the client");
+        TF_CHECK_MSG(tc_expect(&rcpt, token, T_IO_MS) == 0,
+                     "the client got no PONG for the barrier token, so the split "
+                     "below cannot be claimed to be a split");
+
+        TF_CHECK_MSG(pf_send_raw(peer.fd, second, strlen(second)) == 0,
+                     "the second half of the split sequence failed to send");
+        (void)snprintf(want, sizeof want, ":" FED_PEER " PRIVMSG " CHAN
+                       " :caf\304\201 na\303\257ve\r\n");
+        TF_CHECK_MSG(tc_expect(&rcpt, want, T_IO_MS) == 0,
+                     "a UTF-8 sequence from a peer, split across two writes, did not "
+                     "arrive whole; expected \"%s\". `0xC4` ended one write and `0x81` "
+                     "began the next, so the boundary is inside a character: anything "
+                     "judging the halves independently would drop the continuation as a "
+                     "bare C1 and leave a lead byte that renders as nothing. The strip "
+                     "sees a whole assembled line, which is the property this asserts "
+                     "and the reason it holds.\n  recipient saw: %s", want,
+                     tc_buffer(&rcpt) + mark);
+        assert_window_clean(&rcpt, mark, "the peer's split sequence");
+    }
+
+    /* The node's own accounting, so the case is not a claim about bytes with no
+     * statement of what the node thought it did. `fed_message_stripped:` is the
+     * measurement the fix added and `msg_stripped=` is the counter it moved. */
+    TF_CHECK_MSG(nf_expect(&node, "fed_message_stripped: verb=SPRIVMSG", T_IO_MS) == 0,
+                 "the node never reported stripping the peer's message text. One bare "
+                 "C1 was removed and one mask byte was kept as part of a valid "
+                 "sequence, so exactly one line is expected -- and a node that removed "
+                 "nothing would not print one.\n  node said: %s", node.out);
+
+    TF_CHECK_MSG(tc_send(&rcpt, "PING :post-fed") == 0, "the drain PING failed");
+    TF_CHECK_MSG(tc_expect(&rcpt, "PONG", T_IO_MS) == 0,
+                 "the client got no PONG, so nothing above was about the read "
+                 "schedule");
+    tc_close(&rcpt);
+    if (peer.fd >= 0) {
+        (void)close(peer.fd);
+    }
+    TF_CHECK_MSG(nf_stop(&node) == 0, "node A did not exit cleanly");
+    nf_free(&node);
+}
+
 int main(void)
 {
     case_the_two_groups();
     case_relay_text();
+    case_peer_message_text();
     case_clean_message_does_not_count();
 
     tf_done("msg-text");

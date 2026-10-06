@@ -2751,6 +2751,80 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
         for (int i = 0; i < m->nparams - 1; i++) {
             sp[i] = m->params[i + 1];
         }
+        /* ------------------------------------------------------------------
+         * THE INBOUND HALF OF fed_relay_clean(), AND THE PEER SWEEP FOUND IT.
+         * ------------------------------------------------------------------
+         *
+         * WHAT WAS MISSING, and it is a whole half of one line's journey. Three
+         * filters already existed and none of them is on this path:
+         *
+         *   - `msg_verbs.c` filters a CLIENT's message text before fanning it out,
+         *     with `conn_text_strip_relay()`;
+         *   - `fed_relay_clean()` below `fed_queue_line()` filters the same text
+         *     again on the way to a PEER, with the same function;
+         *   - `write_to_members()` -> `send_line_tagged()` filters NOTHING, and it
+         *     is what writes to a local client.
+         *
+         * So a message a PEER originated went peer -> this node -> a person's
+         * terminal with its bytes untouched, while the identical message a client
+         * on this same node originated was stripped. `test_peer_terminal_sweep`
+         * found it on Linux as `:irc.b PRIVMSG #P549 :marker \x9f text` -- a bare
+         * C1 control, which on an 8-bit terminal IS CSI -- and macOS reported the
+         * same sweep clean, which turned out to be the sweep's own blind spot
+         * rather than a platform difference (it drained the client buffer once per
+         * marker and then swept only what arrived after the last drain).
+         *
+         * WHY HERE AND NOT IN `fed_in_message()`. Same reason `fed_relay_clean()`
+         * sits below the verb table rather than in each verb: this is BELOW G9's
+         * arity check, so a message verb added to INBOUND later cannot forget it,
+         * and a table row that knows a verb's parameter layout is a site that can
+         * be written wrong -- which the sweep has already caught once, with the
+         * channel in the wrong slot of an SMODES row.
+         *
+         * WHICH POLICY, and it is the SAME one for the same reason the outbound
+         * table uses it: this field is RELAYED MESSAGE TEXT, and the eight mIRC
+         * formatting bytes in it are semantics a client renders rather than hazard.
+         * The stored-value policy (`conn_text_strip()`, used for a topic or a kick
+         * reason) would strip a colour code off every message on the network. So
+         * the call below and the row above it name the same function, and a change
+         * to the rules is a change to both halves.
+         *
+         * WHY THE STATE VERBS ARE NOT HERE. `STOPIC`, `SKICK` and `SMODES` reach a
+         * local client only through `fanout_forward_channel_sverb()`, which writes
+         * to PEERS and does not emit locally at all -- the gap `fed_dispatch`'s own
+         * header names. So the peer->client exposure this fix closes is the message
+         * path, and the state verbs' exposure is the forward path, which
+         * `fed_relay_clean()` already covers. That is worth stating because the
+         * difference is invisible from the table: the two halves of INBOUND look
+         * identical and are filtered by different functions for that reason.
+         *
+         * THE MEASUREMENT IS REPORTED, for `fed_relay_clean()`'s reason: stripping
+         * a peer's text is invisible on the wire -- the far side sees a shorter
+         * field and cannot tell anything happened -- so a node that silently
+         * shortened relayed text would be indistinguishable from one that mangled
+         * it. `n_msg_stripped` is the same counter the client path increments,
+         * because it is the same decision about the same field; the line below it
+         * says which half of the node did it.
+         *
+         * COST: one extra pass over the text and one bounded copy, on the peer path
+         * for the two message verbs, and only when the peer's line was accepted.
+         * The 8 KiB arena is scoped to this block so it is not held for the state
+         * verbs below, and it is `IRC_MAX_LINE` because the line is already bounded
+         * by the framing layer -- stripping only removes bytes, so the filtered
+         * value always fits in what the unfiltered one occupied. */
+        {
+            char clean[IRC_MAX_LINE];
+            const size_t in_len = strlen(sp[0]);
+            const size_t kept = conn_text_strip_relay(clean, sizeof clean, sp[0]);
+
+            sp[0] = clean;
+            if (kept != in_len) {
+                s->n_msg_stripped++;
+                fed_obs("[observable] fed_message_stripped: verb=%s kept=%zu "
+                       "removed=%zu\n",
+                       m->command, kept, in_len - kept);
+            }
+        }
         fed_in_message(s, &t, m->prefix, &tags, INBOUND[idx].client_verb, sp,
                        m->nparams - 1);
         return;
