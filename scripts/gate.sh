@@ -279,12 +279,45 @@ echo "  ctest timeout : 200s"
 echo
 
 # ---------------------------------------------------------------------------
+# THE PORTABILITY RATCHET, once, before any cell
+# ---------------------------------------------------------------------------
+# It is here and not in each cell because it is a property of the SOURCE, not of a
+# build: thirteen cells on one libc cannot tell that a symbol they all accept is not
+# in the standard this tree is written against. Three defects in this project were
+# invisible to every cell and visible only on Linux -- the glibc `__wur` class, a
+# `<sys/wait.h>` included transitively by one libc's headers and not the other's, and
+# `memmem()` declared without a feature-test macro by the macOS SDK and hidden behind
+# one by glibc -- and the common shape is that the local gate is not a portability
+# oracle. That is a gap in the gate rather than in any one file, so the gate names it.
+#
+# The check is cheap, so running it per cell would cost nothing, but running it once
+# says what it is: ONE answer about the source, not thirteen agreeing with themselves.
+#
+# It counts as a FAILED CHECK rather than a failed CELL, on purpose. The cell total is
+# a claim about the build matrix; inflating it would make the matrix look worse than it
+# is, and folding it into a cell would make a source problem look like a build
+# problem. It is neither, so it is reported as its own thing and fails the gate on its
+# own line.
+FAILED_CHECKS=0
+SUMMARY=""
+echo "--- portability ratchet (source-wide) ---"
+if "$root/scripts/check-portability.sh" > "$GATE_BUILD_ROOT/portability.log" 2>&1; then
+    sed -n '1p' "$GATE_BUILD_ROOT/portability.log" | sed 's/^/  /'
+    SUMMARY="${SUMMARY}check-portability OK\n"
+else
+    printf '  %-26s %s\n' "check-portability.sh" "FAILED"
+    sed -n '2,40p' "$GATE_BUILD_ROOT/portability.log" | sed 's/^/      /'
+    FAILED_CHECKS=$((FAILED_CHECKS + 1))
+    SUMMARY="${SUMMARY}check-portability FAILED\n"
+fi
+echo
+
+# ---------------------------------------------------------------------------
 # One cell. Errors and warnings are counted on the BUILD LOG, so a cell that
 # built nothing cannot report "0 errors" by having produced no log at all.
 # ---------------------------------------------------------------------------
 TOTAL_CELLS=0
 FAILED_CELLS=0
-SUMMARY=""
 
 run_cell() {
     # Extra CMake arguments are the remaining positional parameters, not one
@@ -485,9 +518,12 @@ if [ "$RUN_ASAN" = "1" ]; then
 else
     echo "cells run: $TOTAL_CELLS (12 build cells; --no-asan, so no sanitizer cell)"
 fi
-if [ "$FAILED_CELLS" = "0" ]; then
+if [ "$FAILED_CELLS" = "0" ] && [ "$FAILED_CHECKS" = "0" ]; then
     echo "GATE RESULT: PASS  (failures: 0)"
     exit 0
 fi
-echo "GATE RESULT: FAIL  (failed cells: $FAILED_CELLS)"
+# BOTH COUNTS, because a run where the matrix is clean and a source check is not is a
+# different failure from a run where a cell is red, and reporting only the cell count
+# would let the second look like the first.
+echo "GATE RESULT: FAIL  (failed cells: $FAILED_CELLS, failed checks: $FAILED_CHECKS)"
 exit 1

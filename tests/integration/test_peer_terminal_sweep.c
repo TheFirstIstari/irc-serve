@@ -437,7 +437,8 @@ static void ps_needles_are_per_probe(void)
  * for somebody to discover:
  *
  *   IT CATCHES the form this pass actually produced -- a condition that asserts a
- *   value is ABSENT (`== NULL`, `!strstr`, `!memmem`, a negated search) whose
+ *   value is ABSENT (`== NULL`, `!strstr`, `!sws_find_bytes`, a negated search)
+ *   whose
  *   message does not read as an absence. That is checkable with no judgement: read
  *   the condition, read the message, require the message to contain a negation.
  *
@@ -574,12 +575,13 @@ static void ps_assert_no_inverted_assertions(void)
             }
 
             /* The four negation forms this pass produced and the one shape that
-             * covers them. `== NULL` and `!strstr`/`!memmem` are the assertions that
+             * covers them. `== NULL` and `!strstr`/`!sws_find_bytes` are the
+             * assertions that
              * a value is ABSENT. */
             asserts_absent = (strstr(cond, "== NULL") != NULL) ||
                              (strstr(cond, "!= NULL") == NULL &&
                               (strstr(cond, "!strstr") != NULL ||
-                               strstr(cond, "!memmem") != NULL));
+                               strstr(cond, "!sws_find_bytes") != NULL));
             if (asserts_absent != 0 && msg_len > 0u) {
                 TF_CHECK_MSG(ps_reads_as_absence(msg, msg_len) != 0,
                              "%s: an assertion whose condition is `%s` asserts "
@@ -646,8 +648,13 @@ static size_t ps_wait_new(nf_node_t *node, size_t from, const char *needle,
 
     for (;;) {
         drain_node_pipe(node);
-        if (node->out_len > from && nlen > 0u &&
-            memmem(node->out + from, node->out_len - from, needle, nlen) != NULL) {
+        /* `sws_find_bytes()` rather than `memmem()`: this is a bounded search over
+         * the output produced SINCE `from`, and `memmem()` is a GNU extension that
+         * is not declared on a POSIX libc without `_GNU_SOURCE` -- which is why it
+         * compiled on all thirteen local gate cells and failed on Linux's glibc, as
+         * one implicit declaration and four pointer-versus-integer comparisons. */
+        if (sws_find_bytes(node->out + from, node->out_len - from, needle,
+                           nlen) != NULL) {
             return node->out_len;
         }
         if (pf_now_ms() >= deadline) {
@@ -681,12 +688,16 @@ static const char *ps_last_line_with(const char *out, size_t from, size_t len,
     const char *found = NULL;
     const char *p = out + from;
     const char *end = out + len;
+    size_t nlen = strlen(needle);
 
     while (p < end) {
         const char *nl = (const char *)memchr(p, '\n', (size_t)(end - p));
         size_t n = (nl != NULL) ? (size_t)(nl - p) : (size_t)(end - p);
 
-        if (n >= strlen(needle) && memmem(p, n, needle, strlen(needle)) != NULL) {
+        /* ONE LINE at a time, and the search is bounded by that line's length. The
+         * line is a view into the log and is NOT NUL-terminated where the buffer
+         * ends, which is the case a NUL-terminated search would get wrong. */
+        if (sws_find_bytes(p, n, needle, nlen) != NULL) {
             found = p;
         }
         p += n + 1u;
@@ -738,13 +749,13 @@ static void ps_expect_withheld(const nf_node_t *node, size_t from,
     /* BOTH halves. The field proves the value is being rendered in the slot this
      * row meant it to be in; the measurement proves the `-` is the FILTER's
      * decision and not an empty field that happened to be there. */
-    TF_CHECK_MSG(memmem(line, n, sh->field, strlen(sh->field)) != NULL,
+    TF_CHECK_MSG(sws_find_bytes(line, n, sh->field, strlen(sh->field)) != NULL,
                  "marker 0x%02x on shape %zu: the `%s` line does not carry `%s`, "
                  "so the value this row put there is not being reported at all. "
                  "A WITHHELD field and a MISPLACED one look identical on the wire "
                  "and in the log, and this is the check that tells them apart: %.*s",
                  (unsigned)mark, idx, sh->needle, sh->field, (int)n, line);
-    TF_CHECK_MSG(memmem(line, n, sh->measure, strlen(sh->measure)) != NULL,
+    TF_CHECK_MSG(sws_find_bytes(line, n, sh->measure, strlen(sh->measure)) != NULL,
                  "marker 0x%02x on shape %zu: the `%s` line carries `%s` but not "
                  "`%s`, so the `-` cannot be told from an empty field: %.*s",
                  (unsigned)mark, idx, sh->needle, sh->field, sh->measure,
@@ -797,7 +808,7 @@ static void ps_expect_verdict(const nf_node_t *node, size_t from,
     w = snprintf(want, sizeof want, "refused=%02x", (unsigned)mark);
     TF_CHECK_MSG(w > 0 && (size_t)w < sizeof want,
                  "the verdict needle could not be built");
-    TF_CHECK_MSG(memmem(line, n, want, strlen(want)) != NULL,
+    TF_CHECK_MSG(sws_find_bytes(line, n, want, strlen(want)) != NULL,
                  "marker 0x%02x on shape %zu: the `%s` line does not carry `%s`. "
                  "The sweep's own filter removed this marker before the mode string "
                  "was rendered, so the byte cannot witness what the node did with "
@@ -922,6 +933,22 @@ int main(void)
 
     sws_masks_init();
     memset(g_exc_used, 0, sizeof g_exc_used);
+
+    /* THE INSTRUMENT'S OWN EDGE CASES, BEFORE ANY PROBE. A sweep whose bounded
+     * search is off by one at the end of a range reports CLEAN, because the byte it
+     * read past the end is not a byte anybody looks at -- so the primitive is
+     * verified before it is trusted, in the same function that defines it, and by
+     * BOTH sweeps, because an instrument only one of them verifies is half
+     * verified. */
+    {
+        const char *bad = sws_find_bytes_self_test();
+
+        TF_CHECK_MSG(bad == NULL,
+                     "the bounded-search self-test failed at `%s`, so every "
+                     "search this sweep has just made is unverified: the range "
+                     "may have been read past its end, or a zero-length needle "
+                     "may be matching everything", bad != NULL ? bad : "");
+    }
 
     /* The standing checks run BEFORE the sweep rather than after it, because a
      * check that reports the instrument was broken is only useful while there is

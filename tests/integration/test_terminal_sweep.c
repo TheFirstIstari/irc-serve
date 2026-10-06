@@ -1458,6 +1458,21 @@ int main(void)
     sw_masks_init();
     memset(&g_exc, 0, sizeof g_exc);
 
+    /* THE INSTRUMENT'S OWN EDGE CASES, and the reason this sweep runs them is not
+     * politeness: `sws_find_bytes()` is the primitive that decides whether a byte
+     * reached a scanned surface, and a version of it that reads one byte past a
+     * range reports this sweep CLEAN rather than red. It is verified here and in the
+     * peer sweep because both depend on it and because `ps_assert_no_inverted_
+     * assertions()` already reads this file's source, so an instrument defect here
+     * and a generator defect there are the same failure wearing different hats. */
+    {
+        const char *bad = sws_find_bytes_self_test();
+
+        TF_CHECK_MSG(bad == NULL,
+                     "the bounded-search self-test failed at `%s`, so every "
+                     "search this sweep has just made is unverified", bad != NULL ? bad : "");
+    }
+
     derive_verbs();
 
     /* THE TABLE'S SPLIT POINT IS ASSERTED, not assumed. `SH_SUBJECT_FIRST` is a

@@ -156,7 +156,30 @@ run_fault inverted-assertion-check-has-teeth \
     inverted_assertion.py
 
 note ""
-note "teeth: $PASS of 8 faults caught, $FAIL not."
+# ---------------------------------------------------------------------------
+# 9-11. THE BOUNDED SEARCH'S OWN THREE FAULTS.
+#
+# Each of these is a one-token change that compiles, passes every other test in the
+# tree, and passes all thirteen local gate cells -- which is the point. The peer sweep
+# is the instrument's only consumer, and a search that reads one byte past its range
+# returns the right ANSWER on every ordinary run, so nothing but the self-test in the
+# header can see any of them. That is why the self-test exists, and these are the
+# faults that justify it.
+# ---------------------------------------------------------------------------
+run_fault bounded-search-off-by-one-at-the-end \
+    "test_peer_terminal_sweep test_terminal_sweep" \
+    bounded_search_overrun.py
+
+run_fault zero-length-needle-reports-found \
+    "test_peer_terminal_sweep test_terminal_sweep" \
+    empty_needle_matches.py
+
+run_fault needle-containing-nul-handled-with-strlen \
+    "test_peer_terminal_sweep test_terminal_sweep" \
+    nul_needle_strlen.py
+
+note ""
+note "teeth: $PASS of 11 faults caught, $FAIL not."
 if [ "$FAIL" != "0" ]; then
     note "not caught:$FAILED_LIST"
     exit 1
