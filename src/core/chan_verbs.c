@@ -2200,23 +2200,76 @@ void handle_mode(server_t *s, conn_t *c, const message_t *m)
      * argument to a prefix or ban mode is params[2] for EVERY letter in the
      * string, which is what RFC 1459 2.3.1 specifies: "+oov nick" is two
      * promotions of one nick, not two different nicks. */
-    /* THE FORWARD CASE IS REFUSED, and this is a DELIBERATE difference from
-     * TOPIC. 2.2 says only the origin evaluates +b, +e and +I and that +o and
-     * +v are prefix modes -- and 4.3's frozen SMODES shape names the node that
-     * EVALUATED the change as its first field, so a forwarded SMODES would have
-     * to name a node this one is not. There is no honest line to send, and
-     * sending one that names this node as the evaluator would be asserting an
-     * authority 2.2 does not grant. So the verdict's FORWARD outcome becomes 437
-     * for MODE specifically, and the reason is printed rather than swallowed so
-     * an operator can see it is a policy and not a missing forward. */
+    /* THE FORWARD ARM, AND IT USED TO BE A 437 (#141).
+     *
+     * WHAT IT WAS, and why the reasoning was wrong. The comment here said a
+     * forwarded SMODES "would have to name a node this one is not", because 4.3's
+     * frozen shape puts the EVALUATING server first and this node does not evaluate
+     * +b. Both halves of that are true and the conclusion does not follow:
+     * `fed_sverb_params()` fills that field with `self` -- the forwarding node's own
+     * name -- and the node IS the evaluator, on a member's behalf, in exactly the
+     * sense the field was designed to record. The line it refused to send was the
+     * honest one.
+     *
+     * THE CONSEQUENCE WAS THAT A DOCUMENTED 2.2 FIELD WAS UNREACHABLE FROM HALF THE
+     * NETWORK. `MODE #chan +b mask` is one of the three fields 2.2 reserves to the
+     * origin, so refusing to forward it meant a ban set by an operator on any node
+     * that does not own the channel never took effect anywhere -- the same class of
+     * defect as #132, in which no topic set by any client not attached to the origin
+     * took effect on any mesh. #141.
+     *
+     * NOW IT FORWARDS, and the shape is TOPIC's: nothing is applied locally (2.2
+     * forbids writing a cache field), the peer line carries `params[0] = self`, and
+     * the origin's own client gets the mode change. The client is NOT answered 437
+     * here, for TOPIC's reason: the origin performs the action, so a 437 would tell
+     * a client its operator status was not accepted, which is false about something
+     * that is about to be true. The honest limits are TOPIC's too -- the forward can
+     * still be refused further along -- and what this node promises is that it
+     * ACCEPTED the request.
+     *
+     * THE MASK IS STRIPPED, and the raw-length rule is the locally-owned path's
+     * verbatim, because it must be: the origin applies its own bound to whatever
+     * arrives, so a 400-byte mask of which 200 bytes are control characters would
+     * strip to 200 here, fit, and be stored there -- where the same 400 bytes
+     * unstripped were refused. Checking the RAW length first keeps the origin's
+     * answer a function of what the client sent rather than of which bytes
+     * happened to be in it.
+     *
+     * COST: one bounded copy and one extra pass over the mask, on a path that runs
+     * once per client MODE against a channel this node does not own. */
     if (verdict == CHAN_VERDICT_FORWARD) {
-        printf("[observable] chan_mode_refused: channel=%s nick=%s "
-               "reason=MODE_NEEDS_ORIGIN\n",
-               ch->name, c->nick);
-        (void)reply(s, c, "437", (const char *const[]){ ch->name }, 1,
-                    "Cannot change %s: channel modes are the origin's to "
-                    "evaluate (%s)",
-                    ch->name, ch->origin);
+        const char *fwd[2];
+        char clean_mask[CHAN_MAX_BAN + 1u];
+        const char *mask = (m->nparams >= 3) ? m->params[2] : NULL;
+        int nfwd = 1;
+        size_t kept = 0;
+
+        if (conn_hostmask(c, prefix, sizeof prefix) == 0) {
+            return;
+        }
+        fwd[0] = m->params[1];
+        if (mask != NULL && mask[0] != '\0') {
+            if (strlen(mask) > (size_t)CHAN_MAX_BAN) {
+                /* NOT FORWARDED, AND SAID SO. The origin refuses a mask longer than
+                 * its own bound, and a node that quietly shortened its way inside
+                 * that bound would be answering for a change the origin never
+                 * accepted. The record is inside this branch rather than after both
+                 * of them, so `forwarded=1` on the other line means the STRIPPED
+                 * value went on the wire. */
+                printf("[observable] chan_mode_forward: channel=%s nick=%s modes=%s "
+                       "in_len=%zu kept_len=0 forwarded=0 reason=MASK_TOO_LONG\n",
+                       ch->name, c->nick, m->params[1], strlen(mask));
+                return;
+            }
+            kept = conn_text_strip(clean_mask, sizeof clean_mask, mask);
+            fwd[1] = clean_mask;
+            nfwd = 2;
+        }
+        deliver_state_change(s, c, ch, "MODE", prefix, fwd, nfwd);
+        printf("[observable] chan_mode_forward: channel=%s nick=%s modes=%s "
+               "in_len=%zu kept_len=%zu forwarded=1 reason=CONTROL_BYTES\n",
+               ch->name, c->nick, m->params[1],
+               (mask != NULL) ? strlen(mask) : 0u, kept);
         return;
     }
 

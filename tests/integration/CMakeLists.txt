@@ -473,6 +473,17 @@ irc_add_integration_test(test_hostmask_reachability test_hostmask_reachability.c
 # two-node federation in it.
 irc_add_integration_test(test_fed_topic_authority test_fed_topic_authority.c)
 
+# #141: #132's sibling, in the other verb. WHO IS ALLOWED TO EVALUATE A CHANNEL MODE.
+# `MODE #chan +b` is one of 2.2's three origin-only fields, and the entitlement test
+# read `params[0] <server>` -- which carries the authority -- as though it were the
+# whole of it, so a ban set by an operator on any node but the origin's never took
+# effect anywhere. Four cases: the origin applies a non-owner's +b and its ban list
+# changes ON THE WIRE, a third server's claim is still refused, the origin's own mode
+# change survives one relay hop (which needs the third node, because a refusal sits
+# ABOVE the forward and suppresses it too), and a cache records the letter without
+# enforcing it.
+irc_add_integration_test(test_fed_mode_authority test_fed_mode_authority.c)
+
 # 4.3 / 7/Phase 6 acceptance criterion 2: the FULL 353 CONTENTS on BOTH nodes
 # after a resync, in the Phase 4 order and terminated by a 366 -- and the
 # replace-never-merge property the resync exists for, which needs three bursts

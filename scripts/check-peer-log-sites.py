@@ -99,7 +99,15 @@ ALLOWED = {
     "verb": "a table lookup, never the wire's command word",
     "origin": "a local copy of link->name, or of g_shadow.origin which is one",
     "g_shadow.origin": "burst_copy() of link->name",
-    "params[0]": "the SQUIT <server> this node built from its own name",
+    # NOT this node's own name in general. `params[0]` is the SQUIT `<server>` there,
+    # which fed_in_squit() builds from `s->name`, so it cannot carry a peer-chosen
+    # byte -- and it is ALSO SKICK's `<member>` and SMODES' `<server>`, which are
+    # whatever the peer put in that slot. Both of those now print through
+    # `conn_text_logsafe()` with the count beside them; this entry is the SQUIT site,
+    # and it was being read as a blanket exemption for the other two until #141 made
+    # one of them a value an operator reads on a refusal line.
+    "params[0]": "fed_in_squit()'s <server>, built from this node's own name; the "
+                 "SKICK and SMODES uses of params[0] go through conn_text_logsafe()",
     "holder": "the best remote holder from fed_nickreg_best_holder(): a copy of "
               "fed_rnick::server, which is written only from g_shadow.origin (a "
               "burst_copy of link->name) or from an irc_serve_server_name_valid()",
