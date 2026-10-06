@@ -2715,6 +2715,16 @@ static void case_identifiers_are_refused_and_the_record_kept(void)
                      "NULL for a link whose handshake has not finished and the sender "
                      "silently returns.\n  node said: %s", a.out);
         register_client(&ann, a.port, NICK_E);
+        /* BOTH CLIENTS CLOSED HERE, and that is a leak fix rather than tidiness: `ann`
+         * is the SAME test_client_t the case reuses on node B below, and `tc_connect()`
+         * zeroes a client rather than closing what it held -- so a node-A connection
+         * left open here takes its 4 KiB receive buffer with it. Linux's
+         * LeakSanitizer found it as `Direct leak of 4096 byte(s)` through
+         * `register_client()`, and it is the first thing this project's inline-node
+         * leak work has ever reported from a TEST rather than from a child: an inline
+         * node now runs LSan's atexit handler, and a test that leaks is a test that
+         * leaks. */
+        tc_close(&ann);
         tc_close(&alice);
     }
 
