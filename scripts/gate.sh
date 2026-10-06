@@ -301,11 +301,11 @@ echo
 FAILED_CHECKS=0
 SUMMARY=""
 echo "--- portability ratchet (source-wide) ---"
-if "$root/scripts/check-portability.sh" > "$GATE_BUILD_ROOT/portability.log" 2>&1; then
+if "$root/scripts/check-portability.py" > "$GATE_BUILD_ROOT/portability.log" 2>&1; then
     sed -n '1p' "$GATE_BUILD_ROOT/portability.log" | sed 's/^/  /'
     SUMMARY="${SUMMARY}check-portability OK\n"
 else
-    printf '  %-26s %s\n' "check-portability.sh" "FAILED"
+    printf '  %-26s %s\n' "check-portability.py" "FAILED"
     sed -n '2,40p' "$GATE_BUILD_ROOT/portability.log" | sed 's/^/      /'
     FAILED_CHECKS=$((FAILED_CHECKS + 1))
     SUMMARY="${SUMMARY}check-portability FAILED\n"

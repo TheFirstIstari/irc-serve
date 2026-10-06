@@ -205,7 +205,7 @@ def strip_comments(src):
     reported three. Two wrong versions, both for the same reason: the parser was
     counting braces that were not syntax.
 
-    WHY COMMENTS ARE BLANKED, which is the reason `check-portability.sh` strips before
+    WHY COMMENTS ARE BLANKED, which is the reason `check-portability.py` strips before
     it matches: this check's own argument list and docstring name `m->params[...]` and
     `m->command` many times, and a checker that matched itself would be a checker that
     could only ever fail.

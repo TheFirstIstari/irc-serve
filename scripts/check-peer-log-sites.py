@@ -117,7 +117,7 @@ def strip_comments(src):
 
       * this check's own argument list and docstring name `m->params[...]` and
         `m->command` many times, and a checker that matched itself would be a checker
-        that could only ever fail -- the reason check-portability.sh strips first;
+        that could only ever fail -- the reason check-portability.py strips first;
       * a `[observable]` LINE is recognised by its string literal, so the literals
         cannot be blanked. Comments are replaced by spaces rather than removed so
         that every offset -- and therefore every reported line number -- still
