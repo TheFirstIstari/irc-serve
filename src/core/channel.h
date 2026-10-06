@@ -885,12 +885,49 @@ int chan_mode_has(const chan_t *ch, char m);
  * of "a non-owner's modes[] is a cache and cannot enforce". */
 int chan_mode_set(chan_t *ch, char m, int on);
 
-/* Add a ban mask. Returns 0 on success, -1 on a bad or over-long mask, on a
- * full list (CHAN_MAX_BANS) or on allocation failure. The 'b' letter in
- * modes[] is the caller's business, not this function's: a caller that adds a
- * mask and forgets the letter has two bugs, and hiding one inside the other
- * makes both harder to find. */
-int chan_ban_add(chan_t *ch, const char *mask);
+/* WHY THIS IS AN ENUM AND NOT THE -1 IT WAS, because three conditions collapsed
+ * into one -1 and every caller answered all three with 478 ERR_BANLISTFULL,
+ * whose RFC 2812 5.1 text is "channel :Cannot list bans, list is full". A client
+ * working out WHY it cannot ban something was told its ban list was full when it
+ * had sent nothing, or when it had sent a 300-byte mask -- and the recovery that
+ * implies (remove a ban) is the wrong one for both. An inaccurate error is a wire
+ * behaviour too; the fact that the fix is a wire change is not a reason to leave
+ * one in place.
+ *
+ * WHERE THE BOUND STAYS, and why it is here rather than at the call site: this is
+ * the only writer of `ch->bans`, so a bound checked by the caller would be one
+ * call site out of however many exist later. The caller chooses the NUMERIC and
+ * nothing else. */
+typedef enum {
+    CHAN_BAN_OK = 0,
+    /* A mask that is empty or NULL. 461 ERR_NEEDMOREPARAMS: a parameter the verb
+     * requires is absent. Nothing in RFC 2812 fits "your mask was the empty
+     * string", and 461 is the numeric this node already uses for an absent
+     * required parameter (KICK's reason, TOPIC's text, MODE's arguments). */
+    CHAN_BAN_EMPTY,
+    /* A mask wider than CHAN_MAX_BAN. 417 ERR_INPUTTOOLONG, which is what
+     * chan_verbs.c already answers for an over-long KICK reason and what
+     * reply_refused(..., "417", ...) is for. */
+    CHAN_BAN_TOO_LONG,
+    /* The list is at CHAN_MAX_BANS. 478 ERR_BANLISTFULL, and only this one. */
+    CHAN_BAN_FULL,
+    /* The mask did not fit the stored field, or the array could not grow. Both
+     * are unreachable while the length bound above holds -- the field is
+     * CHAN_MAX_BAN + 1 -- so this exists to be COUNTED rather than folded into
+     * one of the three above: a caller that answers a client with a numeric for
+     * an allocation failure is reporting something the client cannot act on and
+     * the operator needs to see. See chan_verbs.c's arm. */
+    CHAN_BAN_NOMEM
+} chan_ban_verdict_t;
+
+/* Add a ban mask. Returns CHAN_BAN_OK on success and one of the four refusals
+ * above otherwise; see the enum for which numeric each one is answered with and
+ * why the distinction exists.
+ *
+ * The 'b' letter in modes[] is the caller's business, not this function's: a
+ * caller that adds a mask and forgets the letter has two bugs, and hiding one
+ * inside the other makes both harder to find. */
+chan_ban_verdict_t chan_ban_add(chan_t *ch, const char *mask);
 
 /* Remove a ban mask. Returns 1 when one was removed, 0 when there was none. */
 int chan_ban_remove(chan_t *ch, const char *mask);

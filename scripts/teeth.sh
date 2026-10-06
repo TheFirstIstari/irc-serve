@@ -194,8 +194,20 @@ run_fault stopic-authority-reads-the-link-not-the-line \
     "test_fed_topic_authority test_fed_relay" \
     stopic_link_name_instead_of_subject.py
 
+# ---------------------------------------------------------------------------
+# 13. #133: THE EMPTY-MASK BAN REFUSAL BACK ON THE CAPACITY NUMERIC.
+#
+# The second fault in this file that needs a WIRE assertion rather than a log
+# assertion: the whole claim is that the numeric on the wire is 461 and not 478,
+# so a check that counted `chan_ban_refused:` lines would pass either way. The
+# numeric is also the thing a client reads, which is why the wrong one is a defect
+# rather than a naming preference.
+# ---------------------------------------------------------------------------
+run_fault ban-empty-mask-answers-478     "test_banlist" \
+    ban_empty_mask_answers_478.py
+
 note ""
-note "teeth: $PASS of 12 faults caught, $FAIL not."
+note "teeth: $PASS of 13 faults caught, $FAIL not."
 if [ "$FAIL" != "0" ]; then
     note "not caught:$FAILED_LIST"
     exit 1
