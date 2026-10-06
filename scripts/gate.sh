@@ -553,6 +553,38 @@ if [ "$RUN_ASAN" = "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# The docs-truth check, AFTER the cells and not before them.
+# ---------------------------------------------------------------------------
+# IT NEEDS A BUILD TREE and it reads the tree with `ctest -N`, so WHERE IN THIS SCRIPT
+# IT RUNS IS LOAD-BEARING. The first version ran it here at the top, with the other
+# source-wide checks, and picked the alphabetically-first directory under
+# $GATE_BUILD_ROOT -- which, because `run_cell()` only `rm -rf`s the cell it is about
+# to build, is a LEFTOVER from the previous run whenever this one is interrupted or
+# the two disagree about the compiler set. It read a stale 95-test tree and reported
+# four "stale claims" that were this tree's own 98. That is the silent-substitution
+# failure the check's own header warns about, committed by the gate itself, and the
+# only thing that prevents it is that this check REFUSES to substitute a tree.
+#
+# After the cells, the first cell's directory is guaranteed to have just been
+# configured by this run.
+echo
+echo "--- docs truth (needs a build tree, so: after the cells) ---"
+# `${selected[0]}` is an INDEX into all_labels, not a label -- which is why the
+# first version of this built the path "0_Release_tlsOFF" and the check refused it.
+# The refusal was correct and the path was wrong, and that is the check working.
+DOCS_BUILD="$GATE_BUILD_ROOT/${all_labels[${selected[0]}]}_Release_tlsOFF"
+if python3 "$root/scripts/check-docs-truth.py" --build "$DOCS_BUILD" \
+        > "$GATE_BUILD_ROOT/docstruth.log" 2>&1; then
+    sed -n '1p' "$GATE_BUILD_ROOT/docstruth.log" | sed 's/^/  /'
+    SUMMARY="${SUMMARY}check-docs-truth OK\n"
+else
+    printf '  %-26s %s\n' "check-docs-truth.py" "FAILED"
+    sed -n '1,40p' "$GATE_BUILD_ROOT/docstruth.log" | sed 's/^/      /'
+    FAILED_CHECKS=$((FAILED_CHECKS + 1))
+    SUMMARY="${SUMMARY}check-docs-truth FAILED\n"
+fi
+
+# ---------------------------------------------------------------------------
 # Optional pinned test count, then the verdict.
 # ---------------------------------------------------------------------------
 echo

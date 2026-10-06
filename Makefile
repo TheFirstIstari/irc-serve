@@ -10,7 +10,7 @@ BUILD_DIR := build-testing
 BENCH_BUILD_DIR := build-benchmark
 CTEST_TIMEOUT := 60
 
-.PHONY: all build test benchmark local-ci gate clean help docs-check
+.PHONY: all build test benchmark local-ci gate clean help docs-check docs
 .DEFAULT_GOAL := help
 
 help:
@@ -89,6 +89,22 @@ clean:
 
 docs-check:
 	@test -f docs/SPEC_TRACKING.md || (echo "docs/SPEC_TRACKING.md missing"; exit 1)
-	@echo "docs check passed"
+	@BUILD_DIR=$(BUILD_DIR) python3 ./scripts/check-docs-truth.py
+
+# `docs` REGENERATES THE ONE GENERATED THING IN THE TREE, and it is one command
+# because the alternative was a manual instruction that had already been ignored.
+#
+# docs/DEVELOPMENT.md said "AND IF YOU ADD A TAG, ADD IT HERE" about a table whose
+# SHAs were wrong once already, and a document that names an invariant nobody
+# maintains is a hope rather than a rule. scripts/gen-rollback-table.py writes the
+# table between generated markers in place; check-docs-truth.py (run by `make
+# docs-check` and by the gate) then fails if the committed copy has drifted from the
+# repository.
+#
+# WHAT IT DOES NOT DO, and the header of the generator says so: it cannot check the
+# PROSE around the table. A generator can make the rows true; it cannot make the
+# argument made about them true.
+docs:
+	python3 ./scripts/gen-rollback-table.py --write
 
 all: build

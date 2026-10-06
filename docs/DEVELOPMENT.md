@@ -144,60 +144,74 @@ gh api -X PATCH repos/TheFirstIstari/irc-serve/branches/main/protection \
 Tags mark every phase boundary, so "go back to the last working state" is a
 lookup rather than an archaeology exercise.
 
-```
-v0.1.0-preserved     1e0bbe4  Preserve prior work, correct docs, adopt federation
-v0.2.0-tokenizer     4e01501  Phase 1: message tokenizer, tag format, nick charset
-v0.3.0-core          d33bbf0  Phase 2: server core - poll loop, conn_t, framing
-v0.4.0-registration  dc871d3  registration, 001-005 numerics, reply() invariant
-v0.5.0-channels      cbf1eeb  Phase 4: channels, final struct shapes, single-writer
-v0.6.0-docs          7166382  macOS CI, self-hosted runner, generated stats
-v0.7.0-messaging     6757d4e  PRIVMSG, NOTICE, WHO, WHOIS, ISON, away-notify
-```
 
-Every one of those SHAs was WRONG until now, and the table was also missing a tag
-— which is the same failure the README's version number was, in a file whose whole
-purpose is to tell you where to roll back to. The history was rewritten once
-(there are `backup-before-*-rewrite` tags recording it), the phase tags were
-re-created against the rewritten commits, and this table kept naming the pre-rewrite
-objects. They are still in the object store, so `git show 738f254` succeeds and
-returns a commit that is not what `v0.1.0-preserved` resolves to — which is worse
-than a missing SHA, because it looks right.
+<!-- BEGIN GENERATED: rollback-table (scripts/gen-rollback-table.py; `make docs`) -->
+| Tag | Kind | Commit | Subject |
+|---|---|---|---|
+| `v0.1.0-preserved` | tag | `1e0bbe4` | Preserve prior work, correct docs, and adopt a federation-native design (#84) |
+| `v0.2.0-tokenizer` | tag | `4e01501` | Phase 1: message tokenizer, tag format, nick charset rule (#87) |
+| `v0.3.0-core` | tag | `d33bbf0` | Phase 2: server core - poll loop, conn_t framing, registries (#89) |
+| `v0.4.0-registration` | tag | `dc871d3` | feat(core): registration, 001-005 numerics, and the reply() invariant (#90) |
+| `v0.5.0-channels` | tag | `cbf1eeb` | Phase 4: channels, final struct shapes, and the single-writer rule (#96) |
+| `v0.6.0-docs` | tag | `7166382` | docs: traefik-style README, CONTRIBUTING, SECURITY, and a runner-script fix (#95) |
+| `v0.7.0-messaging` | tag | `6757d4e` | feat(core): PRIVMSG, NOTICE, WHO, WHOIS, ISON, AWAY - the working-server line (#99) |
+| `backup-before-attrib-rewrite` | commit | `7e8c9e9` | Merge pull request #112 from TheFirstIstari/fix/runner-oversubscription |
+| `backup-before-claude-rewrite-2` | commit | `89d13b0` | Merge pull request #116 from TheFirstIstari/ci/test_fed_resync-fix |
+| `backup-before-claude-rewrite-3` | commit | `14d64cd` | Merge pull request #118 from TheFirstIstari/phase/10-ircv3 |
+| `safety-net` | commit | `72c0192` | test: two sweeps that cannot report clean while covering nothing |
+<!-- END GENERATED: rollback-table -->
 
-**AND THE TAGS ARE NOT RELEASES, and the newest tag is not a phase tag.** The newest
-tag by `creatordate` is `safety-net` (`72c0192`), which records a safety marker rather
-than a phase boundary; before it come the three `backup-before-*-rewrite` tags. The
-newest *phase* tag is `v0.7.0-messaging` and the project is at a much later phase —
-the number in a tag names the *phase*, which is also why the version in
-`src/core/server.h` and the number in these tags are two different series that will
-not track each other. There is no `v0.8.0` because **no phase after 5 was tagged at
-all** — the table above lists seven phase tags and the last of them is Phase 5's — and
-there is no `v1.0.0` because there has been no release. The four non-phase tags in the
-table are not phases and are not releases either: they mark moments where the history
-was rewritten or where a safety net was added, and `safety-net` is the most recent
-thing in this repository to be worth rolling back to.
+**THE TABLE IS GENERATED, and `make docs` rewrites it.** It used to be a fenced
+block maintained by hand, under an instruction that read *"AND IF YOU ADD A TAG, ADD
+IT HERE"* — a manual invariant on the one file in the tree whose whole purpose is to
+tell you where to roll back to, and it had **already** been wrong twice. Every one of
+those SHAs was a pre-rewrite object: the history was rewritten once (the
+`backup-before-*-rewrite` tags record it), the phase tags were re-created against the
+rewritten commits, and this table kept naming the old ones. They were still in the
+object store, so `git show 738f254` succeeded and returned a commit that is not what
+`v0.1.0-preserved` resolves to — worse than a missing SHA, because it looks right.
 
-**TO CHECK THIS TABLE RATHER THAN TRUST IT — AND THE FIRST OF THESE TWO COMMANDS IS
-WRONG, WHICH IS THE POINT:**
+`scripts/check-docs-truth.py` fails when the committed table disagrees with a fresh
+regeneration, so the instruction is now a `make docs` rather than a memory test.
+
+**WHY THE `Kind` COLUMN EXISTS, and it is not decoration.** Seven of these tags are
+**annotated** and four are **lightweight**, and the difference breaks the obvious
+command. On an annotated tag `%(objectname)` is the **tag object**, not the commit, so
 
 ```sh
-# WRONG, and it was the first line of this block for months. On an ANNOTATED tag
-# %(objectname) is the TAG OBJECT rather than the commit -- and seven of the eleven
-# tags here are annotated, so this prints seven SHAs that name objects
-# `v0.1.0-preserved` does NOT resolve to. It printed them wrongly WHILE THE TABLE
-# BESIDE IT WAS RIGHT, which is the most expensive possible shape for a verification
-# command: it looks like it works.
 git tag -l --sort=creatordate --format='%(refname:short)  %(objectname:short)  %(subject)'
-
-# RIGHT, and the difference is one `git rev-list -n1` dereferencing tag -> commit.
-git for-each-ref --format='%(refname:short)' refs/tags | \
-  while read -r tag; do printf '%-30s %s\n' "$tag" "$(git rev-list -n1 "$tag" | cut -c1-7)"; done
 ```
 
-**AND IF YOU ADD A TAG, ADD IT HERE.** A rollback table that describes a repository
-which no longer exists is worse than no rollback table. That sentence is being made
-enforceable in the next commit: the table becomes generated by `make docs`, and
-`scripts/check-docs-truth.py` fails when the committed copy disagrees with the
-repository — so the instruction becomes a command rather than a memory test.
+prints seven SHAs that are all *wrong* — and it printed them wrongly while the table
+beside it was right, which is the most expensive possible shape for a verification
+command. The dereference is one `git rev-list -n1`, and that is what the generator
+does:
+
+```sh
+# WHAT THE GENERATOR RUNS, and the one command worth remembering:
+git for-each-ref --sort=creatordate --format='%(refname:short)%09%(objecttype)' refs/tags |
+  while IFS="$(printf '\t')" read -r tag kind; do
+    printf '| `%s` | %s | `%s` | %s |\n' "$tag" "$kind" \
+      "$(git rev-list -n1 "$tag" | cut -c1-7)" "$(git log -1 --format=%s "$tag")"
+  done
+
+# OR, WHICH IS THE SAME THING WITH THE BOOKKEEPING DONE FOR IT:
+make docs        # rewrites the table above in place
+make gate        # and fails if it is stale
+```
+
+**AND THE TAGS ARE NOT RELEASES, and the newest one is not a phase tag.** The newest
+tag by `creatordate` is `safety-net`, which records a safety marker rather than a
+phase boundary; before it are the three `backup-before-*-rewrite` tags. The newest
+*phase* tag is `v0.7.0-messaging` and the project is at a much later phase — the
+number in a tag names the *phase*, which is also why the version in
+`src/core/server.h` and the number in these tags are two different series that will
+not track each other. There is no `v0.8.0` because **no phase after 5 was tagged at
+all** — and note that this sentence is *about* the table rather than *in* it, which is
+the limit of what generating it can check. A generator can make the ROWS true; it
+cannot make the ARGUMENT made about them true. Prose is not checkable the way `#error`
+checks code, and the honest position is that the rows are verified and this sentence is
+not.
 
 ### Finding the last good state
 
