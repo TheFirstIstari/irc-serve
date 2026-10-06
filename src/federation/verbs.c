@@ -39,7 +39,13 @@
  * wrong: the operator reading this log IS the reader, and there is no argument that an
  * operator's terminal is not one.
  *
- * SO IT IS ONE FUNCTION AND EVERY SITE SAYS `fed_obs`. A `%s` argument is rendered
+ * SO IT IS ONE FUNCTION AND EVERY SITE SAYS `fed_obs`. Since #135 it is NOT static:
+ * `federation/burst.c` is the other large peer-path logger in the node and could not
+ * reach it, which meant the policy this function documents was in force in one file
+ * out of five that logs peer data. It is declared in verbs.h, and
+ * `scripts/check-peer-log-sites.py` is the sweep that keeps every site honest --
+ * including this one, which a reader of the other four files would otherwise have
+ * no reason to believe in. A `%s` argument is rendered
  * through `conn_text_logsafe()` before it reaches stdout: kept verbatim when every
  * byte is printable ASCII, and WITHHELD as `-` when one is not, which is the tree's
  * standing convention for a log-only field (`cmd_unknown: command=-` beside a
@@ -89,13 +95,13 @@
 #define FED_OBS_SPEC "-+ #0123456789.*hlLqjzt"
 #define FED_OBS_LEN "hlLqjzt"
 
-static void fed_obs(const char *fmt, ...)
+void fed_obs(const char *fmt, ...)
 #if defined(__GNUC__)
     __attribute__((format(printf, 1, 2)))
 #endif
     ;
 
-static void fed_obs(const char *fmt, ...)
+void fed_obs(const char *fmt, ...)
 {
     /* One field buffer, 256 bytes so a whole topic (CHAN_MAX_TOPIC is 255) or a
      * hostmask fits without being withheld for length. It is ONE buffer rather than

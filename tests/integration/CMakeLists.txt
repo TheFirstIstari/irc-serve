@@ -456,6 +456,12 @@ irc_add_integration_test(test_fed_loop test_fed_loop.c)
 # channel's SPRIVMSG to the owner.
 irc_add_integration_test(test_fed_relay test_fed_relay.c)
 
+# #135: the peer-path log sites the burst family REFUSES. The other peer sweep
+# cannot reach these by construction -- it drives shapes this node acts on, and
+# these are the shapes it reports on while refusing -- so they need a fixture of
+# their own or they are unchecked.
+irc_add_integration_test(test_burst_malformed_log test_burst_malformed_log.c)
+
 # #134: the "documented unreachable" claim in msg_verbs.c, CHECKED. A source
 # inspection with no skip and no build-configuration dependence, because the thing
 # it retires is a COMMENT -- and a comment cannot fail.

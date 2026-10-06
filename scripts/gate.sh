@@ -310,6 +310,30 @@ else
     FAILED_CHECKS=$((FAILED_CHECKS + 1))
     SUMMARY="${SUMMARY}check-portability FAILED\n"
 fi
+
+# ---------------------------------------------------------------------------
+# The SECOND source-wide ratchet, and why it is here rather than in one cell
+# ---------------------------------------------------------------------------
+# Same argument as the one above and it is worth stating rather than repeating: this
+# is a property of the SOURCE, so one answer is right and thirteen agreeing with
+# themselves would only be thirteen. It is a source check rather than a build
+# property because what it watches is a text pattern -- a peer string reaching a
+# `printf` -- which no compiler and no sanitizer has an opinion about.
+#
+# It is counted as a FAILED CHECK, not as a failed cell, for the reason the
+# portability ratchet above gives: inflating the cell count would make the build
+# matrix look worse than it is, and folding it into a cell would make a source
+# problem look like a build problem.
+echo "--- peer log-site sweep (source-wide) ---"
+if python3 "$root/scripts/check-peer-log-sites.py" > "$GATE_BUILD_ROOT/peerlog.log" 2>&1; then
+    sed -n '1p' "$GATE_BUILD_ROOT/peerlog.log" | sed 's/^/  /'
+    SUMMARY="${SUMMARY}check-peer-log-sites OK\n"
+else
+    printf '  %-26s %s\n' "check-peer-log-sites.py" "FAILED"
+    sed -n '1,40p' "$GATE_BUILD_ROOT/peerlog.log" | sed 's/^/      /'
+    FAILED_CHECKS=$((FAILED_CHECKS + 1))
+    SUMMARY="${SUMMARY}check-peer-log-sites FAILED\n"
+fi
 echo
 
 # ---------------------------------------------------------------------------

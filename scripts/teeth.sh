@@ -223,8 +223,28 @@ run_fault hostmask-width-derivation-replaced-by-a-literal \
     "test_hostmask_reachability" \
     hostmask_width_literal.py
 
+# ---------------------------------------------------------------------------
+# 16. #135: A PEER'S <nick> BACK IN A printf("%s") ON THE BRANCH THAT REFUSED IT.
+#
+# The one fault in this file that TWO instruments have to catch, which is why it is
+# the one worth the most: the sweep says the argument is not allowed, and the wire
+# test says the byte came out. A fault caught by only one of them would mean the
+# other is decorative, and this is the fault that establishes which is which.
+#
+# `scripts/teeth.sh` runs the C test because that is what `run_fault` drives. The
+# sweep is a SOURCE check, so running it under this harness would need the mutation
+# applied to the copy rather than to this tree -- which `run_fault` does do, since
+# it stages the tree and applies the fault there. So the check named here is the
+# binary, and the sweep's half of the claim is verified separately by running
+# `python3 scripts/check-peer-log-sites.py` against the same mutated copy, which is
+# what the fault's docstring asks a reader to do.
+# ---------------------------------------------------------------------------
+run_fault burst-nick-printed-raw-on-the-refusal-branch \
+    "test_burst_malformed_log" \
+    burst_nick_printed_raw.py
+
 note ""
-note "teeth: $PASS of 15 faults caught, $FAIL not."
+note "teeth: $PASS of 16 faults caught, $FAIL not."
 if [ "$FAIL" != "0" ]; then
     note "not caught:$FAILED_LIST"
     exit 1
