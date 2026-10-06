@@ -456,6 +456,11 @@ irc_add_integration_test(test_fed_loop test_fed_loop.c)
 # channel's SPRIVMSG to the owner.
 irc_add_integration_test(test_fed_relay test_fed_relay.c)
 
+# #134: the "documented unreachable" claim in msg_verbs.c, CHECKED. A source
+# inspection with no skip and no build-configuration dependence, because the thing
+# it retires is a COMMENT -- and a comment cannot fail.
+irc_add_integration_test(test_hostmask_reachability test_hostmask_reachability.c)
+
 # #132: WHO IS ALLOWED TO SET A CHANNEL'S TOPIC. Three cases and a third node
 # between them, because the rule has three arms and the one that needed three
 # nodes is the one whose absence let the defect survive a suite that already had

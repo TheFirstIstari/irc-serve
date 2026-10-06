@@ -206,8 +206,25 @@ run_fault stopic-authority-reads-the-link-not-the-line \
 run_fault ban-empty-mask-answers-478     "test_banlist" \
     ban_empty_mask_answers_478.py
 
+# ---------------------------------------------------------------------------
+# 14. #134: THE <msgtarget> BACK IN A printf("%s"), AND THE REACHABILITY CLAIM
+#     ABOVE IT PROVED BY A COMMENT RATHER THAN BY A TEST.
+#
+# One fault and two tests, which is the shape of #134: the injection fix and the
+# claim that made the site look safe are different defects with different fixes,
+# and the test file covers both. `test_hostmask_reachability` is the only test in
+# the tree whose SUBJECT is a comment, so this is also the only fault here whose
+# failure mode is "a paragraph in a source file went stale".
+# ---------------------------------------------------------------------------
+run_fault msg-target-printed-raw     "test_hostmask_reachability" \
+    msg_params_printed_raw.py
+
+run_fault hostmask-width-derivation-replaced-by-a-literal \
+    "test_hostmask_reachability" \
+    hostmask_width_literal.py
+
 note ""
-note "teeth: $PASS of 13 faults caught, $FAIL not."
+note "teeth: $PASS of 15 faults caught, $FAIL not."
 if [ "$FAIL" != "0" ]; then
     note "not caught:$FAILED_LIST"
     exit 1
