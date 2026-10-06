@@ -1211,6 +1211,15 @@ static void case_mode_472_refusal_is_measured(void)
                  "indistinguishable from an absent value.\n  node said: %s", node.out);
     assert_no_controls_in_log(&node, 0, "the MODE 472 refusals, the whole log");
 
+    /* THE CLIENT'S BUFFER IS RELEASED, and it is worth saying why that line is here
+     * rather than left out: `register_as()` calls `tc_init()`, which allocates the
+     * receive buffer, and a `test_client_t` that is initialised and never closed
+     * leaks it. LeakSanitizer found exactly this -- 8192 bytes, the buffer grown to
+     * IRC_MAX_LINE -- and ONLY on Linux, because macOS's AddressSanitizer has no
+     * LeakSanitizer and this tree's local gate therefore cannot see a leak at all.
+     * A cleanup line that no local run requires is exactly the kind of line that goes
+     * missing, so it is here with the reason. */
+    tc_close(&c);
     TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
     tf_unregister(&node);
 }

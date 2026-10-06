@@ -609,6 +609,12 @@ static void case_batch_no_sign_is_measured(void)
     assert_log_clean(&node, "the pre-registration BATCH refusal");
 
     (void)tc_send(&c, "QUIT :done");
+    /* THE CLIENT'S BUFFER IS RELEASED. `tc_init()` allocates the receive buffer and a
+     * `test_client_t` that is initialised and never closed leaks it; LeakSanitizer
+     * found this one too, and again ONLY on Linux, because macOS's AddressSanitizer
+     * carries no LeakSanitizer. 4096 bytes here against 8192 in the 472 case -- the
+     * same leak, sized by how much this case's client was made to receive. */
+    tc_close(&c);
     TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
     assert_log_clean(&node, "the pre-registration BATCH refusal, including QUIT");
     tf_unregister(&node);
