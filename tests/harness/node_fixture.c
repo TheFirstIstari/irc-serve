@@ -587,7 +587,14 @@ static void nf_child_tick(server_t *s, uint64_t now_ms)
     }
     if (getppid() != g_child_ppid) {
         /* The test process is gone: a failed test must not leave this node
-         * running. Exit without touching the parent's state. */
+         * running. Exit without touching the parent's state.
+         *
+         * `_exit(0)` AND NOT `exit(0)`, and this is the one place in the child
+         * where it is right: the reader for a LeakSanitizer report is the test
+         * process, and it is gone, and the test has already failed. A heap audit
+         * here could only write into a pipe with no reader and delay whatever ran
+         * next. The spawn path below is the opposite case -- a normal shutdown with
+         * a parent waiting on `nf_stop()` -- and there `exit()` is the whole point. */
         _exit(0);
     }
 
@@ -917,7 +924,45 @@ static int nf_spawn_common(nf_node_t *n, nf_mode_t mode, nf_setup_fn setup,
          * make the name a per-mode thing when it is a per-node thing, and the
          * binary mode has no use for it. */
         g_child_name = (name != NULL) ? name : NF_NODE_NAME;
-        _exit(nf_child_run(setup));
+        /* exit(), NOT _exit(), AND THIS IS THE CHANGE THAT MAKES AN INLINE NODE
+         * LEAK-CHECKED AT ALL.
+         *
+         * `_exit()` skips every atexit handler, and LeakSanitizer's leak check IS
+         * one: it registers with atexit and runs from there. So an inline child
+         * left this call was a process whose entire allocation history -- the
+         * `server_t`, everything `server_init()` built, everything `fed_open()`
+         * allocated -- was measured by NOTHING. `nf_child_run()` already calls
+         * `server_shutdown()` before returning, so the child's own teardown ran;
+         * what never ran was the independent audit of whether that teardown was
+         * complete. Binary-spawned children were checked all along, because
+         * `execv()` replaces the image and the sanitized binary's own `exit` runs
+         * LSan's handler -- which is exactly why the leak class had a clean record
+         * in one place and no record at all in the other.
+         *
+         * HOW A LEAK BECOMES A RED TEST, because it is not obvious and it is the
+         * whole mechanism: LSan overrides the exit status with 23 when it finds
+         * anything, and `nf_stop()` returns `WEXITSTATUS(status)` verbatim. So a
+         * child that leaks makes `TF_CHECK_MSG(nf_stop(&node) == 0, ...)` fail,
+         * naming the node, rather than printing a report into a pipe nobody reads.
+         *
+         * THE COST, and it is a real one in two parts. `exit()` flushes stdio, so
+         * anything the PARENT had buffered on a stream at fork() time is flushed a
+         * second time by the child. That is a duplicate in CTest's log, not a test
+         * failure -- the child's own stdout and stderr are dup2'd onto the
+         * fixture's pipe and line-buffered by `nf_child_run()` before either can be
+         * written to -- but it is noise and it is why the child's `setvbuf()` is
+         * the first thing it does. And `exit()` also runs any atexit handler the
+         * PARENT registered, which for this harness means only LSan's; nothing else
+         * in tests/ registers one.
+         *
+         * THE `nf_child_tick()` PATH BELOW STAYS `_exit(0)` and the distinction is
+         * deliberate: that arm runs when the parent is already gone, so the test
+         * has failed and there is no reader for a leak report, no process left to
+         * act on it, and running a full heap audit on the way out of a process
+         * whose test is over would be work whose only possible effect is to delay
+         * the next test. `_exit()` there is the correct answer and this comment is
+         * here so that the next reader does not "fix" it for symmetry. */
+        exit(nf_child_run(setup));
     }
 
     close(pipefd[1]);
