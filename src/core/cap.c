@@ -21,11 +21,17 @@
  * transitive include. */
 #include "core/connection.h"
 #include "core/reply.h"
+/* For transport_is_tls() -- the ONE question this file asks about a CONNECTION's
+ * transport, which is what makes `tls` and `sts` per-connection rather than per-node.
+ * Named rather than read off `c->tls_active`, for the reason connection.h's own
+ * comment on that field gives: the ops pointer is the transport's knowledge and one
+ * predicate is the only way the rest of the tree is allowed to ask for it. */
+#include "core/transport.h"
 #include "account_store.h"
 #include "sasl_framework.h"
-/* Phase 12: the ONE question cap.c asks about TLS, which is "is TLS compiled in". The
- * certificate itself is a field on server_t, so this file never names a TLS type
- * -- which is what keeps the zero-dependency build the default one. */
+/* Phase 12: the ONE question cap.c asks about the BUILD, which is "is TLS compiled
+ * in". The certificate itself is a field on server_t, so this file never names a TLS
+ * type -- which is what keeps the zero-dependency build the default one. */
 #include "tls_backend.h"
 
 /* --------------------------------------------------------------------------
@@ -169,7 +175,7 @@ int cap_known(const char *name)
 /* ---------------------------------------------------------------------------
  * CAN THIS NODE ENCRYPT ANYTHING AT ALL?
  * ---------------------------------------------------------------------------
- * TWO QUESTIONS AND THE ORDER THEY ARE ASKED IN, because the answer is not one
+ * THREE QUESTIONS AND THE ORDER THEY ARE ASKED IN, because the answer is not one
  * thing:
  *
  *   tls_backend_available()  is TLS COMPILED IN? A false here is a build fact and
@@ -177,34 +183,98 @@ int cap_known(const char *name)
  *   s->tls != NULL           did an operator give this NODE a certificate and key
  *                           that loaded? A false here is a configuration fact and
  *                           can differ between two nodes running the SAME binary.
+ *   transport_is_tls(c)      is THIS CONNECTION already encrypted? Neither of the
+ *                           two above answers it, and that is not a gap in them:
+ *                           the implicit-TLS listener and a STARTTLS upgrade both
+ *                           put an encrypted conn_t on a node whose certificate is
+ *                           perfectly well configured.
  *
- * BOTH ARE ASKED, and a node that fails either does not advertise `tls`. That is
- * cap.h's rule and it is why neither name is advertised by default: the default
- * build has neither, and a node built with -DWITH_TLS=ON that was not given a
+ * BOTH NODE FACTS ARE ASKED, and a node that fails either does not advertise `tls`.
+ * That is cap.h's rule and it is why neither name is advertised by default: the
+ * default build has neither, and a node built with -DWITH_TLS=ON that was not given a
  * certificate has neither either.
  *
- * `tls` IS NOT THE SAME QUESTION AS `sts`, and the second question has a THIRD
- * condition. `tls` says "this node speaks STARTTLS", which is a statement about a
+ * `tls` IS NOT THE SAME QUESTION AS `sts`, and the second question has TWO MORE
+ * conditions. `tls` says "this node speaks STARTTLS", which is a statement about a
  * command. `sts` says "here is a policy; act on it", and the specification makes
- * `port` REQUIRED on an insecure connection -- see sts_possible() below, which is
- * why `sts` is not answered from tls_node_possible().
+ * `port` REQUIRED on an insecure connection and has the client hold the policy for
+ * `duration` seconds -- see sts_possible() below, which is why `sts` is not answered
+ * from tls_node_possible() alone.
  *
- * THE COST of asking at runtime rather than at build time is one pointer test per
- * CAP LS, and the benefit is that "advertise only what is real" survives a build
- * flag -- which is the same reason `sasl` consults a store instead of a macro. */
+ * THE COST of asking at runtime rather than at build time is one pointer test and
+ * one transport-pointer test per CAP LS, and the benefit is that "advertise only what
+ * is real" survives a build flag -- which is the same reason `sasl` consults a store
+ * instead of a macro. Neither test is per packet: `CAP LS` is a command a client
+ * sends once or twice in a session's life. */
 static int tls_node_possible(const server_t *s)
 {
     return (tls_backend_available() != 0 && s != NULL && s->tls != NULL) ? 1 : 0;
 }
 
-/* CAN THIS NODE STATE AN `sts` POLICY THE SPECIFICATION WOULD HONOUR?
+/* IS `c` A PLAINTEXT CONNECTION, which is the only kind `tls` and `sts` may be
+ * advertised on?
  *
- * `tls_node_possible()` is NOT sufficient, and the missing condition is the whole
- * of this function. The IRCv3 strict-transport-security specification makes the
+ * NULL IS PLAINTEXT, and that is a decision rather than a shrug. Every question in
+ * this file is asked about a connection that exists, because `CAP LS` is a client
+ * command; NULL reaches here only from a caller with no connection to ask about --
+ * a unit test sweeping the rendered list, which wants the WIDEST list it can get,
+ * because that is what makes the buffer arithmetic interesting. Answering NULL as
+ * "secure" would make every such caller render a shorter list and quietly under-test
+ * the bound; answering it as "plaintext" makes them test the widest case and costs
+ * nothing at the one place that matters, where a NULL connection cannot arrive.
+ *
+ * THE PREDICATE IS transport_is_tls() AND NOT `c->tls_active`, because that field is
+ * a latch the acceptor and the command handler set, and a second question about the
+ * same fact is a second thing to keep in step with the first. The transport's ops
+ * pointer is the one answer, and connection.h says so at the field. */
+static int conn_plaintext(const conn_t *c)
+{
+    return (c == NULL || transport_is_tls(c) == 0) ? 1 : 0;
+}
+
+/* CAN THIS CONNECTION BE TOLD THAT THE NODE SPEAKS STARTTLS?
+ *
+ * A STARTTLS CAPABILITY ON A SECURE CONNECTION IS A LIE, and it is the lie the `tls`
+ * specification names: `tls` says the server supports the STARTTLS command, and on a
+ * connection that is already encrypted there is nothing to upgrade. A client that read
+ * `tls` over TLS and then issued STARTTLS would be answered 691 by this node -- which
+ * is a correct refusal and a contradiction of the advertisement that provoked it.
+ *
+ * IT MATTERS IN BOTH DIRECTIONS, and the second is why this is a question about the
+ * CONNECTION and not about the node:
+ *
+ *   implicit TLS  the client dialled --tls-port. The bytes are already encrypted, so
+ *                 `tls` is meaningless here and `sts` is worse than meaningless:
+ *                 `sts` is a policy about UPGRADING a connection.
+ *   STARTTLS      the same argument, reached by upgrading rather than by dialling. A
+ *                 node that advertised `sts` after the upgrade would be telling a
+ *                 client to protect a connection it is already speaking securely on.
+ *
+ * A node that refuses plaintext entirely (--tls-require) does not get this for free:
+ * its plaintext listener still answers `CAP LS` before it drops the connection at
+ * accept, and what it says there is still read by whatever read it.
+ *
+ * THE COST, which is the point of stating it: `tls` is now a per-CONNECTION answer, so
+ * two clients on one node can be told different `CAP LS` lists. That is not a shorter
+ * list -- it is the list becoming true, and a capability that varies per connection is
+ * exactly what "what can this connection do" means. The alternative was one list for
+ * all of them, which is what made it a lie on exactly the connections that needed it
+ * not to be. */
+static int tls_conn_possible(const server_t *s, const conn_t *c)
+{
+    return (tls_node_possible(s) != 0 && conn_plaintext(c) != 0) ? 1 : 0;
+}
+
+/* CAN THIS CONNECTION BE TOLD AN `sts` POLICY?
+ *
+ * `tls_conn_possible()` is necessary and not sufficient, and the two extra conditions
+ * below are the whole of this function.
+ *
+ * THE FIRST IS THE PORT, and the argument is the specification's own. It makes the
  * `port` key REQUIRED on an insecure connection -- and `CAP LS` travels on the
- * plaintext port, which is exactly what "insecure connection" means here -- and
- * then says what a client does when a required part is missing: "If any required
- * part is missing, clients MUST continue as if no STS policy was advertised."
+ * plaintext port, which is exactly what "insecure connection" means here -- and then
+ * says what a client does when a required part is missing: "If any required part is
+ * missing, clients MUST continue as if no STS policy was advertised."
  *
  * SO WHAT A `sts` WITH NO PORT IS, on a node with a certificate and no --tls-port:
  *
@@ -223,28 +293,54 @@ static int tls_node_possible(const server_t *s)
  *      section naming the hazard that "a client that saw `sts` on a node with no
  *      secure port" produces.
  *
- * So `sts` is WITHHELD and plain `tls` is not. `tls` stays because it is TRUE:
- * this node does answer STARTTLS, and a client that wants to upgrade has to be
- * able to find that out. Withholding it would be refusing to tell a client
+ * So on such a node `sts` is WITHHELD and plain `tls` is not. `tls` stays because it
+ * is TRUE: this node does answer STARTTLS, and a client that wants to upgrade has to
+ * be able to find that out. Withholding it would be refusing to tell a client
  * something real, which is the opposite mistake.
  *
- * `duration=0` IS NOT WHAT IS BEING FIXED HERE. A `sts=duration=0,port=N` on a
- * node that HAS a secure port is correct and is the specification's own recommended
- * shipped default; it states a policy of "no persistence" and names where to get
- * TLS. Only the missing REQUIRED KEY is suppressed.
+ * THE SECOND IS THE DURATION, and it is the condition this pass added.
+ * `--tls-sts-duration` DEFAULTS TO ZERO, so a node given a certificate and a secure
+ * port and nothing else used to advertise
  *
- * THE COST, stated because it is one: a node that was configured with a certificate
- * and no --tls-port now advertises no `sts`, so a client learns nothing about its
- * transport posture. That is the true posture. The alternative -- and it is the one
- * this fixes -- is a client learning something false. An operator who wants the
- * policy stated must give the node a secure port to state it against, which is what
- * --tls-port is for. */
-static int sts_possible(const server_t *s)
+ *     sts=duration=0,port=NNNN
+ *
+ * which is a policy whose entire content is "you may persist nothing", rendered as
+ * though an operator had chosen it. Nobody chose it: it is what happens when they do
+ * not. That is the advertisement-before-the-feature-exists failure in its weakest
+ * and most common form, and the specification names the same reason to make the
+ * number deliberate rather than defaulted -- "Server implementations should consider
+ * using a default value of duration=0 in their example configurations. This will
+ * require server administrators to deliberately choose an expiry according to their
+ * specific needs rather than (perhaps unknowingly) rely on an arbitrary generic
+ * value." A CAPABILITY LINE IS NOT AN EXAMPLE CONFIGURATION, and a client reading one
+ * cannot tell a chosen zero from an unconsidered one.
+ *
+ * cap.h argued the opposite once -- that a `duration=0` with a `port` "is correct and
+ * is deliberately not changed", because it names where TLS is available and asserts
+ * no persistence. That argument is kept there as the COST of this decision rather
+ * than as its justification: an operator who wants "TLS here, persist nothing" can no
+ * longer say so in `CAP LS`, because the only rendering of that wish is a capability
+ * indistinguishable from the one where nobody thought about it. What they get instead
+ * is `tls`, which says STARTTLS is available, and is true.
+ *
+ * THE COST OF THE WHOLE FUNCTION, stated because it is one: a node whose operator
+ * chose no policy advertises no `sts`, so a client learns nothing about its transport
+ * posture. That is the true posture. The alternative -- and it is the one this fixes
+ * -- is a client learning something an operator did not say. An operator who wants
+ * the policy stated must give the node a secure port to state it against AND an
+ * expiry to state, which is what --tls-port and --tls-sts-duration are for.
+ *
+ * COST: one comparison per CAP LS, against a field on server_t, on a command a client
+ * sends once. Nothing is computed and nothing is allocated. */
+static int sts_possible(const server_t *s, const conn_t *c)
 {
-    return (tls_node_possible(s) != 0 && server_tls_port(s) > 0) ? 1 : 0;
+    if (tls_conn_possible(s, c) == 0 || server_tls_port(s) <= 0) {
+        return 0;
+    }
+    return (s->sts_duration > 0u) ? 1 : 0;
 }
 
-int cap_available(const server_t *s, const char *name)
+int cap_available(const server_t *s, const conn_t *c, const char *name)
 {
     if (cap_known(name) == 0) {
         return 0;
@@ -256,10 +352,10 @@ int cap_available(const server_t *s, const char *name)
         return account_possible(s);
     }
     if (strcasecmp(name, CAP_TLS) == 0) {
-        return tls_node_possible(s);
+        return tls_conn_possible(s, c);
     }
     if (strcasecmp(name, CAP_STS) == 0) {
-        return sts_possible(s);
+        return sts_possible(s, c);
     }
     return 1;
 }
@@ -275,18 +371,22 @@ int cap_available(const server_t *s, const char *name)
  * negotiation specification does not otherwise describe.
  *
  * WHICH KEYS APPEAR is argued at CAP_STS_VALUE_MAX in cap.h. What is worth
- * repeating here is that `port` is NOT CONDITIONAL in this function any more: it
- * used to be, and a `sts=duration=0` with no port on a node with no implicit-TLS
- * listener was a policy the specification calls malformed -- `port` is REQUIRED on
- * an insecure connection, and "if any required part is missing, clients MUST
- * continue as if no STS policy was advertised". So the decision moved to
- * sts_possible(), which withholds the whole NAME when there is no secure port, and
- * this function is only ever reached for a node that has one.
+ * repeating here is that NEITHER KEY IS CONDITIONAL in this function any more: both
+ * used to be. `port` used to be omitted when the node had no implicit-TLS listener,
+ * which produced a policy the specification calls malformed -- `port` is REQUIRED on
+ * an insecure connection, and "if any required part is missing, clients MUST continue
+ * as if no STS policy was advertised" -- and `duration` used to be rendered whatever
+ * it held, so a node whose operator never chose an expiry advertised the zero that
+ * means "persist nothing" as though it had been chosen. So BOTH decisions moved to
+ * sts_possible(), which withholds the whole NAME unless there is a secure port AND a
+ * non-zero duration, and this function is only ever reached for a node that has both.
  *
- * WHICH MAKES THE PORT BELOW A REAL PORT, and that is an invariant rather than an
+ * WHICH MAKES BOTH NUMBERS BELOW REAL, and that is an invariant rather than an
  * assumption: cap_available_list() consults cap_available() before cap_value() for
  * every name, so a `sts` that reaches here has already passed sts_possible(). A
- * future caller that rendered a value without asking would be writing `port=0`. */
+ * future caller that rendered a value without asking would be writing `port=0` or
+ * `duration=0` -- which is to say, it would be writing the policy this module exists
+ * not to advertise. */
 static size_t cap_value(const server_t *s, const char *name, char *out, size_t cap)
 {
     int n;
@@ -304,7 +404,7 @@ static size_t cap_value(const server_t *s, const char *name, char *out, size_t c
     return (size_t)n;
 }
 
-size_t cap_available_list(const server_t *s, char *out, size_t cap)
+size_t cap_available_list(const server_t *s, const conn_t *c, char *out, size_t cap)
 {
     size_t n = 0;
 
@@ -317,7 +417,7 @@ size_t cap_available_list(const server_t *s, char *out, size_t cap)
         char value[CAP_STS_VALUE_MAX];
         size_t vlen;
 
-        if (cap_available(s, k_caps[i].name) == 0) {
+        if (cap_available(s, c, k_caps[i].name) == 0) {
             continue;
         }
         /* THE VALUE IS PART OF THE NAME ON THE WIRE, so it is accounted for in the
@@ -860,7 +960,7 @@ static void cap_do_ls(server_t *s, conn_t *c, const message_t *m, int is_list)
             off += got;
         }
     } else {
-        (void)cap_available_list(s, list, sizeof list);
+        (void)cap_available_list(s, c, list, sizeof list);
     }
     cap_reply(s, c, is_list ? "LIST" : "LS", list);
     printf("[observable] cap: fd=%d sub=%s 302=%d caps=%s\n", c->fd,
@@ -921,7 +1021,7 @@ static void cap_do_req(server_t *s, conn_t *c, const message_t *m)
 
     for (int i = 0; i < n; i++) {
         const int known = cap_known(names[i]);
-        const int have = cap_available(s, names[i]);
+        const int have = cap_available(s, c, names[i]);
 
         /* `sts` IS REFUSED EVEN THOUGH THIS NODE OFFERS IT, and that is the
          * specification's rule rather than this file's opinion: "Clients MUST NOT
