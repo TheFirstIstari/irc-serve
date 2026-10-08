@@ -119,6 +119,101 @@ run_fault() {
 
 note "teeth: each fault is applied to a fresh copy, built, and required to go red."
 
+# ---------------------------------------------------------------------------
+# run_source_fault: the same protocol, for a fault a SOURCE CHECK has to catch.
+#
+# WHY A SECOND FUNCTION AND NOT A FLAG ON run_fault. run_fault reads a result out of a
+# COMPILED TEST BINARY, and five of this project's packaging claims are read out of a
+# Python script that needs no build at all. Reusing run_fault for those would have
+# meant naming a C test for a fault no C test has teeth for, and the report would then
+# read as coverage that does not exist. `tests/integration/test_version_truth.c` does
+# watch the PKGBUILD and the changelog, but it is the wrong instrument to prove that
+# `scripts/check-packaging.py` -- which runs on every gate invocation, in a second,
+# with no compiler -- fires on its own.
+#
+# THE BUILD IS STILL DONE, and this is the part that looks like waste. It is not: a
+# fault script that corrupts the tree, or a staging step that silently drops a file,
+# produces a check failure that says nothing about the check. Building first and
+# asserting 0 errors / 0 warnings / a fresh binary proves the fault was the ONLY thing
+# that changed, so the red that follows is attributable.
+#
+# `expect` IS THE SHARP END. Requiring only "the check exited nonzero" would let a
+# fault be caught for the wrong reason -- a missing file, a truncated write, a
+# Python traceback -- and would report that as coverage. Each fault names a substring
+# of its OWN finding, so the check has to produce the right failure.
+# ---------------------------------------------------------------------------
+run_source_fault() {
+    name=$1
+    script=$2
+    expect=$3
+
+    stage_tree
+    if ! (cd "$WORK" && python3 "$TEETH/$script"); then
+        note "FAULT NOT APPLIED: $name ($script)"
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(apply)"
+        return
+    fi
+
+    if ! (cd "$WORK" && cmake -S . -B b -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON \
+            -DWITH_TLS=OFF >"$WORK/cmake.log" 2>&1 \
+            && cmake --build b -j8 >"$WORK/build.log" 2>&1); then
+        note "FAULT $name DID NOT COMPILE -- a fault that does not build proves nothing"
+        tail -5 "$WORK/build.log" 2>/dev/null || true
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(build)"
+        return
+    fi
+
+    # Counted on the BUILD LOG, so a cell that built nothing cannot report "0 errors"
+    # by having produced no log at all. Same rule run_cell() in gate.sh follows.
+    errs=$(grep -c 'error:' "$WORK/build.log" || true)
+    warns=$(grep -c 'warning:' "$WORK/build.log" || true)
+    if [ "$errs" != "0" ] || [ "$warns" != "0" ]; then
+        note "FAULT $name: build printed errors=$errs warnings=$warns"
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(build:$errs/$warns)"
+        return
+    fi
+
+    # The mtime gate, same rule as run_fault: the newest source must be older than the
+    # binary, so a stale object file cannot pass for a fresh one.
+    bin="$WORK/b/src/irc-serve"
+    if [ ! -x "$bin" ]; then
+        note "FAULT $name: no built binary at $bin"
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(nobin)"
+        return
+    fi
+    newest_src=$(find "$WORK" -name '*.c' -o -name '*.h' | xargs ls -t 2>/dev/null | head -1)
+    if [ "$newest_src" -nt "$bin" ]; then
+        note "FAULT $name: the binary is NOT newer than the newest source"
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(stale)"
+        return
+    fi
+
+    if (cd "$WORK" && python3 scripts/check-packaging.py >"$WORK/check.log" 2>&1); then
+        note "FAULT $name NOT CAUGHT: check-packaging.py is still GREEN"
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(green)"
+        return
+    fi
+
+    # The right failure, not merely a failure.
+    if ! grep -Fq "$expect" "$WORK/check.log"; then
+        note "FAULT $name: check-packaging.py went red for the WRONG REASON (no line"
+        note "  matching: $expect)"
+        sed -n '1,12p' "$WORK/check.log" | sed 's/^/      /'
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(wrongreason)"
+        return
+    fi
+
+    note "ok: $name -> check-packaging.py red, naming the expected finding"
+    PASS=$((PASS + 1))
+}
+
 # `test_nick_utf8` AND NOT `test_control_bytes`: the latter covers the MODE `472` and
 # BATCH `NO_SIGN` fields, which are a different filter at a different site, so naming
 # it here would be claiming coverage that fault does not touch. Naming a test that
@@ -244,7 +339,42 @@ run_fault burst-nick-printed-raw-on-the-refusal-branch \
     burst_nick_printed_raw.py
 
 note ""
-note "teeth: $PASS of 16 faults caught, $FAIL not."
+# ---------------------------------------------------------------------------
+# 17-21. THE PACKAGING FAULTS, which a SOURCE CHECK has to catch.
+#
+# Five claims that `scripts/check-packaging.py` made after this pass and that no C
+# test in the tree covers, because they are claims about packaging files rather than
+# about a program's behaviour. `test_version_truth.c` already watches the PKGBUILD's
+# derivation and the changelog's version, so faults 17 and 18 have a second
+# instrument -- these run the Python one, and the point is to establish that the
+# cheap check fires on its own account rather than through the C test.
+#
+# The fifth is the one worth reading the file for: `debian/source/format` with a
+# leading comment block is a real dpkg-source ERROR, not a style question, and it was
+# shipped in this repository for the length of one working session.
+# ---------------------------------------------------------------------------
+run_source_fault changelog-version-diverges-from-header \
+    changelog_version_diverges.py \
+    "debian/changelog version"
+
+run_source_fault pkgbuild-pkgver-hardcoded-instead-of-derived \
+    pkgbuild_pkgver_hardcoded.py \
+    "pkgver is not written as a \`sed\` over the header"
+
+run_source_fault formula-version-diverges-from-header \
+    formula_version_diverges.py \
+    "homebrew formula version"
+
+run_source_fault source-format-is-not-a-documented-format \
+    source_format_invalid.py \
+    "is not one of '3.0 (native)', '3.0 (quilt)'"
+
+run_source_fault source-format-opens-with-a-comment-block \
+    source_format_leading_comment.py \
+    "dpkg-source reads this"
+
+note ""
+note "teeth: $PASS of 21 faults caught, $FAIL not."
 if [ "$FAIL" != "0" ]; then
     note "not caught:$FAILED_LIST"
     exit 1
