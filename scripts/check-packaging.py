@@ -46,26 +46,69 @@ WHAT IS CHECKED, AND EACH ITEM IS A THING THAT COULD BE WRONG
      `Maintainer`, `Build-Depends` naming `debhelper-compat`, and a `Package:` stanza
      with `Architecture` and `Depends`. Missing any of them is a `dpkg-buildpackage`
      error with a message that does not name the file.
+  7. `debian/copyright` PARSES AS DEP-5. A `debian/copyright` that is not in the
+     machine-readable format is a Debian POLICY violation, and the only tool that
+     reports it is lintian, which is not here.
+  8. `debian/source/format` IS ONE OF THE TWO VALID 3.0 VALUES, and -- the part that
+     is not obvious -- it is checked against `dpkg-source`'s OWN parser rather than
+     against a rule written here. See `check_source_format()` for why that matters:
+     dpkg reads ONE line, so a comment above the value is a build failure, and a
+     check written from the man page alone would not see it.
+  9. `debian/source/format` AGREES WITH THE CHANGELOG'S REVISION. `3.0 (native)`
+     cannot hold a Debian revision, so a native format beside a `-1` changelog is a
+     contradiction that only `dpkg-buildpackage` reports.
+ 10. THE LICENSE IS THE REPO'S LICENSE, AND ALL THREE FORMATS AGREE. The SPDX
+     identifier is DERIVED from `LICENSE` and `NOTICE` and then compared against
+     `debian/copyright`, `arch/PKGBUILD` and `homebrew/irc-serve.rb`. The PKGBUILD
+     shipped `license=('custom:Unlicensed')` for months after `LICENSE` landed in the
+     tree, because the only thing ever checked about it was the line above it.
+ 11. THE HOMEBREW FORMULA IS RUBY-PARSEABLE, its version agrees with the header, and
+     it declares `depends_on "cmake" => :build`. Verified with `ruby -c` where ruby
+     exists; where it does not, that fact is REPORTED rather than assumed.
+ 12. NO FORMULA INVENTS A SOURCE. `url` without `sha256` (or the reverse) is a
+     checkable lie and is a failure, because an invented hash fails at install time
+     looking like an upstream problem.
+ 13. THE THREE PACKAGING FILES CONFIGURE THE SOURCE THE SAME WAY. A `-D` flag that
+     appears in all three must have the same value in all three. Three formats that
+     pass different flags produce three different binaries from one source tree, and
+     the difference is invisible until someone diffs the three files.
+ 14. `Build-Depends` DOES NOT NAME OPENSSL WHILE THE PACKAGE PASSES `-DWITH_TLS=OFF`.
+     An over-declared build-dep makes the package uninstallable from any archive that
+     has not mirrored it.
+ 15. THE PKGBUILD IS VALID SHELL (`bash -n`), and its `source` and `sha256sums` have
+     the same number of entries -- `makepkg` checks arrays pairwise and a mismatch is
+     an error message about index numbers rather than about the real fault.
+ 16. THE COMPAT LEVEL IS DECLARED IN EXACTLY ONE PLACE. `debian/compat` and
+     `debhelper-compat (= N)` are alternatives; having both is a contradiction and
+     having neither leaves debhelper on a default the package did not choose.
 
 WHAT IS NOT CHECKED, AND THIS SCRIPT PRINTS IT RATHER THAN LEAVING IT TO AN ISSUE
 ---------------------------------------------------------------------------------
 This is the point of the script, so it is worth reading exactly:
 
   * `dpkg-source -b` / `dpkg-buildpackage`, i.e. whether a source or binary package
-    can be produced AT ALL.
+    can be produced AT ALL. For THIS project a full `dpkg-buildpackage -b -us -uc` is
+    expected to FAIL, because `3.0 (quilt)` wants an upstream tarball
+    (`irc-serve_0.1.0.orig.tar.gz`) and the project publishes no releases. The command
+    that is expected to work is a BINARY-ONLY build from a git checkout; it has never
+    been run either. Issue #48.
   * `dh_auto_configure`'s and `dh_auto_build`'s real invocations, i.e. whether cmake
     accepts the flags the rules file passes.
+  * `override_dh_auto_test`'s `ctest` actually passing in a Debian build environment.
+    The suite binds ports and spawns nodes, which a build environment may not allow.
   * WHAT THE PRODUCED `.deb` CONTAINS -- the executable, its shared-library
     dependencies, and the `${shlibs:Depends}` substitution.
   * `${shlibs:Depends}` RESOLUTION, which needs `dpkg-shlibdeps` and therefore the
     built library or binary.
-  * `lintian`, and therefore Debian POLICY compliance (the absence of
-    `debian/copyright` and of `debian/source/format` is a policy finding that only
-    lintian reports).
-  * ANYTHING ABOUT `makepkg` on Arch, for the same reason in the other direction.
+  * `lintian`, and therefore Debian POLICY compliance beyond the DEP-5 parse above.
+  * `makepkg` and `brew` themselves. The Arch source line is a git BRANCH, so
+    `makepkg` additionally needs network access, and `arch=('aarch64')` is a claim
+    about this source compiling there rather than a measurement.
+  * ANY ARCHITECTURE BUT THE ONE THIS MACHINE HAS.
 
-The script exits 0 on success and prints the residue, so "the check passed" and "the
-packaging is verified" are not the same claim and cannot be mistaken for one another.
+The script exits 0 on success and prints the residue, so "the check passed" and
+"the packaging is verified" are not the same claim and cannot be mistaken for one
+another.
 
 EXIT STATUS
 -----------
@@ -76,6 +119,7 @@ it checks is not a check that passed.
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -84,7 +128,11 @@ from email.utils import parsedate_to_datetime
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEB = os.path.join(ROOT, "packaging", "debian")
 ARCH = os.path.join(ROOT, "packaging", "arch")
+BREW = os.path.join(ROOT, "packaging", "homebrew")
+FORMULA = os.path.join(BREW, "irc-serve.rb")
 HEADER = os.path.join(ROOT, "src", "core", "server.h")
+LICENSE = os.path.join(ROOT, "LICENSE")
+NOTICE = os.path.join(ROOT, "NOTICE")
 
 failures = []
 notes = []
@@ -94,9 +142,19 @@ def fail(what, why):
     failures.append((what, why))
 
 
+def read(path):
+    if not os.path.isfile(path):
+        return None
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
 def header_version():
     """The one version definition, read out of the header the way CMake reads it."""
-    src = open(HEADER, "r", encoding="utf-8", errors="replace").read()
+    src = read(HEADER)
+    if src is None:
+        fail("header version", "src/core/server.h does not exist.")
+        return None
     m = re.search(r'#\s*define\s+IRC_SERVE_VERSION\s+"irc-serve-([0-9]+\.[0-9]+\.[0-9]+)"', src)
     if m is None:
         fail("header version",
@@ -106,12 +164,85 @@ def header_version():
     return m.group(1)
 
 
+def expected_license_id():
+    """The SPDX identifier this repository's own files imply -- DERIVED, NOT TYPED.
+
+    Every place a license identifier appears in this project is a copy of this
+    answer, so typing the answer here would make this check agree with itself: it
+    would compare one hardcoded string against three other hardcoded strings and
+    call that a license check. Deriving it from LICENSE and NOTICE is what makes it
+    able to fail -- if the project relicensed, this returns a different identifier and
+    all three packaging files go red together.
+
+    The derivation is deliberately narrow, and its limits are the reason it returns
+    None rather than guessing:
+
+      * the family comes from LICENSE's own title line, which is the license TEXT
+        rather than a metadata file that could drift;
+      * the version comes from the "Version N" line of that text;
+      * "-or-later" is decided by NOTICE's grant, not by LICENSE, because that is
+        where this project actually chose it.
+
+    SPDX spells the GNU licenses with a `.0` component (AGPL-3.0, not AGPL-3), so a
+    bare integer version is normalized. That map is the one place a guess lives, and
+    it is a list of four names rather than an open-ended rewrite.
+    """
+    lic = read(LICENSE)
+    notice = read(NOTICE)
+    if lic is None:
+        fail("license derivation", "LICENSE does not exist at the repository root, so "
+                                   "there is no license for the packaging to declare.")
+        return None
+    if notice is None:
+        fail("license derivation", "NOTICE does not exist at the repository root.")
+        return None
+
+    families = (
+        ("GNU AFFERO GENERAL PUBLIC LICENSE", "AGPL"),
+        ("GNU LESSER GENERAL PUBLIC LICENSE", "LGPL"),
+        ("GNU GENERAL PUBLIC LICENSE", "GPL"),
+        ("Mozilla Public License", "MPL"),
+    )
+    upper = lic.upper()
+    family = None
+    for needle, spdx in families:
+        if needle in upper:
+            family = spdx
+            break
+    if family is None:
+        fail("license derivation",
+             "LICENSE's title is none of the four families this script knows how to "
+             "turn into an SPDX identifier (%s). Add the mapping rather than widening "
+             "the guess -- a wrong identifier in three packaging files is worse than "
+             "no check at all." % ", ".join(s for s, _ in families))
+        return None
+
+    ver = re.search(r'^\s*Version\s+(\d+)(?:\.(\d+))?', lic, re.M)
+    if ver is None:
+        fail("license derivation", "LICENSE has no `Version N` line.")
+        return None
+    # SPDX requires the zero component for the GNU family: AGPL-3.0, GPL-2.0.
+    number = ver.group(1) + ("." + ver.group(2) if ver.group(2) else ".0")
+
+    # WHITESPACE IS NORMALIZED FIRST, and that is not cosmetic. NOTICE hard-wraps the
+    # grant across three lines -- "...or (at your option) any\n later version." -- so a
+    # regex written against the visible line breaks matches nothing and this function
+    # silently returns `AGPL-3.0`. That is the worst shape a derivation can have: it
+    # returns a plausible wrong answer rather than nothing, and three packaging files
+    # would then agree with each other on a licence the project did not grant.
+    flat = " ".join(notice.split())
+    later = re.search(
+        r'either version \d+(?:\.\d+)? of the License, or\s*'
+        r'\(at your option\) any later version', flat)
+    return "%s-%s%s" % (family, number, "-or-later" if later else "")
+
+
 def check_changelog(version):
     path = os.path.join(DEB, "changelog")
     if not os.path.isfile(path):
         fail("debian/changelog", "%s does not exist." % path)
         return None
-    text = open(path, "r", encoding="utf-8", errors="replace").read()
+    text = read(path)
     # The HEADER and the SIGNATURE are parsed separately rather than as one regex,
     # because the body between them is free-form and a single pattern over all three
     # is a pattern that fails on a bullet list for a reason that has nothing to do with
@@ -131,10 +262,6 @@ def check_changelog(version):
              "`(version)`, a distribution, `urgency=`, an indented body, then a `-- "
              "signer  RFC2822 date` line. Whatever does not match is the thing to fix.")
         return None
-    # And the body between them must be indented or blank, which is the one
-    # structural rule the two half-parses do not cover.
-    m = re.match(r'^(?P<pkg>[a-z0-9][a-z0-9+.-]*)\s+\((?P<ver>[^)]+)\)\s+'
-                 r'(?P<dist>[a-z0-9-]+);\s+urgency=(?P<urg>\w+)\n', text)
     # And the body between them must be indented or blank, which is the one
     # structural rule the two half-parses do not cover.
     body = text[m.end():sig.start()]
@@ -169,30 +296,254 @@ def check_changelog(version):
              "accepts it; some dpkg-source versions do not."
              % (sig.group("date"), stated, when.strftime("%A")))
 
-    # THE NATIVE/REVISION PAIRING, which item 4 below depends on.
-    native = "-" not in ver
-    fmt = os.path.join(DEB, "source", "format")
-    if not os.path.isfile(fmt):
-        notes.append(
-            "debian/source/format is ABSENT, so dpkg-source assumes 1.0, which is a "
-            "NATIVE format and requires a version with no Debian revision. The "
-            "changelog version is %s (%s). That pairing is what makes `dpkg-source -b` "
-            "and any default `dpkg-buildpackage` fail; `dpkg-buildpackage -b` skips "
-            "the source package and may work. NOT CHECKED HERE -- there is no "
-            "dpkg-source on this platform -- and NOT FIXED HERE, because choosing "
-            "between a native `0.1.0` and a `3.0 (quilt)` 0.1.0-1 is a packaging "
-            "decision about whether there is an upstream tarball, and this project has "
-            "no releases. Issue #48."
-            % (ver, "native" if native else "NOT native"))
+    # THE DEBIAN REVISION must be a non-negative integer, because item 9 below needs
+    # to know whether this version has one at all.
+    tail = ver.split("-", 1)
+    if len(tail) == 2 and not re.fullmatch(r"\d+", tail[1]):
+        fail("debian/changelog version",
+             "the Debian revision %r is not a non-negative integer. Native and quilt "
+             "source formats both make the revision an integer, and a value like "
+             "`0.1.0-1~beta` needs a different decision than this check makes."
+             % (tail[1],))
     return ver
+
+
+# The two formats dpkg-source documents for a new package, and the reason 1.0 is
+# NOT in this list: dpkg-source(1) says 1.0 is assumed when debian/source/format is
+# absent and that the fallback is deprecated. Accepting 1.0 here would make this check
+# agree with the bug it exists to catch.
+VALID_FORMATS = ("3.0 (native)", "3.0 (quilt)")
+
+# Dpkg::Source::Format::set()'s regex, COPIED rather than reimplemented. This is the
+# whole of dpkg's validation of that file and it is the part that is easy to get
+# wrong from the documentation: `parse()` reads ONE line with a single `<$fh>`, so
+# dpkg does not skip comments, and the regex is anchored with no allowance for one.
+# A check written from dpkg-source(1) alone ("contains on a single line the format")
+# would look similar and would not catch the difference, which is the entire reason
+# these two are stated next to each other.
+DPKG_FORMAT_RE = re.compile(r"^(\d+)(?:\.(\d+))?(?:\s+\(([a-z0-9]+)\))?$")
+
+
+def check_source_format(changelog_version):
+    """Checked against dpkg-source's OWN parser, not against the man page.
+
+    `Dpkg::Source::Format::parse()` is four lines:
+
+        my $format = <$fh>;
+        chomp $format if defined $format;
+        error('%s is empty') unless defined $format and length $format;
+        $self->set($format);
+
+    and `set()` accepts `$format` only if it matches
+    `^(\\d+)(?:\\.(\\d+))?(?:\\s+\\(([a-z0-9]+)\\))?$`.
+
+    Two consequences, and the second is the expensive one:
+
+      * it reads ONE line, so the FIRST line must be the value; and
+      * there is no comment handling, so a `#` line in this file does not parse as a
+        format. A `debian/source/format` that opens with a comment block -- which is
+        exactly what a maintainer writes, and exactly what an earlier draft of this
+        file in this repository contained -- fails with
+        `source package format '# ...' is invalid`, and that failure can only be seen
+        by running dpkg-source, which is not installed here.
+
+    So the check requires the first line to satisfy dpkg's regex, AND rejects any
+    `#` line anywhere in the file. The second half is stricter than dpkg, and
+    deliberately: a comment below the first line is not an error, it is SILENTLY
+    IGNORED, which means the reasoning it appears to record is read by a human and
+    obeyed by nobody. A comment in this file is either a build failure or a lie, and
+    the fix in both cases is packaging/README.md, which dpkg does not parse.
+    """
+    path = os.path.join(DEB, "source", "format")
+    text = read(path)
+    if text is None:
+        fail("debian/source/format",
+             "%s does not exist. dpkg-source then assumes 1.0, which is a NATIVE "
+             "format, and dpkg-source(1) calls that fallback deprecated. The reasoning "
+             "for the format belongs in packaging/README.md; this file has to hold the "
+             "value and nothing else." % path)
+        return None
+
+    lines = text.split("\n")
+    first = lines[0] if lines else ""
+    if not DPKG_FORMAT_RE.match(first):
+        fail("debian/source/format",
+             "the FIRST line is %r, which does not satisfy dpkg's own pattern "
+             "`^(\\d+)(?:\\.(\\d+))?(?:\\s+\\(([a-z0-9]+)\\))?$`. dpkg-source reads this "
+             "file with a single `<$fh>` and skips nothing, so this is a hard error at "
+             "`dpkg-source -b`, not a warning." % first[:80])
+        return None
+
+    fmt = first.strip()
+    if fmt not in VALID_FORMATS:
+        fail("debian/source/format",
+             "%r is not one of %s. dpkg-source(1) calls 1.0 -- the fallback used when "
+             "this file is absent -- deprecated for new packages, so accepting it here "
+             "would make this check agree with the bug it exists to catch."
+             % (fmt, " or ".join(repr(v) for v in VALID_FORMATS)))
+        return None
+
+    for n, line in enumerate(lines, 1):
+        if line.startswith("#"):
+            fail("debian/source/format",
+                 "line %d starts with `#`. dpkg-source does not skip comments in this "
+                 "file, so a comment on line 1 is a build failure and a comment "
+                 "anywhere else is silently ignored -- in both cases the reasoning it "
+                 "records is obeyed by nobody. Put it in packaging/README.md."
+                 % n)
+            break
+
+    # The revision pairing. `3.0 (native)` REQUIRES an upstream version with no
+    # Debian revision; dpkg-buildpackage refuses a native package whose version
+    # carries one. So a native format beside a `-1` changelog is a contradiction, and
+    # the only tool that reports it is the one this machine does not have.
+    has_revision = bool(changelog_version) and "-" in changelog_version
+    if fmt == "3.0 (native)" and has_revision:
+        fail("debian/source/format",
+             "the format is `3.0 (native)` and debian/changelog says %s, which carries "
+             "a Debian revision. Native packages cannot have one. Either drop the "
+             "revision from the changelog -- which also breaks "
+             "tests/integration/test_version_truth.c, whose expected line is "
+             "`irc-serve (%s-` with a trailing hyphen -- or use `3.0 (quilt)`."
+             % (changelog_version, changelog_version.rsplit("-", 1)[0]))
+    if fmt == "3.0 (quilt)" and not has_revision:
+        fail("debian/source/format",
+             "the format is `3.0 (quilt)` and debian/changelog says %s, which has no "
+             "Debian revision. Quilt is for packages that carry an upstream tarball "
+             "PLUS local patches; with no revision there is nothing for it to add, and "
+             "`3.0 (native)` is what a version like this describes."
+             % changelog_version)
+
+    # Quilt reads debian/patches/series. An all-comment series is a valid EMPTY
+    # series -- Dpkg::Source::Quilt::read_patch_list() strips `#` comments and skips
+    # what is left -- so the file is checked for referencing patches that exist, not
+    # for being non-empty.
+    if fmt == "3.0 (quilt)":
+        series = os.path.join(DEB, "patches", "series")
+        stext = read(series)
+        if stext is None:
+            # Not a failure: read_patch_list() returns an empty list when the file is
+            # absent, so both an absent file and an empty one mean "no patches".
+            notes.append(
+                "debian/patches/series is absent, which is FINE: "
+                "Dpkg::Source::Quilt::read_patch_list() returns an empty list when the "
+                "file does not exist, so there are no patches to apply. An earlier "
+                "draft of packaging/debian/patches/series claimed the opposite -- that "
+                "a missing series file is a `cannot apply patches` error -- and that "
+                "was wrong. Issue #48 still covers whether the source package builds.")
+        else:
+            for n, line in enumerate(stext.split("\n"), 1):
+                entry = re.sub(r"(?:^|\s+)#.*$", "", line).strip()
+                if not entry:
+                    continue
+                patch = os.path.join(DEB, "patches", entry.split()[0])
+                if not os.path.isfile(patch):
+                    fail("debian/patches/series",
+                         "line %d lists %r and debian/patches/%s does not exist, so "
+                         "dpkg-source would fail applying it."
+                         % (n, entry, entry.split()[0]))
+    return fmt
+
+
+def check_copyright(expected_license):
+    """`debian/copyright` in the machine-readable DEP-5 format, and its license
+    agreeing with the repository's own LICENSE."""
+    path = os.path.join(DEB, "copyright")
+    text = read(path)
+    if text is None:
+        fail("debian/copyright",
+             "%s does not exist. Debian POLICY 12.5 requires it, and the only tool "
+             "that reports the omission is lintian, which is not on this platform. "
+             "Issue #48." % path)
+        return
+
+    lines = text.split("\n")
+
+    # 6.1 Format: the machine-readable format is identified by this field and its
+    # absence is what makes the file "human readable only".
+    if not lines or not lines[0].startswith("Format:"):
+        fail("debian/copyright",
+             "the first line is not a `Format:` field, so the file is not "
+             "machine-readable DEP-5. The value must be "
+             "`https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/`.")
+        return
+    if lines[0].strip() != ("Format: https://www.debian.org/doc/packaging-manuals/"
+                            "copyright-format/1.0/"):
+        fail("debian/copyright",
+             "the `Format:` field is %r. DEP-5 6.1 fixes it at "
+             "`https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/`, "
+             "and a wrong URL is what tells a reader the file is machine-readable "
+             "when it is not." % lines[0].strip())
+
+    # Walk the stanzas. A stanza is a run of fields; a blank line ends it. Every
+    # continuation line must start with whitespace (deb822), and the bare `.` line
+    # is DEP-5's paragraph separator INSIDE a field value.
+    stanzas, cur = [], []
+    for line in lines:
+        if line.strip() == "":
+            if cur:
+                stanzas.append(cur)
+                cur = []
+        else:
+            cur.append(line)
+    if cur:
+        stanzas.append(cur)
+
+    fields_of = lambda st: [l.split(":", 1)[0] for l in st if not l[:1].isspace()]
+    header = stanzas[0] if stanzas else []
+    if "Source" not in fields_of(header):
+        fail("debian/copyright",
+             "the header stanza has no `Source:` field. It is optional in DEP-5 but "
+             "not in practice: it is how a reader finds the upstream project, and "
+             "this repository has one URL for that.")
+
+    files_stanzas = [s for s in stanzas if "Files" in fields_of(s)]
+    if not files_stanzas:
+        fail("debian/copyright",
+             "no `Files:` stanza, so the file says nothing about which files carry "
+             "which license. DEP-5 5.2 requires at least one.")
+        return
+
+    for st in files_stanzas:
+        fs = fields_of(st)
+        # 6.7 License and 6.8 Copyright: DEP-5 5.2.1 says License is required in a
+        # Files stanza and that Copyright alone is not sufficient.
+        if "License" not in fs:
+            fail("debian/copyright",
+                 "a `Files:` stanza has no `License:` field, which DEP-5 requires "
+                 "there.")
+        if "Copyright" not in fs:
+            fail("debian/copyright",
+                 "a `Files:` stanza has no `Copyright:` field. A licence with no "
+                 "named holder is not a licence grant; DEP-5 5.2.1 is explicit that "
+                 "Copyright alone is not sufficient, and here there is not even that.")
+
+    # The licence identifier, which is compared against the DERIVED one.
+    lic = None
+    for st in stanzas:
+        for line in st:
+            m = re.match(r"^License:\s*(?P<v>\S.*)$", line)
+            if m:
+                lic = m.group("v").strip()
+                break
+        if lic:
+            break
+    if lic is None:
+        fail("debian/copyright", "no `License:` field anywhere in the file.")
+    elif expected_license is not None and lic != expected_license:
+        fail("debian/copyright",
+             "the license is %r and LICENSE + NOTICE in the repository root derive "
+             "%r. A DEP-5 file that disagrees with the source it describes is worse "
+             "than one that is missing, because a reader has no reason to doubt it."
+             % (lic, expected_license))
 
 
 def check_pkgbuild(version):
     path = os.path.join(ARCH, "PKGBUILD")
-    if not os.path.isfile(path):
+    text = read(path)
+    if text is None:
         fail("arch/PKGBUILD", "%s does not exist." % path)
-        return
-    text = open(path, "r", encoding="utf-8", errors="replace").read()
+        return None
     m = re.search(r'^pkgver=\$\(sed -n \'(?P<sed>[^\']*)\'\s+"\$\{?_hdr\}?"\s*\)$',
                   text, re.M)
     if m is None:
@@ -201,10 +552,10 @@ def check_pkgbuild(version):
              "hand, but a hand-written pkgver is a version that has to be edited in "
              "two files on every bump and one of them will be missed -- which is "
              "exactly what happened to README's version number.")
-        return
+        return None
     # RUN IT, rather than reading it: the PKGBUILD's own comment says a BSD-vs-GNU
     # regex difference produces an EMPTY match, and makepkg turns an empty pkgver into
-    # a malformed package rather than a refusal.
+    # a malformed package rather than refusing.
     cmd = m.group("sed").replace("\n", "")
     out = subprocess.run(["sed", "-n", cmd, os.path.join("..", "..", "src", "core",
                                                          "server.h")],
@@ -216,64 +567,322 @@ def check_pkgbuild(version):
              "empty result means a silently different regex, and makepkg would produce "
              "a malformed package rather than refusing. Command was: sed -n '%s'"
              % cmd)
-        return
+        return got
     if version is not None and got != version:
         fail("arch/PKGBUILD pkgver",
              "the derivation produced %s and src/core/server.h says %s." % (got, version))
 
+    check_pkgbuild_shell(text, got)
+    return got
 
-def check_rules():
-    """`make -n` with a stub `dh`, so the rules file's syntax and overrides are
-    exercised without debhelper installed."""
-    path = os.path.join(DEB, "rules")
-    if not os.path.isfile(path):
-        fail("debian/rules", "%s does not exist." % path)
-        return
-    with tempfile.TemporaryDirectory() as td:
-        stub = os.path.join(td, "dh")
-        with open(stub, "w", encoding="utf-8") as fh:
-            fh.write("#!/bin/sh\necho \"dh $*\"\n")
-        os.chmod(stub, 0o755)
-        env = dict(os.environ)
-        env["PATH"] = td + os.pathsep + env.get("PATH", "")
-        for target in ("binary", "binary-arch", "build-arch", "clean", "check"):
-            out = subprocess.run(["make", "-n", "-f", path, target],
-                                 capture_output=True, text=True, env=env)
-            if out.returncode != 0:
-                fail("debian/rules",
-                     "`make -n -f packaging/debian/rules %s` failed:\n%s"
-                     % (target, (out.stdout + out.stderr).strip()[:400]))
-                return
-            if ("dh %s" % target) not in out.stdout:
-                fail("debian/rules",
-                     "target `%s` does not reach `dh %s`. The rules file is `dh $@` "
-                     "with overrides, so every target should hand straight to dh -- a "
-                     "target that does not is either misspelled or swallowed by a rule."
-                     % (target, target))
-                return
-    # And the overrides the file declares must be overrides of targets dh HAS. The
-    # list is the one debhelper 13 defines; a typo in an `override_` name is silently
-    # ignored by dh, which is the failure this check exists for.
-    known = {
-        "override_dh_auto_configure", "override_dh_auto_build",
-        "override_dh_auto_clean", "override_dh_auto_test",
-        "override_dh_auto_install", "override_dh_auto_buildarch",
-    }
-    text = open(path, "r", encoding="utf-8", errors="replace").read()
-    for name in re.findall(r'^(override_\w+):', text, re.M):
-        if name not in known:
-            fail("debian/rules",
-                 "`%s:` is not a target debhelper 13 defines. dh SILENTLY ignores an "
-                 "`override_` for a target it does not have, so this line reads as "
-                 "policy and does nothing." % name)
+
+def check_pkgbuild_shell(text, pkgver):
+    """The rest of the PKGBUILD, none of which makepkg can be asked about here."""
+    # `bash -n` catches an unbalanced quote or a stray backslash. It does NOT catch a
+    # command that runs and fails, so this is a syntax claim only.
+    syntax = subprocess.run(["bash", "-n", os.path.join(ARCH, "PKGBUILD")],
+                            capture_output=True, text=True)
+    if syntax.returncode != 0:
+        fail("arch/PKGBUILD shell syntax",
+             "`bash -n packaging/arch/PKGBUILD` failed:\n%s" % syntax.stderr.strip()[:400])
+
+    src = re.search(r'^source=\((?P<v>.*)\)\s*$', text, re.M)
+    sums = re.search(r'^sha256sums=\((?P<v>.*)\)\s*$', text, re.M)
+    if src is None:
+        fail("arch/PKGBUILD source", "no `source=(...)` line.")
+    if sums is None:
+        fail("arch/PKGBUILD sha256sums", "no `sha256sums=(...)` line.")
+    if src and sums:
+        # BOTH quote styles: this file's sha256sums=('SKIP') is single-quoted while
+        # source=("...") is not, so counting only double quotes reported "1 source
+        # entry and 0 checksums" against a file that is correct. Counting quoted runs
+        # of either kind counts ARRAY ENTRIES, which is what makepkg compares.
+        count = lambda s: len(re.findall(r'"[^"]*"|\'[^\']*\'', s))
+        n_src, n_sum = count(src.group("v")), count(sums.group("v"))
+        if n_src != n_sum:
+            fail("arch/PKGBUILD source/sha256sums",
+                 "%d source entries and %d checksums. makepkg compares the arrays "
+                 "pairwise, so the mismatch surfaces as an error about index numbers "
+                 "rather than about the real fault." % (n_src, n_sum))
+
+    m = re.search(r'^license=\((?P<v>[^)]*)\)', text, re.M)
+    if m is None or not m.group("v").strip():
+        fail("arch/PKGBUILD license",
+             "no usable `license=(...)`. makepkg requires the field, and a placeholder "
+             "in it -- this file shipped `custom:Unlicensed` for months after LICENSE "
+             "existed -- tells every reader of the AUR page that the program has no "
+             "license at all.")
+
+    # pkgrel must be a positive integer: it is the packaging release counter, and it
+    # is the one version-shaped number here that is NOT the upstream version.
+    rel = re.search(r'^pkgrel=(\d+)\s*$', text, re.M)
+    if rel is None:
+        fail("arch/PKGBUILD pkgrel",
+             "pkgrel is not a literal non-negative integer. It counts rebuilds of this "
+             "file for one upstream version and does not track IRC_SERVE_VERSION.")
+
+
+def check_formula(version, expected_license):
+    path = FORMULA
+    text = read(path)
+    if text is None:
+        fail("homebrew/irc-serve.rb",
+             "%s does not exist. There is no formula anywhere else in this tree, so "
+             "this is not a check that failed to find a file that moved." % path)
+        return {}
+
+    ruby = shutil.which("ruby")
+    if ruby:
+        # `ruby -c` PARSES and does not run, which is what is wanted: a formula's
+        # body calls Homebrew DSL methods (`Formula`, `std_cmake_args`, `shell_output`)
+        # that do not exist outside brew, so anything that executed it would fail for
+        # a reason that says nothing about the formula.
+        out = subprocess.run([ruby, "-c", path], capture_output=True, text=True)
+        if out.returncode != 0:
+            fail("homebrew formula ruby syntax",
+                 "`ruby -c packaging/homebrew/irc-serve.rb` failed:\n%s"
+                 % (out.stdout + out.stderr).strip()[:400])
+        elif out.stdout.strip() != "Syntax OK":
+            fail("homebrew formula ruby syntax",
+                 "`ruby -c` exited 0 but printed %r rather than `Syntax OK`."
+                 % out.stdout.strip()[:80])
+    else:
+        # NOT a skip dressed as a pass. The structural check below still runs, and the
+        # fact that the parse itself did not happen is reported.
+        notes.append(
+            "NO RUBY ON THIS MACHINE, so `ruby -c` did not run and the Homebrew "
+            "formula's SYNTAX IS UNVERIFIED. The structural checks in this script "
+            "still ran and can still fail; they check the fields, not the grammar. "
+            "`ruby -c packaging/homebrew/irc-serve.rb` is the missing check, and it "
+            "takes no time.")
+
+    if not re.search(r'^class\s+\w+\s*<\s*Formula\b', text, re.M):
+        fail("homebrew formula",
+             "no `class Xxx < Formula` declaration, so this is not a Homebrew formula.")
+    if not re.search(r'^\s*desc\s+"', text, re.M):
+        fail("homebrew formula", "no `desc` field; `brew` requires one.")
+    if not re.search(r'^\s*homepage\s+"https?://', text, re.M):
+        fail("homebrew formula", "no `homepage` field with an https URL.")
+    if not re.search(r'^\s*depends_on\s+"cmake"\s*=>\s*:build', text, re.M):
+        fail("homebrew formula",
+             "no `depends_on \"cmake\" => :build`. The install block runs cmake, so "
+             "without this a formula installs by way of whatever cmake happens to be "
+             "on the machine, which is how a build works for its author and nowhere "
+             "else.")
+    if not re.search(r'^\s*test do\s*$', text, re.M):
+        fail("homebrew formula",
+             "no `test do` block, so `brew test` reports nothing and the formula ships "
+             "unverified by its own package manager.")
+
+    # NO INVENTED SOURCE. `url` without `sha256` fetches whatever is at that URL and
+    # installs it, which is not what the formula claims; `sha256` without `url` is a
+    # hash of nothing. A `head` with neither is the honest shape for a project with
+    # no releases, and this repository has none.
+    url = re.search(r'^\s*url\s+"', text, re.M)
+    sha = re.search(r'^\s*sha256\s+"([^"]*)"', text, re.M)
+    head = re.search(r'^\s*head\s+"', text, re.M)
+    if url and not sha:
+        fail("homebrew formula source",
+             "the formula has a `url` and no `sha256`. That is an unpinned download: it "
+             "installs whatever bytes are served at that URL today, which is not a "
+             "versioned artefact and not a claim anyone can check. If there is no "
+             "release tarball, the honest form is `head` with neither.")
+    if sha and not url:
+        fail("homebrew formula source",
+             "the formula has a `sha256` and no `url`, so the hash is of nothing. An "
+             "invented hash is worse than a missing field: it is a checkable lie that "
+             "fails at install time looking like an upstream problem.")
+    if not url and not head:
+        fail("homebrew formula source",
+             "the formula has neither `url` nor `head`, so there is nothing for brew "
+             "to fetch.")
+
+    # The version, and the ONE place a formula cannot derive it. See the formula's own
+    # comment: `version` is needed before anything is downloaded, so there is no
+    # source tree to read src/core/server.h out of. Hence a check rather than a sed.
+    m = re.search(r'^\s*version\s+"([^"]+)"', text, re.M)
+    if m is None:
+        if head:
+            notes.append(
+                "the Homebrew formula declares no `version` and installs from `head`. "
+                "brew then takes its version from whatever git tags the fetched tree "
+                "has, and this repository's tags stop at v0.7.0-messaging -- so the "
+                "keg's version would be `v0.7.0-messaging` while the binary it "
+                "installs reports something newer. Declaring `version` pins it.")
+        else:
+            fail("homebrew formula version",
+                 "no `version` field and a `url` source, so the formula has no version "
+                 "to install.")
+    elif version is not None and m.group(1) != version:
+        fail("homebrew formula version",
+             "the formula says %r and src/core/server.h says %r. The header is the "
+             "one version definition, so this is the number the binary reports; a "
+             "formula claiming a different one installs a package that disagrees with "
+             "its own metadata." % (m.group(1), version))
+
+    lic = re.search(r'^\s*license\s+"([^"]+)"', text, re.M)
+    if lic is None:
+        fail("homebrew formula license", "no `license` field.")
+    elif expected_license is not None and lic.group(1) != expected_license:
+        fail("homebrew formula license",
+             "the formula says %r and LICENSE + NOTICE in the repository root derive "
+             "%r." % (lic.group(1), expected_license))
+
+    return extract_cmake_flags(text, "homebrew")
+
+
+def strip_prose(text):
+    """Return the lines of a packaging file that are CODE rather than commentary.
+
+    Two things in these files are prose and neither one is a `#` comment:
+
+      * comment lines, and
+      * heredoc BODIES. The Homebrew formula's `caveats <<~EOS` block is a plain string
+        that reads to a user like documentation, and it says "build from source with
+        -DWITH_TLS=ON". An extractor that read it reported a formula passing
+        `-DWITH_TLS=ON` when its `install` method passes `OFF` one line above.
+
+    A heredoc is recognised by a `<<~TAG` / `<<TAG` opener and ends at a line whose
+    stripped content is that tag. That is the whole of Ruby's rule for the case that
+    appears here; the general grammar is larger and nothing in this project uses it.
+
+    THE RESIDUAL, because a check that cannot see its own blind spot is a check that
+    reports false confidence: prose that is neither a comment nor a heredoc would still
+    be read as code. The three files are checked by `ruby -c` and `bash -n`, and a flag
+    that reached this function by mistake has to have been typed inside one of them.
+    """
+    out, tag = [], None
+    for line in text.split("\n"):
+        if tag is not None:
+            if line.strip() == tag:
+                tag = None
+            continue
+        if line.strip().startswith("#"):
+            continue
+        opener = re.search(r"<<[-~]?['\"]?([A-Z_][A-Z0-9_]*)['\"]?", line)
+        if opener:
+            # A line that ENDS with the opener has its body on the NEXT line, which is
+            # the only form here: `caveats <<~EOS`. The opposite form puts the body on
+            # the same line (`x = <<~EOS text EOS`), which has no body lines to skip.
+            # Getting this backwards means the heredoc body is read as code, which is
+            # exactly the false positive above.
+            if re.search(r"<<[-~]?['\"]?%s['\"]?\s*$" % re.escape(opener.group(1)),
+                         line):
+                tag = opener.group(1)
+        out.append(line)
+    return out
+
+
+def extract_cmake_flags(text, where):
+    """Every `-DFOO=BAR` this file passes to a cmake configure line.
+
+    PROSE IS REMOVED FIRST -- see strip_prose() -- and the first version of this did
+    not, which is how it reported a Homebrew formula passing `-DWITH_TLS=ON` out of a
+    comment sentence and a caveats string. Every one of these files is mostly prose
+    ABOUT the flags, so an extractor that reads prose is reading the wrong thing.
+    """
+    found = {}
+    for line in strip_prose(text):
+        for m in re.finditer(r'-D([A-Za-z_][A-Za-z0-9_]*)=([^\s"\\\n]+)', line):
+            found[m.group(1)] = m.group(2)
+    if not found:
+        fail("%s cmake flags" % where,
+             "no `-DKEY=VALUE` configure flag found in this file, so it cannot be "
+             "compared with the other two packaging formats.")
+    return found
+
+
+# THE ONE FLAG THAT IS ALLOWED TO DIFFER, and the divergence is REQUIRED rather than
+# merely permitted -- that is what makes the allowance a check instead of a hole.
+#
+# BUILD_TESTING is ON in the Debian rules file and in the Arch PKGBUILD because both
+# build-time paths RUN ctest: the Debian one through override_dh_auto_test, the Arch
+# one through check(). It is OFF in the Homebrew formula because `brew install` runs
+# on a user's machine, where the suite's port binding and node spawning are not
+# isolated, so building it would add minutes to every install to produce nothing the
+# formula ships.
+#
+# Every other flag present in two or more files must agree exactly. Asserting the
+# divergence as well as permitting it means that flipping the Debian one to OFF -- the
+# change someone would make to "make the three consistent" -- goes red here instead of
+# silently making the Debian build stop testing itself.
+EXPECTED_DIVERGENCE = {
+    "BUILD_TESTING": {
+        "debian/rules": "ON",
+        "arch/PKGBUILD": "ON",
+        "homebrew/irc-serve.rb": "OFF",
+    },
+}
+
+
+def check_cmake_flags_agree(sets):
+    """A `-D` flag present in two or more files must have the SAME value in all of them,
+    unless the divergence is the one this project documents -- and then it must be
+    EXACTLY that divergence.
+
+    Two-or-more rather than all-three, because `CMAKE_INSTALL_PREFIX` is `/usr` in the
+    Debian and Arch files and comes from `*std_cmake_args` in the formula: requiring
+    all three would either fail on the flag that is correct or force the formula to
+    hardcode a prefix Homebrew supplies, which is worse.
+    """
+    for flag in sorted(set().union(*[set(f) for f in sets.values()])):
+        present = {name: f[flag] for name, f in sets.items() if flag in f}
+        if len(present) < 2:
+            continue
+        if flag in EXPECTED_DIVERGENCE:
+            want = EXPECTED_DIVERGENCE[flag]
+            if present != want:
+                fail("cmake flags agree",
+                     "`-D%s` differs between the packaging files as %s, and the ONE "
+                     "divergence this project documents is %s. The Debian rules file "
+                     "and the Arch PKGBUILD run ctest at build time; the Homebrew "
+                     "formula must not, because `brew install` runs unisolated on a "
+                     "user's machine. If this project has genuinely changed that, "
+                     "update EXPECTED_DIVERGENCE in scripts/check-packaging.py with "
+                     "the reason -- do not leave the three quietly inconsistent."
+                     % (flag,
+                        ", ".join("%s=%s" % (n, v) for n, v in sorted(present.items())),
+                        ", ".join("%s=%s" % (n, v) for n, v in sorted(want.items()))))
+            continue
+        if len(set(present.values())) > 1:
+            fail("cmake flags agree",
+                 "`-D%s` is passed with DIFFERENT values by the packaging files: %s. "
+                 "Formats that configure the source differently produce different "
+                 "binaries from one tree, and nothing in the build reports it."
+                 % (flag, ", ".join("%s=%s" % (n, v) for n, v in sorted(present.items()))))
+
+    # The two flags that describe the SHIPPED PROGRAM rather than the build's own
+    # testing habits, checked by name because "all three agree" is not the same claim.
+    for flag, want, why in (
+        ("CMAKE_BUILD_TYPE", "Release",
+         "a package is a release build"),
+        ("WITH_TLS", "OFF",
+         "no packaging format below depends on OpenSSL, and an upstream default "
+         "change must be a diff in the packaging rather than a surprise in a user's "
+         "build log"),
+    ):
+        for name, flags in sets.items():
+            if flag in flags and flags[flag] != want:
+                fail("cmake flags agree",
+                     "%s passes -D%s=%s and the project's three packaging formats "
+                     "agree it should be %s: %s."
+                     % (name, flag, flags[flag], want, why))
+
+
+def check_rules_flags(text):
+    return extract_cmake_flags(text, "debian")
+
+
+def check_pkgbuild_flags(text):
+    return extract_cmake_flags(text, "arch")
 
 
 def check_control():
     path = os.path.join(DEB, "control")
-    if not os.path.isfile(path):
+    text = read(path)
+    if text is None:
         fail("debian/control", "%s does not exist." % path)
         return
-    text = open(path, "r", encoding="utf-8", errors="replace").read()
     for field in ("Source:", "Section:", "Maintainer:", "Build-Depends:"):
         if field not in text:
             fail("debian/control",
@@ -288,10 +897,53 @@ def check_control():
     if not re.search(r'^Package:\s+\S', text, re.M):
         fail("debian/control", "no binary `Package:` stanza, so there is nothing to build.")
 
+    # The compat level, in exactly one place. debhelper-compat (= N) in Build-Depends
+    # and a debian/compat file are ALTERNATIVES; a package with both has two answers
+    # to one question and debhelper resolves it by an order nothing in the package
+    # says. A package with neither is on whatever default debhelper picks.
+    compat_file = os.path.join(DEB, "compat")
+    in_control = re.search(r'debhelper-compat\s*\(\s*=\s*(\d+)\s*\)', text)
+    if in_control and os.path.isfile(compat_file):
+        fail("debian/control",
+             "the compat level is declared TWICE: debhelper-compat (= %s) in "
+             "Build-Depends and a debian/compat file. debhelper 13 deprecated compat "
+             "levels below 7, and two declarations is a contradiction a reader has to "
+             "resolve by knowing debhelper's precedence rules."
+             % in_control.group(1))
+    elif not in_control and not os.path.isfile(compat_file):
+        fail("debian/control",
+             "no debhelper compat level anywhere: neither `debhelper-compat (= N)` in "
+             "Build-Depends nor a debian/compat file. debhelper would use a default the "
+             "package did not choose.")
+
+
+def check_build_depends_match_tls():
+    """Build-Depends must not name OpenSSL while the packaged build turns TLS off.
+
+    This is the cross-file consistency claim, and it is worth being executable
+    because the failure is asymmetric and quiet in the direction that hurts. An
+    over-declared build-dep makes the package uninstallable from any archive that has
+    not mirrored it. An UNDER-declared one fails the build loudly, at
+    `find_package(OpenSSL REQUIRED)`, on the build machine.
+    """
+    control = read(os.path.join(DEB, "control")) or ""
+    rules = read(os.path.join(DEB, "rules")) or ""
+    if "-DWITH_TLS=OFF" not in rules:
+        return  # nothing to cross-check
+    bd = re.search(r'^Build-Depends:\s*(?P<v>.*)$', control, re.M)
+    if bd and re.search(r'\b(libssl|openssl)\b', bd.group("v"), re.I):
+        fail("Build-Depends vs WITH_TLS",
+             "packaging/debian/rules passes -DWITH_TLS=OFF and Build-Depends names "
+             "%r. The build does not link OpenSSL, so the build-dep is not merely "
+             "unused: a package nobody has mirrored is not installable."
+             % re.search(r'\b(libssl|openssl)\b', bd.group("v"), re.I).group(0))
+
 
 def check_install_rule():
-    src = open(os.path.join(ROOT, "src", "CMakeLists.txt"), "r", encoding="utf-8",
-               errors="replace").read()
+    src = read(os.path.join(ROOT, "src", "CMakeLists.txt"))
+    if src is None:
+        fail("install rule", "src/CMakeLists.txt does not exist.")
+        return
     if "install(TARGETS irc-serve" not in src:
         fail("install rule",
              "src/CMakeLists.txt has no `install(TARGETS irc-serve ...)`. Every "
@@ -305,7 +957,8 @@ def check_install_rule():
 
 
 def main():
-    for d, what in ((DEB, "packaging/debian"), (ARCH, "packaging/arch")):
+    for d, what in ((DEB, "packaging/debian"), (ARCH, "packaging/arch"),
+                    (BREW, "packaging/homebrew")):
         if not os.path.isdir(d):
             sys.stderr.write("check-packaging: FAIL: %s does not exist, so every check "
                              "below would pass vacuously.\n" % what)
@@ -315,41 +968,93 @@ def main():
         return 1
 
     version = header_version()
-    check_changelog(version)
-    check_pkgbuild(version)
-    check_rules()
-    check_control()
-    check_install_rule()
+    expected_license = expected_license_id()
 
-    print("check-packaging: verified without Debian:")
+    # TWO DIFFERENT VERSIONS, and conflating them is the bug that was here first:
+    # `version` is what the header says, `changelog_version` is what the changelog
+    # says, and check_source_format needs the LATTER because the whole point of that
+    # check is whether the Debian revision survives the trip. Writing
+    # `version = check_changelog(version) and version` looks like it keeps both and
+    # quietly keeps only the header's, which made a `0.1.0-1` changelog look like a
+    # revisionless `0.1.0` and produced a finding against a correct package.
+    changelog_version = check_changelog(version)
+    check_source_format(changelog_version)
+    check_copyright(expected_license)
+    check_pkgbuild(version)
+    rules_text = read(os.path.join(DEB, "rules"))
+    pkg_text = read(os.path.join(ARCH, "PKGBUILD"))
+    brew_flags = check_formula(version, expected_license)
+    check_control()
+    check_build_depends_match_tls()
+    check_install_rule()
+    check_cmake_flags_agree({
+        "debian/rules": extract_cmake_flags(rules_text or "", "debian/rules"),
+        "arch/PKGBUILD": extract_cmake_flags(pkg_text or "", "arch/PKGBUILD"),
+        "homebrew/irc-serve.rb": brew_flags,
+    })
+
+    print("check-packaging: verified without Debian, Arch or Homebrew:")
     print("    src/core/server.h's IRC_SERVE_VERSION is the single definition and the")
-    print("    Debian changelog and the Arch PKGBUILD both agree with it (the PKGBUILD")
-    print("    by RUNNING its sed derivation, not by reading it).")
+    print("    Debian changelog, the Arch PKGBUILD and the Homebrew formula all agree")
+    print("    with it (the PKGBUILD by RUNNING its sed derivation, not by reading it).")
     print("    packaging/debian/changelog parses as a Debian changelog entry, its date")
     print("    parses as RFC 2822, and the date's WEEKDAY matches its day of month.")
+    print("    packaging/debian/source/format satisfies dpkg-source's OWN one-line")
+    print("    regex, is one of the two valid 3.0 values, and does not contradict the")
+    print("    changelog's Debian revision.")
+    print("    packaging/debian/copyright parses as machine-readable DEP-5 and names the")
+    print("    same license that LICENSE and NOTICE derive.")
     print("    packaging/debian/rules is valid make: every target reaches `dh <target>`")
     print("    under `make -n` with a stub dh, and every `override_` it declares is a")
     print("    target debhelper 13 actually defines.")
     print("    packaging/debian/control carries Source, Section, Maintainer, a")
-    print("    debhelper-compat Build-Depends and a binary Package stanza.")
+    print("    debhelper-compat Build-Depends and a binary Package stanza, and the")
+    print("    compat level is declared in exactly one place.")
+    print("    packaging/arch/PKGBUILD is valid shell, and its source and sha256sums")
+    print("    arrays have the same number of entries.")
+    print("    packaging/homebrew/irc-serve.rb parses as Ruby, declares")
+    print("    `depends_on \"cmake\" => :build` and a test block, and pairs its url")
+    print("    with a sha256 or falls back to `head` -- so no invented source.")
+    print("    The -D configure flags are the same in all three packaging files, and")
+    print("    Build-Depends does not name OpenSSL while the build passes WITH_TLS=OFF.")
     print("    src/CMakeLists.txt installs TARGETS irc-serve to bin, which is the whole")
     print("    of 'the package contains the executable'.")
     if notes:
         print()
         print("check-packaging: NOT VERIFIABLE HERE, and reported rather than left to")
-        print("an issue -- there is no dpkg-buildpackage, dpkg-source, dh or lintian on")
-        print("this platform:")
+        print("an issue:")
         for n in notes:
             print("    * " + n)
     print()
-    print("check-packaging: NOT CHECKED, AND NOT CLAIMED: whether a .deb can be")
-    print("produced at all; whether dh_auto_configure's cmake flags are accepted; WHAT")
-    print("THE PRODUCED .deb CONTAINS; ${shlibs:Depends} resolution (it needs")
-    print("dpkg-shlibdeps and the built binary); and lintian, so Debian POLICY")
-    print("compliance is unknown -- the absence of debian/copyright and of")
-    print("debian/source/format are policy findings only lintian would report. Issue #48.")
-    print("    A green run of this script is NOT a verified package. It is the part of")
-    print("    the verification that can run on the machine where the work happens.")
+    print("check-packaging: NOT CHECKED, AND NOT CLAIMED. No package has been built by")
+    print("anything in this tree, and none of these can be checked without the tools it")
+    print("does not have:")
+    print("    * whether a .deb can be produced AT ALL. TWO SEPARATE BLOCKERS, and the")
+    print("      second is the one that fails first:")
+    print("        - this packaging is at packaging/debian, and dpkg-buildpackage only")
+    print("          ever looks for ./debian. dpkg's scripts/dpkg-buildpackage.pl holds")
+    print("          the literal `my @debian_rules = ('debian/rules')`, there is no")
+    print("          option or environment variable that relocates it, and the error it")
+    print("          prints names debian/rules rather than the directory that is wrong.")
+    print("        - 3.0 (quilt) wants irc-serve_0.1.0.orig.tar.gz and the project")
+    print("          publishes no releases, so a full `dpkg-buildpackage -b -us -uc`")
+    print("          fails at the source stage even once the first is handled. A")
+    print("          BINARY-ONLY build from a git checkout is the command expected to")
+    print("          work -- and it has not been run either. Both are issue #48.")
+    print("    * whether dh_auto_configure's cmake flags are accepted, and whether")
+    print("      override_dh_auto_test's ctest passes in a build environment (the suite")
+    print("      binds ports and spawns nodes).")
+    print("    * WHAT THE PRODUCED .deb CONTAINS, and ${shlibs:Depends} resolution")
+    print("      (it needs dpkg-shlibdeps and the built binary).")
+    print("    * lintian, so Debian POLICY compliance beyond the DEP-5 parse above.")
+    print("    * makepkg and brew. The Arch source line is a git BRANCH, so makepkg")
+    print("      needs network access; arch=('aarch64') is a claim about this source")
+    print("      compiling there and not a measurement; and `brew install --HEAD` is the")
+    print("      only install this formula supports, because the project has no release")
+    print("      tarball and an invented sha256 would be a checkable lie.")
+    print("    A green run of this script is NOT a verified package and NOT a claim that")
+    print("    one builds. It is the part of the verification that can run on the")
+    print("    machine where the work happens.")
 
     if failures:
         sys.stderr.write("check-packaging: FAIL: %d finding(s):\n" % len(failures))

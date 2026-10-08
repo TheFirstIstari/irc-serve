@@ -87,3 +87,4 @@ build-*/
 # Stray compiled executables accidentally left in source dirs
 tests/benchmark/throughput
 tests/benchmark/footprint
+__pycache__/

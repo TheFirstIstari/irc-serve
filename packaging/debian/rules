@@ -1,10 +1,65 @@
 #!/usr/bin/make -f
+# packaging/debian/rules -- binary-only build of irc-serve for Debian.
+#
+# WHAT THIS FILE IS: the standard `dh $@` catch-all plus the two overrides this
+# package actually needs. It is not clever and the cleverness is the point --
+# every line here is one a reviewer can check against the CMake flags in
+# packaging/arch/PKGBUILD and packaging/homebrew/irc-serve.rb, which pass the SAME
+# configure line. Three packaging formats that configure the source differently
+# produce three different programs, and the difference is invisible until someone
+# diffs the three files.
+#
+# NOTE FOR ANYONE WHO WANTS TO EXPLAIN debian/source/format HERE: do not. That file
+# is read by Dpkg::Source::Format::parse(), which takes ONE LINE and validates it
+# against ^(\d+)(?:\.(\d+))?(?:\s+\(([a-z0-9]+)\))?$ -- a comment block above the
+# value makes dpkg-source fail with "source package format '# ...' is invalid".
+# The reasoning behind the choice lives in packaging/README.md, which dpkg does not
+# parse.
+#
+# THE CMAKE ARGUMENTS, and the two that were missing:
+#   -DCMAKE_INSTALL_PREFIX=/usr is not tidiness. CMake's default prefix is
+#     /usr/local, and dh_auto_install honours DESTDIR but not the prefix, so
+#     without this line the .deb would contain /usr/local/bin/irc-serve -- a
+#     directory Debian does not manage, which lintian flags and which puts the
+#     binary outside the PATH an installed Debian expects.
+#   -DWITH_TLS=OFF states what this package is instead of inheriting whatever the
+#     source tree's default happens to be. An upstream change to that default
+#     would otherwise silently add an OpenSSL dependency to a package whose
+#     Depends: says it has none.
+#   -DBUILD_TESTING=ON builds the suite, and override_dh_auto_test below runs it:
+#     a package whose build has not run its own tests is a package whose build
+#     proves nothing. THE COST, WHICH IS REAL: it pays the suite's wall clock
+#     twice over, once to build and once to run, on every package build.
+#
+# DEB_BUILD_MAINT_OPTIONS=hardening=+all is dpkg-buildflags' standard hardening
+# set. It is one line and it is what makes the binary carry the same protections
+# every other Debian binary carries; it needs no build-dep beyond dpkg-dev, which
+# every build-essential already pulls in.
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 
 %:
 	dh $@
 
 override_dh_auto_configure:
-	dh_auto_configure -- -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+	dh_auto_configure -- -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+		-DBUILD_TESTING=ON -DWITH_TLS=OFF
 
+# --timeout 200, and 200 IS A MEASURED NUMBER: scripts/gate.sh runs every one of
+# this project's cells with `--timeout 200` and all thirteen are green, so 200 is
+# known to be enough for the suite on a loaded machine. The 60 this replaced was
+# not measured against anything, and a per-test timeout that is too tight does not
+# fail loudly -- it fails as a flaky package build on a slow Debian host.
 override_dh_auto_test:
-	ctest --test-dir build --output-on-failure --timeout 60
+	ctest --test-dir build --output-on-failure --timeout 200
+
+# dh_auto_install is deliberately NOT overridden. The cmake buildsystem installs
+# through CMake's own install rules, which honour DESTDIR, so the binary lands at
+# $(DESTDIR)/usr/bin/irc-serve from src/CMakeLists.txt's
+# `install(TARGETS irc-serve RUNTIME DESTINATION bin)`. Overriding it to say the
+# same thing by hand would be a second description of the same fact, and the two
+# could drift.
+#
+# WHICH IS ALSO WHY THERE IS NO debian/install FILE. It would say the same thing
+# again, in a third place. scripts/check-packaging.py asserts the install rule is
+# present in src/CMakeLists.txt instead, so the claim is checked without being
+# duplicated.

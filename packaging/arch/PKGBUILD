@@ -17,41 +17,111 @@ _hdr=src/core/server.h
 # line below refuses rather than handing makepkg a malformed pkgver.
 pkgver=$(sed -n 's/^#[[:space:]]*define[[:space:]][[:space:]]*IRC_SERVE_VERSION[[:space:]][[:space:]]*"irc-serve-\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' "$_hdr")
 [ -n "$pkgver" ] || { echo "PKGBUILD: could not read IRC_SERVE_VERSION out of $_hdr" >&2; exit 1; }
+# pkgrel is the ARCH packaging release counter, and it is the one version-shaped
+# number here that is not the upstream version. It counts how many times THIS file
+# has been rebuilt for the same upstream version; it does not track IRC_SERVE_VERSION
+# and must not be made to.
 pkgrel=1
 pkgdesc="Federated modern-spec IRC server in C — performance-first, minimal footprint"
+# A CLAIM, NOT A MEASUREMENT, and the difference is worth stating plainly: no
+# aarch64 build of this tree was run by the change that wrote this line. The
+# project is C99 and POSIX with no architecture-specific code, and its portability
+# ratchet (scripts/check-portability.py) is source-wide rather than per-target, so
+# the list is defensible -- but nobody has watched it compile there. Narrowing it to
+# arch=('x86_64') would be a claim that IS measured, at the cost of the other
+# architecture, which is a call for whoever owns the AUR package.
 arch=('x86_64' 'aarch64')
 url="https://github.com/TheFirstIstari/irc-serve"
-# BLOCKER: no LICENSE file exists in the repo. Do not claim MIT (or any license)
-# until a LICENSE file is added upstream. The license() field is required by
-# makepkg but must match reality.
-license=('custom:Unlicensed')
+# LICENSE, NOT A PLACEHOLDER. This used to read `license=('custom:Unlicensed')`
+# under a comment saying no LICENSE file existed in the repo. That was true when it
+# was written and it stopped being true when LICENSE landed -- and nothing caught
+# it, because the packaging check only ever read the pkgver line. The repository's
+# license is the GNU Affero General Public License v3 or later: LICENSE is the AGPL
+# v3 text verbatim, and NOTICE states "either version 3 of the License, or (at your
+# option) any later version". So the identifier is AGPL-3.0-or-later, and NOT
+# 'custom:Unlicensed', which told every Arch user reading the AUR page that this
+# program had no license at all. The same string is in packaging/debian/copyright's
+# License: field and in the Homebrew formula's `license`; scripts/check-packaging.py
+# asserts all three agree with LICENSE, so they cannot drift apart quietly.
+license=('AGPL-3.0-or-later')
+# glibc and nothing else, and that is the whole runtime dependency list because the
+# packaged build is configured -DWITH_TLS=OFF. The linkage is therefore only against
+# the C runtime, and adding openssl here without turning TLS on would be declaring a
+# dependency the binary does not have.
 depends=('glibc')
-makedepends=('make' 'cmake>=3.20' 'gcc' 'clang')
+# NO CLANG. The previous list carried it and build() below never selects a compiler,
+# so it was a build dependency for nothing; cmake takes CC from the toolchain. gcc is
+# named because it is the compiler makepkg.conf points CC at on Arch.
+makedepends=('make' 'cmake>=3.20' 'gcc')
 # BRANCH, NOT A TAG, and this used to be `#tag=v${pkgver}` -- which named a tag that
 # does not exist. The repository's tags are PER PHASE and stop at v0.7.0-messaging;
-# there is no v0.1.0 tag and there is no release, so a source line pointing at one
-# makes `makepkg -e` fail on a package nobody can build. A branch is what this
-# project actually has, and the #branch= field keeps makepkg from silently building
-# a stale HEAD.
+# there is no v0.1.0 tag and there is no release (the upstream repository's release
+# list is EMPTY), so a source line pointing at a tarball makes `makepkg -e` fail on
+# a package nobody can build. A branch is what this project actually has, and the
+# #branch= field keeps makepkg from silently building a stale HEAD.
+# THE COST, WHICH IS REAL: this is a VCS source, so makepkg needs NETWORK ACCESS to
+# fetch it, and it builds whatever main is at the moment it runs rather than a
+# pinned, hashed artifact. That is the honest cost of a project with no releases,
+# and it is paid deliberately -- the alternative is a source line that names a file
+# which does not exist. When a release tarball is cut, this becomes
+# `source=("https://github.com/TheFirstIstari/irc-serve/archive/v${pkgver}.tar.gz")`
+# with a real sha256, and nothing else in this file changes.
 source=("git+https://github.com/TheFirstIstari/irc-serve.git#branch=main")
-sha256sums=('SKIP')  # TODO: generate real hashes once a stable release tarball is published
+# SKIP IS CORRECT FOR A VCS SOURCE, not a placeholder. makepkg cannot hash a git
+# branch to a stable value, and 'SKIP' is how it is told not to try; the pinning that
+# a 'SKIP' gives up is recovered by pinning the branch ref instead. Any OTHER value
+# here would be a hash of something and would fail the moment main moves.
+sha256sums=('SKIP')
 
-CTEST_TIMEOUT=${CTEST_TIMEOUT:-120}
-
+# THE SAME CONFIGURE LINE as packaging/debian/rules and packaging/homebrew/
+# irc-serve.rb. The flags that describe the SHIPPED PROGRAM -- Release, prefix /usr,
+# TLS off -- are the ones held identical across all three. BUILD_TESTING=ON is
+# shared with the Debian rules file and is deliberately DIFFERENT from the formula's,
+# because build() below is followed by a check() that runs the suite: without the
+# suite built, there would be nothing for that check to run.
+#
+# -DWITH_TLS=OFF IS STATED RATHER THAN INHERITED. The source default is already OFF,
+# but a package whose depends=() says `glibc` alone must not acquire an OpenSSL
+# dependency because an upstream default changed; the flag makes that a diff here
+# rather than a surprise in a user's build log. THE COST, STATED PLAINLY: THIS
+# PACKAGE HAS NO TRANSPORT ENCRYPTION. Turning it on is `-DWITH_TLS=ON` plus
+# `depends+=(openssl)`.
 build() {
-  cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_TESTING=ON
+  cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+    -DBUILD_TESTING=ON -DWITH_TLS=OFF
   cmake --build build --parallel $(nproc)
 }
 
+# 200 IS MEASURED, NOT CHOSEN: scripts/gate.sh runs every cell of the project's
+# build matrix with `--timeout 200` and all thirteen are green. The 120 this
+# replaced was not measured against anything, and a per-test timeout that is too
+# tight does not fail loudly -- it shows up as an intermittently failing AUR build.
+CTEST_TIMEOUT=${CTEST_TIMEOUT:-200}
+
+# THE FULL SUITE, and this is unchanged from before this file was revised. It was
+# tempting to replace it with an `irc-serve --help` smoke check, which is what the
+# Homebrew formula does, and that would have been a reduction in coverage dressed as
+# a simplification: the property a broken Arch package actually gets wrong is that
+# its test suite fails, and Arch gives makepkg an environment (network access, a
+# free loopback, a full core count) where running the suite is the whole point.
+# THE COST, WHICH IS REAL: the suite builds a multi-node mesh, so this check is
+# slower than a smoke test and binds ports. It is what the project already does in
+# all thirteen gate cells, so the risk is a risk the project has taken everywhere.
 check() {
   ctest --test-dir build --output-on-failure --timeout "${CTEST_TIMEOUT}"
 }
 
 package() {
   DESTDIR="${pkgdir}" cmake --install build
-  if [ -f LICENSE ]; then
-    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
-  else
-    echo "WARNING: LICENSE not found; license file omitted from package" >&2
-  fi
+  # UNCONDITIONAL, and that is a change. The old form tested for LICENSE and warned
+  # when it was missing, which is how a package with no license file ships without
+  # anyone noticing: a warning in a build log is not a build failure, and the file
+  # this package installs under an AGPL license is required, not optional.
+  # NOTICE and README are installed for the same reason: an AGPL package that
+  # ships neither the licence text nor the project's attribution notice has dropped
+  # half of what its licence asks for. /usr/share/licenses and /usr/share/doc are
+  # the FHS locations, and install -D creates them.
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 NOTICE "${pkgdir}/usr/share/licenses/${pkgname}/NOTICE"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
 }

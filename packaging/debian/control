@@ -1,12 +1,51 @@
-# Debian packaging stub
-# Target: debian package build
-
+# packaging/debian/control -- irc-serve, a federated modern-spec IRC server in C.
+#
+# `#` COMMENTS ARE LEGAL HERE, which was checked rather than assumed: deb822(5)
+# says "Lines starting with '#', without any preceding whitespace are comment lines
+# that are only permitted in source package control files (debian/control) ... These
+# comment lines are ignored, even between two continuation lines. They do not end
+# logical lines." So a comment may sit between a field and its continuation lines.
+# Note that "without any preceding whitespace" -- an INDENTED `#` is not a comment,
+# it is a continuation line, so none of the comments below are indented.
+#
+# WHAT IS AND IS NOT IN Build-Depends, because an over-declared build-dep is not a
+# harmless act of caution: it makes the package uninstallable from any archive that
+# has not mirrored it, so a build-dep that is not needed is a distribution problem
+# created by a packaging file.
+#
+# debhelper-compat (= 13): the ONE place the debhelper compat level is declared.
+# There is deliberately NO debian/compat file. debhelper deprecated compat < 7 in
+# version 13, and a compat file next to a debhelper-compat build-dep is
+# contradictory -- one of the two wins and which one is not something a reader
+# should have to work out. scripts/check-packaging.py fails if both appear, or if
+# neither does.
+#
+# cmake (>= 3.20): the version is not decoration. CMakeLists.txt's first line is
+# `cmake_minimum_required(VERSION 3.20)`, and cmake below that fails with its own
+# error naming a minimum, which is a worse failure than a build-dep that says so
+# before the build starts.
+#
+# NO OPENSSL, because the package builds the zero-dependency configuration.
+# CMakeLists.txt's WITH_TLS option defaults to OFF and the packaged build passes
+# -DWITH_TLS=OFF explicitly (see packaging/debian/rules), so libssl-dev is not
+# needed and libssl must NOT be a dependency. src/CMakeLists.txt's
+# `find_package(OpenSSL 1.1.1 REQUIRED)` is inside the WITH_TLS branch and is
+# therefore never reached by this build. THE CONSEQUENCE, STATED RATHER THAN HIDDEN:
+# THIS PACKAGE HAS NO TRANSPORT ENCRYPTION. -DWITH_TLS=ON plus a libssl-dev
+# build-dep produces a TLS-capable binary in about three lines of diff, but that
+# wants a second binary package (irc-serve-tls), because a TLS build and a non-TLS
+# build of the same source cannot share one Package: stanza whose Depends: differs.
+# That is a release decision, not a packaging detail, and it is not made here.
 Source: irc-serve
 Section: net
 Priority: optional
 Maintainer: TheFirstIstari <euphonium.ashe.f@gmail.com>
-Build-Depends: debhelper-compat (= 13), cmake
+Build-Depends: debhelper-compat (= 13), cmake (>= 3.20)
 Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/TheFirstIstari/irc-serve
+Vcs-Browser: https://github.com/TheFirstIstari/irc-serve
+Vcs-Git: https://github.com/TheFirstIstari/irc-serve.git
 
 Package: irc-serve
 Architecture: any
@@ -14,3 +53,8 @@ Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: Federated modern-spec IRC server in C
  Performance-first, minimal memory footprint, federated nodes,
  load-balanced, auto-scaling capable.
+ .
+ This build has no transport encryption: it is configured with -DWITH_TLS=OFF, so
+ it has no third-party runtime dependency at all. See SECURITY.md for the
+ transport-encryption layer, which is available in the source tree but is not
+ compiled into this package.
