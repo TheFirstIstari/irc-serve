@@ -6,6 +6,10 @@ on is macOS, which has no `dpkg-buildpackage`, no `dpkg-source`, no `dh`, no
 and what was not is listed under "What is NOT verified". Issue **#48** stays open
 until a real Debian build runs; this file does not close it.
 
+The Debian packaging lives at `packaging/debian/` and is reachable from the
+repository root as **`debian/`**, which is a committed symlink. See "The `./debian`
+problem" below for why that is the layout and what it costs.
+
 ## What is here
 
 | Path | What it is |
@@ -17,12 +21,11 @@ until a real Debian build runs; this file does not close it.
 ## The build command for each format
 
 ```sh
-# Debian: BINARY-ONLY. See "Why binary-only" and "The ./debian problem" below -- the
-# two commands there are not optional extras, and running the second one without the
-# first finds no packaging at all.
-ln -s packaging/debian debian
+# Debian: BINARY-ONLY. See "Why 3.0 (quilt) and not 3.0 (native)" below --
+# `dpkg-buildpackage -b` never
+# looks for the .orig.tar.gz that `3.0 (quilt)` wants and that this project cannot
+# produce. There is no `ln -s` here: `debian` is already a committed symlink.
 dpkg-buildpackage -b -us -uc
-rm debian
 
 # Arch: from the directory holding the PKGBUILD. NEEDS NETWORK ACCESS, because the
 # source line is a git branch rather than a tarball (the project has no releases).
@@ -37,7 +40,7 @@ brew test --HEAD irc-serve
 Each command is what a maintainer of that distribution would run. **None of them has
 been executed.**
 
-## The `./debian` problem, and why the symlink above is not tidiness
+## The `./debian` problem, and the layout this tree settled on
 
 `dpkg-buildpackage` does not look for a packaging directory anywhere but the current
 one. In dpkg's own `scripts/dpkg-buildpackage.pl` the list is a literal:
@@ -45,26 +48,66 @@ one. In dpkg's own `scripts/dpkg-buildpackage.pl` the list is a literal:
     my @debian_rules = ('debian/rules');
 
 There is no option, no environment variable and no `-C` that relocates it, and
-`dpkg-source` is the same (`$dir` defaults to `.`). This repository keeps its
-packaging at `packaging/debian`, so from the repository root `dpkg-buildpackage`
-finds **no packaging at all** -- and the error it prints names `debian/rules`, not
-the directory, so the message points at a file that exists somewhere else in the tree.
+`dpkg-source` is the same (`$dir` defaults to `.`). So a package built from this
+repository has to be findable at `./debian`, and the files are at
+`packaging/debian`.
 
-Three ways out, and this is issue #48's item 3 and an open decision rather than a
-settled one:
+**THE LAYOUT IS A COMMITTED SYMLINK, `debian -> packaging/debian`,** and it is
+committed rather than made by the build command. That was an open decision with three
+options (issue #48's item 3); here is why this one, and what each rejected option
+would have cost:
 
-1. **A symlink**, which is what the command above does. It is what this tree's layout
-   needs today and it is not committed: a `debian` symlink at the repository root
-   would be a second path to the same files, and `dpkg-source` would want to know
-   whether to ship it inside the `.debian.tar`.
-2. **A root `debian/` directory** holding the real files, with `packaging/debian`
-   becoming a pointer instead. That reverses the current arrangement.
-3. **A build tree**: copy or `git worktree` the checkout somewhere and place or link
-   `debian/` there, keeping the source tree itself free of packaging paths.
+1. **A committed symlink — chosen.** One home for the files (`packaging/debian`, so
+   the three distributions sit together and are described by this one README), and the
+   path dpkg reads. It is the smallest change that satisfies dpkg's literal, and it
+   adds no second copy of anything.
+2. **A real root `debian/` holding the files, with `packaging/debian` becoming a
+   pointer** — rejected. It reverses the arrangement for no gain, and it splits the
+   three distributions across two places: `debian/` at the root and `arch/` and
+   `homebrew/` under `packaging/`.
+3. **A build tree** (`git worktree`, or a copy with `debian/` placed in it) —
+   rejected. It works, and it is the only option that keeps the source tree free of a
+   second path at all, but it makes `dpkg-buildpackage` unrunnable from a plain
+   checkout: every attempt becomes "check out somewhere else first", and the thing
+   that gets skipped is the one that finds no packaging.
 
-Whichever is chosen, `scripts/check-packaging.py` reads `packaging/debian/...` and
-would need its paths updated to match. That is recorded here rather than decided
-here, because it changes where every other packaging tool has to look.
+### THE COSTS, because there are three and they are not small
+
+* **TWO PATHS TO THE SAME FILES**, which is what a symlink is. The packaging is at
+  `packaging/debian/` and equally at `debian/`, and a patch or an edit made through
+  one is made to both. That is tolerable precisely because there is one set of bytes:
+  `scripts/check-packaging.py` asserts the two paths are the SAME inode
+  (`os.path.realpath`) rather than two files that happen to agree today.
+* **`dpkg-source` AND THE SOURCE PACKAGE.** The concern that was recorded against
+  this option -- "would `dpkg-source` want to ship the symlink inside the
+  `.debian.tar`?" -- does not arise for the documented command, because `-b` never
+  runs `dpkg-source`. It would arise for a source build, which this project cannot do
+  anyway: `3.0 (quilt)` wants `irc-serve_0.1.0.orig.tar.gz` and there are no
+  releases. When a release tarball is cut, this is a one-line `debian/watch` away and
+  nothing here changes.
+* **A TOOL THAT WALKS THE TREE SEES IT TWICE.** Anything globbing `**/debian/**` finds
+  the files twice. Nothing in this repository does (`CMakeLists.txt` globs nothing, and
+  the check scripts read one path), and `check-packaging.py` reads every Debian file
+  through `debian/` -- the path dpkg reads -- so the checks describe what a build
+  would actually see.
+
+### WHY THE TARGET IS RELATIVE
+
+`debian -> packaging/debian`, not `debian -> /Users/someone/dev/irc-serve/packaging/debian`.
+A committed symlink with an absolute target resolves on exactly one machine and
+dangles on every other, including CI's. `scripts/check-packaging.py` asserts the
+literal target string, so the difference is a red build rather than a surprise on
+someone else's checkout.
+
+### AND IT IS ASSERTED, NOT DESCRIBED
+
+`scripts/check-packaging.py` runs in `scripts/gate.sh` as a source-wide check, and its
+first check is the layout: that `debian` exists at the root, that it is a symlink, that
+its target is the relative string above, that `packaging/debian` is a real directory,
+and that `rules`, `control`, `changelog` and `copyright` are reachable through the
+symlink as the same files. A layout that is only described in this file is a layout
+that can drift while every other check stays green; this one goes red if the symlink is
+deleted, replaced by a real directory, or pointed somewhere else.
 
 ## The version, and how the three formats get it
 
@@ -180,9 +223,13 @@ the verification that can run where the work happens.
 Stated plainly rather than left to be discovered:
 
 * **No `.deb` has ever been produced.** `dpkg-buildpackage` has not been run.
-* **`dpkg-buildpackage` finds no packaging from the repository root**, because the
-  packaging is at `packaging/debian` and dpkg only ever looks for `./debian`. See "The
-  `./debian` problem" above; the fix is not chosen.
+* **That the symlink is what a real `dpkg-buildpackage` would follow.** The layout is
+  asserted by `scripts/check-packaging.py` -- that `debian` exists at the root, is a
+  symlink, and that `debian/rules` and `packaging/debian/rules` are the same file --
+  but that is a check reading a filesystem, not dpkg reading one. Whether dpkg
+  follows a committed symlink, and whether `dh` objects to one, is unverified here
+  because this machine has no dpkg at all. This is the one claim in this file that a
+  Debian machine settles in about a minute, and it is part of what #48 needs.
 * **`dpkg-source -b` has not been run**, so the source package is unproven. As
   explained above, it is expected to fail for want of an upstream tarball.
 * **What a produced `.deb` would contain** is unverified: the executable's presence
