@@ -30,12 +30,25 @@
 # and this is corroboration.
 #
 # WHAT IT DOES NOT SEE, stated rather than discovered:
-#   * CHILDREN. `nf_spawn_inline*()` forks a child and the child is a separate
-#     process; `leaks --atExit` reports on the process it launched. Nor does
-#     LeakSanitizer see those children, because `nf_child_run()`'s caller uses
-#     `_exit()`, which does not run the atexit handler LSan checks at. So an
-#     INLINE-SPAWNED NODE IS NOT LEAK-CHECKED BY ANYTHING IN THIS PROJECT. Children
-#     exec'd from `nf_spawn_binary()` DO return from main() normally and are checked.
+#   * CHILDREN, ON THIS PLATFORM ONLY. `nf_spawn_inline*()` forks a child, and
+#     `leaks --atExit` reports on the process it launched -- it does not follow the
+#     fork, so an inline child's heap is not measured by the run below. Children
+#     exec'd from `nf_spawn_binary()` DO return from main() normally and ARE measured.
+#
+#     THIS PARAGRAPH USED TO CLAIM THE OPPOSITE AND IT WAS TRUE WHEN IT WAS WRITTEN.
+#     It said an inline child was not leak-checked by ANYTHING in this project,
+#     because `nf_child_run()`'s caller used `_exit()` and `_exit()` skips the atexit
+#     handler LeakSanitizer checks at. That is no longer true: the spawn path calls
+#     `exit()` (tests/harness/node_fixture.c, "exit(), NOT _exit(), AND THIS IS THE
+#     CHANGE THAT MAKES AN INLINE NODE LEAK-CHECKED AT ALL"), so on LINUX an
+#     inline child's heap IS measured by LSan's own handler, and a child that leaks
+#     makes `nf_stop()` return 23 rather than 0 -- which every test that asserts
+#     `nf_stop(&node) == 0` is already asserting.
+#
+#     So the honest statement of the boundary is narrower than it was: Linux CI
+#     measures the children, this script does not. It is still the case that this is
+#     not a substitute, because a report this tool prints about a CHILD would have to
+#     come from the parent, and nothing here attaches one.
 #   * ANYTHING AFTER A CRASH. A test that aborts is not measured.
 set -u
 dir="${1:-}"
@@ -70,6 +83,8 @@ for b in "$dir"/tests/*/*; do
     esac
 done
 echo "leaksweep: $total test binaries measured, $bad leaking."
-echo "leaksweep: forked children are NOT measured -- see the header. Linux CI is the"
-echo "leaksweep: oracle for those, and it is the oracle for this as well."
+echo "leaksweep: forked INLINE children are not measured here -- leaks(1) does not"
+echo "leaksweep: follow the fork. Linux CI's LeakSanitizer DOES measure them, through"
+echo "leaksweep: the atexit handler the spawn path reaches with exit(), and it is the"
+echo "leaksweep: oracle for this as well."
 [ "$bad" = "0" ]
