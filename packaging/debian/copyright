@@ -1,0 +1,32 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Source: https://github.com/TheFirstIstari/irc-serve
+Upstream-Name: irc-serve
+Upstream-Contact: TheFirstIstari <euphonium.ashe.f@gmail.com>
+
+Files: *
+Copyright: 2026 TheFirstIstari and contributors
+License: AGPL-3.0-or-later
+ This program is free software: you can redistribute it and/or modify it under
+ the terms of the GNU Affero General Public License as published by the Free
+ Software Foundation, either version 3 of the License, or (at your option) any
+ later version.
+ .
+ This program is distributed in the hope that it will be useful, but WITHOUT ANY
+ WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+ PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+ .
+ You should have received a copy of the GNU Affero General Public License along
+ with this program. If not, see <https://www.gnu.org/licenses/>.
+ .
+ On Debian systems, the full text of the GNU Affero General Public License
+ version 3 can be found in "/usr/share/common-licenses/AGPL-3".
+Comment: The Copyright line is taken from the NOTICE file at the root of this
+ source tree, which is the project's own statement of who holds it ("Copyright
+ (C) 2026 TheFirstIstari and contributors"). It is NOT taken from the LICENSE
+ file: LICENSE is the AGPL v3 licence text verbatim and its header is FSF
+ boilerplate, so a copyright holder read out of it would be invented. The
+ identifier is the SPDX "or later" form because NOTICE grants "either version
+ 3 of the License, or (at your option) any later version", and the same
+ identifier is what packaging/arch/PKGBUILD and packaging/homebrew/irc-serve.rb
+ carry. scripts/check-packaging.py asserts that all four agree with LICENSE, so
+ this file cannot drift away from the other two without the gate going red.

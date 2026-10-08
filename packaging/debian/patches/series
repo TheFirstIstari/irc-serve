@@ -1,0 +1,23 @@
+# debian/patches/series -- EMPTY, and this file exists rather than being absent.
+#
+# 3.0 (quilt) applies whatever debian/patches/series lists, so this is where a
+# packaging-local patch would be registered. It is empty because irc-serve builds
+# from its own unmodified source: there is no patch to carry.
+#
+# EVERY LINE HERE IS A COMMENT, and that is valid rather than a near miss:
+# Dpkg::Source::Quilt::read_patch_list() strips `#` comments and skips the lines
+# that are left empty, so an all-comment file parses as an empty series. A reader
+# who wants to check that claim has the function name in this sentence for exactly
+# that reason.
+#
+# THE FILE IS ALSO NOT REQUIRED, which is a correction to what an earlier draft of
+# this comment asserted. That draft claimed a missing series file makes dpkg-source
+# fail with "cannot apply patches". It does not: read_patch_list() returns an empty
+# list when the file does not exist, so both an absent file and this one mean "no
+# patches". The file is kept anyway because a maintainer looking for where to put a
+# patch should find the answer rather than have to know the format's internals.
+#
+# A previous draft of this comment was wrong about dpkg-source in the other
+# direction too: it credited the series file with making 3.0 (quilt) work, when it
+# is debian/source/format that selects the format. A comment that states a fact
+# about a tool backwards is worse than no comment, so both are recorded here.
