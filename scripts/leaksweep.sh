@@ -15,8 +15,11 @@
 # leaks" was only ever true of the gate, not of the platform.
 #
 # WHY IT IS NOT GATED, and this is a decision rather than an omission:
-#   * IT IS SLOW. 98 binaries, each forking children and running real sockets, is
-#     minutes rather than seconds, and the gate is already thirteen fresh builds.
+#   * IT IS SLOW. One `leaks(1)` run per test binary -- a hundred of them at the time
+#     of writing, and the count only goes up -- each forking children and running real
+#     sockets, is minutes rather than seconds, and the gate is already thirteen fresh
+#     builds. Counted here rather than named, because a number in a comment about cost
+#     is a number that goes stale and keeps arguing for the same conclusion.
 #   * IT IS DARWIN-ONLY. `leaks(1)` is a macOS tool. On the Linux CI job it does not
 #     exist, so gating on it would leave the one place that CAN see leaks ungated by
 #     it -- which is backwards.
@@ -49,6 +52,25 @@
 #     measures the children, this script does not. It is still the case that this is
 #     not a substitute, because a report this tool prints about a CHILD would have to
 #     come from the parent, and nothing here attaches one.
+#
+#     WHAT THE ORACLE SAID, and it is a measurement rather than a claim. On
+#     2026-10-08 (PR #146) the Linux `ci_sanitizers (ASan+UBSan) WITH_TLS=ON` cell ran
+#     with `ASAN_OPTIONS: detect_leaks=1` and reported `100% tests passed, 0 tests
+#     failed out of 100`, `check-skips: OK: 0 skipped`. The inline-spawning tests ran
+#     in that cell and passed -- `test_fed_skick_log` (#65), `test_tls` (#88),
+#     `test_control_bytes` (#92) -- so the handler ran over forked nodes and reported
+#     NOTHING. ZERO INLINE-CHILD LEAKS, where before this path nothing measured them
+#     at all. That is the deliverable: the measurement is live, and it is clean.
+#
+#     AND THE CONSEQUENCE, because it is the opposite of what a fault-injection pass
+#     would report and it would be dishonest to imply otherwise: RESTORING `_exit()`
+#     IS NOT RED ANYWHERE. Not locally, and not on CI either. `_exit()` does not cause
+#     a failure -- it SUPPRESSES a check, and a suppressed check cannot report a leak
+#     that is not there. With zero leaks measured, the two forms are
+#     observationally identical, so no fault can distinguish them and this change is
+#     verified BY MEASUREMENT rather than by teeth. It becomes fault-visible the
+#     moment a child leaks and a test asserts `nf_stop(&node) == 0`, which is the
+#     whole of the mechanism and is stated at node_fixture.c's `exit()` call.
 #   * ANYTHING AFTER A CRASH. A test that aborts is not measured.
 set -u
 dir="${1:-}"
