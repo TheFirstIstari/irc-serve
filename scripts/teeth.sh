@@ -367,7 +367,7 @@ run_source_fault formula-version-diverges-from-header \
 
 run_source_fault source-format-is-not-a-documented-format \
     source_format_invalid.py \
-    "is not one of '3.0 (native)', '3.0 (quilt)'"
+    "is not one of '3.0 (native)' or '3.0 (quilt)'"
 
 run_source_fault source-format-opens-with-a-comment-block \
     source_format_leading_comment.py \
