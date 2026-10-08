@@ -295,9 +295,21 @@ typedef enum {
  * An EMPTY (or NULL) name is admissible: an empty realname is a legal state this
  * node already renders, and a client clearing its own realname has to be able to
  * say so. The two refusals are CONN_REALNAME_TOO_LONG (longer than
- * CONN_MAX_REALNAME, which 005 advertises as NAMELEN) and CONN_REALNAME_BAD_BYTE
- * (a C0 control or DEL -- the log-injection set; CR, LF and NUL cannot arrive
- * because the parser refuses them first, but the rest can).
+ * CONN_MAX_REALNAME, which 005 advertises as NAMELEN) and CONN_REALNAME_BAD_BYTE.
+ *
+ * BAD_BYTE MEANS "THE SAME WALK THE STRIP USES, IN CHECK MODE", which is
+ * `conn_text_display_check()` below -- C0, DEL, a raw C1 (`0x80`-`0x9F` with
+ * nothing expecting a continuation), the encoded pair `0xC2 0x80`-`0xC2 0x9F`,
+ * and invalid or truncated UTF-8. It used to mean "C0 or DEL", which counted fewer
+ * bytes than `conn_text_strip()` removes from the same value: a realname holding a
+ * bare `0x9F` was ACCEPTED here and would then be MANGLED by the strip every
+ * numeric applies to it. The definition was one function and the field had two
+ * answers, which is the divergence this header exists to prevent.
+ *
+ * `ā`, `café` and `日本語` are NOT refused, and that is the part a reader should
+ * check rather than assume: the walk asks whether a continuation byte is EXPECTED
+ * before it looks at the byte on its own, so `0x81` inside `0xC4 0x81` is a letter
+ * and the identical byte standing alone is a control.
  *
  * Never truncates and never rewrites. The argument for both refusals is at the
  * definition. */

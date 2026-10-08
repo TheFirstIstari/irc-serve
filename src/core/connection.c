@@ -415,18 +415,54 @@ size_t conn_hostmask(const conn_t *c, char *out, size_t cap)
  * comment says so, and renders it as a bare `:`), and a client that clears its own
  * realname must be able to say so.
  *
- * THE BYTE TEST IS NOT WRITTEN HERE. It is `conn_byte_is_bad()` below, which the
- * header names as the single definition of the log-injection set, and this
- * function asks it for a count and treats a non-zero count as the refusal. That
- * is a deliberate indirection: a third field needs the same question asked and
- * answering it from its own copy of `ch <= 0x1f || ch == 0x7f` is how the two
- * come to disagree about which bytes are dangerous.
+ * THE BYTE TEST IS NOT WRITTEN HERE, and THAT IS THE WHOLE FIX.
  *
- * WHAT IT COSTS: the loop no longer stops at the FIRST bad byte, because the
- * count is a count. On a registration path, over a string the parser has already
- * bounded at one IRC line, that is one extra pass over at most a few hundred
- * bytes on a command a client sends once -- and it buys the exact byte count the
- * log line below reports. */
+ * It used to be `conn_text_bad_count(name) != 0`, which asks `conn_byte_is_bad()`
+ * and therefore counts C0 and DEL ONLY. The strip the tree applies to a STORED
+ * field -- `conn_text_strip()`, i.e. this same walk in strip mode -- also removes a
+ * RAW C1 (`0x80`-`0x9F` with nothing expecting a continuation) and the ENCODED C1
+ * pair `0xC2 0x80`-`0xC2 0x9F`, because on an 8-bit terminal `0x9B` IS CSI. So the
+ * check accepted realnames the strip would have rewritten, which is the divergence
+ * connection.c's own header warns about: "two functions answering 'which bytes are
+ * dangerous' is how they come to disagree".
+ *
+ * IT WAS LATENT rather than live, and the reason is worth stating because it is the
+ * only reason this survived: `311` renders the realname through
+ * `emit_numeric_ex()`, which runs `conn_text_strip_wire()`, so the byte was removed
+ * before it could reach a third party. What was left was a stored value this node
+ * had accepted and would then quietly mangle -- `Ma<0x9F>llory` shown to every
+ * member of every channel as `Mallory`-with-a-hole, and a realname that no longer
+ * matched the one the user typed, on a field whose whole policy is "refuse rather
+ * than rewrite" (3.2: never deliver a silently altered parameter).
+ *
+ * SO IT ASKS `conn_text_display_check()`, which is THE SAME WALK in check mode --
+ * the walk `valid_nick()` uses for `conn_t::nick`, which is the other stored field
+ * rendered into every line its owner sends. One definition, asked twice.
+ *
+ * AND IT IS NOW STRICTER THAN THE STRIP IN ONE RESPECT, which is deliberate and is
+ * the walk's own documented difference: check mode also faults INVALID UTF-8 -- an
+ * overlong `0xC0`/`0xC1`, a surrogate half, a lead byte outside UTF-8, a sequence
+ * that stops early -- where a stripper passes them through. `text_step()` argues
+ * that split at length: "A stripper may pass an ill-formed byte through -- the
+ * recipient's client decides what to do with a byte it cannot interpret -- but a
+ * nickname is STORED and re-rendered into every prefix this node emits, so invalid
+ * UTF-8 in one is a value that will be copied around the mesh for ever with no way
+ * to tell what it was supposed to be." A realname is stored and re-rendered into
+ * `311`, `301`, `352` and the extended-join for every member of every channel.
+ *
+ * THE COST, and it is a real one: `ā`, `café` and `日本語` are unaffected -- the walk
+ * asks whether a continuation byte is EXPECTED before it looks at the byte, which is
+ * why `0x81` inside `0xC4 0x81` is a letter and the identical byte on its own is a
+ * control. What a realname can no longer carry is a byte sequence that is not UTF-8
+ * at all, and no client sends one: the whole point of a realname is that a human
+ * typed it. The other cost is one walk rather than one count, and the walk runs over
+ * at most CONN_MAX_REALNAME bytes on a command a client sends once.
+ *
+ * TWO PASSES, and the length is why it is two: `conn_text_display_check()` walks
+ * once for the verdict and once more for a sequence that stops at the string's end,
+ * because the terminator is not a byte the loop is ever asked about. Over a
+ * realname that is bounded at 255 bytes on a path that runs once per registration
+ * and once per SETNAME. */
 conn_realname_verdict_t conn_realname_check(const char *name)
 {
     if (name == NULL) {
@@ -435,7 +471,7 @@ conn_realname_verdict_t conn_realname_check(const char *name)
     if (strlen(name) > (size_t)CONN_MAX_REALNAME) {
         return CONN_REALNAME_TOO_LONG;
     }
-    if (conn_text_bad_count(name) != 0u) {
+    if (conn_text_display_check(name) != CONN_DISPLAY_OK) {
         return CONN_REALNAME_BAD_BYTE;
     }
     return CONN_REALNAME_OK;
