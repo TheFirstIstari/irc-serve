@@ -183,7 +183,14 @@
  *
  * BOTH ARE WITHHELD ON A NODE WITH NO CERTIFICATE, which is cap.h's rule rather
  * than a decision of this phase: a node that advertised either could not honour
- * it. */
+ * it. AND BOTH ARE WITHHELD ON A CONNECTION THAT IS ALREADY ENCRYPTED, which is
+ * the specification's rule rather than this file's: `tls` says the server supports
+ * the STARTTLS command and there is nothing left to upgrade, and `sts` is a policy
+ * about upgrading a connection that has already been upgraded. That is why
+ * cap_available() takes a `conn_t *` -- the implicit-TLS listener and a STARTTLS
+ * upgrade both put an encrypted conn_t on a node whose certificate is perfectly
+ * well configured, and a node-wide answer would be a lie on exactly those two
+ * connections. */
 #define CAP_TLS "tls"
 #define CAP_STS "sts"
 
@@ -235,16 +242,36 @@
  *               rendering: cap.c's sts_possible() withholds the NAME instead, and
  *               plain `tls` -- which is merely true -- is still advertised.
  *   duration=   REQUIRED on a SECURE connection -- how long the client must keep
- *               using TLS. 0 means "no persistence policy", which is the shipped
- *               default on the specification's own advice: "Server
- *               implementations should consider using a default value of
- *               duration=0 in their example configurations. This will require
- *               server administrators to deliberately choose an expiry according
- *               to their specific needs rather than (perhaps unknowingly) rely on
- *               an arbitrary generic value." **A `duration=0` WITH a `port` is
- *               correct and is deliberately not changed** -- it names where TLS is
- *               available and asserts no persistence, which is the default the
- *               specification recommends.
+ *               using TLS. **A `duration=0` IS NOT RENDERED AT ALL**, and that is
+ *               the second change this pass made to this paragraph: it used to say
+ *               that `duration=0` with a `port` "is correct and is deliberately not
+ *               changed -- it names where TLS is available and asserts no
+ *               persistence, which is the default the specification recommends", and
+ *               that was a true statement about the specification's EXAMPLE
+ *               CONFIGURATION applied to a CAPABILITY LINE.
+ *
+ *               Those are two different places. An example configuration is a file
+ *               an administrator edits, and `duration=0` in one is a decision. A
+ *               capability line is a sentence this node composes from whatever the
+ *               operator's flags happened to say -- and `--tls-sts-duration` DEFAULTS
+ *               TO ZERO, so a node that was given a certificate and a secure port
+ *               and nothing else advertised `sts=duration=0,port=NNNN` as though
+ *               somebody had chosen it. A client cannot tell the two apart, and the
+ *               specification's own sentence says why the default belongs in an
+ *               example and not on the wire: using it in an example configuration
+ *               "will require server administrators to deliberately choose an expiry
+ *               according to their specific needs rather than (perhaps unknowingly)
+ *               rely on an arbitrary generic value". Withholding the name is what
+ *               makes the choice deliberate; `tls` still answers the question the
+ *               capability was partly answering, and is true.
+ *
+ *               THE COST, because the previous paragraph is not an argument against
+ *               this one: an operator who wants "TLS here, persist nothing" can no
+ *               longer say so in `CAP LS`, because the only rendering of that wish is
+ *               a capability indistinguishable from the one where nobody thought
+ *               about it. They get `tls` -- STARTTLS is available -- which is the
+ *               part that is a fact about this node rather than a policy about a
+ *               future visit.
  *
  * The buffer is a constant rather than a caller-chosen size for the same reason
  * CAP_LS_MAX is: `sts=duration=4294967295,port=65535` is 34 bytes, and a capability
@@ -276,14 +303,36 @@ void cap_init(conn_t *c);
  * knows but this node cannot currently do is answered NAK. */
 int cap_known(const char *name);
 
-/* Can this node offer `name` RIGHT NOW? 1 offered, 0 not. */
-int cap_available(const server_t *s, const char *name);
+/* Can this node offer `name` TO THIS CONNECTION RIGHT NOW? 1 offered, 0 not.
+ *
+ * `c` IS PART OF THE QUESTION, and it is not a convenience parameter. `tls` and `sts`
+ * describe a way to get from PLAINTEXT to encrypted, so on a connection that is
+ * already encrypted neither can be true: the `tls` specification forbids advertising
+ * `tls` on a secure connection, and `sts` is a policy about upgrading a connection
+ * that is already upgraded. Every other name in the table is a property of the NODE
+ * (or of the connection's own negotiation state, which its own predicate reads), so
+ * `c` is NULL for them and only these two read it.
+ *
+ * A NULL `c` means "ask about the node, not about a connection" and is answered as
+ * a PLAINTEXT connection -- the widest list. cap.c's conn_plaintext() gives the
+ * reasoning; the one caller with no connection is tests/protocol/test_cap_bounds.c,
+ * which sweeps the buffer bound and wants the longest list it can render.
+ *
+ * Cost: one pointer test and, for the two TLS names, one transport-pointer test --
+ * per CAP LS, not per packet. */
+int cap_available(const server_t *s, const conn_t *c, const char *name);
 
 /* Render the available set into `out` as the space-separated list a `CAP LS`
  * trailing parameter carries. Returns the byte count written, or 0 if it does not
  * fit -- which cannot happen for a buffer sized CAP_LS_MAX, and is reported
- * rather than truncated if it somehow does. */
-size_t cap_available_list(const server_t *s, char *out, size_t cap);
+ * rather than truncated if it somehow does.
+ *
+ * `c` is threaded through for the reason cap_available() above gives: the rendered
+ * list depends on whether the connection being answered is already encrypted, so a
+ * `CAP LS` over TLS is a SHORTER list than the same command on the plaintext port of
+ * the same node. That difference is the point of the parameter and is asserted on
+ * the wire in tests/integration/test_tls.c. */
+size_t cap_available_list(const server_t *s, const conn_t *c, char *out, size_t cap);
 
 /* A buffer that holds every capability this node can advertise plus their
  * separators and a NUL. It is a constant rather than a caller-chosen size so a

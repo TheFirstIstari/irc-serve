@@ -1105,6 +1105,172 @@ static void case_realname_still_refused(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * CASE 6b -- A BARE C1 IS REFUSED, AND A VALID MULTI-BYTE SEQUENCE IS NOT
+ * ---------------------------------------------------------------------------
+ * `conn_realname_check()` asked `conn_text_bad_count()`, which counts C0 and DEL and
+ * NOTHING ELSE -- while `conn_text_strip()`, the walk this node applies to a stored
+ * field, also removes a raw `0x80`-`0x9F` and the encoded pair `0xC2 0x80`-
+ * `0xC2 0x9F`. On an 8-bit terminal `0x9B` IS CSI, so a realname holding one was
+ * ACCEPTED by the check and would then be MANGLED by the strip every numeric
+ * applies to it: `Ma<0x9F>llory` reported to every member of every channel as
+ * `Mallory`-with-a-hole, on a field whose whole policy is "refuse rather than
+ * rewrite".
+ *
+ * IT WAS LATENT, and that is the only reason it survived: `311` renders the realname
+ * through `emit_numeric_ex()`, which strips. So the byte never reached a third
+ * party -- but the node held a value it had accepted and would not reproduce, which
+ * is 3.2's "never deliver a silently altered parameter" with the alteration three
+ * lines downstream of the check.
+ *
+ * BOTH DIRECTIONS ARE ASSERTED, and the second is not a formality. The obvious wrong
+ * fix is to refuse every byte in `0x80`-`0x9F`, which is what a range test over "the
+ * dangerous bytes" gives you -- and that eats `ā` (`0xC4 0x81`, whose second byte is
+ * `0x81`), every accented Latin character on the network, silently. What separates
+ * the letter from the control is only whether a sequence is in progress, so the
+ * positive case is the one that says the predicate is the WALK and not the range.
+ *
+ * ASSERTED ON THE WIRE, through `311`: a realname is a field, and the field is
+ * rendered to a client that did not send it. The refusal itself is asserted twice --
+ * the `417` the client sees and the `setname_refused: reason=BAD_BYTE` line the
+ * operator reads -- because a node that answered 417 and stored the value anyway
+ * would pass the first.
+ */
+#define C1_9F "\237"  /* 0x9F: CSI on an 8-bit terminal, and not printable ASCII */
+/* `ā` and `日`, spelled as octal triples for the reason the ESC/BEL defines above
+ * give. Both are VALID UTF-8 and both are somebody's name. */
+#define A_MACRON "\304\201"
+#define HI_NIHON "\346\227\245\346\234\254"
+
+static void case_realname_bare_c1_refused(void)
+{
+    nf_node_t node;
+    test_client_t vic;
+    test_client_t mallory;
+    char line[256];
+    size_t mark;
+
+    TF_CHECK_MSG(nf_spawn_binary(&node) == 0, "could not spawn the node");
+    /* `setname` IS NEGOTIATED, or every SETNAME below is answered by the silent
+     * refusal in handle_setname() and the 417 assertions would be vacuous. This is
+     * what register_as()'s wait for the ACK is for. */
+    register_as(&mallory, node.port, "mallory", "*spoofed", "setname");
+    register_as(&vic, node.port, "vic", "*spoofed", NULL);
+
+    /* ---- 1. THE BARE C1 IS REFUSED ---- */
+    (void)snprintf(line, sizeof line, "SETNAME :Ma" C1_9F "llory");
+    TF_CHECK_MSG(tc_send(&mallory, line) == 0, "the hostile SETNAME send failed");
+    TF_CHECK_MSG(tc_expect(&mallory, " 417 ", T_IO_MS) == 0,
+                 "a SETNAME carrying a bare 0x9F was NOT refused. `311` renders the "
+                 "realname through emit_numeric_ex(), which strips it, so the byte "
+                 "never reached a third party -- which is why this was latent rather "
+                 "than live -- but the node now HOLDS a value it will not reproduce, "
+                 "and the field's policy is to refuse rather than to rewrite.\n"
+                 "  mallory saw: %s", tc_buffer(&mallory));
+    TF_CHECK_MSG(nf_expect(&node, "setname_refused: fd=", T_IO_MS) == 0,
+                 "the node did not report the refusal on its own output, so an "
+                 "operator reading the log would not know a realname was offered and "
+                 "declined.\n  node said: %s", node.out);
+    /* The REASON is named, because BAD_BYTE and TOO_LONG are two different problems
+     * and a log that said only "refused" would not say which. */
+    TF_CHECK_MSG(nf_expect(&node, "reason=BAD_BYTE", T_IO_MS) == 0,
+                 "the refusal line does not name BAD_BYTE, so an operator cannot tell "
+                 "a byte this node will not store from a realname that was too long "
+                 "-- and the two have different fixes.\n  node said: %s", node.out);
+    assert_no_controls_in_log(&node, 0, "the refused bare-C1 realname");
+
+    /* ---- 2. AND IT WAS NOT STORED ----
+     *
+     * THE FENCE IS THE PING, and the assertion is on what arrived AFTER it: vic asks
+     * WHOIS and the 311 must carry the realname `USER` supplied. This is the half
+     * that cannot be satisfied by the 417 -- a node that refused, printed the refusal
+     * and then wrote the value anyway would pass everything above.
+     *
+     * AND THE EXPECTED VALUE IS NOT VACUOUS, because a node that accepted the byte
+     * would render `Real Ma<0x9F>llory` through the same strip as `Real Mally`: the
+     * byte is REMOVED, so the stored-then-stripped value differs from the untouched
+     * one by more than the strip. */
+    drain(&vic);
+    mark = tc_received(&vic);
+    TF_CHECK_MSG(tc_send(&vic, "WHOIS mallory") == 0, "the WHOIS send failed");
+    /* THE FENCE, and it is what makes the next assertion about THIS WHOIS: `311` is
+     * already in vic's buffer from the WHOIS above, and tc_expect() searches what has
+     * been accumulated -- so a plain wait would return instantly and the assertions
+     * would read the first answer for ever. The PING is written after the WHOIS on
+     * the same connection, so when its PONG is in hand the 311 is in hand too. */
+    TF_CHECK_MSG(tc_send(&vic, "PING :whois-fence-1") == 0, "the fence PING failed");
+    TF_CHECK_MSG(tc_expect(&vic, "whois-fence-1", T_IO_MS) == 0,
+                 "no PONG for the first WHOIS fence, so the bytes after the mark are "
+                 "not yet the answer to it.");
+    TF_CHECK_MSG(strstr(tc_buffer(&vic) + mark, " 311 ") != NULL,
+                 "WHOIS was not answered with a 311, so there is no rendered realname "
+                 "to read.\n  vic saw: %s", tc_buffer(&vic) + mark);
+    TF_CHECK_MSG(strstr(tc_buffer(&vic) + mark, ":Real mallory") != NULL,
+                 "the 311 does not carry the realname the client registered with, so "
+                 "the refused value WAS stored and then mangled by the strip: a "
+                 "realname is shown to every member of every channel, and this node "
+                 "would be showing one the user never typed.\n  vic saw: %s",
+                 tc_buffer(&vic));
+
+    /* ---- 3. AND A VALID MULTI-BYTE SEQUENCE IS ACCEPTED ----
+     *
+     * The positive case, and the one a range-test "fix" fails. `ā` carries 0x81 as
+     * its second byte -- inside the range a naive filter refuses -- and `日本語` is
+     * three three-byte sequences. Both are somebody's name, and the whole of the
+     * walk's design is that a continuation byte is defined by the byte BEFORE it. */
+    /* THE MARK, taken AFTER a drain and BEFORE the send, and the reason is that
+     * `drain()` does not empty the buffer -- it proves everything up to the PONG has
+     * ARRIVED, and `tc_expect()` then searches what has been accumulated, which still
+     * holds the bare-C1 case's 417. So the absence below is scoped to the bytes that
+     * arrived after this offset, which is the pattern the peer tests use for the same
+     * reason (`mark = tc_received(&bob); strstr(tc_buffer(&bob) + mark, ...)`). */
+    drain(&mallory);
+    mark = tc_received(&mallory);
+    (void)snprintf(line, sizeof line, "SETNAME :" A_MACRON " " HI_NIHON);
+    TF_CHECK_MSG(tc_send(&mallory, line) == 0, "the multi-byte SETNAME failed");
+    /* THE ECHO, NOT AN ABSENCE. `setname`'s confirmation is the server-to-client
+     * SETNAME carrying the value back, so waiting for it proves the change HAPPENED
+     * rather than proving that no error arrived -- which is what a bare "no 417"
+     * assertion does, and it is the assertion a node that silently dropped every
+     * SETNAME would pass. */
+    TF_CHECK_MSG(tc_expect(&mallory, " SETNAME :" A_MACRON " " HI_NIHON "\r\n",
+                           T_IO_MS) == 0,
+                 "a realname of valid multi-byte UTF-8 was not accepted: either the "
+                 "node refused it, or it accepted it and did not echo it. `ā` is "
+                 "0xC4 0x81 -- its second byte is inside the C1 range a naive range "
+                 "test refuses -- so this is the assertion that says the predicate is "
+                 "the UTF-8 WALK and not a byte range, and getting it wrong eats "
+                 "every accented Latin character on the network silently.\n"
+                 "  mallory saw: %s", tc_buffer(&mallory));
+    TF_CHECK_MSG(strstr(tc_buffer(&mallory) + mark, " 417 ") == NULL,
+                 "the valid multi-byte SETNAME was refused AND echoed, so the bytes in "
+                 "the echo came from somewhere other than the stored realname.\n"
+                 "  mallory saw: %s", tc_buffer(&mallory) + mark);
+
+    /* ---- 4. AND IT REACHES A THIRD PARTY BYTE FOR BYTE ---- */
+    drain(&vic);
+    mark = tc_received(&vic);
+    TF_CHECK_MSG(tc_send(&vic, "WHOIS mallory") == 0, "the second WHOIS failed");
+    TF_CHECK_MSG(tc_send(&vic, "PING :whois-fence-2") == 0, "the second fence failed");
+    TF_CHECK_MSG(tc_expect(&vic, "whois-fence-2", T_IO_MS) == 0,
+                 "no PONG for the second WHOIS fence, so the bytes after the mark are "
+                 "not yet the answer to it.");
+    TF_CHECK_MSG(strstr(tc_buffer(&vic) + mark, " 311 ") != NULL,
+                 "the second WHOIS was not answered with a 311.\n  vic saw: %s",
+                 tc_buffer(&vic) + mark);
+    TF_CHECK_MSG(strstr(tc_buffer(&vic) + mark, ":" A_MACRON " " HI_NIHON) != NULL,
+                 "the 311 does not carry the multi-byte realname byte for byte, so the "
+                 "value this node STORED is not the value a third client is shown -- "
+                 "which is the same silent-rewrite failure as the bare C1, with the "
+                 "roles reversed: here the accepted value is the one that changes.\n"
+                 "  vic saw: %s", tc_buffer(&vic) + mark);
+
+    tc_close(&vic);
+    tc_close(&mallory);
+    TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
+    nf_free(&node);
+}
+
+/* ---------------------------------------------------------------------------
  * CASE 7 -- `MODE`'s 472: A PLACEHOLDER ON THE WIRE AND A MEASUREMENT IN THE LOG
  * ---------------------------------------------------------------------------
  * This case exists because of a bypass, and the bypass is the reason the case is
@@ -1241,6 +1407,7 @@ int main(void)
     case_topic_strip_keeps_good_bytes();
     case_relayed_parameters_are_stripped();
     case_realname_still_refused();
+    case_realname_bare_c1_refused();
     case_mode_472_refusal_is_measured();
 
     tf_done("control-bytes");

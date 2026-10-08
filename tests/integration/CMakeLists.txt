@@ -484,6 +484,21 @@ irc_add_integration_test(test_fed_topic_authority test_fed_topic_authority.c)
 # enforcing it.
 irc_add_integration_test(test_fed_mode_authority test_fed_mode_authority.c)
 
+# The `fed_skick:` OBSERVABLE LINE IS READABLE. `fed_in_skick()` handed the peer's
+# `<member>` and `<target>` to `fed_obs()` as bare `%s` arguments, two lines after
+# `fed_in_smodes()` had been given `subject_len=` and `subject_bad_bytes=` for the
+# same kind of field. `fed_obs()` withholds, so this was never an injection -- it was
+# a line whose `by=-` could not be told from an empty field, because nothing beside it
+# said which. Three probes on one link: a clean SKICK (so the withheld case below
+# cannot be passed by a node whose filter swallowed everything), a hostile `<member>`,
+# and a hostile `<target>`.
+#
+# IT IS NOT A ROW IN THE PEER SWEEP, and the file says why at length: the sweep's
+# SKICK row puts its marker in the `<reason>`, which `fed_relay_clean()` covers, and
+# moving it into `<member>` would put that byte on the PEER SOCKET -- a different
+# question, and one this pass does not answer.
+irc_add_integration_test(test_fed_skick_log test_fed_skick_log.c)
+
 # 4.3 / 7/Phase 6 acceptance criterion 2: the FULL 353 CONTENTS on BOTH nodes
 # after a resync, in the Phase 4 order and terminated by a 366 -- and the
 # replace-never-merge property the resync exists for, which needs three bursts

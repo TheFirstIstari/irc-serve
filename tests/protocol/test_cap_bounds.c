@@ -41,12 +41,21 @@
  * ---------------------------------------------------------------------------
  * The maximum output needs every capability available at once, including `sts`,
  * whose value is `sts=duration=4294967295,port=65535` -- 34 bytes, the longest
- * value any name in this tree has. Three of the four conditions are fields:
+ * value any name in this tree has. Four of the five conditions are fields:
  * `sasl` needs a credential in the store, `account-tag` needs a registry entry,
- * and `sts`'s duration is `server_t::sts_duration`. The fourth is not a field:
+ * and `sts`'s duration is `server_t::sts_duration`. The fifth is not a field:
  * `sts` is offered only when `tls_node_possible()` AND `server_tls_port()` agree,
  * and the first of those asks whether `server_t::tls` is non-NULL while the second
  * asks what an implicit-TLS LISTENER is bound to.
+ *
+ * THE CONNECTION IS NULL HERE, and that is the answer that makes this sweep the WIDEST
+ * one rather than a narrow one: cap.c's conn_plaintext() reads a NULL connection as
+ * plaintext, so `tls` and `sts` are offered. That is what this file wants -- the
+ * bound is most interesting around the longest list the function can produce, and a
+ * list with the two TLS names missing is 33 bytes shorter before any sweep starts.
+ * cap.c gives the reasoning at the predicate; the per-connection behaviour itself is
+ * asserted over the wire in tests/integration/test_tls.c, where there is a real
+ * encrypted connection to ask about.
  *
  * So the worst case is constructed rather than waited for: a real listening
  * socket on the loopback, adopted as `tls_listen_fd`, and `tls` set to a non-NULL
@@ -240,7 +249,9 @@ static void sweep_cap_available_list(void)
         size_t n;
 
         memset(buf, CANARY_BYTE, sizeof buf);
-        n = cap_available_list(&s, (char *)buf, cap);
+        /* NULL for the connection: see the header. The sweep wants the widest list
+         * the function can render, and cap.c reads a NULL connection as plaintext. */
+        n = cap_available_list(&s, NULL, (char *)buf, cap);
         if (!canary_intact(&buf[cap], cap)) {
             return;
         }

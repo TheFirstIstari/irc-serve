@@ -657,6 +657,186 @@ static void case_sts_requires_a_secure_port(const char *cert, const char *key)
     nf_free(&n);
 }
 
+/* ===========================================================================
+ * CASE GROUP 1c: `tls` AND `sts` ARE NOT ADVERTISED ON A SECURE CONNECTION
+ * ===========================================================================
+ *
+ * THE THREE CONNECTIONS, AND WHY THREE IS THE NUMBER THAT PROVES ANYTHING. A
+ * capability list that is computed per NODE has one answer, and a test could only
+ * compare that answer against a second configuration -- which is how the defect
+ * stayed invisible. What is being claimed is about a PROPERTY OF A CONNECTION:
+ *
+ *   1. plaintext        `tls` and `sts` ARE advertised, because both describe how to
+ *                       get from here to encrypted.
+ *   2. implicit TLS     NEITHER is advertised. The `tls` specification forbids `tls`
+ *                       on a secure connection: there is nothing left to STARTTLS.
+ *                       `sts` is worse than pointless, because `sts` is a policy
+ *                       about UPGRADING a connection and this one is already upgraded.
+ *   3. STARTTLS         NEITHER, and reached the other way round. Case 2 could be
+ *                       satisfied by a node that simply never dialled its own
+ *                       implicit-TLS port; case 3 is the same claim on a connection
+ *                       that started in the clear and was upgraded in place, which is
+ *                       the one a `tls`-advertising node produces.
+ *
+ * A fix that suppressed `tls` and `sts` on every connection passes 2 and 3 and fails
+ * 1; a fix that left them everywhere fails 2 and 3 and passes 1. All three are needed
+ * because the two errors have opposite signs.
+ *
+ * WHAT IS ASSERTED IS THE WIRE: the trailing parameter of `CAP LS`. Not a field on a
+ * conn_t, not a return value -- the list a client reads.
+ */
+static void case_caps_vary_by_connection(const char *cert, const char *key,
+                                         const char *sts_arg,
+                                         unsigned long expect_duration)
+{
+    nf_node_t n;
+    test_client_t plain;
+    char a0[] = "irc-serve";
+    char a1[] = "0";
+    char a2[] = "--name";
+    char a3[] = "irc.tls";
+    char a4[] = "--tls-port";
+    char a5[] = "0";
+    char *argv[13];
+    int tls_port;
+
+    argv[0] = a0; argv[1] = a1; argv[2] = a2; argv[3] = a3;
+    argv[4] = "--tls-cert"; argv[5] = (char *)(uintptr_t)(const void *)cert;
+    argv[6] = "--tls-key"; argv[7] = (char *)(uintptr_t)(const void *)key;
+    /* `--tls-port 0`, NOT the port another node in this test already holds: the
+     * kernel's choice is read back off this child's own output further down, which is
+     * what makes the implicit-TLS connection below reach THIS node rather than a
+     * neighbour that happens to be listening on the number passed in. */
+    argv[8] = a4; argv[9] = a5;
+    /* THE POLICY IS OPTIONAL HERE, and that is the point of the duration half of this
+     * case: the same node shape, the same certificate and the same secure port, with
+     * and without an operator-chosen expiry, must differ in what `CAP LS` says. */
+    if (sts_arg != NULL) {
+        argv[10] = "--tls-sts-duration";
+        argv[11] = (char *)(uintptr_t)(const void *)sts_arg;
+    } else {
+        argv[10] = NULL;
+    }
+    argv[12] = NULL;
+    if (nf_spawn_binary_argv(&n, argv) != 0) {
+        check(0, "spawn a node with a certificate and a secure port", NULL);
+        return;
+    }
+    {
+        const char *p = strstr(n.out, "tls_port=");
+
+        tls_port = (p != NULL) ? atoi(p + 9) : -1;
+    }
+    check(tls_port > 0,
+          "the node this case asks about bound its OWN implicit-TLS port, so the "
+          "secure connection below reaches the node whose plaintext CAP LS was just "
+          "read",
+          n.out);
+
+    /* ---- 1. THE PLAINTEXT CONNECTION, WHICH IS THE POSITIVE CASE ---- */
+    if (tc_connect(&plain, n.port) != 0) {
+        check(0, "connect to the plaintext port", NULL);
+    } else {
+        check(tc_send(&plain, "CAP LS") == 0, "send CAP LS in the clear", NULL);
+        check(tc_expect(&plain, " LS :", 10000) == 0,
+              "the plaintext listener answers CAP LS", tc_buffer(&plain));
+        check(strstr(tc_buffer(&plain), " tls") != NULL,
+              "ON PLAINTEXT, `tls` IS advertised: this node does answer STARTTLS, so "
+              "withholding it would be refusing to tell a client something true",
+              tc_buffer(&plain));
+        if (expect_duration != 0ul) {
+            char want[64];
+
+            (void)snprintf(want, sizeof want, "sts=duration=%lu", expect_duration);
+            check(strstr(tc_buffer(&plain), want) != NULL,
+                  "and `sts` carries the policy the operator chose, because a "
+                  "plaintext connection is the one a persistence policy is FOR",
+                  tc_buffer(&plain));
+        } else {
+            /* THE DURATION RULE, and it is asserted on a node with a secure port so
+             * that the only difference from the case above is the absent flag:
+             * `--tls-sts-duration` DEFAULTS TO ZERO, so a node given a certificate
+             * and a port and nothing else used to advertise a policy whose entire
+             * content was "persist nothing" -- as though an operator had chosen it.
+             * Nobody chose it. */
+            check(strstr(tc_buffer(&plain), " sts") == NULL,
+                  "with NO --tls-sts-duration, `sts` is NOT advertised at all: the "
+                  "zero default is not a decision, and a client cannot tell an "
+                  "unconsidered expiry from a chosen one",
+                  tc_buffer(&plain));
+        }
+        tc_close(&plain);
+    }
+
+    /* ---- 2. THE IMPLICIT-TLS CONNECTION ---- */
+    if (tls_port > 0) {
+        tf_tls_t t;
+        const char *why = NULL;
+
+        if (tf_tls_connect(&t, tls_port, cert, "irc.tls", &why) != 0) {
+            check(0, "an implicit-TLS handshake succeeds, so the secure connection "
+                     "this case asserts about exists",
+                  (why != NULL) ? why : "handshake failed");
+        } else {
+            check(tf_tls_send(&t, "CAP LS") == 0,
+                  "a client sends CAP LS over TLS, which is legal: nothing in the "
+                  "negotiation specification restricts it to the plaintext port",
+                  NULL);
+            check(tf_tls_expect(&t, " LS :", 10000) == 0,
+                  "the node answers CAP LS on an implicit-TLS connection",
+                  tf_tls_buffer(&t));
+            check(strstr(tf_tls_buffer(&t), " tls") == NULL,
+                  "and `tls` is NOT in the list: there is nothing left to STARTTLS on "
+                  "a connection that is already encrypted, so a client that read it "
+                  "would be answering 691 to a STARTTLS its own advertisement invited",
+                  tf_tls_buffer(&t));
+            check(strstr(tf_tls_buffer(&t), " sts") == NULL,
+                  "and `sts` is NOT in the list either: `sts` is a policy about "
+                  "UPGRADING a connection, and this one is already upgraded",
+                  tf_tls_buffer(&t));
+            tf_tls_close(&t);
+        }
+    }
+
+    /* ---- 3. THE STARTTLS-UPGRADED CONNECTION ----
+     *
+     * The SAME node, so `tls` and `sts` are demonstrably available here: the plain
+     * connection above was told so. If this case passed because the node had no TLS
+     * surface, case 1 above would have said so first. */
+    {
+        tf_tls_t up;
+        const char *why = NULL;
+
+        if (tf_tls_connect_plain(&up, n.port) != 0 ||
+            tf_tls_send(&up, "STARTTLS") != 0 ||
+            tf_tls_expect(&up, " 670 ", 10000) != 0) {
+            check(0, "STARTTLS reaches 670 on the plaintext port", tf_tls_buffer(&up));
+        } else if (tf_tls_upgrade(&up, up.fd, cert, "irc.tls", &why) != 0) {
+            check(0, "the STARTTLS upgrade completes a real handshake",
+                  (why != NULL) ? why : "upgrade failed");
+        } else {
+            check(tf_tls_send(&up, "CAP LS") == 0,
+                  "a client sends CAP LS after upgrading in place", NULL);
+            check(tf_tls_expect(&up, " LS :", 10000) == 0,
+                  "the node answers CAP LS on the UPGRADED connection",
+                  tf_tls_buffer(&up));
+            check(strstr(tf_tls_buffer(&up), " tls") == NULL,
+                  "`tls` is NOT advertised after a STARTTLS, and that is the half a "
+                  "node-wide answer gets wrong: the node does speak STARTTLS -- it "
+                  "just did -- but THIS connection cannot do it again",
+                  tf_tls_buffer(&up));
+            check(strstr(tf_tls_buffer(&up), " sts") == NULL,
+                  "and `sts` is NOT advertised after a STARTTLS either, for the same "
+                  "reason as the implicit-TLS case and against the same policy",
+                  tf_tls_buffer(&up));
+            tf_tls_close(&up);
+        }
+    }
+
+    (void)nf_stop(&n);
+    nf_free(&n);
+}
+
 int main(void)
 {
     char dir[TF_DIR_MAX];
@@ -877,6 +1057,15 @@ int main(void)
             check(nf_expect(&n, "tls_handshake_start: fd=", 5000) == 0,
                   "the node reports starting the handshake, so the handshake is "
                   "visible to an operator and not just to the client", NULL);
+            /* THE CAPABILITY LIST IS PER CONNECTION, and it is asserted here on THIS
+             * node -- the one whose plaintext `CAP LS` above carried `tls` and the
+             * `sts` value -- so all three connections are the same node's. The
+             * duration half is a second node with the same certificate and the same
+             * secure port and NO policy, which is the only difference that can make
+             * `sts` disappear, and it is a separate spawn because the flag is read
+             * once at startup. */
+            case_caps_vary_by_connection(g_cert, g_key, "15552000", 15552000ul);
+            case_caps_vary_by_connection(g_cert, g_key, NULL, 0ul);
             /* The counters are published at SHUTDOWN, not per tick, so the check
              * has to come after nf_stop() rather than before it. Asking for a
              * counter the node has not printed yet is a check that fails for a

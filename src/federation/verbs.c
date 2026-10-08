@@ -2190,18 +2190,58 @@ static void fed_in_smodes(server_t *s, server_link_t *link, chan_t *ch,
                                        params, nparams, tags);
 }
 
-/* SKICK: <member> <channel> <target> [<reason>]. */
+/* SKICK: <member> <channel> <target> [<reason>].
+ *
+ * ---------------------------------------------------------------------------
+ * WHY BOTH PRINTED FIELDS ARE MEASURED, AND IT IS NOT THE INJECTION
+ * ---------------------------------------------------------------------------
+ * `fed_obs()` withholds a value holding a byte in the strip set, so this line was
+ * never an injection: `conn_text_logsafe()` runs on every `%s` it renders, and a peer
+ * that sent `SKICK <ESC>[2J ...` printed `by=-` rather than a CSI sequence in an
+ * operator's terminal. What it WAS is a line that cannot be read. `by=-` means two
+ * different things -- "the peer sent nothing" and "the peer sent something this node
+ * would not print" -- and the line carried no length and no bad-byte count to tell
+ * them apart, so the one an operator actually needs (a peer sending bytes it should
+ * not) is indistinguishable from a peer with nothing to say.
+ *
+ * `fed_in_smodes()` prints `subject_len=` and `subject_bad_bytes=` beside the same
+ * kind of field for the same reason, and this line is the one that was left out. The
+ * convention is now uniform for the two verbs whose `<member>`/`<server>` fields are
+ * peer-chosen, and tests/integration/test_fed_skick_log.c asserts the measurement is
+ * present -- a `fed_skick:` line with no `by_len=` is a failure, not a shorter line.
+ *
+ * MEASURED RATHER THAN STRIPPED, and the reason is that this is a LOG: nothing
+ * downstream reads it, so the bytes were already withheld by `fed_obs()` and the
+ * measurement is what an operator is left with. It costs two walks of a bounded
+ * peer-supplied string (`conn_text_logsafe()` and `strlen()`) plus one of the same
+ * length inside `conn_text_bad_count()`, on a path that runs once per SKICK rather
+ * than once per packet.
+ *
+ * WHAT THIS DOES NOT CLAIM: that `<member>` and `<target>` are STORED safely, and
+ * they are not read as safe by anything here. `chan_remote_remove()` is handed
+ * `params[2]` and looks it up in a roster; it stores nothing. The reason at
+ * connection.h's policy table -- a field that is stored goes through its own policy,
+ * a field that is only logged goes through this one -- is the whole reason the two
+ * are separate decisions, and naming it here is what stops a reader from taking the
+ * measurement as a sanitiser. */
 static void fed_in_skick(server_t *s, server_link_t *link, chan_t *ch,
                          const char *prefix, const irc_serve_tags_t *tags,
                          const char *const *params, int nparams)
 {
+    char shown_by[CONN_LOG_FIELD_MAX + 1u];
+    char shown_target[CONN_LOG_FIELD_MAX + 1u];
+
     if (nparams < 3 || nparams > 4) {
         return;
     }
+    (void)conn_text_logsafe(shown_by, sizeof shown_by, params[0]);
+    (void)conn_text_logsafe(shown_target, sizeof shown_target, params[2]);
     (void)chan_remote_remove(ch, link->name, params[2]);
     fed_touch_server(ch, link->name, 0);
-    fed_obs("[observable] fed_skick: channel=%s by=%s target=%s\n", ch->name,
-           params[0], params[2]);
+    fed_obs("[observable] fed_skick: channel=%s by=%s by_len=%zu by_bad_bytes=%zu "
+            "target=%s target_len=%zu target_bad_bytes=%zu\n",
+            ch->name, shown_by, strlen(params[0]), conn_text_bad_count(params[0]),
+            shown_target, strlen(params[2]), conn_text_bad_count(params[2]));
     (void)fanout_forward_channel_sverb(s, ch, FANOUT_STATE_CHANGE, "SKICK", prefix,
                                        params, nparams, tags);
     (void)chan_dispose_if_empty(s, ch);

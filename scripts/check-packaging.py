@@ -126,7 +126,21 @@ import tempfile
 from email.utils import parsedate_to_datetime
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEB = os.path.join(ROOT, "packaging", "debian")
+# THE PATH dpkg LOOKS AT, and the two are deliberately different objects in this
+# file. `dpkg-buildpackage` has a literal list -- in dpkg's own
+# scripts/dpkg-buildpackage.pl it is `my @debian_rules = ('debian/rules')` -- with no
+# option, no environment variable and no -C that relocates it, so a package built
+# from this tree has to be at ./debian. That is `DEB_PATH`. `DEB_HOME` is where the
+# files LIVE, and every check below reads through `DEB_PATH` so it verifies the
+# layout dpkg will see rather than a directory that happens to hold the right files.
+DEB_PATH = os.path.join(ROOT, "debian")
+DEB_HOME = os.path.join(ROOT, "packaging", "debian")
+# The one spelling the symlink is asserted to carry, and the reason it is RELATIVE
+# rather than absolute: a checkout at /home/builder/irc-serve and one at
+# /Users/someone/dev/irc-serve must both work, and a committed symlink can only be
+# relative to the directory it lives in. An absolute target would be a path that
+# resolves to nothing on every machine but the one that made it.
+DEB_LINK_TARGET = "packaging/debian"
 ARCH = os.path.join(ROOT, "packaging", "arch")
 BREW = os.path.join(ROOT, "packaging", "homebrew")
 FORMULA = os.path.join(BREW, "irc-serve.rb")
@@ -237,8 +251,95 @@ def expected_license_id():
     return "%s-%s%s" % (family, number, "-or-later" if later else "")
 
 
+def check_layout():
+    """THE ./debian LAYOUT, asserted rather than described.
+
+    WHY IT IS HERE AND NOT ONLY IN packaging/README.md. `dpkg-buildpackage` reads
+    `@debian_rules = ('debian/rules')` -- a literal, with no option and no environment
+    variable that relocates it -- and every other check in this script reads through
+    `DEB_PATH` for exactly that reason. A layout that is only DESCRIBED is a layout
+    that can drift: the symlink could be deleted, replaced by a real directory, or
+    pointed somewhere else, and every other check here would keep passing while
+    `dpkg-buildpackage` stopped finding the packaging at all. That is the failure this
+    function exists to make red, and it is the same shape as the `tls_port=-1` anchor
+    in tests/integration/test_tls.c: a reader -- and a future change that made
+    --tls-port implied -- must be able to tell the two situations apart.
+
+    FOUR CLAIMS, and the order matters because each is about a DIFFERENT failure:
+
+      1. `debian` EXISTS AT THE ROOT, so dpkg's literal path resolves at all.
+      2. It is a SYMLINK, not a real directory. A real `debian/` would be a SECOND
+         copy of the packaging in the tree, and two copies are two things to keep in
+         step -- which is why this tree keeps one home and points at it.
+      3. Its target is the RELATIVE string `packaging/debian`, so a checkout at any
+         path resolves it. An absolute target is a path that works on exactly one
+         machine, and it is the failure mode a COMMITTED symlink has that an
+         uncommitted one does not.
+      4. The files dpkg names are reachable THROUGH the symlink and are the same
+         files, not copies: `debian/rules` and `packaging/debian/rules` are one inode.
+
+    Claim 4 is a realpath comparison rather than a content comparison on purpose: two
+    files with equal contents can drift apart tomorrow, and this is a claim about one
+    directory rather than about today's bytes.
+
+    Returns True when the layout is sound. main() STOPS when it is not, because every
+    other check in this file reads through `debian/`, so a missing link produces a
+    cascade of "debian/rules does not exist" findings that are one finding said seven
+    times.
+    """
+    if not os.path.lexists(DEB_PATH):
+        fail("./debian layout",
+             "there is no `debian` at the repository root, so `dpkg-buildpackage -b` "
+             "run from here finds no packaging at all -- dpkg's rule list is the "
+             "literal `debian/rules` and nothing relocates it, and the error it "
+             "prints names debian/rules rather than the directory that is wrong. The "
+             "packaging is at packaging/debian; this tree resolves that with a "
+             "committed symlink, and the symlink is missing. `ln -s packaging/debian "
+             "debian`, and commit it.")
+        return False
+    if not os.path.islink(DEB_PATH):
+        fail("./debian layout",
+             "`debian` is not a symlink. Either it is a real directory holding a "
+             "second copy of the packaging -- the arrangement this tree rejected, "
+             "because two copies are two things to keep in step -- or it is a regular "
+             "file, which dpkg would refuse. The layout is `debian -> "
+             "packaging/debian`, and this is a %s."
+             % ("directory" if os.path.isdir(DEB_PATH) else "regular file"))
+        return False
+    target = os.readlink(DEB_PATH)
+    if target != DEB_LINK_TARGET:
+        fail("./debian layout",
+             "`debian` points at %r and the layout is `debian -> %s`. An absolute "
+             "target resolves on exactly one machine, and any other target puts the "
+             "packaging somewhere this check does not read." % (target, DEB_LINK_TARGET))
+        return False
+    if not os.path.isdir(DEB_HOME):
+        fail("./debian layout",
+             "`debian` points at packaging/debian, which is not a directory, so the "
+             "symlink dangles and dpkg finds nothing.")
+        return False
+    # THE FILES dpkg NAMES, compared as PATHS rather than read, because the claim is
+    # "these are the same file" and reading both would only prove they have equal
+    # bytes TODAY.
+    for name in ("rules", "control", "changelog", "copyright"):
+        via_link = os.path.join(DEB_PATH, name)
+        at_home = os.path.join(DEB_HOME, name)
+        if not os.path.isfile(via_link):
+            fail("./debian layout",
+                 "`debian/%s` is not reachable through the symlink, which is the path "
+                 "dpkg reads; packaging/debian/%s is the file that exists."
+                 % (name, name))
+            continue
+        if os.path.realpath(via_link) != os.path.realpath(at_home):
+            fail("./debian layout",
+                 "`debian/%s` and `packaging/debian/%s` are DIFFERENT files, so the "
+                 "tree holds two copies of the packaging and dpkg would build the one "
+                 "nobody edits." % (name, name))
+    return True
+
+
 def check_changelog(version):
-    path = os.path.join(DEB, "changelog")
+    path = os.path.join(DEB_PATH, "changelog")
     if not os.path.isfile(path):
         fail("debian/changelog", "%s does not exist." % path)
         return None
@@ -354,7 +455,7 @@ def check_source_format(changelog_version):
     obeyed by nobody. A comment in this file is either a build failure or a lie, and
     the fix in both cases is packaging/README.md, which dpkg does not parse.
     """
-    path = os.path.join(DEB, "source", "format")
+    path = os.path.join(DEB_PATH, "source", "format")
     text = read(path)
     if text is None:
         fail("debian/source/format",
@@ -419,7 +520,7 @@ def check_source_format(changelog_version):
     # what is left -- so the file is checked for referencing patches that exist, not
     # for being non-empty.
     if fmt == "3.0 (quilt)":
-        series = os.path.join(DEB, "patches", "series")
+        series = os.path.join(DEB_PATH, "patches", "series")
         stext = read(series)
         if stext is None:
             # Not a failure: read_patch_list() returns an empty list when the file is
@@ -436,7 +537,7 @@ def check_source_format(changelog_version):
                 entry = re.sub(r"(?:^|\s+)#.*$", "", line).strip()
                 if not entry:
                     continue
-                patch = os.path.join(DEB, "patches", entry.split()[0])
+                patch = os.path.join(DEB_PATH, "patches", entry.split()[0])
                 if not os.path.isfile(patch):
                     fail("debian/patches/series",
                          "line %d lists %r and debian/patches/%s does not exist, so "
@@ -448,7 +549,7 @@ def check_source_format(changelog_version):
 def check_copyright(expected_license):
     """`debian/copyright` in the machine-readable DEP-5 format, and its license
     agreeing with the repository's own LICENSE."""
-    path = os.path.join(DEB, "copyright")
+    path = os.path.join(DEB_PATH, "copyright")
     text = read(path)
     if text is None:
         fail("debian/copyright",
@@ -878,7 +979,7 @@ def check_pkgbuild_flags(text):
 
 
 def check_control():
-    path = os.path.join(DEB, "control")
+    path = os.path.join(DEB_PATH, "control")
     text = read(path)
     if text is None:
         fail("debian/control", "%s does not exist." % path)
@@ -901,7 +1002,7 @@ def check_control():
     # and a debian/compat file are ALTERNATIVES; a package with both has two answers
     # to one question and debhelper resolves it by an order nothing in the package
     # says. A package with neither is on whatever default debhelper picks.
-    compat_file = os.path.join(DEB, "compat")
+    compat_file = os.path.join(DEB_PATH, "compat")
     in_control = re.search(r'debhelper-compat\s*\(\s*=\s*(\d+)\s*\)', text)
     if in_control and os.path.isfile(compat_file):
         fail("debian/control",
@@ -926,8 +1027,8 @@ def check_build_depends_match_tls():
     not mirrored it. An UNDER-declared one fails the build loudly, at
     `find_package(OpenSSL REQUIRED)`, on the build machine.
     """
-    control = read(os.path.join(DEB, "control")) or ""
-    rules = read(os.path.join(DEB, "rules")) or ""
+    control = read(os.path.join(DEB_PATH, "control")) or ""
+    rules = read(os.path.join(DEB_PATH, "rules")) or ""
     if "-DWITH_TLS=OFF" not in rules:
         return  # nothing to cross-check
     bd = re.search(r'^Build-Depends:\s*(?P<v>.*)$', control, re.M)
@@ -957,8 +1058,22 @@ def check_install_rule():
 
 
 def main():
-    for d, what in ((DEB, "packaging/debian"), (ARCH, "packaging/arch"),
-                    (BREW, "packaging/homebrew")):
+    # THE LAYOUT FIRST, and the reason is WHICH FINDING A READER GETS. The vacuity
+    # guard below asks "does this directory exist"; when `debian` is the thing that is
+    # missing, that guard's answer is a correct but useless FAIL -- while
+    # check_layout() names the fix. So the layout is checked first, and the guard is
+    # about the directories that are supposed to be REAL: packaging/debian (where the
+    # files live), packaging/arch and packaging/homebrew.
+    if check_layout() is not True:
+        for what, why in failures:
+            sys.stderr.write("    %s\n        %s\n" % (what, why))
+        sys.stderr.write("check-packaging: FAIL: the ./debian layout, which every "
+                         "check below reads through. Stopping here rather than "
+                         "reporting each file it makes unreachable.\n")
+        return 1
+    for d, what in ((DEB_HOME, "packaging/debian (where the files live)"),
+                     (ARCH, "packaging/arch"),
+                     (BREW, "packaging/homebrew")):
         if not os.path.isdir(d):
             sys.stderr.write("check-packaging: FAIL: %s does not exist, so every check "
                              "below would pass vacuously.\n" % what)
@@ -969,6 +1084,11 @@ def main():
 
     version = header_version()
     expected_license = expected_license_id()
+
+    # `debian/` IS NOT RE-CHECKED HERE. check_layout() ran at the top of main(),
+    # before the vacuity guard, because everything below reads THROUGH `debian/` and a
+    # missing or dangling symlink would otherwise make those checks report a missing
+    # FILE rather than a missing LAYOUT -- a finding about the wrong thing.
 
     # TWO DIFFERENT VERSIONS, and conflating them is the bug that was here first:
     # `version` is what the header says, `changelog_version` is what the changelog
@@ -981,7 +1101,7 @@ def main():
     check_source_format(changelog_version)
     check_copyright(expected_license)
     check_pkgbuild(version)
-    rules_text = read(os.path.join(DEB, "rules"))
+    rules_text = read(os.path.join(DEB_PATH, "rules"))
     pkg_text = read(os.path.join(ARCH, "PKGBUILD"))
     brew_flags = check_formula(version, expected_license)
     check_control()
@@ -994,6 +1114,11 @@ def main():
     })
 
     print("check-packaging: verified without Debian, Arch or Homebrew:")
+    print("    `debian` at the repository root is a symlink to `packaging/debian`, so")
+    print("    dpkg's literal `debian/rules` path resolves, the target is RELATIVE so any")
+    print("    checkout path works, and every file below is the same inode rather than a")
+    print("    second copy -- so every other check in this script reads the packaging")
+    print("    through the path dpkg itself reads.")
     print("    src/core/server.h's IRC_SERVE_VERSION is the single definition and the")
     print("    Debian changelog, the Arch PKGBUILD and the Homebrew formula all agree")
     print("    with it (the PKGBUILD by RUNNING its sed derivation, not by reading it).")
@@ -1029,18 +1154,15 @@ def main():
     print("check-packaging: NOT CHECKED, AND NOT CLAIMED. No package has been built by")
     print("anything in this tree, and none of these can be checked without the tools it")
     print("does not have:")
-    print("    * whether a .deb can be produced AT ALL. TWO SEPARATE BLOCKERS, and the")
-    print("      second is the one that fails first:")
-    print("        - this packaging is at packaging/debian, and dpkg-buildpackage only")
-    print("          ever looks for ./debian. dpkg's scripts/dpkg-buildpackage.pl holds")
-    print("          the literal `my @debian_rules = ('debian/rules')`, there is no")
-    print("          option or environment variable that relocates it, and the error it")
-    print("          prints names debian/rules rather than the directory that is wrong.")
+    print("    * whether a .deb can be produced AT ALL. The `./debian` blocker is GONE --")
+    print("      the root symlink resolves dpkg's literal path, and that is asserted")
+    print("      above -- so what is left is the one below, and it is still #48:")
     print("        - 3.0 (quilt) wants irc-serve_0.1.0.orig.tar.gz and the project")
     print("          publishes no releases, so a full `dpkg-buildpackage -b -us -uc`")
-    print("          fails at the source stage even once the first is handled. A")
-    print("          BINARY-ONLY build from a git checkout is the command expected to")
-    print("          work -- and it has not been run either. Both are issue #48.")
+    print("          fails at the source stage. A BINARY-ONLY build from a git checkout")
+    print("          is the command expected to work -- and it has not been run. Issue")
+    print("          #48 needs a real Debian machine for that, and this change does not")
+    print("          close it.")
     print("    * whether dh_auto_configure's cmake flags are accepted, and whether")
     print("      override_dh_auto_test's ctest passes in a build environment (the suite")
     print("      binds ports and spawns nodes).")
