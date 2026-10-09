@@ -14,23 +14,48 @@
 # as LeakSanitizer and agreement is not guaranteed, but "the local gate cannot see
 # leaks" was only ever true of the gate, not of the platform.
 #
-# WHY IT IS NOT GATED, and this is a decision rather than an omission:
-#   * IT IS SLOW. One `leaks(1)` run per test binary -- a hundred of them at the time
-#     of writing, and the count only goes up -- each forking children and running real
-#     sockets, is minutes rather than seconds, and the gate is already thirteen fresh
-#     builds. Counted here rather than named, because a number in a comment about cost
-#     is a number that goes stale and keeps arguing for the same conclusion.
-#   * IT IS DARWIN-ONLY. `leaks(1)` is a macOS tool. On the Linux CI job it does not
-#     exist, so gating on it would leave the one place that CAN see leaks ungated by
-#     it -- which is backwards.
-#   * IT COULD BE WRONG AND STILL BLOCK. A checker whose false-positive rate is
-#     unknown and which cannot run where the problem is has no business failing a
-#     build. This is the same reasoning that keeps `audit-teardown.py`'s full
-#     enumeration out of the gate and its `--strict` mode in it.
+# WHY IT IS NOT GATED, AND THE MEASUREMENT THAT SETTLED IT
+# ---------------------------------------------------------
+# MEASURED on this machine, Release + WITH_TLS=ON, all 100 test binaries:
 #
-# WHAT IT IS FOR: a person, before a push, who has touched ownership. It is the local
-# half of the pair, and the honest label on the pair is that Linux CI is the oracle
-# and this is corroboration.
+#     ./scripts/leaksweep.sh build/          10m25s wall, 100 measured, 0 leaking
+#     scripts/gate-linux-cell.sh (cachyos)      ~30s wall, whole suite, 0 leaking
+#
+# The second line counts the suite plus the LeakSanitizer probe, which the Linux cell
+# builds and this one does not, so there is deliberately no test count to compare
+# against: `scripts/check-docs-truth.py` reads this file and a number here would be a
+# count of a build configuration that is not the default one.
+#
+# Ten and a half minutes against thirty seconds, and the thirty-second one is the tool
+# that SEES MORE. The three reasons this file used to give for staying out of the gate
+# are now measurements, and one of them has changed:
+#
+#   * IT IS SLOW. Above: ten minutes is not a marginal cost on a gate that is already
+#     thirteen fresh builds, and it is spent on the WEAKER of the two tools.
+#   * IT IS DARWIN-ONLY, so gating on it would leave the one place that can see leaks
+#     ungated by it -- which is backwards. That was the argument while the only other
+#     leak check was a CI job nobody ran locally.
+#   * IT COULD BE WRONG AND STILL BLOCK. Still true, and now redundant: a checker
+#     whose false-positive rate is unknown has no business failing a build, and
+#     LeakSanitizer is the checker with a known failure mode.
+#
+# WHAT CHANGED, AND IT IS THE WHOLE OF IT: `scripts/gate-linux-cell.sh` now runs the
+# suite under ASan + LeakSanitizer + UBSan in a glibc container, in about half a minute.
+# Before that cell existed this file was the only leak measurement a developer could
+# run at all; now it is the slower, shallower one, and the argument for keeping it is
+# that it works with no docker and no second machine.
+#
+# SO: NOT FOLDED INTO THE GATE, and NOT DELETED. It stays as the pre-push step it was
+# always going to be, and the gate's answer to the same question is the Linux cell. The
+# honest summary for anyone deciding whether to run either: on a Mac with no Linux host
+# and no docker, run this; anywhere else, run `scripts/gate-linux-cell.sh`, which is
+# faster and also measures the forked children this file cannot follow.
+#
+# WHAT IT IS FOR: a person, before a push, who has touched ownership AND has no Linux
+# host. It is the local half of the pair, and the honest label on the pair is that
+# LeakSanitizer is the oracle and this is corroboration -- and the oracle is now
+# `scripts/gate-linux-cell.sh`, reachable from the gate itself with `--linux`, rather
+# than a CI job that only exists on someone else's machine.
 #
 # WHAT IT DOES NOT SEE, stated rather than discovered:
 #   * CHILDREN, ON THIS PLATFORM ONLY. `nf_spawn_inline*()` forks a child, and

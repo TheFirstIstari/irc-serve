@@ -45,7 +45,7 @@ is nothing, because there has never been one.
 | Tests | **100 passing, 0 skipped**, 0 failing |
 | Warnings | **0**, on gcc-16, upstream Clang 23 and Apple clang 21 (`-Weverything`), Release **and** Debug |
 | Fortify cell | `-D_FORTIFY_SOURCE=2` (`IRC_FORTIFY=1 ./local-ci.sh`) — a **no-op on macOS**, see below |
-| Sanitizers | ASan + UBSan clean locally; **LeakSanitizer clean** on the Linux CI job |
+| Sanitizers | ASan + UBSan clean locally; **ASan + LeakSanitizer + UBSan clean on Linux**, on the CI job and in `scripts/gate-linux-cell.sh` |
 | Code scanning | **0 open alerts** (CodeQL) |
 | Language | strict C11, **no required third-party libraries**; TLS (`-DWITH_TLS=ON`) adds the optional one |
 | Size | ~45,400 lines of C (`src/` only) |
@@ -244,6 +244,7 @@ have.
 make gate                      # all 12 cells + an ASan+UBSan cell
 make gate GATE_ARGS=-j2        # serial ctest, for bisecting a failure
 make gate GATE_ARGS=--no-asan  # 12 build cells only
+make gate GATE_ARGS=--linux    # ALSO the Linux cell, via docker
 ./scripts/gate.sh --help
 ```
 
@@ -263,6 +264,31 @@ Three things about it are load-bearing:
   evidence about a file only if it compiled that file.
 - **It refuses to run on fewer than three compilers.** A gate that silently runs
   six cells and prints a pass is worse than no gate.
+
+#### The Linux cell, and why it exists
+
+`--linux` adds one more cell: the suite built and run in a **glibc container** under
+**ASan + LeakSanitizer + UBSan**, at both `WITH_TLS=OFF` and `ON`. It is opt-in
+because it is two full sanitized builds, and it is a cell rather than a source check
+because it is the same kind of evidence as the other thirteen.
+
+It exists because **six defects in this project have been invisible to every macOS cell
+and visible only on Linux**: glibc's `__wur`, a `<sys/wait.h>` one libc's headers
+include and the other's do not, `memmem()` behind a feature-test macro,
+`debian/rules` configuring nothing at all because debhelper autodetected the top-level
+`Makefile`, a `tf_free()` that left a node registered so `tf_done()` called `nf_kill()`
+on a returned stack frame, and a 64 KiB test leak. The common cause is not any one of
+them: **it is that a gate which only ever runs on Darwin reports its own blindness as
+green**, and LeakSanitizer does not exist on Darwin at all.
+
+**It degrades to a visible SKIP.** `scripts/gate-linux-cell.sh` has three exit codes —
+0 ran and passed, 1 ran and failed, 3 **did not run** — and the gate prints a different
+word for each and does **not** count a skipped cell as one that ran. "Skipped" and
+"passed" being indistinguishable is the decorative-check failure this project keeps
+paying for, and a separate exit code is the cheapest way to stop it.
+
+Run it on its own with `./scripts/gate-linux-cell.sh`, which needs Linux and docker and
+refuses on anything else rather than pretending.
 
 Compilers are discovered, not hardcoded — `/usr/bin/gcc`, `/usr/bin/clang` and
 `/usr/bin/cc` are all Apple's clang on macOS and collapse to one cell, and
