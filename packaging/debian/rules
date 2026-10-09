@@ -70,13 +70,25 @@ override_dh_auto_build:
 override_dh_auto_clean:
 	dh_auto_clean --buildsystem=cmake
 
-# dh_auto_test, NOT a hand-written `ctest --test-dir build`, and the substitution of
-# the path is the other half of the defect above. debhelper's cmake buildsystem puts
-# its build tree at `obj-$(DEB_HOST_MULTIARCH)` -- it is not `build`, which is what
-# scripts/gate.sh, the Arch PKGBUILD and the Makefile all use -- so the hand-written
-# `ctest --test-dir build` named a directory that has never existed in a Debian
-# build. dh_auto_test knows where the tree is, and it is the same answer for a
-# cross-build, which `obj-$(DEB_HOST_MULTIARCH)` interpolates and `build` cannot.
+# ctest DIRECTLY, and NOT dh_auto_test, and the reason is measured rather than
+# preferred. debhelper's cmake buildsystem puts its build tree at
+# `obj-$(DEB_HOST_MULTIARCH)` -- it is NOT `build`, which is what scripts/gate.sh, the
+# Arch PKGBUILD and the Makefile all use -- so the hand-written
+# `ctest --test-dir build` that this line replaces named a directory that has never
+# existed in a Debian build. That is the other half of the defect above.
+#
+# dh_auto_test knows where the tree is, and it was the obvious fix, and it is WRONG
+# for this package: `dh_auto_test --buildsystem=cmake -- --output-on-failure
+# --timeout 200` expands to `make test ARGS+=--output-on-failure ARGS+=--timeout
+# 200`, which passes the two flags to MAKE and prints make's option summary and
+# exits 2. Measured on debian bookworm. The arguments reach the test driver, not
+# ctest, so the two flags this line exists to pass are silently discarded -- or rather
+# not silently: make refuses them.
+#
+# $(DEB_HOST_MULTIARCH) rather than a hardcoded obj-$(dpkg-architecture) so a
+# cross-build -- `dpkg-buildpackage -a arm64` -- finds its own tree, which is the one
+# case a literal `x86_64` would break. DEB_HOST_MULTIARCH is exported by
+# dpkg-buildpackage; dpkg-buildpackage -b with no -A sets it to the build arch.
 #
 # --output-on-failure, so a red test prints its assertions into the build log instead
 # of only its name. --timeout 200, and 200 IS A MEASURED NUMBER: scripts/gate.sh runs
@@ -86,14 +98,14 @@ override_dh_auto_clean:
 # it fails as a flaky package build on a slow Debian host.
 #
 # THE COST, WHICH IS REAL AND IS NOT HIDDEN: the suite binds TCP ports on loopback.
-# In a Docker container's own network namespace that works (it is the container's
-# private loopback, and nothing else is listening), and it was measured -- all 100
-# tests ran on debian bookworm in the container. It would NOT work under
-# `docker run --network host` sharing a host where another copy of the suite is
-# already binding the same ports, which is the one configuration where this override
-# can fail for a reason that is not a defect in this package.
+# In a Docker container's own network namespace that works -- it is the container's
+# private loopback and nothing else is listening -- and it was measured: all 100 tests
+# ran to completion on debian bookworm inside a docker container, 0 failures, 0
+# skips. It would NOT work under `docker run --network host` on a host where another
+# copy of the suite is already binding the same ports, which is the one configuration
+# where this override can fail for a reason that is not a defect in this package.
 override_dh_auto_test:
-	dh_auto_test --buildsystem=cmake -- --output-on-failure --timeout 200
+	ctest --test-dir "obj-$(DEB_HOST_MULTIARCH)" --output-on-failure --timeout 200
 
 # dh_auto_install is deliberately NOT overridden. The cmake buildsystem installs
 # through CMake's own install rules, which honour DESTDIR, so the binary lands at
