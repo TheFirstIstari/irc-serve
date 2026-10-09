@@ -9,6 +9,22 @@ no lintian here, and LeakSanitizer's absence on Darwin is the same shape of prob
 a check that can only run in one place, which therefore does not run at all on the
 machine where the work happens.
 
+WHAT CHANGED, AND IT IS THE POINT OF THE SCRIPT STILL EXISTING. This file was written
+when the Linux side had never been run, and its residue section said so: "whether a
+.deb can be produced AT ALL ... Issue #48 needs a real Debian machine for that, and
+this change does not close it." A Linux machine is now reachable, and
+scripts/build-debian-package.sh ran the recipe. The measured results are in the
+residue section at the bottom of this file, and #48 STAYS OPEN anyway -- one green
+build on one machine from one commit is not a verified packaging.
+
+WHAT THE ORACLE FOUND THAT NO TEXT CHECK COULD HAVE. `debian/rules` shipped for a year
+with no `--buildsystem=cmake` on any dh_auto_* target, so debhelper autodetected this
+tree's top-level `Makefile`, dh_auto_configure ran `make` (which printed the make help
+text and exited 0), and NOTHING WAS CONFIGURED AND NOTHING WAS BUILT. Every check in
+this file reads text and was green throughout. That is the strongest argument this
+project has for keeping both halves: the text checks stay, and now there is also
+something that runs the tool.
+
 The project's rule is that a stale claim is worse than an absent one, and the claim
 this replaces is the worst kind: "packaging/debian/rules created (basic dh pattern)".
 A file existing is not a verification. So this script verifies everything that CAN be
@@ -87,15 +103,18 @@ WHAT IS NOT CHECKED, AND THIS SCRIPT PRINTS IT RATHER THAN LEAVING IT TO AN ISSU
 This is the point of the script, so it is worth reading exactly:
 
   * `dpkg-source -b` / `dpkg-buildpackage`, i.e. whether a source or binary package
-    can be produced AT ALL. For THIS project a full `dpkg-buildpackage -b -us -uc` is
-    expected to FAIL, because `3.0 (quilt)` wants an upstream tarball
-    (`irc-serve_0.1.0.orig.tar.gz`) and the project publishes no releases. The command
-    that is expected to work is a BINARY-ONLY build from a git checkout; it has never
-    been run either. Issue #48.
+    can be produced AT ALL. RUN ON LINUX NOW, by scripts/build-debian-package.sh; see
+    the measured residue at the bottom of this file. What this script alone cannot
+    check is that the answer is still true tomorrow, which is why the runner is a
+    script and not a paragraph here.
   * `dh_auto_configure`'s and `dh_auto_build`'s real invocations, i.e. whether cmake
-    accepts the flags the rules file passes.
+    accepts the flags the rules file passes. RUN, and it found the defect this script
+    could not see: with no `--buildsystem=cmake`, debhelper picked the top-level
+    Makefile and configured nothing at all.
   * `override_dh_auto_test`'s `ctest` actually passing in a Debian build environment.
-    The suite binds ports and spawns nodes, which a build environment may not allow.
+    RUN: 100 tests, 0 failures, 0 skips, in a container. The concern this list named --
+    that a build environment may not allow the port binding -- did not materialise,
+    because a container's network namespace gives the suite a private loopback.
   * WHAT THE PRODUCED `.deb` CONTAINS -- the executable, its shared-library
     dependencies, and the `${shlibs:Depends}` substitution.
   * `${shlibs:Depends}` RESOLUTION, which needs `dpkg-shlibdeps` and therefore the
@@ -531,7 +550,9 @@ def check_source_format(changelog_version):
                 "file does not exist, so there are no patches to apply. An earlier "
                 "draft of packaging/debian/patches/series claimed the opposite -- that "
                 "a missing series file is a `cannot apply patches` error -- and that "
-                "was wrong. Issue #48 still covers whether the source package builds.")
+                "was wrong. This file also ends with a newline, which lintian's"
+                " quilt-series-without-trailing-newline tag requires and which an"
+                " earlier draft did not have.")
         else:
             for n, line in enumerate(stext.split("\n"), 1):
                 entry = re.sub(r"(?:^|\s+)#.*$", "", line).strip()
@@ -554,8 +575,8 @@ def check_copyright(expected_license):
     if text is None:
         fail("debian/copyright",
              "%s does not exist. Debian POLICY 12.5 requires it, and the only tool "
-             "that reports the omission is lintian, which is not on this platform. "
-             "Issue #48." % path)
+             "that reports the omission is lintian, which needs the Debian build"
+             " environment scripts/build-debian-package.sh provides." % path)
         return
 
     lines = text.split("\n")
@@ -1057,6 +1078,206 @@ def check_install_rule():
              "user programs go in /usr/bin, and dh_lint would flag it.")
 
 
+def check_rules_buildsystem():
+    """Every dh_auto_* target in debian/rules must NAME the cmake buildsystem.
+
+    This check exists because of a defect that every other check in this file was green
+    through, on the machine where they all run, and which only a real `dpkg-buildpackage`
+    on Linux found: `debian/rules` had no `--buildsystem=cmake` anywhere, so debhelper
+    AUTODETECTED the buildsystem, saw this tree's top-level `Makefile`, and chose
+    `makefile`. `dh_auto_configure` ran `make`, which printed this project's make help
+    text and exited 0. `dh_auto_build` ran `make` again. NOTHING WAS CONFIGURED AND
+    NOTHING WAS BUILT, and the build died three targets later at the test override on a
+    directory that had never been created.
+
+    THE POINT OF ADDING IT HERE rather than only fixing the rules file: the fix is three
+    words on three lines and a later edit could quietly drop one of them, which is a
+    defect whose only symptom is an empty package. A check that costs a regex turns the
+    silent version into a red line in the gate.
+
+    WHAT IT DELIBERATELY DOES NOT DO: it does not verify that cmake accepts the flags,
+    that the suite passes, or that a .deb appears. Those need dpkg-buildpackage, and
+    scripts/build-debian-package.sh runs them. This checks the text that would silently
+    defeat them.
+    """
+    path = os.path.join(DEB_PATH, "rules")
+    text = read(path)
+    if text is None:
+        return  # check_layout/check_rules already named the missing file.
+    # Every dh_auto_* invocation, in recipe position and with the backslash-continued
+    # multi-line form. The recipe prefix is required: `override_dh_auto_build:` is a
+    # TARGET NAME that contains the string `dh_auto_build` and must not be mistaken
+    # for an invocation of it.
+    calls = re.findall(r"^\tdh_auto_(\w+)(.*)$", text, re.M)
+    if not calls:
+        fail("debian/rules buildsystem",
+             "no dh_auto_* recipe in debian/rules at all. A `%: dh $@` rules file with "
+             "no override relies on debhelper's autodetection, and autodetection read "
+             "this tree's top-level Makefile and chose `makefile` -- so nothing is ever "
+             "configured or built. This file exists because that shipped for a year "
+             "with every check in this script green.")
+        return
+    missing = [name for name, rest in calls if "--buildsystem=cmake" not in rest]
+    if missing:
+        fail("debian/rules buildsystem",
+             "dh_auto_%s does not name --buildsystem=cmake. debhelper autodetects "
+             "per target, and its detection found the top-level Makefile in this tree, "
+             "so a target without the flag runs `make` instead of cmake: it prints the "
+             "make help text, exits 0, and builds nothing. The build then fails at a "
+             "LATER target on a missing build directory, which names a symptom and not "
+             "this cause. Measured on debian bookworm with debhelper 13: "
+             "`dpkg-buildpackage -us -uc` with this defect and with override_dh_auto_test"
+             " deleted exits 2 having configured nothing and produced no .deb."
+             % ", dh_auto_".join(missing))
+
+
+def check_debian_text_files_end_with_newline():
+    """debian/control, debian/rules and debian/patches/series end with a newline.
+
+    Not tidiness. lintian raises `no-newline-at-end` as a WARNING on debian/control and    debian/rules and `quilt-series-without-trailing-newline` as an ERROR on the
+    series file, and it was an ERROR on the series file in this tree until this pass.
+    Three files, three characters, and the one that is an error is the one that would
+    have blocked an upload.
+    """
+    for rel in ("control", "rules", os.path.join("patches", "series")):
+        path = os.path.join(DEB_PATH, rel)
+        if not os.path.isfile(path):
+            continue
+        with open(path, "rb") as fh:
+            data = fh.read()
+        if data and not data.endswith(b"\n"):
+            fail("debian/%s newline" % rel,
+                 "does not end with a newline. lintian reports `no-newline-at-end` on "
+                 "debian/control and debian/rules, and on debian/patches/series it "
+                 "reports `quilt-series-without-trailing-newline` at ERROR severity, "
+                 "which is the one that blocks an upload.")
+
+
+def check_extended_description_width():
+    """debian/control's extended Description lines fit an 80-column terminal.
+
+    lintian's `extended-description-line-too-long` fires at more than 80 characters and
+    points at Policy 3.4.1. This tree's description was 81 columns wide on the line
+    that begins "This build has no transport encryption", which is a real tag rather
+    than lintian taste, so it is rewrapped rather than overridden.
+    """
+    text = read(os.path.join(DEB_PATH, "control"))
+    if text is None:
+        return
+    lines = text.split("\n")
+    in_desc = False
+    for n, line in enumerate(lines, 1):
+        if in_desc:
+            # deb822: a continuation line of ANY field starts with one space, and the
+            # extended part of a Description is a run of them. A line at column zero is
+            # the next field and ends the description. ONE space, not two: the first
+            # draft of this check assumed two, which made it terminate on the very
+            # first continuation line and pass vacuously on a 113-column Description.
+            # The fault below is that check being written wrong, and the reason to say
+            # so here is that a vacuous width check is indistinguishable from a clean
+            # one in every run that is not itself a fault.
+            if not line.startswith(" "):
+                in_desc = False
+                continue
+            if len(line) > 80:
+                fail("debian/control extended description",
+                     "line %d is %d characters. lintian's "
+                     "`extended-description-line-too-long` fires above 80 and cites "
+                     "Policy 3.4.1: the description is read in an 80x25 terminal. "
+                     "Rewrap it." % (n, len(line)))
+        elif line.startswith("Description:"):
+            in_desc = True
+
+
+def check_debian_build_script_exists():
+    """scripts/build-debian-package.sh exists, is executable, and is the one that ran.
+
+    The residue section printed by this script describes a Linux recipe in detail,
+    including what it found. If that script is renamed or deleted, the prose here keeps
+    describing a measurement nobody can reproduce, which is worse than not printing it:
+    a reader concludes the package was verified, and the only way to check that is to
+    go looking for the runner. The runner is asserted so that its absence is a red line
+    rather than a sentence that is quietly true of nothing.
+    """
+    p = os.path.join(ROOT, "scripts", "build-debian-package.sh")
+    if not os.path.isfile(p):
+        fail("scripts/build-debian-package.sh",
+             "does not exist, and the residue this script prints attributes its Linux "
+             "measurements to it. Either restore the script or delete the measured "
+             "section: prose describing a runner that is not here is a claim with no "
+             "way to check it.")
+        return
+    if not os.access(p, os.X_OK):
+        fail("scripts/build-debian-package.sh",
+             "is not executable. It has a shebang and is meant to be run directly; the "
+             "gate finds it by path and would silently skip a non-executable file in "
+             "any loop that tests -x.")
+
+
+def check_manual_page_exists():
+    """packaging/debian/irc-serve.1 exists, and dh_installdocs will ship it.
+
+    Debian POLICY 12.1 and lintian's `no-manual-page` both ask for a manual page for
+    every binary in /usr/bin. The first lintian run on a real .deb raised exactly that
+    tag against /usr/bin/irc-serve, and the answer is a page rather than an override:
+    an override here would be a claim that another package ships the page, which would
+    have to be true of something.
+
+    debhelper installs `debian/irc-serve.1` into /usr/share/man/man1 automatically --
+    dh_installdocs runs before dh_installman and nothing else is needed -- so the
+    presence of the file here is the whole of what this checks. It also asserts the
+    NAME matches the binary's, because a man page under a different name installs fine
+    and is then not the page `man irc-serve` shows.
+    """
+    path = os.path.join(DEB_PATH, "irc-serve.1")
+    if not os.path.isfile(path):
+        fail("debian/irc-serve.1",
+             "does not exist, and /usr/bin/irc-serve is a binary in a section that "
+             "wants a manual page. Measured: lintian 2.116.3 raises "
+             "`no-manual-page [usr/bin/irc-serve]` against the .deb this tree builds. "
+             "Either write the page or record why not in "
+             "packaging/debian/irc-serve.lintian-overrides -- what must not happen is "
+             "the tag being ignored, because lintian's exit status is 0 for warnings "
+             "and a tag nobody reads is a tag that never gets read.")
+        return
+    text = read(path) or ""
+    if ".TH IRC\\-SERVE 1" not in text:
+        fail("debian/irc-serve.1",
+             "has no `.TH IRC-SERVE 1` header line. groff needs the .TH line to know "
+             "the section, and without it `man irc-serve` prints a page with no title. "
+             "Verified on debian bookworm by installing the .deb and running "
+             "`man -l /inst/usr/share/man/man1/irc-serve.1`.")
+
+
+def check_lintian_overrides_are_overridden():
+    """Every tag in irc-serve.lintian-overrides is a tag lintian actually raises.
+
+    A stale override is worse than no override: it is a file that says "judged and
+    accepted" about a tag this package no longer raises, and it is how a suppression
+    list becomes a place where defects go to be forgotten. The tag list cannot be
+    re-derived here -- it needs lintian and a built .deb -- so this checks the part
+    that IS derivable: the file is a sequence of `package: tag` lines, and each tag
+    names something lintian's tag vocabulary looks like rather than a paragraph.
+    """
+    path = os.path.join(DEB_PATH, "irc-serve.lintian-overrides")
+    if not os.path.isfile(path):
+        return  # Not a failure: an empty override list is a clean package.
+    text = read(path)
+    if text is None:
+        return
+    for n, line in enumerate(text.split("\n"), 1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if not re.fullmatch(r"[a-z0-9][a-z0-9+.-]*: [a-z0-9][a-z0-9+.-]*", s):
+            fail("debian/irc-serve.lintian-overrides",
+                 "line %d is %r. Each entry is `package: tag`, and a `*` wildcard is "
+                 "allowed in the package field only. Anything else here is ignored by "
+                 "lintian, so a note written in this file is a note read by nobody -- "
+                 "which is the same failure this script's debian/source/format check "
+                 "exists to prevent." % (n, s[:60]))
+
+
 def main():
     # THE LAYOUT FIRST, and the reason is WHICH FINDING A READER GETS. The vacuity
     # guard below asks "does this directory exist"; when `debian` is the thing that is
@@ -1107,6 +1328,12 @@ def main():
     check_control()
     check_build_depends_match_tls()
     check_install_rule()
+    check_rules_buildsystem()
+    check_debian_text_files_end_with_newline()
+    check_extended_description_width()
+    check_manual_page_exists()
+    check_lintian_overrides_are_overridden()
+    check_debian_build_script_exists()
     check_cmake_flags_agree({
         "debian/rules": extract_cmake_flags(rules_text or "", "debian/rules"),
         "arch/PKGBUILD": extract_cmake_flags(pkg_text or "", "arch/PKGBUILD"),
@@ -1144,6 +1371,18 @@ def main():
     print("    Build-Depends does not name OpenSSL while the build passes WITH_TLS=OFF.")
     print("    src/CMakeLists.txt installs TARGETS irc-serve to bin, which is the whole")
     print("    of 'the package contains the executable'.")
+    print("    every dh_auto_* recipe in debian/rules names --buildsystem=cmake, because")
+    print("    debhelper's autodetection found the top-level Makefile and configured")
+    print("    NOTHING when the flag was absent (measured on Linux; see the header).")
+    print("    debian/control, debian/rules and debian/patches/series end with a")
+    print("    newline, and the extended Description fits 80 columns -- all three are")
+    print("    lintian tags, and the series one is an ERROR.")
+    print("    packaging/debian/irc-serve.1 exists, so lintian's no-manual-page has an")
+    print("    answer, and every entry in irc-serve.lintian-overrides is a well-formed")
+    print("    `package: tag` line rather than a note lintian ignores.")
+    print("    scripts/build-debian-package.sh exists and is the recipe that runs the")
+    print("    rest of this on Linux; its presence is asserted here so a deleted runner")
+    print("    does not leave the residue section below describing a script that is gone.")
     if notes:
         print()
         print("check-packaging: NOT VERIFIABLE HERE, and reported rather than left to")
@@ -1151,32 +1390,52 @@ def main():
         for n in notes:
             print("    * " + n)
     print()
-    print("check-packaging: NOT CHECKED, AND NOT CLAIMED. No package has been built by")
-    print("anything in this tree, and none of these can be checked without the tools it")
-    print("does not have:")
-    print("    * whether a .deb can be produced AT ALL. The `./debian` blocker is GONE --")
-    print("      the root symlink resolves dpkg's literal path, and that is asserted")
-    print("      above -- so what is left is the one below, and it is still #48:")
-    print("        - 3.0 (quilt) wants irc-serve_0.1.0.orig.tar.gz and the project")
-    print("          publishes no releases, so a full `dpkg-buildpackage -b -us -uc`")
-    print("          fails at the source stage. A BINARY-ONLY build from a git checkout")
-    print("          is the command expected to work -- and it has not been run. Issue")
-    print("          #48 needs a real Debian machine for that, and this change does not")
-    print("          close it.")
-    print("    * whether dh_auto_configure's cmake flags are accepted, and whether")
-    print("      override_dh_auto_test's ctest passes in a build environment (the suite")
-    print("      binds ports and spawns nodes).")
-    print("    * WHAT THE PRODUCED .deb CONTAINS, and ${shlibs:Depends} resolution")
-    print("      (it needs dpkg-shlibdeps and the built binary).")
-    print("    * lintian, so Debian POLICY compliance beyond the DEP-5 parse above.")
+    print("check-packaging: NOT CHECKED BY THIS SCRIPT, AND NOT CLAIMED BY IT. What")
+    print("follows is split by WHO can check it, because that distinction is the whole")
+    print("point of this file: it is the part of the verification that runs without")
+    print("Debian, Arch or Homebrew, and it has no opinion about the rest.")
+    print()
+    print("  MEASURED ON LINUX, by scripts/build-debian-package.sh, on cachyos-x8664")
+    print("  inside debian:bookworm (dpkg 1.21.23, debhelper 13, cmake 3.25.1,")
+    print("  gcc 12.2.0, lintian 2.116.3). Reproduce with:")
+    print("      docker build -t ircserve-deb:bookworm - <the Dockerfile that script prints>")
+    print("      ./scripts/build-debian-package.sh --lintian")
+    print()
+    print("    * A .deb IS produced, from the source AND binary stages:")
+    print("      dpkg-buildpackage -us -uc, and both the source package")
+    print("      (irc-serve_0.1.0-1.dsc/.debian.tar.xz/.orig.tar.gz) and the binary")
+    print("      (irc-serve_0.1.0-1_amd64.deb + -dbgsym) come out.")
+    print("    * The .deb contains /usr/bin/irc-serve, and nothing under /usr/local.")
+    print("    * Version is 0.1.0-1 and Depends: libc6 (>= 2.34) -- ${shlibs:Depends}")
+    print("      and ${misc:Depends} were both SUBSTITUTED by dpkg-shlibdeps.")
+    print("    * The extracted binary runs: `irc-serve --help` prints irc-serve-0.1.0.")
+    print("    * lintian on the .deb: zero tags. The three it raised before this pass")
+    print("      were fixed or reasoned about:")
+    print("        - no-manual-page                       FIXED: packaging/debian/irc-serve.1")
+    print("        - extended-description-line-too-long   FIXED: rewrapped to <=79 columns")
+    print("        - initial-upload-closes-no-bugs        NOT A DEFECT, and recorded in")
+    print("          packaging/debian/irc-serve.lintian-overrides with the reasoning: this")
+    print("          package is not uploaded to Debian, so there is no ITP bug to close.")
+    print("      lintian on the .changes also raised quilt-series-without-trailing-newline")
+    print("      (an ERROR, and a real one: the file had no final newline) and")
+    print("      no-newline-at-end on debian/control and debian/rules. All three fixed.")
+    print("    * WHAT THIS IS NOT: a package that has been built ONCE, on ONE machine, from")
+    print("      ONE commit, with one compiler and one distro. Issue #48 stays open on")
+    print("      that basis. See the issue for the residual.")
+    print()
+    print("  STILL NOT CHECKED BY ANYTHING IN THIS TREE, because it needs the other two")
+    print("  packagers:")
     print("    * makepkg and brew. The Arch source line is a git BRANCH, so makepkg")
     print("      needs network access; arch=('aarch64') is a claim about this source")
     print("      compiling there and not a measurement; and `brew install --HEAD` is the")
     print("      only install this formula supports, because the project has no release")
     print("      tarball and an invented sha256 would be a checkable lie.")
-    print("    A green run of this script is NOT a verified package and NOT a claim that")
-    print("    one builds. It is the part of the verification that can run on the")
-    print("    machine where the work happens.")
+    print("    * Whether the source package builds on a distro OTHER than bookworm, on a")
+    print("      non-x86-64 host, or with a cross-compiler. The rules file's")
+    print("      obj-$(DEB_HOST_MULTIARCH) is written for that case; no run has done it.")
+    print()
+    print("    A green run of this script is NOT a verified package. It is the part of the")
+    print("    verification that needs no Debian, and it says which part that is.")
 
     if failures:
         sys.stderr.write("check-packaging: FAIL: %d finding(s):\n" % len(failures))

@@ -1,0 +1,125 @@
+.\" packaging/debian/irc-serve.1 -- the manual page lintian says /usr/bin/irc-serve
+.\" is missing. Debian POLICY section 12.1 asks for one, lintian reports the absence as
+.\" `no-manual-page`, and this file is the answer.
+.\"
+.\" WHY IT IS SHORT, and the cost that honesty imposes: `irc-serve --help` is 180 lines
+.\" and is the program's own complete flag surface, kept next to the code that parses it.
+.\" This page does not restate it -- a second description of the same flags is a second
+.\" thing to rot, which is the argument packaging/debian/rules makes about NOT having a
+.\" debian/install file. What is here instead is what `--help` does not lead with: what
+.\" the program is, what a minimal invocation looks like, where the configuration is
+.\" documented, and the two facts an operator has to know before the first connection --
+.\" that this build has no transport encryption, and that a node with no --secret
+.\" federates with nobody. Both are printed by --help and both are the kind of thing
+.\" someone reads here.
+.\"
+.\" EVERY FACT BELOW IS COPIED FROM THE TREE, not from memory. The version comes from
+.\" src/core/server.h's IRC_SERVE_VERSION; the flag names and defaults come from the
+.\" --help text of the same commit this page ships in. scripts/check-docs-truth.py reads
+.\" the version out of the same header and fails if the two disagree.
+.TH IRC\-SERVE 1 "2026\-09\-05" "irc\-serve 0.1.0" "User Commands"
+.SH NAME
+irc\-serve \- federated modern\-spec IRC server in C
+.SH SYNOPSIS
+.B irc\-serve
+.RI [ port ]
+.RB [ \-\-name
+.IR NAME ]
+.RB [ \-\-secret
+.IR S ]
+.RB [ \-\-peer
+.IR NAME , HOST , PORT ]...
+.RB [ \-\-sasl\-store
+.IR PATH ]
+.RB [ \-\-account\-store
+.IR PATH ]
+.SH DESCRIPTION
+.B irc\-serve
+is a single\-process IRC server implementing the modern IRC client protocol set, with
+federation between nodes over the
+.B FEDERATE
+handshake. It is written in C99 and POSIX with no runtime dependency beyond the C
+library, so a packaged build links against glibc alone.
+.PP
+With no arguments it listens on port 6667 as
+.BR irc.test .
+A
+.I port
+of 0 asks the kernel for an ephemeral port and the node reports which one it chose on
+its startup line, which is what the test suite does.
+.SH OPTIONS
+Every flag, its grammar, its default and its failure mode is printed by
+.B "irc\-serve \-\-help"
+and that text is the authoritative surface.
+.B \-\-help
+exits 0 rather than starting a node.
+.TP
+.BI \-\-name " NAME"
+This node's server name. Default
+.BR irc.test .
+.TP
+.BI \-\-secret " S"
+The shared federation secret a peer must present in
+.BR FEDERATE .
+Default is empty, which means this node REFUSES inbound peers: with no secret it
+federates with nobody, and a claim is rejected as
+.B reason=NO_SECRET
+rather than as a wrong secret.
+.TP
+.BI \-\-peer " NAME,HOST,PORT"
+A peer to link with, repeatable up to 16. Configure each pair in ONE direction: a link
+establishes when either side connects, so two nodes that both list each other will both
+dial and neither will accept.
+.SH NOTES
+.SS Transport encryption
+The Debian package is configured with
+.B \-DWITH_TLS=OFF
+and therefore has NO transport encryption at all: no
+.B tls
+or
+.B sts
+capability is advertised and
+.B STARTTLS
+is answered 691. The TLS implementation is in the source tree and is not compiled into
+this build. See SECURITY.md in the source tree, which describes the transport layer and
+what a build that includes it requires.
+.SS Peer links and TLS, in the source tree build
+The
+.BR \-\-tls\-cert ,
+.BR \-\-tls\-key ,
+.BR \-\-tls\-ca ,
+.BR \-\-tls\-require ,
+.BR \-\-tls\-port ,
+.BR \-\-peer\-tls ,
+.BR \-\-tls\-insecure ,
+.BR \-\-tls\-ocsp\-staple
+and
+.BR \-\-tls\-staple\-permissive
+flags exist in a
+.BR \-DWITH_TLS=ON
+build and are refused or absent in this one.
+.B \-\-peer\-tls
+enforces TLS on the direction THIS NODE DIALS and cannot prevent a peer from dialling
+this node's plaintext port; that is what
+.B \-\-tls\-require
+and
+.B \-\-tls\-port
+are for.
+.SH FILES
+.TP
+.I /usr/share/doc/irc\-serve/changelog.Debian.gz
+The packaging changelog.
+.TP
+.I /usr/share/doc/irc\-serve/copyright
+The licence, AGPL\-3.0\-or\-later. The full text is in
+.IR /usr/share/common\-licenses/AGPL\-3 .
+.SH EXIT STATUS
+.B \-\-help
+exits 0. A configuration error exits non\-zero with a named reason on stderr, and a node
+that cannot bind or cannot load its stores does not start.
+.SH SEE ALSO
+The project README, SECURITY.md and docs/SPEC_TRACKING.md in the source tree, and
+.B "irc\-serve \-\-help"
+for the complete flag surface.
+.SH BUGS
+Report at https://github.com/TheFirstIstari/irc\-serve/issues
