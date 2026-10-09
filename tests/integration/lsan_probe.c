@@ -157,7 +157,7 @@ static int run_as_child(void)
      * It is a local rather than a global precisely so that dropping the reference is a
      * fact about the stack frame that has returned, rather than a store somebody could
      * later undo. */
-    g_probe_block = NULL;
+    g_probe_block = NULL;  /* audit-teardown: DELIBERATE LEAK block -- this file exists to leak */
     fprintf(stderr, "lsan_probe: child leaked %d bytes on purpose\n",
             PROBE_LEAK_BYTES);
     /* Return from main() normally, so LSan's atexit handler runs. This is the whole

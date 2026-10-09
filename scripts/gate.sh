@@ -4,6 +4,10 @@
 #   ./scripts/gate.sh                 all 12 cells, default job counts
 #   ./scripts/gate.sh -j 2            serial-ish ctest, for bisecting
 #   ./scripts/gate.sh --no-asan       skip the ASan+UBSan cell
+#   ./scripts/gate.sh --linux         ALSO run the Linux cell: glibc + ASan + LSan +
+#                                     UBSan in a docker container. Opt-in because it is
+#                                     two full sanitized builds, and it degrades to a
+#                                     visible SKIP when docker is unavailable.
 #   GATE_BUILD_ROOT=/tmp/g ./scripts/gate.sh
 #
 # WHY THIS IS COMMITTED RATHER THAN LIVING IN /tmp. It used to, and /tmp did not
@@ -47,6 +51,12 @@ set -euo pipefail
 CTEST_JOBS_BUILD=8      # cmake --build --parallel; the machine's cores, capped
 CTEST_JOBS_TEST=""      # ctest -j; defaults to the build job count when empty
 RUN_ASAN=1
+# RUN_LINUX is INITIALISED HERE and again to 0 further down, where the cell itself is.
+# The second assignment is the load-bearing one and the first exists so that the
+# argument parser above has a variable to set: a parser that assigns to a variable first
+# declared three hundred lines later is a script that reads as if the flag does nothing.
+RUN_LINUX=0
+LINUX_SKIPPED=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -j)   shift
@@ -54,6 +64,14 @@ while [ $# -gt 0 ]; do
               [ -n "$CTEST_JOBS_TEST" ] || { echo "gate.sh: -j needs a number" >&2; exit 2; } ;;
         -j*)  CTEST_JOBS_TEST="${1#-j}" ;;
         --no-asan) RUN_ASAN=0 ;;
+        --linux)   RUN_LINUX=1 ;;
+        # Extra arguments for the Linux cell, passed through verbatim. This exists so a
+        # developer bisecting a Linux-only failure can say `--linux --linux-args=--no-probe`
+        # without this file growing a second Linux-related flag; and it is a single
+        # `GATE_LINUX_ARGS` word rather than a set of flags precisely because the cell
+        # has exactly two options and a passthrough is harder to get wrong than two
+        # flags that drift out of step with it.
+        --linux-args=*) GATE_LINUX_ARGS="${1#--linux-args=}" ;;
         -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
         *) echo "gate.sh: unknown argument '$1' (try --help)" >&2; exit 2 ;;
     esac
@@ -553,6 +571,75 @@ if [ "$RUN_ASAN" = "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# The Linux cell: glibc, ASan + LSan + UBSan, in a container.
+# ---------------------------------------------------------------------------
+# OPT-IN with --linux, and it is a CELL and not a FAILED CHECK, on purpose. It is a
+# build of the source and a run of the suite, so it is the same kind of evidence the
+# other thirteen cells produce, and counting it as a source check would inflate the
+# check list with a thing that is not a source check. It is also the most expensive
+# cell by a wide margin -- two full sanitized builds of 101 tests in a container -- so
+# it is asked for rather than paid for by default.
+#
+# WHY IT IS HERE AT ALL: six defects in this project have been invisible to every
+# macOS cell and visible only on Linux. glibc's __wur, a <sys/wait.h> included by one
+# libc's headers and not the other's, memmem(), a tf_done() leak, a 64 KiB test leak,
+# and a debian/rules that configured nothing at all. The common cause is not any one of
+# them: it is that this gate is not an oracle for the platform the software ships on,
+# and a gate that cannot see a class of defect reports its own blindness as green.
+# LeakSanitizer does not exist on Darwin at all, so no local configuration of this
+# script can close that gap -- only a Linux userspace can, which is what this cell is.
+#
+# DEGRADATION, WHICH IS THE PART THAT MATTERS. scripts/gate-linux-cell.sh has THREE
+# exit codes -- 0 ran and passed, 1 ran and failed, 3 did not run -- and this block
+# prints a DIFFERENT WORD for each. A cell that skips and prints OK is the decorative
+# check this project keeps finding; a cell that prints "SKIPPED, the Linux cell did not
+# run" while the gate still passes is the honest version of the same thing, and the
+# reason the exit code is separate is that the summary line and the matrix total can
+# then both be honest about it.
+#
+# The matrix total below counts what RAN and says so, and prints the skipped cells
+# separately rather than folding them into either number.
+if [ "$RUN_LINUX" = "1" ]; then
+    echo
+    echo "--- Linux cell: glibc, ASan + LeakSanitizer + UBSan (docker) ---"
+    if "$root/scripts/gate-linux-cell.sh" ${GATE_LINUX_ARGS:-} \
+            > "$GATE_BUILD_ROOT/linux-cell.log" 2>&1; then
+        LINUX_VERDICT="PASS"
+        LINUX_SKIPPED=0
+        # Every line, indented, because the counts in it are the measurement and a
+        # summary that says "PASS" without the numbers is the same claim this cell
+        # exists to stop being asked to take on trust.
+        sed -n '/^--- WITH_TLS=OFF: ctest/,$p' "$GATE_BUILD_ROOT/linux-cell.log" \
+            | sed 's/^/  /'
+        TOTAL_CELLS=$((TOTAL_CELLS + 1))
+        SUMMARY="${SUMMARY}linux-cell (glibc+ASan+LSan+UBSan, tls=OFF+ON) OK\n"
+    else
+        rc=$?
+        if [ "$rc" = "3" ]; then
+            # THE THIRD OUTCOME, and the one this whole branch exists for.
+            LINUX_VERDICT="SKIPPED"
+            LINUX_SKIPPED=1
+            printf '  %-26s %s\n' "linux-cell" "DID NOT RUN (see below)"
+            sed -n '1,40p' "$GATE_BUILD_ROOT/linux-cell.log" | sed 's/^/      /'
+            # NOT a failure. A machine without docker has not found a defect, and
+            # failing the gate for it would train people to disable the gate. But it
+            # is also not a pass, and it is not counted as a cell that ran -- so the
+            # total below says "12 of 13 ran" rather than claiming thirteen.
+            LINUX_REASON=$(sed -n '2p' "$GATE_BUILD_ROOT/linux-cell.log" 2>/dev/null || true)
+            SUMMARY="${SUMMARY}linux-cell SKIPPED (did not run; not counted as a cell)\n"
+        else
+            LINUX_VERDICT="FAIL"
+            LINUX_SKIPPED=0
+            printf '  %-26s %s\n' "linux-cell" "FAILED"
+            sed -n '1,60p' "$GATE_BUILD_ROOT/linux-cell.log" | sed 's/^/      /'
+            TOTAL_CELLS=$((TOTAL_CELLS + 1))
+            FAILED_CELLS=$((FAILED_CELLS + 1))
+            SUMMARY="${SUMMARY}linux-cell FAILED\n"
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # The docs-truth check, AFTER the cells and not before them.
 # ---------------------------------------------------------------------------
 # IT NEEDS A BUILD TREE and it reads the tree with `ctest -N`, so WHERE IN THIS SCRIPT
@@ -599,14 +686,45 @@ fi
 printf '%b' "$SUMMARY" | sed 's/^/  /'
 
 echo
+# Linux verdict in the summary block, so the SKIPPED word appears in the same place a
+# reader looks for the result rather than only in the prose above.
+if [ "$RUN_LINUX" = "1" ]; then
+    printf '  %-26s %s\n' "linux-cell" "$LINUX_VERDICT"
+fi
+
 # The count is REPORTED, not asserted, and it says what actually ran. An earlier
 # version hardcoded "+ 1 sanitizer cell", which was wrong under --no-asan: the
 # total said 13 while 12 ran. A summary that describes a cell the run skipped is
 # the small version of the lie this gate exists to prevent.
+# THE COUNT IS WHAT RAN, AND THE ARITHMETIC IS SPELLED OUT rather than computed into a
+# string, because a total that is assembled from a template is a total that can claim a
+# cell ran when it did not. That failure has already happened once in this file -- an
+# earlier version hardcoded "+ 1 sanitizer cell" and said 13 under --no-asan while 12
+# ran -- so the parts are named here instead.
+_cells_desc="12 build cells"
 if [ "$RUN_ASAN" = "1" ]; then
-    echo "cells run: $TOTAL_CELLS (12 build cells + 1 ASan+UBSan cell)"
+    _cells_desc="$_cells_desc + 1 ASan+UBSan cell"
 else
-    echo "cells run: $TOTAL_CELLS (12 build cells; --no-asan, so no sanitizer cell)"
+    _cells_desc="$_cells_desc (--no-asan, so no sanitizer cell)"
+fi
+if [ "$RUN_LINUX" = "1" ]; then
+    if [ "$LINUX_VERDICT" = "PASS" ]; then
+        _cells_desc="$_cells_desc + 1 Linux cell (glibc, ASan+LSan+UBSan)"
+    elif [ "$LINUX_VERDICT" = "FAIL" ]; then
+        _cells_desc="$_cells_desc + 1 Linux cell (FAILED)"
+    else
+        # SKIPPED IS NOT COUNTED. A total that said "13 cells" when twelve ran and one
+        # did not is a total that lies by addition, and the number is the one thing
+        # about a gate matrix that people read without the log.
+        _cells_desc="$_cells_desc (--linux requested; the Linux cell DID NOT RUN and is not counted)"
+    fi
+fi
+echo "cells run: $TOTAL_CELLS ($_cells_desc)"
+if [ "$RUN_LINUX" = "1" ] && [ "$LINUX_VERDICT" = "SKIPPED" ]; then
+    echo "LINUX CELL: NOT RUN -- not a pass, not a failure, and not counted above."
+    echo "  LeakSanitizer does not exist on this platform, so no leak in this tree is"
+    echo "  excluded by anything this run did. Run it on a Linux host with docker:"
+    echo "    ./scripts/gate-linux-cell.sh"
 fi
 if [ "$FAILED_CELLS" = "0" ] && [ "$FAILED_CHECKS" = "0" ]; then
     echo "GATE RESULT: PASS  (failures: 0)"
