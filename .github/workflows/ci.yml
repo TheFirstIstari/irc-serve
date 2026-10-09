@@ -532,9 +532,25 @@ jobs:
             -DWITH_TLS=${{ matrix.with_tls }} \
             -DBUILD_BENCHMARK=ON \
             -DIRC_SANITIZE=ON \
+            -DIRC_LSAN_PROBE=ON \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
       - name: Build
         run: cmake --build build --parallel $(nproc)
+      # -DIRC_LSAN_PROBE=ON ADDS ONE TEST, and what it is for is the claim this whole
+      # job makes. Everything else here reports "0 leaks", and a suppressed check cannot
+      # report a leak that is not there -- so "0 leaks" is ALSO what a build with leak
+      # detection switched off, or wired to nothing, reports. The probe is
+      # tests/integration/lsan_probe.c: it makes a child leak 64 KiB ON PURPOSE and
+      # FAILS unless LeakSanitizer reports the leak, names the byte count, and exits
+      # non-zero. So this job now proves the leak oracle is live before it reports what
+      # the leak oracle found, which is the one thing a count of zero cannot do for
+      # itself.
+      #
+      # It is opt-in in CMake (`option(IRC_LSAN_PROBE ... OFF)`) and so the default
+      # build and the default test count are unchanged; it is ON HERE because this is
+      # the job whose entire claim is about leaks. Note that it raises this job's test
+      # count from 100 to 101, which is why nothing in this repository pins the count.
+      #
       # The option is opt-in, so a misspelled -D would produce a completely
       # uninstrumented build that passes every test and reports a green gate for
       # a sanitizer that is not running. Three things have to be true and are
