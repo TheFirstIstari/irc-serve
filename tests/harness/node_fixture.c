@@ -1128,6 +1128,40 @@ void nf_free(nf_node_t *n)
     if (n == NULL) {
         return;
     }
+    /* OUT OF tf_register's REGISTRY, AND THIS LINE IS A FIX, NOT A COMMENT.
+     *
+     * WHAT WAS WRONG, MEASURED on cachyos-x8664 (Linux, gcc 16.2, ASan) as
+     *   ERROR: AddressSanitizer: stack-use-after-return
+     *     #0 nf_kill   tests/harness/node_fixture.c:1108
+     *     #1 tf_done   tests/harness/test_util.c:167
+     *     #2 main      tests/integration/test_cap_negotiation.c:1303
+     *   ... is located in stack of thread T0 ... frame test_sasl_plain
+     *
+     * The shape: a test's helper function declares `nf_node_t node;` ON ITS OWN
+     * STACK, spawns into it (which calls tf_register(&node), storing the ADDRESS of
+     * that stack slot in the registry), then calls nf_kill(&node); nf_free(&node);
+     * and RETURNS. tf_free() released the buffers but left the ADDRESS in the
+     * registry, because before this line only nf_stop() called tf_unregister() and
+     * nf_stop() is the polite exit a test takes instead of nf_kill(). So the
+     * registry outlived the frame: tf_done() at the end of main walked it and called
+     * nf_kill() on a pointer into a returned stack frame.
+     *
+     * WHY NOBODY SAW IT, and this is the sixth time this project has learned this
+     * lesson in a different costume: tf_done()'s own comment says it iterates "by
+     * index and unregister[s] AS WE GO", and it did not, because neither function it
+     * called unregistered. A comment describing the fix that was never applied is
+     * worse than no comment. What the thirteen macOS gate cells could not see is the
+     * more interesting half: ASan's stack-use-after-return detection is a RUNTIME
+     * option that Apple clang leaves OFF and gcc on Linux leaves ON, so the same
+     * binary shape reads as a harmless stale pointer on one and as a fatal error on
+     * the other. Nothing about the code differs.
+     *
+     * THE COST, WHICH IS REAL AND IS ONE LINE: a node freed without being stopped is
+     * no longer killed by tf_report() when a later check in the same test fails --
+     * which is correct, because the test asked for it to be released, and a released
+     * node's pid is not meaningful to signal. A test that wants a node to survive a
+     * failing check does not call nf_free(). */
+    tf_unregister(n);
     /* Out of the registry before the descriptor below is closed, so that no LATER
      * pump can be selecting on a descriptor this call is about to close. The wait
      * loops are single-threaded, so no pump is in flight here; what this prevents

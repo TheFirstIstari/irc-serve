@@ -155,14 +155,26 @@ void tf_done(const char *name)
 {
     int i;
 
-    /* Iterate by index and unregister AS WE GO, because tf_unregister() does
-     * `g_nodes[i] = g_nodes[--g_nnodes]` -- it compacts the array by moving the LAST
-     * element into the hole. The previous version walked forward calling
-     * tf_unregister() on every slot, which SKIPS an element every time: with three
-     * nodes [A,B,C], unregistering index 0 moves C into it, and the loop then reads
-     * index 1 (now C) and index 2 (past the end), leaving B never released. It
-     * "worked" because the registry was not what the caller cared about; now it is,
-     * so the walk is from the end and the array is only reset once at the end. */
+    /* Iterate by index FROM THE END, because the loop's own body now unregisters:
+     * nf_free() calls tf_unregister(), which does `g_nodes[i] = g_nodes[--g_nnodes]`
+     * -- it compacts the array by moving the LAST element into the hole. Walking
+     * forward would SKIP an element every time: with three nodes [A,B,C],
+     * unregistering index 0 moves C into it, and the loop then reads index 1 (now C)
+     * and index 2 (past the end), leaving B never released.
+     *
+     * THIS COMMENT USED TO DESCRIBE THAT WALK WITHOUT BEING TRUE OF THE CODE, which
+     * is worth saying rather than quietly fixing. It claimed the loop unregistered
+     * as it went when neither nf_kill() nor nf_free() unregistered at all -- which is
+     * how a node freed inside a helper function stayed in this registry as a pointer
+     * into a RETURNED stack frame, and how tf_done()'s own nf_kill() call became an
+     * ASan stack-use-after-return on Linux. A comment describing a fix that was never
+     * applied is worse than no comment: it reads as the reason the code is correct.
+     * The walk direction was right for a reason that did not hold; it is right now,
+     * and the reason it is right is in this paragraph.
+     *
+     * `g_nnodes = 0` after the loop is belt and braces: the loop empties the registry
+     * by construction now, and this makes that a property of the exit rather than an
+     * inference about the loop. */
     for (i = g_nnodes - 1; i >= 0; i--) {
         nf_kill(g_nodes[i]);
         nf_free(g_nodes[i]);

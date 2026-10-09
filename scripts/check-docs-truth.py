@@ -47,6 +47,13 @@ WHAT IS CHECKED
 
 WHAT IS NOT CHECKED, AND IT IS WORTH BEING SPECIFIC
 ---------------------------------------------------
+  * PROSE IN A SHIPPED SCRIPT, other than a test count. `scripts/` IS read now, and the
+    extension is deliberately narrow: only the test count, which is the one number this
+    script can compute. A general "N cells / N sites / N binaries" pattern was written
+    and measured, and it matched 34 lines of which most were correct by definition --
+    `gate.sh`'s matrix IS twelve cells, and the checkers' own docstrings quote stale
+    numbers on purpose in order to say "this was wrong". A check red on correct lines
+    gets deleted, and a deleted check catches nothing.
   * PROSE. "There is no v0.8.0 because nothing after Phase 5 was tagged" is a claim
     about what the table MEANS; a script that verified it would have to have an
     opinion about what a reader would conclude, and a check that encodes an opinion is
@@ -165,6 +172,104 @@ RE_NEWEST = re.compile(r"newest tag is `([^`]+)`")
 
 DOCS = ("README.md", "docs/SPEC_TRACKING.md", "docs/DEVELOPMENT.md")
 
+# ---------------------------------------------------------------------------
+# SHIPPED SCRIPTS ARE DOCS, AND THE ARGUMENT FOR ADDING THEM
+# ---------------------------------------------------------------------------
+# The third item this pass was asked to settle was whether to extend this check to
+# `scripts/`, and the argument for it is not "a numeric claim in a shell script is
+# prose too" -- it is that these scripts are SHIPPED. `scripts/gate.sh`,
+# `scripts/build-debian-package.sh` and `scripts/gate-linux-cell.sh` are how the next
+# person reproduces this project's green, and a comment in them is the only
+# documentation that travels with the command. A stale count in one is not a typo in a
+# private scratch file; it is the project's own definition of its gate, written down
+# somewhere nobody diffs.
+#
+# WHAT IT COST TO FIND OUT, which is the evidence rather than the argument: this pass
+# added `scripts/gate-linux-cell.sh`, and while reading the existing scripts for style
+# it found `scripts/audit-teardown.py` asserting "macOS `leaks(1)` over all 98 binaries
+# confirms it" -- TWICE, once in a comment and once in the printed output, with 100
+# tests registered and 100 test binaries built. The number had been wrong since tests
+# were added, in the one file whose entire job is to report what it did. Nothing checked
+# it, because nothing read `scripts/`.
+#
+# The fix in that file was to delete the number rather than update it, and that is the
+# right shape for the ones this check cannot compute: a count of "the test binaries" is
+# true at every test count, and a check that demands it equal a number has to be
+# re-derived every time a test is added. So the checks below are of two kinds:
+#   * COMPUTABLE claims, which are compared against the tree, and
+#   * FORBIDDEN hardcoded counts in shipped scripts, which are a FAILURE because the
+#     only correct value of "N test binaries" is the one nobody has to write down.
+#
+# THE LIMIT, and it is a real one: this reads COMMENTS AND STRING LITERALS in shell and
+# Python. It cannot tell a number in a comment from a number in a command, and it does
+# not try -- the patterns below are anchored on prose ("all N binaries", "N cells",
+# "N sites") rather than on any digit, so a `--timeout 300` is not a claim and is not
+# flagged. A prose pattern that misses a phrasing nobody has hit is a check with a hole,
+# and saying so is better than implying coverage.
+SHIPPED_SCRIPTS = sorted(
+    glob.glob(os.path.join(ROOT, "scripts", "*.sh"))
+    + glob.glob(os.path.join(ROOT, "scripts", "*.py")))
+
+# Prose claims about the TEST COUNT in a shipped script, and ONLY that count. This is
+# the one number this script can compute (registered_tests() above), which is the whole
+# reason it is the one being checked.
+#
+# A GENERAL "N builds / N cells / N sites" pattern was written and MEASURED, and it is
+# not here: it matched 34 sites across scripts/, of which the overwhelming majority are
+# legitimately-fixed numbers or a checker's own history. `gate.sh` says "12 cells"
+# because the matrix IS twelve cells by definition; it says "16 cells" while explaining
+# that discovery would give sixteen and that this is why the count is fixed; it says
+# "13 cells" inside a comment about a hypothetical bad summary; `audit-teardown.py`'s
+# docstring quotes "39 tests" and "95 tests" as the STALE CLAIMS it exists to catch. A
+# check that is red on 30 correct lines is deleted inside one pass, and a deleted check
+# catches nothing -- which is the same argument this file's own header makes about
+# prose and about over-pinning. So the extension is the computable claim and nothing
+# else.
+#
+# `\d+` in a comment is not matched here either: the CHECKERS' OWN files are excluded,
+# because a checker quoting the wrong number in order to say "this was wrong" is doing
+# its job, and a rule that flagged it would flag the very sentences that document it.
+RE_SCRIPT_TESTCOUNT = re.compile(
+    r"\b(\d+)\s+(?:tests?|test binaries)\b")
+
+# A QUOTED MEASUREMENT IS NOT A CLAIM ABOUT NOW. `scripts/leaksweep.sh` records what a
+# named CI run on a named date reported -- `100% tests passed, 0 tests failed out of
+# 100` -- inside backticks. That is a quotation of a tool's output on a day, and it is
+# exactly what should be in a comment: it is falsifiable against that run and it stops
+# being a claim the moment the tree's test count moves. Matching it would mean the only
+# way to keep this check green is to delete the project's record of what the oracle said,
+# which is the opposite of what a documentation check is for.
+#
+# So a match inside a backtick span is skipped, and a match outside one is a CLAIM and is
+# compared against the tree. The two are different kinds of sentence and a reader can
+# tell them apart at a glance; a checker that could not would be a checker that had to
+# guess, and this one does not.
+# ACROSS LINES, which the first version of this did not do and the effect of which was
+# that a quotation wrapped over two lines stopped being a quotation: the span is blanked
+# over the whole text rather than per line, because a backtick pair in a wrapped
+# comment is on two different lines.
+#
+# DOTALL, so a backtick span may contain newlines. Paired backticks, so an ODD number of
+# them -- an unpaired backtick in prose -- leaves the rest of the file unquoted rather
+# than blanking it to the end.
+RE_BACKTICK_SPAN = re.compile(r"`[^`]*`", re.S)
+
+
+def script_count_claims(text):
+    """[(count, line_number, line)] for each test-count claim NOT inside backticks.
+
+    Line numbers are recovered from the blanked text rather than from the original, which
+    is why the blanking preserves every byte INCLUDING newlines: `re.sub` with a function
+    returning spaces of the same length leaves the line structure byte-identical, so a
+    match found in the blanked text sits at the same line in the original.
+    """
+    blanked = RE_BACKTICK_SPAN.sub(lambda mm: re.sub(r"[^\n]", " ", mm.group(0)), text)
+    out = []
+    for n, line in enumerate(blanked.split("\n"), 1):
+        for m in RE_SCRIPT_TESTCOUNT.finditer(line):
+            out.append((int(m.group(1)), n, text.split("\n")[n - 1].strip()))
+    return out
+
 
 def check_docs(build, log):
     ntests = registered_tests(build)
@@ -259,6 +364,66 @@ def check_docs(build, log):
 
 BEGIN = "<!-- BEGIN GENERATED: rollback-table (scripts/gen-rollback-table.py; `make docs`) -->"
 END = "<!-- END GENERATED: rollback-table -->"
+
+
+def check_scripts(build):
+    """Test-count claims in SHIPPED scripts, against the registered test count.
+
+    WHY THIS EXISTS IS IN THE HEADER, and the short version is that a stale count in a
+    shipped script is a stale count in the project's own definition of its gate. It was
+    not hypothetical: `scripts/audit-teardown.py` said "all 98 binaries" twice, with
+    100 registered.
+
+    WHAT IT DOES NOT CHECK, and the limits are stated because the extension is narrow on
+    purpose:
+
+      * ONLY THE TEST COUNT. A general "N cells / N sites" pattern was written and
+        measured, and it matched 34 lines of which most were correct by definition --
+        `gate.sh`'s matrix IS twelve cells, and the checkers' docstrings quote stale
+        numbers on purpose. A check red on correct lines gets deleted, and a deleted
+        check catches nothing.
+      * IT DOES NOT PARSE SHELL. It reads text and looks for prose shapes. It cannot
+        tell a number in a comment from a number in a command; the patterns are anchored
+        on words so that `--timeout 300` is not a claim and is not flagged.
+      * A CLAIM IN BACKTICKS IS A QUOTATION and is skipped, because recording what a
+        named CI run reported on a named date is what a comment is for.
+      * THE CHECKERS' OWN FILES ARE EXCLUDED, because a checker quoting the wrong number
+        in order to say "this was wrong" is doing its job.
+    """
+    ntests = registered_tests(build)
+    if ntests is None:
+        sys.stderr.write(
+            "check-docs-truth: FAIL: cannot ask `ctest -N` how many tests there are, so "
+            "the shipped scripts' test-count claims would go UNCHECKED. Not skipping "
+            "them: a check that quietly checks nothing is the failure this script "
+            "exists to end.\n")
+        findings.append(("scripts/*.sh", "every test-count claim in a shipped script",
+                         "cannot be computed", "ctest -N could not be run"))
+        return
+    scripts = [p for p in SHIPPED_SCRIPTS
+               if not os.path.basename(p).startswith("check-")]
+    if not scripts:
+        sys.stderr.write(
+            "check-docs-truth: FAIL: no shipped scripts found under scripts/, so this "
+            "check would pass vacuously on the thing it exists to cover.\n")
+        return
+    for path in scripts:
+        rel = os.path.relpath(path, ROOT)
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+        for count, lineno, line in script_count_claims(text):
+            if count == ntests:
+                note(rel, line[:52],
+                     "%s: a test count that agrees with ctest -N's %d" % (rel, ntests))
+                continue
+            finding(rel,
+                    "%s:%d: %s" % (rel, lineno, line),
+                    "%d registered test(s)" % ntests,
+                    "a shipped script's prose says %d tests. Scripts/ is read by this "
+                    "check because a shipped script is documentation the next person "
+                    "reproduces the gate from, and a stale count there rots unnoticed. "
+                    "Either correct the number or delete it: \"the test binaries\" is "
+                    "true at every test count and needs no maintenance." % count)
 
 
 def check_rollback_table():
@@ -359,10 +524,12 @@ def main():
         return 1
 
     check_docs(build, log)
+    check_scripts(build)
 
     print("check-docs-truth: %d numeric claim(s) in README.md, "
-          "docs/SPEC_TRACKING.md and docs/DEVELOPMENT.md checked against %s."
-          % (len(checked), os.path.relpath(build, ROOT)))
+          "docs/SPEC_TRACKING.md, docs/DEVELOPMENT.md and %d shipped script(s) "
+          "checked against %s."
+          % (len(checked), len(SHIPPED_SCRIPTS), os.path.relpath(build, ROOT)))
     for rel, claim, why in checked:
         print("    %-22s %-52s  %s" % (rel, claim[:52], why))
     if findings:

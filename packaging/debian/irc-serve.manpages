@@ -1,0 +1,20 @@
+# debian/irc-serve.manpages -- which files dh_installman installs, and where from.
+#
+# WHY THIS FILE IS NECESSARY AND NOT OBVIOUS: dh_installman does NOT glob debian/*.1.
+# It reads the list of pages from this file (or from debian/tmp, which it searches as a
+# fallback) and from its command line, and nothing else. A package that drops
+# debian/irc-serve.1 into the packaging directory and assumes debhelper will notice gets
+# a .deb with no manual page in it and an `irc-serve --help` that is the only
+# documentation a user can find.
+#
+# MEASURED, and the reason this comment is here rather than a shorter file: the first
+# real build of this package had debian/irc-serve.1 and lintian still raised
+# `no-manual-page [usr/bin/irc-serve]`, because dh_installman ran, found no list, and
+# installed nothing -- silently, with exit 0. dh_installman with this file added exits 0
+# and puts irc-serve.1 under debian/irc-serve/usr/share/man/man1/.
+#
+# `debian/irc-serve.1`, not `irc-serve.1`: dh_installman's search directories are `.` and
+# `debian/tmp`, not `debian/`. The bare filename is the version that produces
+#   dh_installman: error: Cannot find (any matches for) "irc-serve.1" (tried in ., debian/tmp)
+# which is a loud failure, and the loud one is the reason the quiet one was found.
+debian/irc-serve.1

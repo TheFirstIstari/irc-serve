@@ -106,6 +106,17 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STRICT = "--strict" in sys.argv
 
+# A DELIBERATE leak, declared at the point of the leak. Three groups: the keyword, the
+# owning pointer's NAME, and the reason. All three required, and the reason must be at
+# least eight characters, because the whole value of this exemption is that a reader can
+# see WHICH allocation and WHY without finding this rule.
+#   block = malloc(n);  /* audit-teardown: DELIBERATE LEAK block -- this file exists to leak */
+# The name is in the marker rather than implied by its position because the marker sits
+# on the statement that DROPS the pointer, which is several lines after the malloc: a
+# marker with no name cannot tell two acquisitions in one function apart.
+DELIBERATE_LEAK = re.compile(
+    r"audit-teardown:\s*DELIBERATE\s+LEAK\s+([A-Za-z_]\w*)[^\n]*?--\s*([^\n*]{8,})")
+
 # The name shapes. Deliberately several: the point is to be BROAD in what it looks at
 # and NARROW in what it judges, which is the opposite of what a ratchet usually is and
 # is what keeps the false-positive count at zero.
@@ -162,6 +173,46 @@ FUNC_DEF = re.compile(
 #   * a hand-rolled "same function" scan.
 # A rule built on a boundary this script cannot find reliably is a rule that flags
 # correct code, and a check that flags correct code gets deleted.
+def top_level_body_ranges(clean):
+    """The (first_line, last_line) of every top-level body, in the SAME order as
+    top_level_bodies() -- which is why this exists at all.
+
+    strip_comments() BLANKS every comment, keeping byte offsets and line breaks. That is
+    what makes the parser safe, and it is also why the deliberate-leak marker could not
+    be found in the cleaned body: the marker IS a comment, so by the time rule 2 looks
+    for it there is nothing there. An exemption that can never fire is not an
+    exemption, and this audit would have been green for a reason nobody could see.
+
+    So the ranges are computed from the same CLEANED text the parser uses -- so the
+    line numbering cannot drift from it -- and the marker is then looked for in the
+    RAW lines. Offsets survive stripping, so `body_end - body_start` in cleaned bytes
+    is exactly the raw text of the same span.
+    """
+    ranges = []
+    lines = clean.split("\n")
+    offs = []
+    off = 0
+    for ln in lines:
+        offs.append(off)
+        off += len(ln) + 1
+    for i, ln in enumerate(lines):
+        if not ln.startswith("{"):
+            continue
+        start = offs[i]
+        depth = 0
+        j = start
+        while j < len(clean):
+            if clean[j] == "{":
+                depth += 1
+            elif clean[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    ranges.append((i + 1, i + 1 + clean[start:j].count("\n")))
+                    break
+            j += 1
+    return ranges
+
+
 def top_level_bodies(clean):
     bodies = []
     lines = clean.split("\n")
@@ -324,11 +375,18 @@ def main():
     # SAME NAME. A file-scoped version passes that, which is why the first version was
     # file-scoped and is not any more.
     acquires = 0
+    # Every exempted acquisition, printed. A suppression that does not appear in the
+    # output is a suppression nobody reads, and this audit has spent its whole life
+    # arguing that a check nobody reads is not a check.
+    deliberate = []
     for path in files:
         rel = os.path.relpath(path, ROOT)
         raw = open(path, "r", encoding="utf-8", errors="replace").read()
         clean = strip_comments(raw)
-        for lineno, body in top_level_bodies(clean):
+        bodies = top_level_bodies(clean)
+        body_ranges = top_level_body_ranges(clean)
+        raw_lines = raw.split("\n")
+        for body_index, (lineno, body) in enumerate(bodies):
             for am in ACQUIRE.finditer(body):
                 var = am.group(1)
                 acquires += 1
@@ -341,7 +399,7 @@ def main():
                 # obligation is now in the caller. `tests/integration/
                 # test_close_sites.c`'s `load()` is exactly that shape and it is
                 # CORRECT -- three call sites free it, which macOS `leaks(1)` over
-                # all 98 binaries confirms -- so flagging it would be the sixth false
+                # the test binaries confirms -- so flagging it would be the sixth false
                 # positive this audit has produced and it would have earned the check
                 # the deletion its first five nearly earned.
                 #
@@ -352,9 +410,61 @@ def main():
                 if re.search(r"\breturn\s+(?:\(\s*\w+\s*\*\s*\)\s*)?"
                              + re.escape(var) + r"\s*;", body):
                     continue
+                # THE DELIBERATE-LEAK EXEMPTION, and it is one file, one function and
+                # one MARKER rather than a filename or a suppression switch.
+                #
+                # tests/integration/lsan_probe.c acquires a block and never frees it.
+                # That is the entire purpose of the file: it is the test that proves
+                # LeakSanitizer is live by leaking 64 KiB on purpose and failing unless
+                # LSan reports it. Rule 2 cannot tell that from #134's leak -- it is
+                # the same text shape -- and a check that cannot fail is worth less than
+                # no check, so the exemption is here and is narrow.
+                #
+                # WHY IT IS A MARKER IN THE SOURCE rather than a path in this script: a
+                # path here is invisible at the point somebody adds the next deliberate
+                # leak, and a marker is not. The `audit-teardown:` prefix is chosen so
+                # that `grep -rn 'audit-teardown:' tests/ src/` answers "where is this
+                # rule bent, and why" without reading this file. The reason is REQUIRED
+                # on the same line, so a bare marker does not parse: a suppression
+                # someone cannot explain is a suppression nobody will review.
+                #
+                # THE LIMIT, STATED RATHER THAN DISCOVERED: this exemption covers rule 2
+                # for ONE acquisition in ONE function of ONE file. Every other
+                # acquisition in that file, and every line after it, is audited normally
+                # -- so a genuine leak added to lsan_probe.c beside the deliberate one
+                # is still red.
+                # The marker is looked for in the RAW lines of this function, because
+                # the cleaned body has every comment blanked out of it. See
+                # top_level_body_ranges() for why that is a separate function rather
+                # than an inline fix.
+                raw_span = ""
+                if body_index < len(body_ranges):
+                    lo, hi = body_ranges[body_index]
+                    raw_span = "\n".join(raw_lines[lo - 1:hi])
+                # EVERY marker in the function is collected, not just the first, and
+                # matched by name against THIS acquisition. Both halves matter: a
+                # function with two acquisitions and one marker must exempt that one
+                # and report the other, which is the limit the exemption's comment
+                # claims and which a first-match search would not deliver.
+                marked = {mm.group(1): mm.group(2).strip().rstrip(".")
+                          for mm in DELIBERATE_LEAK.finditer(raw_span)}
+                if var in marked:
+                    deliberate.append((rel, lineno, var, marked[var]))
+                    continue
                 rows2.append((rel, lineno, var, am.group(0).strip()))
 
     print()
+    if deliberate:
+        print("    %d exempted: a DELIBERATE leak, declared in the source." %
+              len(deliberate))
+        for rel, lineno, var, why in deliberate:
+            print("      %s:%d: %s -- %s" % (rel, lineno, var, why))
+        print("    Each one carries an `audit-teardown: DELIBERATE LEAK <var> -- <why>`")
+        print("    marker on the statement that drops the pointer, naming the owning")
+        print("    variable and the reason. The exemption is for THAT acquisition only:")
+        print("    a second acquisition in the same function, or in the same file, is")
+        print("    audited normally and is red.")
+        print()
     print("RULE 2 -- AN OWNING POINTER ACQUIRED AND NEVER FREED IN THE SAME "
           "FUNCTION. %d acquisition(s) in %d top-level function(s) across src/ and "
           "tests/." % (acquires, sum(len(top_level_bodies(strip_comments(
@@ -394,7 +504,7 @@ def main():
     print("forwarding ownership and is exempted, because the obligation is now in a")
     print("function this rule cannot reason about. `test_close_sites.c`'s `load()` is")
     print("that shape and is correct today -- three call sites free it, and macOS")
-    print("`leaks(1)` over all 98 binaries confirms it. #134's leak went through a")
+    print("`leaks(1)` over the test binaries confirms it. #134's leak went through a")
     print("wrapper of the same shape, so RULE 2 WOULD NOT HAVE CAUGHT IT AS SHIPPED.")
     print("What caught it was Linux CI, and what stops it recurring is that the")
     print("test's wrapper now reads into a CALLER-PROVIDED BUFFER and owns nothing,")
@@ -444,7 +554,8 @@ def main():
         if bad or rows2:
             return 1
         print("audit-teardown --strict: OK (2 strict helpers both release; %d "
-              "acquisition(s) all paired)." % acquires)
+              "acquisition(s) paired, %d declared a deliberate leak)."
+              % (acquires - len(deliberate), len(deliberate)))
     return 0
 
 

@@ -2029,6 +2029,6 @@ int fed_burst_apply(server_t *s, server_link_t *link, const message_t *m)
      * a path that does not execute, which is the cheapest possible insurance, and
      * the alternative -- leaving a bare `%s` on a peer string in a file with
      * twenty-seven other log lines -- is the state #135 is filed about. */
-    fed_obs("[observable] fed_burst_unhandled: command=%s\n", m->command);
+    fed_obs("[observable] fed_burst_unhandled: command=%s command_len=%zu command_bad_bytes=%zu\n", m->command, strlen(m->command), conn_text_bad_count(m->command));
     return -1;
 }

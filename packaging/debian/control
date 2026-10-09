@@ -54,7 +54,7 @@ Description: Federated modern-spec IRC server in C
  Performance-first, minimal memory footprint, federated nodes,
  load-balanced, auto-scaling capable.
  .
- This build has no transport encryption: it is configured with -DWITH_TLS=OFF, so
- it has no third-party runtime dependency at all. See SECURITY.md for the
- transport-encryption layer, which is available in the source tree but is not
- compiled into this package.
+ This build has no transport encryption: it is configured with
+ -DWITH_TLS=OFF, so it has no third-party runtime dependency at all.
+ See SECURITY.md for the transport-encryption layer, which is available
+ in the source tree but is not compiled into this package.

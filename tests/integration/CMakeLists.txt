@@ -851,3 +851,39 @@ irc_add_integration_test(test_relay_shape test_relay_shape.c)
 # test_msg_text.c asserts BOTH halves, the two C1 subtleties (the pair, and the
 # UTF-8 that collides with it), and the announcement decision.
 irc_add_integration_test(test_msg_text test_msg_text.c)
+
+# ---------------------------------------------------------------------------
+# THE LEAKSANITIZER PROBE: OPT-IN, AND THE OPT-IN IS THE DESIGN
+# ---------------------------------------------------------------------------
+# -DIRC_LSAN_PROBE=ON builds lsan_probe and registers it as a CTest test. OFF is the
+# default and nothing turns it on except scripts/gate.sh's Linux cell, which does so
+# because LeakSanitizer does not exist on Darwin and this is the only place in the
+# project that can be told the leak gate is live at all.
+#
+# WHY OFF MUST BE THE DEFAULT, and this is a judgement about failure modes rather than
+# about taste: lsan_probe FAILS BY DESIGN on a platform without leak detection, and
+# checks it proves it. A test in the normal gate that is red on purpose stops being
+# distinguishable from a test that is red because something broke -- the second hour of
+# a bisect is exactly when that distinction matters and exactly when nobody re-reads the
+# CMakeLists to find out which it is. So the probe is opt-in, it adds nothing to the
+# default build, and the default test count is unchanged: it is 100 either way, because
+# with the option off this block does not exist.
+#
+# WHY IT IS NOT IN scripts/check-skips.sh's WORLD AT ALL. That script reads a ctest log
+# and fails on any test reported as skipped. This test cannot be skipped -- it either
+# proves the leak oracle is live or it fails -- so a skip line for it would be a
+# category error, and the ratchet would be protecting a state this test cannot be in.
+#
+# THE COST, WHICH IS REAL AND IS PAID ONLY WHEN THE OPTION IS ON: one extra executable
+# to build, and one process per run that leaks 64 KiB on purpose. See
+# tests/integration/lsan_probe.c's header for why the leak is 64 KiB and not one byte.
+#
+# IT DEPENDS ON NOTHING but the harness's own conventions, deliberately: no
+# test_harness link, because this test spawns no node and needs no fixture, and linking
+# one would pull node_fixture.c into a program whose entire point is that it leaks a
+# block of exactly a known size.
+if(IRC_LSAN_PROBE)
+  add_executable(lsan_probe lsan_probe.c)
+  add_test(NAME LeakSanitizerProbe COMMAND lsan_probe)
+  set_tests_properties(LeakSanitizerProbe PROPERTIES LABELS Sanitizer TIMEOUT 60)
+endif()

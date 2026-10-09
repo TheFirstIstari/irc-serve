@@ -102,6 +102,31 @@ option(BUILD_TESTING "Build tests" ON)
 option(BUILD_BENCHMARK "Build benchmarks" ON)
 
 # ---------------------------------------------------------------------------
+# IRC_LSAN_PROBE: build the test that proves LeakSanitizer is working at all
+# ---------------------------------------------------------------------------
+# OFF by default, and it is the only option here whose default exists to keep the gate's
+# numbers unchanged rather than because the feature is unfinished.
+#
+# WHAT IT TURNS ON: tests/integration/lsan_probe.c, which leaks 64 KiB on purpose in a
+# child process and FAILS unless LeakSanitizer reports the leak and exits non-zero.
+#
+# WHY IT IS OPT-IN. The probe is red on any platform without working leak detection --
+# that is what makes it a probe. Leaving it in the default gate would mean shipping a
+# test that fails on macOS, or passing an option that makes 13 cells lie about which
+# tests ran, or neutering the probe until it passes everywhere and therefore proves
+# nothing. scripts/gate.sh's Linux cell passes -DIRC_LSAN_PROBE=ON because that cell is
+# the only place in this project where the answer exists.
+#
+# WHAT IT COSTS WHEN OFF: one `if()` in tests/integration/CMakeLists.txt and one unused
+# source file. What it costs when ON: one executable to build and one process that leaks
+# 64 KiB per run. Neither is worth paying by default.
+#
+# IT IS NOT A SUBSTITUTE FOR THE SUITE RUNNING UNDER LSan, which is the thing that
+# actually finds leaks in this tree's 100 tests. This option only answers the prior
+# question -- is the thing that finds them switched on.
+option(IRC_LSAN_PROBE "Build the deliberate-leak probe that proves LeakSanitizer is live" OFF)
+
+# ---------------------------------------------------------------------------
 # IRC_FORTIFY: -D_FORTIFY_SOURCE=2, opt-in, and READ THIS BEFORE TRUSTING IT
 # ---------------------------------------------------------------------------
 # Added because of a Linux-only build break this option cannot catch. glibc

@@ -1,7 +1,7 @@
 #!/usr/bin/make -f
 # packaging/debian/rules -- binary-only build of irc-serve for Debian.
 #
-# WHAT THIS FILE IS: the standard `dh $@` catch-all plus the two overrides this
+# WHAT THIS FILE IS: the standard `dh $@` catch-all plus the four overrides this
 # package actually needs. It is not clever and the cleverness is the point --
 # every line here is one a reviewer can check against the CMake flags in
 # packaging/arch/PKGBUILD and packaging/homebrew/irc-serve.rb, which pass the SAME
@@ -40,17 +40,72 @@ export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 %:
 	dh $@
 
+# --buildsystem=cmake ON EVERY dh_auto_* TARGET BELOW, AND THE ABSENCE OF IT WAS A
+# REAL DEFECT THAT NOBODY COULD SEE. debhelper AUTODETECTS the buildsystem, and its
+# detection saw this tree's top-level `Makefile` and chose `makefile`. So
+# dh_auto_configure ran `make` -- which printed this project's make help text and
+# exited 0 -- dh_auto_build ran `make` again, and NOTHING WAS CONFIGURED AND NOTHING
+# WAS BUILT. The build then died three targets later at override_dh_auto_test, on
+# "Failed to change working directory to .../build: No such file or directory",
+# which names a ctest problem and is caused by a configure that never ran.
+#
+# MEASURED, not asserted: `dpkg-buildpackage -b -us -uc` on debian bookworm,
+# gcc 12.2.0, cmake 3.25.1, with the override_dh_auto_test block deleted (so nothing
+# could catch it) exits 2 having configured nothing, built nothing, and installed
+# nothing. The .deb it would have produced does not exist. THE POINT OF DELETING THE
+# TEST BLOCK: the test run was the only thing standing between this defect and a
+# silently empty package.
+#
+# WHY THE FIX IS NOT ONE FLAG: debhelper takes `--buildsystem=` per target, so a tree
+# with a top-level Makefile and a CMakeLists.txt must state it on configure, build,
+# clean AND test. Stating it on configure alone is the obvious half-fix and still
+# builds nothing.
 override_dh_auto_configure:
-	dh_auto_configure -- -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
-		-DBUILD_TESTING=ON -DWITH_TLS=OFF
+	dh_auto_configure --buildsystem=cmake -- -DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_INSTALL_PREFIX=/usr -DBUILD_TESTING=ON -DWITH_TLS=OFF
 
-# --timeout 200, and 200 IS A MEASURED NUMBER: scripts/gate.sh runs every one of
-# this project's cells with `--timeout 200` and all thirteen are green, so 200 is
-# known to be enough for the suite on a loaded machine. The 60 this replaced was
-# not measured against anything, and a per-test timeout that is too tight does not
-# fail loudly -- it fails as a flaky package build on a slow Debian host.
+override_dh_auto_build:
+	dh_auto_build --buildsystem=cmake
+
+override_dh_auto_clean:
+	dh_auto_clean --buildsystem=cmake
+
+# ctest DIRECTLY, and NOT dh_auto_test, and the reason is measured rather than
+# preferred. debhelper's cmake buildsystem puts its build tree at
+# `obj-$(DEB_HOST_MULTIARCH)` -- it is NOT `build`, which is what scripts/gate.sh, the
+# Arch PKGBUILD and the Makefile all use -- so the hand-written
+# `ctest --test-dir build` that this line replaces named a directory that has never
+# existed in a Debian build. That is the other half of the defect above.
+#
+# dh_auto_test knows where the tree is, and it was the obvious fix, and it is WRONG
+# for this package: `dh_auto_test --buildsystem=cmake -- --output-on-failure
+# --timeout 200` expands to `make test ARGS+=--output-on-failure ARGS+=--timeout
+# 200`, which passes the two flags to MAKE and prints make's option summary and
+# exits 2. Measured on debian bookworm. The arguments reach the test driver, not
+# ctest, so the two flags this line exists to pass are silently discarded -- or rather
+# not silently: make refuses them.
+#
+# $(DEB_HOST_MULTIARCH) rather than a hardcoded obj-$(dpkg-architecture) so a
+# cross-build -- `dpkg-buildpackage -a arm64` -- finds its own tree, which is the one
+# case a literal `x86_64` would break. DEB_HOST_MULTIARCH is exported by
+# dpkg-buildpackage; dpkg-buildpackage -b with no -A sets it to the build arch.
+#
+# --output-on-failure, so a red test prints its assertions into the build log instead
+# of only its name. --timeout 200, and 200 IS A MEASURED NUMBER: scripts/gate.sh runs
+# every cell with `--timeout 200` and all of them are green, so 200 is known to be
+# enough for the suite on a loaded machine. The 60 this replaced was not measured
+# against anything, and a per-test timeout that is too tight does not fail loudly --
+# it fails as a flaky package build on a slow Debian host.
+#
+# THE COST, WHICH IS REAL AND IS NOT HIDDEN: the suite binds TCP ports on loopback.
+# In a Docker container's own network namespace that works -- it is the container's
+# private loopback and nothing else is listening -- and it was measured: all 100 tests
+# ran to completion on debian bookworm inside a docker container, 0 failures, 0
+# skips. It would NOT work under `docker run --network host` on a host where another
+# copy of the suite is already binding the same ports, which is the one configuration
+# where this override can fail for a reason that is not a defect in this package.
 override_dh_auto_test:
-	ctest --test-dir build --output-on-failure --timeout 200
+	ctest --test-dir "obj-$(DEB_HOST_MULTIARCH)" --output-on-failure --timeout 200
 
 # dh_auto_install is deliberately NOT overridden. The cmake buildsystem installs
 # through CMake's own install rules, which honour DESTDIR, so the binary lands at

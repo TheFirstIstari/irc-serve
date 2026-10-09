@@ -1,0 +1,19 @@
+# debian/irc-serve.lintian-overrides -- tags lintian raises that are not defects here.
+#
+# WHAT THIS FILE IS FOR, and it is not a suppression list: it is the place to record a
+# tag that was raised, examined, and judged not to be a defect in this package --
+# WITH THE REASONING, so the next person does not have to re-derive it. The alternative
+# to recording a judgement here is leaving the tag to be raised again at every build and
+# re-explained every time, which is how a real defect gets filed as noise.
+#
+# Measured with lintian 2.116.3+deb12u1 on debian bookworm, against
+# irc-serve_0.1.0-1_amd64.deb built by dpkg-buildpackage from this source package.
+
+# This package is not being uploaded to Debian. lintian reads an initial upload with one
+# changelog entry at revision -1 and no ITP bug closed, because the normal flow for a NEW
+# package is to open an ITP bug and close it in the upload. This package declares
+# `Section: net`, `Distribution: unstable` and a Homepage on GitHub, and it is built and
+# installed locally; there is no ITP bug to close and lintian cannot tell that from an
+# author who forgot one. Overriding it is the honest record: the tag is real, its
+# trigger is real, and it does not apply.
+irc-serve: initial-upload-closes-no-bugs
