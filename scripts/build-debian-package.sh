@@ -108,10 +108,36 @@ git -C "$root" rev-parse --git-dir >/dev/null 2>&1 \
 
 # The version and the source name, read from debian/changelog rather than typed here, so
 # this script cannot disagree with the file it is checking.
-changelog_ver=$(sed -n '1s/^[^ (]*(\([^)]*\)).*/\1/p' "$root/packaging/debian/changelog" 2>/dev/null || true)
-[ -n "$changelog_ver" ] || fail "could not read a version out of packaging/debian/changelog"
-src_name=$(sed -n '1s/^\([^ (]*\)(.*/\1/p' "$root/packaging/debian/changelog" 2>/dev/null || true)
-[ -n "$src_name" ] || fail "could not read a source name out of packaging/debian/changelog"
+# The version and the source name, out of the changelog's FIRST LINE, which deb822 and
+# dpkg-source both fix as `<source> (<version>) <distribution>; <urgency>`.
+#
+# READ WITH cut AND tr, NOT WITH A sed SUBSTITUTION, and the reason is measured: the
+# obvious `sed -n '1s/^[^ (]*(\([^)]*\)).*/\1/p'` returns the EMPTY STRING on both BSD
+# sed (macOS) and GNU sed (Linux) for the line
+#     irc-serve (0.1.0-1) unstable; urgency=medium
+# without an error and without a diagnostic -- because a bracket expression `[^ (]` with
+# an embedded space followed by a literal `(` is not the expression either sed reads the
+# way a person expects, and the substitution simply does not match. A script whose
+# version-parsing silently yields nothing is worse than one that fails, because the next
+# thing it does is build a tarball with an empty name in it. Two field extractions with
+# no pattern language in between cannot fail quietly.
+first_line=$(sed -n '1p' "$root/packaging/debian/changelog")
+src_name=$(printf '%s\n' "$first_line" | cut -d' ' -f1)
+changelog_ver=$(printf '%s\n' "$first_line" | cut -d' ' -f2 | tr -d '()')
+# And the shape is asserted rather than assumed, because cut does not care: a
+# mis-indented or rewrapped changelog would otherwise produce a plausible-looking
+# source name and a version of "unstable;" and this script would build a file called
+# irc-serve_unstable;.orig.tar.gz and report it as a package build.
+case "$changelog_ver" in
+    *[!0-9.+~:-]*|"")
+        fail "packaging/debian/changelog's first line does not have the shape
+    <source> (<version>) <distribution>; <urgency=...>
+  read as: $first_line" ;;
+esac
+case "$src_name" in
+    *[!a-z0-9.+-]*|"")
+        fail "packaging/debian/changelog's first line names no source package. Read as: $first_line" ;;
+esac
 upstream_ver=${changelog_ver%%-*}
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/irc-serve-deb.XXXXXX")
