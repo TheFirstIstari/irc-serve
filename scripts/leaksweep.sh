@@ -16,7 +16,10 @@
 #
 # WHY IT IS NOT GATED, AND THE MEASUREMENT THAT SETTLED IT
 # ---------------------------------------------------------
-# MEASURED on this machine, Release + WITH_TLS=ON, all 100 test binaries:
+# MEASURED on this machine, Release + WITH_TLS=ON, over every test binary the build
+# produced. The COUNT IS DELIBERATELY ABSENT: scripts/check-docs-truth.py now reads
+# this file and treats a test count here as a live claim, and a count written to
+# describe one afternoon's run is not one.
 #
 #     ./scripts/leaksweep.sh build/          10m25s wall, 100 measured, 0 leaking
 #     scripts/gate-linux-cell.sh (cachyos)      ~30s wall, whole suite, 0 leaking
