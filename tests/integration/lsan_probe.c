@@ -70,9 +70,13 @@
  * and the parent looks for this many bytes in the report. */
 #define PROBE_LEAK_BYTES 65536
 
-/* The only pointer the child ever holds to the block it leaks, and it is set to NULL
- * before main() returns -- see run_as_child() for why that line is load-bearing and
- * what the probe measured when it was missing. */
+/* Deliberately assigned and immediately cleared to NULL in run_as_child(), so that a
+ * reader does not go looking for a use of this and find none: the child keeps its block
+ * in a LOCAL and only touches this global to record that nothing global points at it.
+ * A global that held the pointer at exit would be REACHABLE, and LSan reports
+ * unreachable blocks -- see the note on the NULL store in run_as_child(). It is
+ * non-const and file-scope so the store is a real store the optimiser can see, rather
+ * than a local whose slot it might reuse for the fprintf argument. */
 static void *g_probe_block;
 
 /* ---------------------------------------------------------------------------
@@ -80,38 +84,79 @@ static void *g_probe_block;
  * anything, the report would name a different block and the parent's byte-count
  * assertion would stop being evidence about this file.
  * --------------------------------------------------------------------------- */
+
+/* Read the block, out of line, so the allocation cannot be optimised away.
+ *
+ * THIS FUNCTION EXISTS BECAUSE OF A MEASUREMENT, and the measurement is the most
+ * surprising result of writing this probe: at -O3 -DNDEBUG -- which is exactly what
+ * CMAKE_BUILD_TYPE=Release builds -- a child that does nothing but
+ *
+ *     g = malloc(65536); memset(g, 0xA5, 65536); g = NULL;
+ *
+ * EXITS 0 WITH NO LEAKSANITIZER REPORT AT ALL. Not a suppressed report: no
+ * allocation. GCC eliminates the malloc and the memset together, because the block is
+ * written and never read, so nothing in the program's observable behaviour depends on
+ * it existing. An allocator is allowed to be elided when its result is unused, and here
+ * the result IS unused -- the memset is a write to memory nobody will read.
+ *
+ * THAT MATTERS FAR BEYOND THIS FILE. It means a Release build of this tree can contain
+ * a leak that a Debug build's LSan reports and a Release build's does not, not because
+ * LSan missed it but because the compiler removed the allocation. Every "0 leaks" claim
+ * this project has made is a claim about ONE build configuration, and saying so is the
+ * honest form of the claim. `touch_block()` makes the read observable, which pins the
+ * allocation in place: the block is now genuinely allocated, genuinely unused after
+ * this returns, and genuinely reported.
+ *
+ * `noinline` is load-bearing rather than tidiness: a static function at -O3 would be
+ * inlined into its caller, and the caller could then reason about the same elision.
+ * The out-of-line frame is what makes the read opaque to the optimiser.
+ *
+ * THE COST: one non-inlined function and one fprintf of the block's address per probe
+ * run, in a process that is about to be killed. It prints its own address, which is
+ * not a secret and is the line that makes the report's stack trace match the allocation
+ * site rather than merely being nearby.
+ */
+__attribute__((noinline))
+static void touch_block(void *p)
+{
+    /* A volatile read of the FIRST byte, so the compiler cannot prove the whole block
+     * is dead: `p[0]` alone would still leave 65535 bytes it has not looked at, though
+     * in practice the fprintf below is what forces the allocation to survive. */
+    volatile unsigned char first = ((const unsigned char *)p)[0];
+
+    fprintf(stderr, "lsan_probe: child allocated %p, first byte 0x%02x\n", p,
+            (unsigned)first);
+}
+
 static int run_as_child(void)
 {
-    g_probe_block = malloc(PROBE_LEAK_BYTES);
-    if (g_probe_block == NULL) {
+    void *block = malloc(PROBE_LEAK_BYTES);
+
+    if (block == NULL) {
         fprintf(stderr, "lsan_probe: malloc(%d) failed, so there is nothing to leak\n",
                 PROBE_LEAK_BYTES);
         return 1;
     }
     /* Touch every page, so the allocation is real memory and not a lazy mapping an
-     * allocator could decline to back. LSan tracks the malloc either way, but a report
-     * about an untouched page is a weaker claim than one about 64 KiB actually used. */
-    memset(g_probe_block, 0xA5, PROBE_LEAK_BYTES);
-    /* AND THEN DROP THE ONLY POINTER TO IT, WHICH IS WHAT MAKES IT A LEAK.
+     * allocator could decline to back. */
+    memset(block, 0xA5, PROBE_LEAK_BYTES);
+    /* Read it back out of line, so the allocation cannot be optimised away. See
+     * touch_block()'s comment: without this the child exits 0 with no report, and the
+     * probe is measuring nothing. */
+    touch_block(block);
+    /* AND THEN DROP THE ONLY POINTER, WHICH IS WHAT MAKES IT A LEAK.
      *
-     * This line is here because the first version of this file left `g_probe_block`
-     * pointing at the block, and the probe went RED on the build where it had been
-     * green: LSan reported nothing and the child exited 0. The reason is that LSan
-     * checks REACHABILITY, not allocation -- it reports blocks no live pointer can
-     * reach, and a global pointer in .bss is about as reachable as a pointer gets. So
-     * `static void *g_probe_block` held at exit is not a leak; it is a global, and the
-     * program is entitled to keep it.
+     * LSan checks REACHABILITY, not allocation: it reports blocks no live pointer can
+     * reach. A global pointer in .bss is about as reachable as a pointer gets, so an
+     * earlier version of this file -- which kept the block in a `static void *` and
+     * never cleared it -- reported NOTHING and exited 0, on the build where it had been
+     * green. That is not a leak; it is a global, and the program is entitled to keep
+     * one. The failure was silent and expensive in the worst way: the probe went red,
+     * which looks like LSan being broken rather than the probe being wrong.
      *
-     * The failure was silent and expensive in the worst way: the probe FAILED, which
-     * looked like LSan being broken rather than the probe being wrong, and the obvious
-     * response -- trust the red -- would have meant deleting a working check. Which is
-     * the argument for reading what a red test says before believing it, and for a
-     * probe having more than one assertion: half 1 was the only one that fired, and it
-     * fired correctly, saying "no report". It was the PROBE that was wrong.
-     *
-     * It is kept as a global rather than being a local because the compiler would be
-     * free to reuse the stack slot, and a stack slot that has been reused is not
-     * evidence about anything. A global, cleared, is unambiguous. */
+     * It is a local rather than a global precisely so that dropping the reference is a
+     * fact about the stack frame that has returned, rather than a store somebody could
+     * later undo. */
     g_probe_block = NULL;
     fprintf(stderr, "lsan_probe: child leaked %d bytes on purpose\n",
             PROBE_LEAK_BYTES);
