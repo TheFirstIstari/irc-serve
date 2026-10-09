@@ -127,23 +127,42 @@ static int run_child(const char *exe, char **argv, char *out, size_t outcap)
     if (pipe(errpipe) != 0) {
         return -1;
     }
-    if (dup2(errpipe[1], STDERR_FILENO) < 0) {
+
+    /* THE FORK COMES BEFORE ANY dup2, AND MOVING IT AFTER ONE HANGS THE PARENT.
+     *
+     * The first version of this redirected the PARENT's own fd 2 into the pipe before
+     * forking, so that the child inherited it. That makes the parent hold the pipe's
+     * WRITE END for the rest of its life, and a read() on the other end therefore never
+     * sees EOF -- it waits for a writer that is itself -- so the test blocked on
+     * read() until ctest's TIMEOUT killed it, on the plain build AND under LSan. The
+     * symptom was a 60-second timeout with no diagnostic, on a run whose whole purpose
+     * is to produce a diagnostic.
+     *
+     * The parent's stderr is left exactly as it was and the redirection happens in the
+     * CHILD, between fork and exec, which is where a redirection belongs: the child
+     * never returns to this function, so it cannot keep the write end open.
+     *
+     * THE COST: the parent no longer sees the child's report on its own stderr while the
+     * test runs, so on failure the report appears inside this test's own failure
+     * message rather than in the ctest log directly. That is not a loss -- the failure
+     * path prints `out` in full -- and it is the only arrangement that terminates. */
+    pid = fork();
+    if (pid < 0) {
         (void)close(errpipe[0]);
         (void)close(errpipe[1]);
         return -1;
     }
-    (void)close(errpipe[1]);
-
-    pid = fork();
-    if (pid < 0) {
-        (void)close(errpipe[0]);
-        return -1;
-    }
     if (pid == 0) {
-        /* The child. setenv then execv, so the options that turn leak detection ON and
-         * the variable that selects this file's child path travel through exec rather
-         * than through inherited state: the child is a fresh, fully instrumented
-         * process image, which is the process LSan will report on. */
+        /* The child: take the pipe as stderr, drop both of the parent's ends, then
+         * setenv and execv so the options that turn leak detection ON and the variable
+         * that selects this file's child path travel through exec rather than through
+         * inherited state. The child is a fresh, fully instrumented process image,
+         * which is the process LSan reports on. */
+        if (dup2(errpipe[1], STDERR_FILENO) < 0) {
+            _exit(127);
+        }
+        (void)close(errpipe[0]);
+        (void)close(errpipe[1]);
         (void)setenv("ASAN_OPTIONS", "detect_leaks=1", 1);
         (void)setenv("LSAN_OPTIONS", "exitcode=23", 1);
         (void)setenv(PROBE_ENV, "1", 1);
@@ -154,6 +173,12 @@ static int run_child(const char *exe, char **argv, char *out, size_t outcap)
         fprintf(stderr, "lsan_probe: execv(%s) failed\n", exe);
         _exit(127);
     }
+
+    /* Close the write end in the PARENT before waiting on the child. This is the same
+     * thing the comment above the fork is about, from the other side: the parent's
+     * copy of the write end is the only one left alive once the child has exec'd, and
+     * holding it is what makes read() below block forever. */
+    (void)close(errpipe[1]);
 
     (void)waitpid(pid, &status, 0);
     for (;;) {
