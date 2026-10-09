@@ -70,10 +70,9 @@
  * and the parent looks for this many bytes in the report. */
 #define PROBE_LEAK_BYTES 65536
 
-/* What the child leaks. A static pointer rather than a local, because the point is
- * that LSan can still see the address after main() has returned; a local that has
- * been overwritten would be a weaker demonstration and could pass for the wrong
- * reason. */
+/* The only pointer the child ever holds to the block it leaks, and it is set to NULL
+ * before main() returns -- see run_as_child() for why that line is load-bearing and
+ * what the probe measured when it was missing. */
 static void *g_probe_block;
 
 /* ---------------------------------------------------------------------------
@@ -93,6 +92,27 @@ static int run_as_child(void)
      * allocator could decline to back. LSan tracks the malloc either way, but a report
      * about an untouched page is a weaker claim than one about 64 KiB actually used. */
     memset(g_probe_block, 0xA5, PROBE_LEAK_BYTES);
+    /* AND THEN DROP THE ONLY POINTER TO IT, WHICH IS WHAT MAKES IT A LEAK.
+     *
+     * This line is here because the first version of this file left `g_probe_block`
+     * pointing at the block, and the probe went RED on the build where it had been
+     * green: LSan reported nothing and the child exited 0. The reason is that LSan
+     * checks REACHABILITY, not allocation -- it reports blocks no live pointer can
+     * reach, and a global pointer in .bss is about as reachable as a pointer gets. So
+     * `static void *g_probe_block` held at exit is not a leak; it is a global, and the
+     * program is entitled to keep it.
+     *
+     * The failure was silent and expensive in the worst way: the probe FAILED, which
+     * looked like LSan being broken rather than the probe being wrong, and the obvious
+     * response -- trust the red -- would have meant deleting a working check. Which is
+     * the argument for reading what a red test says before believing it, and for a
+     * probe having more than one assertion: half 1 was the only one that fired, and it
+     * fired correctly, saying "no report". It was the PROBE that was wrong.
+     *
+     * It is kept as a global rather than being a local because the compiler would be
+     * free to reuse the stack slot, and a stack slot that has been reused is not
+     * evidence about anything. A global, cleared, is unambiguous. */
+    g_probe_block = NULL;
     fprintf(stderr, "lsan_probe: child leaked %d bytes on purpose\n",
             PROBE_LEAK_BYTES);
     /* Return from main() normally, so LSan's atexit handler runs. This is the whole
