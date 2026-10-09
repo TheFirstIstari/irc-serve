@@ -559,8 +559,16 @@ int fed_send_sverb(server_t *s, conn_t *peer, const irc_serve_tags_t *tags,
      * like a node whose peers were silent, and the two have opposite fixes. */
     if (s == NULL || peer == NULL || client_verb == NULL || prefix == NULL ||
         (params == NULL && nparams != 0)) {
-        fed_obs("[observable] fed_sverb_refused: verb=%s reason=bad_args\n",
-               (client_verb != NULL) ? client_verb : "?");
+        /* MEASURED FROM THE SAME TERNARY THAT IS PRINTED, so the number describes the
+         * value ON THE LINE. Measuring the unguarded `client_verb` would be a NULL
+         * dereference on exactly the branch this refusal exists to report, and the
+         * fallback's length of 1 is the correct answer rather than a fudge: the line
+         * says `verb=?`. */
+        fed_obs("[observable] fed_sverb_refused: verb=%s reason=bad_args "
+                "verb_len=%zu verb_bad_bytes=%zu\n",
+               (client_verb != NULL) ? client_verb : "?",
+               strlen((client_verb != NULL) ? client_verb : "?"),
+               conn_text_bad_count((client_verb != NULL) ? client_verb : "?"));
         return -1;
     }
     /* An ALREADY-MAPPED verb is not mapped again. A caller that hands this an
@@ -572,8 +580,8 @@ int fed_send_sverb(server_t *s, conn_t *peer, const irc_serve_tags_t *tags,
     sverb = fed_sverb_for(client_verb);
     if (sverb == NULL) {
         fed_obs("[observable] fed_sverb_refused: verb=%s target=%s "
-               "reason=NO_SVERB\n",
-               client_verb, target);
+               "reason=NO_SVERB verb_len=%zu verb_bad_bytes=%zu target_len=%zu target_bad_bytes=%zu\n",
+               client_verb, target, strlen(client_verb), conn_text_bad_count(client_verb), strlen(target), conn_text_bad_count(target));
         return -1;
     }
 
@@ -583,8 +591,8 @@ int fed_send_sverb(server_t *s, conn_t *peer, const irc_serve_tags_t *tags,
      * fed_queue_line() in verbs.h. */
     if (fed_queue_line(s, peer, tags, prefix, sverb, params, nparams, &why) != 0) {
         fed_obs("[observable] fed_sverb_refused: verb=%s target=%s "
-               "reason=%s\n",
-               client_verb, target, fed_queue_why_name(why));
+               "reason=%s verb_len=%zu verb_bad_bytes=%zu target_len=%zu target_bad_bytes=%zu\n",
+               client_verb, target, fed_queue_why_name(why), strlen(client_verb), conn_text_bad_count(client_verb), strlen(target), conn_text_bad_count(target));
         return -1;
     }
     return 0;
@@ -1113,10 +1121,18 @@ static void fed_in_message(server_t *s, fanout_target_t *t, const char *prefix,
      * It is also the countable line a loop shows up in: a message that keeps
      * circulating prints this again, so "delivered exactly once" can be
      * asserted from the node as well as from the client. */
+    /* `from_len=` is measured from the SAME ternary that is printed, not from the bare
+     * `prefix`: on the fallback branch `prefix` is NULL and strlen(NULL) is the crash
+     * this measurement sits next to a guard to avoid. The reported 1 is the length of
+     * the `?` the reader can actually see. */
     fed_obs("[observable] fed_message: channel=%s from=%s delivered=%d "
-           "origin=%s hops=%lu\n",
+           "origin=%s hops=%lu channel_len=%zu channel_bad_bytes=%zu "
+           "origin_len=%zu origin_bad_bytes=%zu from_len=%zu from_bad_bytes=%zu\n",
            t->name, (prefix != NULL) ? prefix : "?", delivered, tags->origin,
-           (unsigned long)tags->hops);
+           (unsigned long)tags->hops, strlen(t->name), conn_text_bad_count(t->name),
+           strlen(tags->origin), conn_text_bad_count(tags->origin),
+           strlen((prefix != NULL) ? prefix : "?"),
+           conn_text_bad_count((prefix != NULL) ? prefix : "?"));
 }
 
 /* SJOIN: <channel> <member> <flags>. */
@@ -1141,8 +1157,14 @@ static void fed_in_sjoin(server_t *s, server_link_t *link, chan_t *ch,
          * why the BURST format grew a <server> field and this one has not. See
          * channel.h's chan_remote_t for the two-server split. */
         chan_remote_add(ch, link->name, link->name, params[1], params[3], flags) != 0) {
-        fed_obs("[observable] fed_sjoin_reject: channel=%s member=%s server=%s\n",
-               ch->name, (nparams > 1) ? params[1] : "?", link->name);
+        /* The `nparams > 1` guard is why the measurement comes from the SAME ternary
+         * rather than from `params[1]`: on the branch where the guard failed,
+         * params[1] does not exist. */
+        fed_obs("[observable] fed_sjoin_reject: channel=%s member=%s server=%s "
+                "member_len=%zu member_bad_bytes=%zu\n",
+               ch->name, (nparams > 1) ? params[1] : "?", link->name,
+               strlen((nparams > 1) ? params[1] : "?"),
+               conn_text_bad_count((nparams > 1) ? params[1] : "?"));
         return;
     }
     /* 2.1's REGISTRY, on the LIVE path and not only on the burst path, and the
@@ -1165,9 +1187,9 @@ static void fed_in_sjoin(server_t *s, server_link_t *link, chan_t *ch,
     (void)fed_nickreg_resolve_local(s, params[1], server_now_ms());
     fed_touch_server(ch, link->name, 1);
     fed_obs("[observable] fed_sjoin: channel=%s member=%s server=%s flags=%u "
-           "local=%zu remote=%zu origin=%s owned=%d\n",
+           "local=%zu remote=%zu origin=%s owned=%d member_len=%zu member_bad_bytes=%zu\n",
            ch->name, params[1], link->name, flags, ch->nmembers, ch->nremotes,
-           ch->origin, chan_origin_is_self(s, ch));
+           ch->origin, chan_origin_is_self(s, ch), strlen(params[1]), conn_text_bad_count(params[1]));
     (void)fanout_forward_channel_sverb(s, ch, FANOUT_STATE_CHANGE, "SJOIN", prefix,
                                        params, nparams, tags);
 }
@@ -1221,8 +1243,8 @@ static void fed_in_snick(server_t *s, server_link_t *link, const char *prefix,
     (void)prefix;
 
     fed_nickreg_rename(s, link->name, params[0], params[1], server_now_ms());
-    fed_obs("[observable] fed_nickreg_rename: server=%s from=%s to=%s\n", link->name,
-           params[0], params[1]);
+    fed_obs("[observable] fed_nickreg_rename: server=%s from=%s to=%s to_len=%zu to_bad_bytes=%zu\n", link->name,
+           params[0], params[1], strlen(params[1]), conn_text_bad_count(params[1]));
 
     /* THE ROSTERS, one channel at a time. There is no index from nickname to
      * channel, and there must not be: a member's name is not a global key, so a
@@ -1253,11 +1275,11 @@ static void fed_in_snick(server_t *s, server_link_t *link, const char *prefix,
          * connected but not in any channel this node knows about -- the common
          * case on a relay. The registry is still updated above, and a rename
          * that reaches nobody is not a failure: there was nothing to tell. */
-        fed_obs("[observable] fed_snick: server=%s from=%s to=%s rosters=0\n",
-               link->name, params[0], params[1]);
+        fed_obs("[observable] fed_snick: server=%s from=%s to=%s rosters=0 to_len=%zu to_bad_bytes=%zu\n",
+               link->name, params[0], params[1], strlen(params[1]), conn_text_bad_count(params[1]));
     } else {
-        fed_obs("[observable] fed_snick: server=%s from=%s to=%s rosters=%d\n",
-               link->name, params[0], params[1], renamed);
+        fed_obs("[observable] fed_snick: server=%s from=%s to=%s rosters=%d to_len=%zu to_bad_bytes=%zu\n",
+               link->name, params[0], params[1], renamed, strlen(params[1]), conn_text_bad_count(params[1]));
     }
 }
 
@@ -1443,17 +1465,26 @@ static void fed_in_advertise(server_t *s, server_link_t *link, const char *prefi
     for (const char *c = loadbuf; *c != '\0'; c++) {
         if (*c < '0' || *c > '9') {
             s->n_fed_advertise_bad++;
+            /* MEASURED FROM params[0], NOT FROM loadbuf, and the difference is the
+             * point: `loadbuf` is a 16-byte COPY of the peer's field, so a peer that
+             * sent 200 characters has 15 of them in loadbuf and 200 in params[0].
+             * Reporting `value_len=` from loadbuf would say 15 for an input of 200 --
+             * a measurement that is wrong precisely when the input is interesting.
+             * The value PRINTED is loadbuf, which is the copy, and the value
+             * MEASURED is what the peer sent. */
             fed_obs("[observable] fed_advertise_refused: peer=%s reason=LOAD_NOT_NUML "
-                   "value=%s\n",
-                   link->name, loadbuf);
+                   "value=%s value_len=%zu value_bad_bytes=%zu\n",
+                   link->name, loadbuf, strlen(params[0]),
+                   conn_text_bad_count(params[0]));
             return;
         }
         load = (load * 10u) + (unsigned long)(*c - '0');
         if (load > 100u) {
             s->n_fed_advertise_bad++;
             fed_obs("[observable] fed_advertise_refused: peer=%s reason=LOAD_RANGE "
-                   "value=%s\n",
-                   link->name, loadbuf);
+                   "value=%s value_len=%zu value_bad_bytes=%zu\n",
+                   link->name, loadbuf, strlen(params[0]),
+                   conn_text_bad_count(params[0]));
             return;
         }
     }
@@ -1471,8 +1502,8 @@ static void fed_in_advertise(server_t *s, server_link_t *link, const char *prefi
         if (!irc_serve_server_name_valid(params[1])) {
             s->n_fed_advertise_bad++;
             fed_obs("[observable] fed_advertise_refused: peer=%s reason=NAME_INVALID "
-                   "name=%s\n",
-                   link->name, params[1]);
+                   "name=%s name_len=%zu name_bad_bytes=%zu\n",
+                   link->name, params[1], strlen(params[1]), conn_text_bad_count(params[1]));
             return;
         }
         if (params[2][0] == '\0' || strlen(params[2]) >= CONN_HOST_MAX + 1u) {
@@ -1501,8 +1532,8 @@ static void fed_in_advertise(server_t *s, server_link_t *link, const char *prefi
             if (*c < '0' || *c > '9') {
                 s->n_fed_advertise_bad++;
                 fed_obs("[observable] fed_advertise_refused: peer=%s reason=PORT_NOT_NUML "
-                       "value=%s\n",
-                       link->name, params[3]);
+                       "value=%s value_len=%zu value_bad_bytes=%zu\n",
+                       link->name, params[3], strlen(params[3]), conn_text_bad_count(params[3]));
                 return;
             }
             port = (port * 10u) + (unsigned long)(*c - '0');
@@ -1511,8 +1542,8 @@ static void fed_in_advertise(server_t *s, server_link_t *link, const char *prefi
         if (digits == 0 || port == 0u || port > 65535u) {
             s->n_fed_advertise_bad++;
             fed_obs("[observable] fed_advertise_refused: peer=%s reason=PORT_RANGE "
-                   "value=%s\n",
-                   link->name, params[3]);
+                   "value=%s value_len=%zu value_bad_bytes=%zu\n",
+                   link->name, params[3], strlen(params[3]), conn_text_bad_count(params[3]));
             return;
         }
     }
@@ -1603,17 +1634,17 @@ static void fed_in_advertise(server_t *s, server_link_t *link, const char *prefi
     if (hinted != 0) {
         if (chan_same_name(slot->name, s->name)) {
             fed_obs("[observable] fed_advertise: peer=%s name=%s host=%s port=%u "
-                   "load=%u%% detail=SELF_NAME\n",
-                   link->name, slot->name, slot->host, slot->port, slot->load_pct);
+                   "load=%u%% detail=SELF_NAME name_len=%zu name_bad_bytes=%zu host_len=%zu host_bad_bytes=%zu\n",
+                   link->name, slot->name, slot->host, slot->port, slot->load_pct, strlen(slot->name), conn_text_bad_count(slot->name), strlen(slot->host), conn_text_bad_count(slot->host));
         } else if (advert_name_is_held(s, slot->name)) {
             s->n_fed_advertise_collision++;
             fed_obs("[observable] fed_advertise_collision: peer=%s advertised=%s "
-                   "held_by=this_node\n",
-                   link->name, slot->name);
+                   "held_by=this_node advertised_len=%zu advertised_bad_bytes=%zu\n",
+                   link->name, slot->name, strlen(slot->name), conn_text_bad_count(slot->name));
         } else {
             fed_obs("[observable] fed_advertise: peer=%s name=%s host=%s port=%u "
-                   "load=%u%% dialed=NO\n",
-                   link->name, slot->name, slot->host, slot->port, slot->load_pct);
+                   "load=%u%% dialed=NO name_len=%zu name_bad_bytes=%zu host_len=%zu host_bad_bytes=%zu\n",
+                   link->name, slot->name, slot->host, slot->port, slot->load_pct, strlen(slot->name), conn_text_bad_count(slot->name), strlen(slot->host), conn_text_bad_count(slot->host));
         }
     } else {
         fed_obs("[observable] fed_advertise: peer=%s load=%u%% dialed=NO\n",
@@ -1922,8 +1953,8 @@ static void fed_in_stopic(server_t *s, server_link_t *link, chan_t *ch,
     if (!chan_same_name(tags->origin, ch->origin) &&
         !chan_server_has(ch, tags->origin)) {
         fed_obs("[observable] fed_topic_ignored: channel=%s from=%s subject=%s "
-                "origin=%s reason=NOT_THE_ORIGIN_OR_A_MEMBER_SERVER\n",
-                ch->name, link->name, tags->origin, ch->origin);
+                "origin=%s reason=NOT_THE_ORIGIN_OR_A_MEMBER_SERVER subject_len=%zu subject_bad_bytes=%zu\n",
+                ch->name, link->name, tags->origin, ch->origin, strlen(tags->origin), conn_text_bad_count(tags->origin));
         return;
     }
     if (chan_set_topic(ch, params[2], params[0]) != 0) {
@@ -2134,9 +2165,9 @@ static void fed_in_smodes(server_t *s, server_link_t *link, chan_t *ch,
                     (void)conn_text_logsafe(shown_mask, sizeof shown_mask, mask);
                     fed_obs("[observable] fed_modes_ban_cached: channel=%s "
                             "subject=%s mask=%s mask_len=%zu mask_bad_bytes=%zu "
-                            "on=%d origin=%s\n",
+                            "on=%d origin=%s subject_len=%zu subject_bad_bytes=%zu\n",
                             ch->name, shown_by, shown_mask, strlen(mask),
-                            conn_text_bad_count(mask), on, ch->origin);
+                            conn_text_bad_count(mask), on, ch->origin, strlen(shown_by), conn_text_bad_count(shown_by));
                 } else if (mask != NULL && mask[0] != '\0') {
                     char clean[CHAN_MAX_BAN + 1u];
                     const char *effective = mask;
@@ -2151,24 +2182,30 @@ static void fed_in_smodes(server_t *s, server_link_t *link, chan_t *ch,
                      * shortened into its bound. */
                     if (strlen(mask) > (size_t)CHAN_MAX_BAN) {
                         fed_obs("[observable] fed_modes_ban_ignored: channel=%s "
-                                "subject=%s reason=MASK_TOO_LONG len=%zu\n",
-                                ch->name, shown_by, strlen(mask));
+                                "subject=%s reason=MASK_TOO_LONG len=%zu subject_len=%zu "
+                                "subject_bad_bytes=%zu\n",
+                                ch->name, shown_by, strlen(mask), strlen(params[0]),
+                                conn_text_bad_count(params[0]));
                     } else if (on) {
                         const chan_ban_verdict_t bv = chan_ban_add(ch, effective);
 
                         if (bv != CHAN_BAN_OK) {
                             fed_obs("[observable] fed_modes_ban_ignored: "
-                                    "channel=%s subject=%s verdict=%d\n", ch->name,
-                                    shown_by, (int)bv);
+                                    "channel=%s subject=%s verdict=%d subject_len=%zu "
+                                    "subject_bad_bytes=%zu\n", ch->name, shown_by, (int)bv,
+                                    strlen(params[0]), conn_text_bad_count(params[0]));
                         } else if (mask_kept != strlen(mask)) {
                             fed_obs("[observable] fed_modes_ban_mask_stripped: "
-                                    "channel=%s subject=%s in_len=%zu kept_len=%zu\n",
-                                    ch->name, shown_by, strlen(mask), mask_kept);
+                                    "channel=%s subject=%s in_len=%zu kept_len=%zu subject_len=%zu "
+                                    "subject_bad_bytes=%zu\n", ch->name, shown_by,
+                                    strlen(mask), mask_kept, strlen(params[0]),
+                                    conn_text_bad_count(params[0]));
                         }
                     } else if (chan_ban_remove(ch, effective) == 0) {
                         fed_obs("[observable] fed_modes_ban_ignored: channel=%s "
-                                "subject=%s reason=NOT_BANNED\n",
-                                ch->name, shown_by);
+                                "subject=%s reason=NOT_BANNED subject_len=%zu "
+                                "subject_bad_bytes=%zu\n", ch->name, shown_by,
+                                strlen(params[0]), conn_text_bad_count(params[0]));
                     }
                 }
             }
@@ -2179,12 +2216,12 @@ static void fed_in_smodes(server_t *s, server_link_t *link, chan_t *ch,
         (void)conn_text_logsafe(shown, sizeof shown, params[2]);
         fed_obs("[observable] fed_modes: channel=%s by=%s by_len=%zu "
                "by_bad_bytes=%zu modes=%s modes_len=%zu "
-               "modes_bad_bytes=%zu applied=%s refused=%s cached=%s\n",
+               "modes_bad_bytes=%zu applied=%s refused=%s cached=%s cached_len=%zu cached_bad_bytes=%zu\n",
                ch->name, shown_by, strlen(params[0]),
                conn_text_bad_count(params[0]), shown, strlen(params[2]),
                conn_text_bad_count(params[2]),
                (applied[0] != '\0') ? applied : "-",
-               (refused[0] != '\0') ? refused : "-", ch->modes);
+               (refused[0] != '\0') ? refused : "-", ch->modes, strlen(ch->modes), conn_text_bad_count(ch->modes));
     }
     (void)fanout_forward_channel_sverb(s, ch, FANOUT_STATE_CHANGE, "SMODES", prefix,
                                        params, nparams, tags);
@@ -2326,9 +2363,9 @@ static void fed_in_squit(server_t *s, server_link_t *link,
     if (chan_same_name(gone, s->name)) {
         s->n_fed_squit_self++;
         fed_obs("[observable] fed_squit_refused: fd=%d peer=%s server=%s self=%s "
-               "reason=SELF_NOT_GONE\n",
+               "reason=SELF_NOT_GONE server_len=%zu server_bad_bytes=%zu\n",
                (link != NULL) ? link->fd : -1, (link != NULL) ? link->name : "?",
-               gone, s->name);
+               gone, s->name, strlen(gone), conn_text_bad_count(gone));
         return;
     }
 
@@ -2391,8 +2428,8 @@ static void fed_in_squit(server_t *s, server_link_t *link,
             i++;
         }
     }
-    fed_obs("[observable] fed_squit: server=%s chans=%zu purged=%zu remote=%zu\n", gone,
-           chans, purged, (size_t)server_chan_count(s));
+    fed_obs("[observable] fed_squit: server=%s chans=%zu purged=%zu remote=%zu server_len=%zu server_bad_bytes=%zu\n", gone,
+           chans, purged, (size_t)server_chan_count(s), strlen(gone), conn_text_bad_count(gone));
 
     /* 3.1's non-owner row: apply here, forward onward. "Onward" for a
      * server-scoped state change is the OTHER ESTABLISHED LINKS, and the two
@@ -2582,11 +2619,11 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
          * being spoken to by something that is not a peer, and that is a finding
          * rather than a statistic. */
         s->n_fed_preauth_drop++;
-        fed_obs("[observable] fed_preauth_drop: fd=%d command=%s state=%s\n", c->fd,
+        fed_obs("[observable] fed_preauth_drop: fd=%d command=%s state=%s command_len=%zu command_bad_bytes=%zu\n", c->fd,
                m->command,
                (link != NULL) ? ((link->state == (int)ESTABLISHED) ? "ESTABLISHED"
                                                                      : "PENDING")
-                              : "NONE");
+                              : "NONE", strlen(m->command), conn_text_bad_count(m->command));
         return;
     }
 
@@ -2608,8 +2645,8 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
          * disagree. A counted return rather than a silent one, so an edit that
          * reorders G1 and G3 leaves a number behind instead of a hole. */
         s->n_fed_preauth_drop++;
-        fed_obs("[observable] fed_preauth_drop: fd=%d command=%s state=UNREACHABLE\n",
-               c->fd, m->command);
+        fed_obs("[observable] fed_preauth_drop: fd=%d command=%s state=UNREACHABLE command_len=%zu command_bad_bytes=%zu\n",
+               c->fd, m->command, strlen(m->command), conn_text_bad_count(m->command));
         return;
     }
 
@@ -2627,9 +2664,13 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
              * this node can reason about. */
             s->n_fed_malformed++;
             fed_obs("[observable] fed_untagged: fd=%d peer=%s command=%s "
-                   "prefix=%s reason=BAD_PREFIX\n",
+                   "prefix=%s reason=BAD_PREFIX command_len=%zu command_bad_bytes=%zu "
+                   "prefix_len=%zu prefix_bad_bytes=%zu\n",
                    c->fd, link->name, m->command,
-                   (m->prefix != NULL) ? m->prefix : "(none)");
+                   (m->prefix != NULL) ? m->prefix : "(none)", strlen(m->command),
+                   conn_text_bad_count(m->command),
+                   strlen((m->prefix != NULL) ? m->prefix : "(none)"),
+                   conn_text_bad_count((m->prefix != NULL) ? m->prefix : "(none)"));
             return;
         }
 
@@ -2639,8 +2680,8 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
              * the resync verbs is a version fact, and calling it an untagged
              * relay would send the operator looking for a loop. */
             s->n_fed_verb_deferred++;
-            fed_obs("[observable] fed_verb_deferred: fd=%d peer=%s command=%s\n",
-                   c->fd, link->name, m->command);
+            fed_obs("[observable] fed_verb_deferred: fd=%d peer=%s command=%s command_len=%zu command_bad_bytes=%zu\n",
+                   c->fd, link->name, m->command, strlen(m->command), conn_text_bad_count(m->command));
             return;
         }
 
@@ -2661,8 +2702,8 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
              * not stamp. */
             s->n_fed_malformed++;
             fed_obs("[observable] fed_untagged: fd=%d peer=%s command=%s "
-                   "reason=BURST_UNTAGGED\n",
-                   c->fd, link->name, m->command);
+                   "reason=BURST_UNTAGGED command_len=%zu command_bad_bytes=%zu\n",
+                   c->fd, link->name, m->command, strlen(m->command), conn_text_bad_count(m->command));
             return;
         }
 
@@ -2686,8 +2727,8 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
              * harmless one. */
             s->n_fed_untagged_relay++;
             fed_obs("[observable] fed_untagged: fd=%d peer=%s command=%s prefix=%s "
-                   "reason=RELAY_UNTAGGED\n",
-                   c->fd, link->name, m->command, pserver);
+                   "reason=RELAY_UNTAGGED command_len=%zu command_bad_bytes=%zu prefix_len=%zu prefix_bad_bytes=%zu\n",
+                   c->fd, link->name, m->command, pserver, strlen(m->command), conn_text_bad_count(m->command), strlen(pserver), conn_text_bad_count(pserver));
             return;
         }
 
@@ -2730,9 +2771,9 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
         tags.id = server_next_msg_id(s);
         tags.hops = 0u;
         fed_obs("[observable] fed_untagged: fd=%d peer=%s command=%s origin=%s "
-               "epoch=%llu id=%llu reason=ORIGINATED_UNTAGGED\n",
+               "epoch=%llu id=%llu reason=ORIGINATED_UNTAGGED command_len=%zu command_bad_bytes=%zu\n",
                c->fd, link->name, m->command, tags.origin,
-               (unsigned long long)tags.epoch, (unsigned long long)tags.id);
+               (unsigned long long)tags.epoch, (unsigned long long)tags.id, strlen(m->command), conn_text_bad_count(m->command));
     }
 
     /* --- G5: the hop ceiling --------------------------------------------- */
@@ -2745,8 +2786,8 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
          * message that some other node had already decided to stop. */
         s->n_fed_hop_drop++;
         fed_obs("[observable] fed_hop_drop: fd=%d peer=%s command=%s hops=%lu "
-               "ceiling=%d\n",
-               c->fd, link->name, m->command, (unsigned long)tags.hops, IRC_MAX_HOPS);
+               "ceiling=%d command_len=%zu command_bad_bytes=%zu\n",
+               c->fd, link->name, m->command, (unsigned long)tags.hops, IRC_MAX_HOPS, strlen(m->command), conn_text_bad_count(m->command));
         return;
     }
 
@@ -2776,9 +2817,9 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
          * it bounds the damage, it does not stop the loop. */
         s->n_fed_own_origin++;
         fed_obs("[observable] fed_own_origin_drop: fd=%d peer=%s command=%s "
-               "origin=%s self=%s hops=%lu\n",
+               "origin=%s self=%s hops=%lu command_len=%zu command_bad_bytes=%zu\n",
                c->fd, link->name, m->command, tags.origin, s->name,
-               (unsigned long)tags.hops);
+               (unsigned long)tags.hops, strlen(m->command), conn_text_bad_count(m->command));
         return;
     }
 
@@ -2805,10 +2846,10 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
         s->n_fed_dup_drop++;
         s->n_fed_dedup_dup++;
         fed_obs("[observable] fed_duplicate: fd=%d peer=%s command=%s origin=%s "
-               "epoch=%llu id=%llu hops=%lu\n",
+               "epoch=%llu id=%llu hops=%lu command_len=%zu command_bad_bytes=%zu\n",
                c->fd, link->name, m->command, tags.origin,
                (unsigned long long)tags.epoch, (unsigned long long)tags.id,
-               (unsigned long)tags.hops);
+               (unsigned long)tags.hops, strlen(m->command), conn_text_bad_count(m->command));
         return;
     }
 
@@ -2903,13 +2944,13 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
     if (idx < 0) {
         if (is_deferred(m->command) != 0) {
             s->n_fed_verb_deferred++;
-            fed_obs("[observable] fed_verb_deferred: fd=%d peer=%s command=%s\n",
-                   c->fd, link->name, m->command);
+            fed_obs("[observable] fed_verb_deferred: fd=%d peer=%s command=%s command_len=%zu command_bad_bytes=%zu\n",
+                   c->fd, link->name, m->command, strlen(m->command), conn_text_bad_count(m->command));
             return;
         }
         s->n_fed_unknown_verb++;
-        fed_obs("[observable] fed_unknown_verb: fd=%d command=%s peer=%s\n", c->fd,
-               m->command, link->name);
+        fed_obs("[observable] fed_unknown_verb: fd=%d command=%s peer=%s command_len=%zu command_bad_bytes=%zu\n", c->fd,
+               m->command, link->name, strlen(m->command), conn_text_bad_count(m->command));
         return;
     }
 
@@ -2923,8 +2964,8 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
     if (m->nparams < INBOUND[idx].min || m->nparams > INBOUND[idx].max) {
         s->n_fed_malformed++;
         fed_obs("[observable] fed_malformed: fd=%d command=%s field=arity "
-               "nparams=%d want=%d..%d\n",
-               c->fd, m->command, m->nparams, INBOUND[idx].min, INBOUND[idx].max);
+               "nparams=%d want=%d..%d command_len=%zu command_bad_bytes=%zu\n",
+               c->fd, m->command, m->nparams, INBOUND[idx].min, INBOUND[idx].max, strlen(m->command), conn_text_bad_count(m->command));
         return;
     }
     /* --- G10: the handler -------------------------------------------------- */
@@ -2943,8 +2984,8 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
         if (fanout_resolve(s, NULL, m->params[0], FANOUT_MESSAGE, &t) == 0) {
             s->n_fed_malformed++;
             fed_obs("[observable] fed_malformed: fd=%d command=%s field=target "
-                   "target=%s reason=NO_SUCH_TARGET\n",
-                   c->fd, m->command, m->params[0]);
+                   "target=%s reason=NO_SUCH_TARGET command_len=%zu command_bad_bytes=%zu target_len=%zu target_bad_bytes=%zu\n",
+                   c->fd, m->command, m->params[0], strlen(m->command), conn_text_bad_count(m->command), strlen(m->params[0]), conn_text_bad_count(m->params[0]));
             return;
         }
         /* The TEXT is the second parameter and it is the whole payload; the
@@ -3034,8 +3075,8 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
             if (kept != in_len) {
                 s->n_msg_stripped++;
                 fed_obs("[observable] fed_message_stripped: verb=%s kept=%zu "
-                       "removed=%zu\n",
-                       m->command, kept, in_len - kept);
+                       "removed=%zu verb_len=%zu verb_bad_bytes=%zu\n",
+                       m->command, kept, in_len - kept, strlen(m->command), conn_text_bad_count(m->command));
             }
             fed_in_message(s, &t, m->prefix, &tags, INBOUND[idx].client_verb, sp,
                            m->nparams - 1);
@@ -3056,8 +3097,8 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
         if (ch == NULL) {
             s->n_fed_malformed++;
             fed_obs("[observable] fed_malformed: fd=%d command=%s field=channel "
-                   "channel=%s\n",
-                   c->fd, m->command, m->params[at]);
+                   "channel=%s command_len=%zu command_bad_bytes=%zu channel_len=%zu channel_bad_bytes=%zu\n",
+                   c->fd, m->command, m->params[at], strlen(m->command), conn_text_bad_count(m->command), strlen(m->params[at]), conn_text_bad_count(m->params[at]));
             return;
         }
         for (int i = 0; i < m->nparams; i++) {
@@ -3078,7 +3119,7 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
              * G8 is the only way here. It is a BUG REPORT rather than a silent
              * return, because a table row with no arm is a verb this node
              * advertises by handling and does not do. */
-            fed_obs("[observable] fed_unhandled_verb: command=%s\n", m->command);
+            fed_obs("[observable] fed_unhandled_verb: command=%s command_len=%zu command_bad_bytes=%zu\n", m->command, strlen(m->command), conn_text_bad_count(m->command));
         }
     }
 }
