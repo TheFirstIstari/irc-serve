@@ -219,6 +219,7 @@ for tls in OFF ON; do
             -e UBSAN_OPTIONS=halt_on_error=1 \
             -v "$work:/build" -w /build/irc-serve "$IMAGE" \
             ctest --test-dir "build-linux-tls$tls" -j "$JOBS" --timeout 300 \
+                  --output-on-failure \
             > "$d.test.log" 2>&1; then
         echo "    TESTS FAILED"
         grep -E 'tests passed|tests failed out of|\*\*\*' "$d.test.log" \
@@ -227,6 +228,19 @@ for tls in OFF ON; do
         # leak" a measurement rather than an impression: a log that contains the word
         # LeakSanitizer once is a different fact from a log that contains it zero times,
         # and only the number distinguishes a clean run from a run nobody read.
+        #
+        # --output-on-failure ABOVE IS WHAT MAKES THESE COUNTS MEAN ANYTHING, and that
+        # was measured rather than assumed: without it, ctest prints only the summary
+        # line for a failed test and writes each test's own output to
+        # Testing/Temporary/LastTest.log. The first version of this cell had no
+        # --output-on-failure, and a fault-injected 4 KiB leak in server_init() made it
+        # fail correctly while printing
+        #     ERROR: LeakSanitizer   0
+        #     ERROR: AddressSanitizer 0
+        #     UBSan runtime error    0
+        # -- three zeros under a heading that says "sanitizer findings", which is worse
+        # than printing nothing. A count of findings in a log that does not contain the
+        # findings is a count of nothing.
         echo "    sanitizer findings:"
         printf '      ERROR: LeakSanitizer   %s\n' "$(grep -c 'ERROR: LeakSanitizer' "$d.test.log" || true)"
         printf '      ERROR: AddressSanitizer %s\n' "$(grep -c 'ERROR: AddressSanitizer' "$d.test.log" || true)"
