@@ -4,10 +4,10 @@
 # WHY THIS EXISTS, AND WHY IT IS NOT IN THE GATE
 # ------------------------------------------------
 # Linux CI's LeakSanitizer found a 64 KiB leak in this tree's test suite, on both
-# sanitizer cells, and it was the only leak in 98 tests. Every one of this project's
-# thirteen local gate cells said nothing about it, because LeakSanitizer does not exist
-# on Darwin -- which is now the fifth time the local gate could not see something Linux
-# could, after glibc's `__wur`, a missing `<sys/wait.h>`, `memmem`, and `tf_done()`.
+# sanitizer cells, and it was the only leak the suite had. Every macOS gate cell said
+# nothing about it, because LeakSanitizer does not exist on Darwin -- which is now the
+# fifth time the local gate could not see something Linux could, after glibc's `__wur`,
+# a missing `<sys/wait.h>`, `memmem`, and `tf_done()`.
 #
 # `leaks(1)` DOES exist on Darwin and DOES report leaks at exit with an allocation
 # trace, so the leak is measurable on this machine after all. It is not the same tool

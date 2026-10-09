@@ -61,7 +61,7 @@
 # leaks, and a gate that confuses "built with sanitizers" with "ran leak detection" is
 # the suppressed-check failure in its most respectable disguise.
 #
-# COST, WHICH IS REAL AND IS NOT HIDDEN: two full builds of 100 tests plus one
+# COST, WHICH IS REAL AND IS NOT HIDDEN: two full builds of the whole suite plus one
 # executable, in a container, on a machine with 32 cores this is about two minutes. It
 # is opt-in at the gate level (--linux) precisely because of that: it is the most
 # expensive cell in the gate by a wide margin and it is the only one that can see a

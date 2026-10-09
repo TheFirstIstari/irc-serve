@@ -500,7 +500,8 @@ done
 # LEAK DETECTION IS OFF HERE AND THAT IS NOT AN OMISSION. LeakSanitizer does not
 # exist on Darwin -- measured, not assumed: an ASan binary run with
 # detect_leaks=1 aborts with "AddressSanitizer: detect_leaks is not supported on
-# this platform", taking all 85 tests with it. The ONLY leak check for TLS in this
+# this platform", taking every test in the binary with it. The ONLY leak check for
+# TLS in this
 # project is ci_sanitizers' WITH_TLS=ON cell on Linux, and no local script can
 # replace it. What this cell checks here is the memory-error half of ASan plus
 # UBSan, both of which do run on Darwin.
@@ -577,8 +578,8 @@ fi
 # build of the source and a run of the suite, so it is the same kind of evidence the
 # other thirteen cells produce, and counting it as a source check would inflate the
 # check list with a thing that is not a source check. It is also the most expensive
-# cell by a wide margin -- two full sanitized builds of 101 tests in a container -- so
-# it is asked for rather than paid for by default.
+# cell by a wide margin -- two full sanitized builds of the whole suite in a
+# container -- so it is asked for rather than paid for by default.
 #
 # WHY IT IS HERE AT ALL: six defects in this project have been invisible to every
 # macOS cell and visible only on Linux. glibc's __wur, a <sys/wait.h> included by one

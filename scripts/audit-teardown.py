@@ -399,7 +399,7 @@ def main():
                 # obligation is now in the caller. `tests/integration/
                 # test_close_sites.c`'s `load()` is exactly that shape and it is
                 # CORRECT -- three call sites free it, which macOS `leaks(1)` over
-                # all 98 binaries confirms -- so flagging it would be the sixth false
+                # the test binaries confirms -- so flagging it would be the sixth false
                 # positive this audit has produced and it would have earned the check
                 # the deletion its first five nearly earned.
                 #
@@ -504,7 +504,7 @@ def main():
     print("forwarding ownership and is exempted, because the obligation is now in a")
     print("function this rule cannot reason about. `test_close_sites.c`'s `load()` is")
     print("that shape and is correct today -- three call sites free it, and macOS")
-    print("`leaks(1)` over all 98 binaries confirms it. #134's leak went through a")
+    print("`leaks(1)` over the test binaries confirms it. #134's leak went through a")
     print("wrapper of the same shape, so RULE 2 WOULD NOT HAVE CAUGHT IT AS SHIPPED.")
     print("What caught it was Linux CI, and what stops it recurring is that the")
     print("test's wrapper now reads into a CALLER-PROVIDED BUFFER and owns nothing,")
