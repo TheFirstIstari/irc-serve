@@ -1230,6 +1230,27 @@ def check_manual_page_exists():
     and is then not the page `man irc-serve` shows.
     """
     path = os.path.join(DEB_PATH, "irc-serve.1")
+    manpages_path = os.path.join(DEB_PATH, "irc-serve.manpages")
+    if not os.path.isfile(manpages_path):
+        fail("debian/irc-serve.manpages",
+             "does not exist. dh_installman does NOT glob debian/*.1: it installs the "
+             "pages named in debian/<package>.manpages, or what it finds in debian/tmp, "
+             "or what it is given on the command line, and nothing else. Measured: the "
+             "first real build of this package had debian/irc-serve.1, dh_installman "
+             "ran, found no list, installed nothing and EXITED 0, and lintian went on "
+             "raising no-manual-page against the finished .deb. A silent no-op that "
+             "leaves the tag in place is the failure this file prevents.")
+        return
+    listing = [re.sub(r"(?:^|\s+)#.*$", "", ln).strip()
+               for ln in (read(manpages_path) or "").split("\n")]
+    listing = [ln for ln in listing if ln]
+    if not any(re.fullmatch(r"(?:debian/)?irc-serve\.1(?:\.gz)?", ln) for ln in listing):
+        fail("debian/irc-serve.manpages",
+             "does not list irc-serve.1. It lists %r. dh_installman installs exactly "
+             "what is listed, so a man page that is present and unlisted is a man page "
+             "that is not in the package -- which is what lintian's no-manual-page "
+             "reports, and it reported it against a build that had the file."
+             % (listing,))
     if not os.path.isfile(path):
         fail("debian/irc-serve.1",
              "does not exist, and /usr/bin/irc-serve is a binary in a section that "
@@ -1377,8 +1398,10 @@ def main():
     print("    debian/control, debian/rules and debian/patches/series end with a")
     print("    newline, and the extended Description fits 80 columns -- all three are")
     print("    lintian tags, and the series one is an ERROR.")
-    print("    packaging/debian/irc-serve.1 exists, so lintian's no-manual-page has an")
-    print("    answer, and every entry in irc-serve.lintian-overrides is a well-formed")
+    print("    packaging/debian/irc-serve.1 exists AND is listed in irc-serve.manpages,")
+    print("    so lintian's no-manual-page has an answer -- the second half being the")
+    print("    part dh_installman requires and does not do by itself (measured).")
+    print("    Every entry in irc-serve.lintian-overrides is a well-formed")
     print("    `package: tag` line rather than a note lintian ignores.")
     print("    scripts/build-debian-package.sh exists and is the recipe that runs the")
     print("    rest of this on Linux; its presence is asserted here so a deleted runner")
@@ -1411,7 +1434,12 @@ def main():
     print("    * The extracted binary runs: `irc-serve --help` prints irc-serve-0.1.0.")
     print("    * lintian on the .deb: zero tags. The three it raised before this pass")
     print("      were fixed or reasoned about:")
-    print("        - no-manual-page                       FIXED: packaging/debian/irc-serve.1")
+    print("        - no-manual-page                       FIXED, and it took TWO files:")
+    print("          packaging/debian/irc-serve.1 writes the page and")
+    print("          packaging/debian/irc-serve.manpages makes dh_installman install it.")
+    print("          dh_installman does not glob debian/*.1, so the page alone produced a")
+    print("          .deb with no page in it, dh_installman exited 0, and lintian said")
+    print("          no-manual-page about the finished package. Measured on the second run.")
     print("        - extended-description-line-too-long   FIXED: rewrapped to <=79 columns")
     print("        - initial-upload-closes-no-bugs        NOT A DEFECT, and recorded in")
     print("          packaging/debian/irc-serve.lintian-overrides with the reasoning: this")
