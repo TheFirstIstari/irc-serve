@@ -45,6 +45,29 @@ WHAT IS CHECKED
      regeneration -- which is the whole of the `make docs` invariant, made
      enforceable.
 
+WHICH REPOSITORY, AND WHY IT IS NOT THIS CLONE
+----------------------------------------------
+Checks 4 and 5 used to read `refs/tags`, and that is the wrong repository. This
+project carries tags that exist only on one developer's machine, so a clone with them
+answers differently from a fresh one -- and the answer is then true of nobody. It was
+not hypothetical: the machine this was fixed on held 11 tags and `origin` held 9, and
+the two the clone had extra were enough to make README's "the tree's newest tag is
+`safety-net`" sentence true locally and false everywhere else.
+
+So both now ask the REMOTE, through `scripts/gen-rollback-table.py`:
+`git ls-remote --tags origin` for the list, and a fetch into a private namespace
+(`refs/ircserve-docstruth/tags`) for the dates and subjects that `ls-remote` does not
+carry. A local tag cannot appear in that list, so it cannot change a verdict.
+
+THE ADJACENT HAZARD, and it is the reason this is not done by ignoring tags. The
+rollback table's SHAs and subjects are a documented claim about the repository too, and
+a table that disagrees with `origin` is exactly what `make docs` and this check exist
+to catch. So the generator was changed rather than bypassed: it still compares the
+committed table byte for byte against a fresh regeneration, it now just regenerates
+from the remote. Nothing was weakened, and the check is strictly more of an answer than
+it was -- before, "the table agrees with the repository" meant "with the clone", which
+was a statement about one machine wearing the words of a statement about all of them.
+
 WHAT IS NOT CHECKED, AND IT IS WORTH BEING SPECIFIC
 ---------------------------------------------------
   * PROSE IN A SHIPPED SCRIPT, other than a test count. `scripts/` IS read now, and the
@@ -133,6 +156,19 @@ def permitted_skips():
     return n
 
 
+def docs_remote():
+    """Which remote the repository-state claims are read from.
+
+    Overridable, because the fault that proves this file reads the right repository is
+    "point it at the local clone" -- and a check that can only be proved by editing its
+    own source has no proof. DOCS_TRUTH_REMOTE is a NAMED input to the check rather
+    than a fault hook: `DOCS_TRUTH_REMOTE=. make docs-check` is a thing a person can
+    legitimately want to run, and it asks the identical question of a different
+    repository.
+    """
+    return os.environ.get("DOCS_TRUTH_REMOTE") or DEFAULT_DOCS_REMOTE
+
+
 def src_lines():
     out = subprocess.run(
         ["bash", "-c",
@@ -144,13 +180,34 @@ def src_lines():
         return None
 
 
+DEFAULT_DOCS_REMOTE = "origin"
+
+
 def newest_tag():
-    out = subprocess.run(
-        ["git", "-C", ROOT, "for-each-ref", "--sort=-creatordate",
-         "--count=1", "--format=%(refname:short)", "refs/tags"],
-        capture_output=True, text=True)
-    t = out.stdout.strip().splitlines()
-    return t[0] if t else None
+    """The newest tag ON THE REMOTE, with the provenance that produced it.
+
+    It used to be `git for-each-ref --sort=-creatordate --count=1 refs/tags`, which
+    answers a question about THIS CLONE. A clone with a local-only tag answers that
+    differently from a fresh one, so the verdict was a function of the machine rather
+    than of the repository -- which is the whole of what changed here.
+
+    It delegates rather than reimplementing, so there is exactly ONE place in the tree
+    that knows how to read a remote's tags and exactly one answer. `ls-remote` alone
+    cannot do this: it carries names and object SHAs and no dates, so the ordering the
+    claim is about is not in its output.
+
+    Returns (name, provenance) or (None, reason-on-stderr). None is NOT a skip: the
+    caller turns it into a finding, because a doc check that cannot ask the question
+    and reports clean is the decorative-assertion failure this file exists to end.
+    """
+    script = os.path.join(ROOT, "scripts", "gen-rollback-table.py")
+    out = subprocess.run([sys.executable, script, "--newest-tag",
+                          "--remote", docs_remote()],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        return None, (out.stdout + out.stderr).strip()
+    name = out.stdout.strip().splitlines()[0] if out.stdout.strip() else None
+    return name, out.stderr.strip()
 
 
 def header_version():
@@ -275,7 +332,7 @@ def check_docs(build, log):
     ntests = registered_tests(build)
     nskips_permitted = permitted_skips()
     nlines = src_lines()
-    tag = newest_tag()
+    tag, tag_where = newest_tag()
 
     if ntests is None:
         finding("README.md", "every test-count claim",
@@ -350,13 +407,30 @@ def check_docs(build, log):
 
         # 5. "newest tag is `X`"
         for m in RE_NEWEST.finditer(text):
-            note(rel, m.group(0), "newest tag vs git for-each-ref --sort=-creatordate")
-            if tag is not None and m.group(1) != tag:
+            # The `why` column names WHERE the answer came from. It is in the output
+            # rather than only in a comment because the whole failure this check had
+            # was invisible: a developer whose clone carried two extra tags saw a
+            # green run of a check that was reading the wrong repository. A check that
+            # prints which repository it consulted cannot be misread that way again,
+            # and the next person to find this has the line to look at.
+            where = tag_where or "an UNREADABLE source"
+            note(rel, m.group(0), "newest tag vs %s" % where)
+            if tag is None:
+                finding(rel, m.group(0), "(unknown)",
+                        "the repository's tags could not be read, so this claim is "
+                        "UNCHECKED rather than confirmed: %s. Not skipping it: a doc "
+                        "check that cannot ask the question must fail rather than "
+                        "report clean." % where)
+                continue
+            if m.group(1) != tag:
                 finding(rel, m.group(0), "the newest tag is `%s`" % tag,
-                        "by creatordate. A phase tag is a poor answer here precisely "
-                        "because phase tags stopped being created while other tags "
-                        "did not -- which is what made the sentence wrong without "
-                        "anything looking wrong.")
+                        "by creatordate, read from %s. A phase tag is a poor answer "
+                        "here precisely because phase tags stopped being created "
+                        "while other tags did not -- which is what made the sentence "
+                        "wrong without anything looking wrong. NOTE THAT THIS IS THE "
+                        "REPOSITORY AND NOT YOUR CLONE: a tag that exists only in a "
+                        "local checkout cannot and does not change this answer."
+                        % where)
 
     # 6. the generated rollback table
     check_rollback_table()
@@ -431,9 +505,17 @@ def check_rollback_table():
 
     This is the `make docs` invariant made enforceable, and it is the check that
     replaces a manual "AND IF YOU ADD A TAG, ADD IT HERE".
+
+    THE ADJACENT HAZARD IS NOT AVOIDED BY BEING CAREFUL HERE. The table's SHAs and
+    subjects are a claim about the repository as much as the tag list is, so a table
+    that disagrees with `origin` has to be caught, and it is: the generator now
+    regenerates FROM origin, and the comparison below is still a byte-for-byte
+    equality. The change made the question better-posed; it did not make it
+    easier to pass.
     """
     out = subprocess.run([sys.executable,
-                          os.path.join(ROOT, "scripts", "gen-rollback-table.py")],
+                          os.path.join(ROOT, "scripts", "gen-rollback-table.py"),
+                          "--remote", docs_remote()],
                          capture_output=True, text=True)
     if out.returncode != 0:
         finding("docs/DEVELOPMENT.md", "the generated rollback table",
@@ -453,7 +535,7 @@ def check_rollback_table():
     m = re.search(re.escape(BEGIN) + r"(.*?)" + re.escape(END), doc, re.S)
     got = m.group(1).strip()
     note("docs/DEVELOPMENT.md", "the generated rollback table",
-         "regenerated by scripts/gen-rollback-table.py")
+         "regenerated from remote '%s'" % docs_remote())
     if got != want:
         want_tags = re.findall(r"^\| `([^`]+)`", want, re.M)
         got_tags = re.findall(r"^\| `([^`]+)`", got, re.M)
@@ -461,9 +543,11 @@ def check_rollback_table():
         only_got = [t for t in got_tags if t not in want_tags]
         if only_want or only_got:
             finding("docs/DEVELOPMENT.md", "the rollback table's tag list",
-                    "%d tags in the repository" % len(want_tags),
-                    "in the repository but not in the table: %s; in the table but not "
-                    "in the repository: %s. Run `make docs`."
+                    "%d tags in remote '%s'" % (len(want_tags), docs_remote()),
+                    "in the remote but not in the table: %s; in the table but not "
+                    "in the remote: %s. Run `make docs`. A tag that exists only in "
+                    "a local checkout is not a rollback point for anyone reading the "
+                    "document, so it does not belong in it."
                     % (", ".join(only_want) or "(none)",
                        ", ".join(only_got) or "(none)"))
         else:
@@ -530,6 +614,10 @@ def main():
           "docs/SPEC_TRACKING.md, docs/DEVELOPMENT.md and %d shipped script(s) "
           "checked against %s."
           % (len(checked), len(SHIPPED_SCRIPTS), os.path.relpath(build, ROOT)))
+    print("check-docs-truth: repository-state claims (tags, rollback table) were read "
+          "from remote '%s', NOT from this clone's refs/tags -- a tag that exists only "
+          "in a local checkout cannot change a verdict here."
+          % docs_remote())
     for rel, claim, why in checked:
         print("    %-22s %-52s  %s" % (rel, claim[:52], why))
     if findings:

@@ -882,8 +882,44 @@ irc_add_integration_test(test_msg_text test_msg_text.c)
 # test_harness link, because this test spawns no node and needs no fixture, and linking
 # one would pull node_fixture.c into a program whose entire point is that it leaks a
 # block of exactly a known size.
+#
+# ---------------------------------------------------------------------------
+# THE ASAN ERROR-CLASS PROBE: THE SAME OPT-IN, A DIFFERENT CLAIM
+# ---------------------------------------------------------------------------
+# asan_coverage_probe provokes ONE finding per AddressSanitizer error class this
+# project reports a count for -- heap-use-after-free, stack-use-after-scope,
+# heap-buffer-overflow and, the one whose ASan runtime option is off by default in
+# three of the five toolchains measured in its header, stack-use-after-return. It
+# fails unless AddressSanitizer names each one. It is built under the SAME
+# -DIRC_LSAN_PROBE switch, because the switch's real meaning is "build the opt-in
+# sanitizer coverage probes" and the gate only ever turns it on for the Linux cell,
+# which is the only place in this project where those answers exist.
+#
+# WHY IT IS BUILT BUT NOT REGISTERED WITH CTEST, and this is the one asymmetry in
+# the block. lsan_probe.c is a CTest test; this is not, and the reason is what
+# ctest CANNOT express. A red suite line means "a test failed", and here a failure
+# means "this toolchain was not watching a class" -- which is a fact about the
+# gate, not about the software. Putting it in ctest would print the second as the
+# first on the one screen a person reads when the Linux cell goes red. So
+# scripts/gate-linux-cell.sh runs this binary directly, with the same ASAN_OPTIONS
+# it gives ctest, and prints one COVER line per class. The exit status is still
+# non-zero when a class is unproved, so the cell fails; it just fails with a
+# sentence that names the class and the option.
+#
+# WHY THE OPTION NAME IS NOT CHANGED. `IRC_LSAN_PROBE` now builds two probes and
+# only one of them is about LeakSanitizer. Renaming it would invalidate every
+# existing `-DIRC_LSAN_PROBE=ON` on a command line, in this file's documentation
+# and in any bisecting a developer is halfway through, to buy a name that reads
+# better in one place. The narrow name is the cheaper mistake and the comment at
+# CMakeLists.txt:105 says what the switch actually does.
+#
+# THE COST, paid only when the option is on: one more executable, and four
+# short-lived child processes per run that each provoke one deliberate error and
+# are killed by the sanitizer doing it.
 if(IRC_LSAN_PROBE)
   add_executable(lsan_probe lsan_probe.c)
   add_test(NAME LeakSanitizerProbe COMMAND lsan_probe)
   set_tests_properties(LeakSanitizerProbe PROPERTIES LABELS Sanitizer TIMEOUT 60)
+
+  add_executable(asan_coverage_probe asan_coverage_probe.c)
 endif()
