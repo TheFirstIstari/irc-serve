@@ -173,6 +173,14 @@ static void stash_address(void)
 {
     int local = 7;
 
+    /* codeql[js/cpp/using-expired-stack-address] -- the second of exactly two
+     * suppressions in this file, and deliberately the same rule as the first. See
+     * provoke_stack_use_after_scope() for why the alternatives are worse; this one is
+     * the RETURN variant rather than the SCOPE variant, and it is the class whose
+     * runtime option is off by default in three of the five toolchains in the header.
+     * CodeQL flagged it as a second alert when the first was suppressed, which is the
+     * evidence that the suppression is line-scoped rather than a blanket on the file. */
+    // codeql[js/cpp/using-expired-stack-address]
     g_returned_block = &local;
 }
 
@@ -209,29 +217,31 @@ static void provoke_stack_use_after_scope(void)
     {
         int local = 7;
 
-        /* codeql[js/cpp/using-expired-stack-address] -- DELIBERATE, AND THIS IS THE
-         * ONLY SUPPRESSION IN THE TREE. The escape below IS the defect this probe
-         * exists to provoke: `local` has left its scope, and the read of it in the
-         * caller is what AddressSanitizer's stack-use-after-scope reports. CodeQL is
-         * right -- that is exactly what the code does -- and it is right about a
-         * function whose entire contract is to be wrong in that one specific way and
-         * to stop there. The alternative shapes are worse:
+        /* codeql[js/cpp/using-expired-stack-address] -- DELIBERATE. The escape
+         * below IS the defect this probe exists to provoke: `local` has left its
+         * scope, and the read of it in the caller is what AddressSanitizer's
+         * stack-use-after-scope reports. CodeQL is right -- that is exactly what the
+         * code does -- and it is right about a function whose entire contract is to
+         * be wrong in that one specific way and to stop there. The alternative shapes
+         * are worse:
          *
-         *   * FIXING IT would delete the probe. A stack-use-after-scope claim that is
+         *   * FIXING IT would delete the case. A stack-use-after-scope claim that is
          *     never exercised is a claim in a comment.
          *   * HIDING THE FILE from CodeQL would hide every FUTURE finding in it too,
-         *     including a real one, and this file is 200 lines of deliberate defects.
+         *     including a real one, and this file is a few hundred lines of
+         *     deliberate defects.
          *   * OBFUSCATING the escape so the scanner cannot follow it -- through a
          *     function pointer, say -- would make the case harder to read and the
          *     sanitizer report's source line less useful, in exchange for nothing.
          *
-         * What makes the suppression safe rather than convenient is that it is not
-         * the only thing standing between this file and a green scan: `stash_address`
-         * below provokes the RETURN variant and is NOT suppressed, and the same rule
-         * fires there as a second alert whenever CodeQL's analysis improves enough to
-         * reach it. If somebody deleted this line, the build still passed, the probe
-         * still passed, and the scan would go red on the one function this comment
-         * is claiming is deliberate. */
+         * THESE ARE THE ONLY TWO CODEQL SUPPRESSIONS IN THE TREE, they are on two
+         * lines, and each names the class it is provoking. The second one is
+         * `g_returned_block = &local` in stash_address(), for stack-use-after-return.
+         * Suppressing one of them and not the other was not a choice: it was tried,
+         * and the scan went red on the second alert, which is the useful thing about
+         * a narrowly-scoped suppression -- it does not quietly swallow the rest of
+         * the file. If somebody deleted either line here, the build would still pass
+         * and the probe would still pass, and the scan would go red again. */
         // codeql[js/cpp/using-expired-stack-address]
         escaped = keep_address(&local);
     }
