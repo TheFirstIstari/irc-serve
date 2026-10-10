@@ -382,9 +382,42 @@ if python3 "$root/scripts/check-peer-log-sites.py" > "$GATE_BUILD_ROOT/peerlog.l
     SUMMARY="${SUMMARY}check-peer-log-sites OK\n"
 else
     printf '  %-26s %s\n' "check-peer-log-sites.py" "FAILED"
-    sed -n '1,40p' "$GATE_BUILD_ROOT/peerlog.log" | sed 's/^/      /'
+    sed -n '2,40p' "$GATE_BUILD_ROOT/peerlog.log" | sed 's/^/      /'
     FAILED_CHECKS=$((FAILED_CHECKS + 1))
     SUMMARY="${SUMMARY}check-peer-log-sites FAILED\n"
+fi
+
+# ---------------------------------------------------------------------------
+# THE LINUX CELL'S REPORT CONTRACT, checked here rather than in the cell.
+# ---------------------------------------------------------------------------
+# WHY IT IS HERE AND NOT ONLY IN `gate.sh --linux`. The Linux cell prints a count of
+# sanitizer findings, and a count of zero is only meaningful next to a statement of
+# what was being watched -- it did not watch one class for as long as the cell
+# existed, and said nothing. Its own report now states its coverage per class, and a
+# coverage statement that is only ever checked by the cell that produces it is a
+# statement nobody re-checks: editing the report to drop the coverage block would
+# cost two minutes of container build to notice, so it would not be noticed.
+#
+# So the cell grew `--report-selftest`, which renders the report from canned inputs
+# and asserts the rendered text still carries its build type, its per-class coverage
+# and its completeness marker. It needs no docker, no Linux and no build, so it runs
+# here, on macOS, on every gate invocation -- which is where the report is most in
+# question, because macOS is where the cell cannot run at all.
+#
+# WHAT IT IS NOT: it does not check that the classes really are watched in the
+# container. That is tests/integration/asan_coverage_probe.c's job, run inside the
+# cell with the cell's own ASAN_OPTIONS. This is the format contract; that is the
+# measurement. A check that ran only where it is cheap is how the cheap half stays
+# alive between the expensive runs.
+echo "--- linux-cell report contract (source-wide) ---"
+if "$root/scripts/gate-linux-cell.sh" --report-selftest > "$GATE_BUILD_ROOT/linuxreport.log" 2>&1; then
+    sed -n '1p' "$GATE_BUILD_ROOT/linuxreport.log" | sed 's/^/  /'
+    SUMMARY="${SUMMARY}linux-cell report contract OK\n"
+else
+    printf '  %-26s %s\n' "gate-linux-cell.sh --report-selftest" "FAILED"
+    sed -n '1,40p' "$GATE_BUILD_ROOT/linuxreport.log" | sed 's/^/      /'
+    FAILED_CHECKS=$((FAILED_CHECKS + 1))
+    SUMMARY="${SUMMARY}linux-cell report contract FAILED\n"
 fi
 echo
 

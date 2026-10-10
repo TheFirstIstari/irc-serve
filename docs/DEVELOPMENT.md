@@ -155,10 +155,8 @@ lookup rather than an archaeology exercise.
 | `v0.5.0-channels` | tag | `cbf1eeb` | Phase 4: channels, final struct shapes, and the single-writer rule (#96) |
 | `v0.6.0-docs` | tag | `7166382` | docs: traefik-style README, CONTRIBUTING, SECURITY, and a runner-script fix (#95) |
 | `v0.7.0-messaging` | tag | `6757d4e` | feat(core): PRIVMSG, NOTICE, WHO, WHOIS, ISON, AWAY - the working-server line (#99) |
-| `backup-before-attrib-rewrite` | commit | `7e8c9e9` | Merge pull request #112 from TheFirstIstari/fix/runner-oversubscription |
 | `backup-before-claude-rewrite-2` | commit | `89d13b0` | Merge pull request #116 from TheFirstIstari/ci/test_fed_resync-fix |
 | `backup-before-claude-rewrite-3` | commit | `14d64cd` | Merge pull request #118 from TheFirstIstari/phase/10-ircv3 |
-| `safety-net` | commit | `72c0192` | test: two sweeps that cannot report clean while covering nothing |
 <!-- END GENERATED: rollback-table -->
 
 **THE TABLE IS GENERATED, and `make docs` rewrites it.** It used to be a fenced
@@ -174,8 +172,36 @@ object store, so `git show 738f254` succeeded and returned a commit that is not 
 `scripts/check-docs-truth.py` fails when the committed table disagrees with a fresh
 regeneration, so the instruction is now a `make docs` rather than a memory test.
 
+**WHICH REPOSITORY THE TABLE DESCRIBES, and this was wrong until it was fixed.** Both
+the generator and the check used to read `refs/tags` out of **this clone**. That is the
+wrong repository, and it was not a theoretical problem: the machine this was fixed on
+held 11 tags while `origin` held 9, so `make docs` there wrote a table that CI could
+not reproduce and the check answered a different question on that machine than it
+answered everywhere else. Two of the three tags it added were enough to make README's
+sentence naming `safety-net` as the newest tag true locally and false for every other
+reader. (It is phrased that way so it does not read as a fresh claim of the shape
+`check-docs-truth.py` looks for -- the two words "newest tag is" followed by a backticked
+name. A paragraph about a stale claim must not itself be one, which is the same reason
+that check's own scripts are excluded from the shipped-script sweep it applies to
+`scripts/`.)
+
+So the tag LIST comes from `git ls-remote --tags origin` — a question asked of the
+remote, which a local ref cannot answer — and the dates and subjects come from a
+fetch into a **private** namespace, `refs/ircserve-docstruth/tags`, rather than from
+`refs/tags`. Both halves are needed: `ls-remote` carries names and object SHAs but no
+dates, and the claim this table exists to support ("the newest tag is X") is an ordering
+claim. Nothing outside `scripts/gen-rollback-table.py` reads that namespace, and
+`ls-remote` is re-run every time, so a tag deleted on the remote leaves the table.
+
+**WHAT THAT COSTS, stated rather than discovered.** `make docs` and `make docs-check`
+now need the remote to be reachable. They do not fall back to the local clone when it
+is not, and that is deliberate: a fallback is this defect, and putting it back "for the
+offline case" would return it for exactly the runs nobody is watching. A
+documentation check that cannot ask the question fails, which is the same rule
+`check-docs-truth.py` already applies to a missing build tree.
+
 **WHY THE `Kind` COLUMN EXISTS, and it is not decoration.** Seven of these tags are
-**annotated** and four are **lightweight**, and the difference breaks the obvious
+**annotated** and two are **lightweight**, and the difference breaks the obvious
 command. On an annotated tag `%(objectname)` is the **tag object**, not the commit, so
 
 ```sh
@@ -185,24 +211,25 @@ git tag -l --sort=creatordate --format='%(refname:short)  %(objectname:short)  %
 prints seven SHAs that are all *wrong* — and it printed them wrongly while the table
 beside it was right, which is the most expensive possible shape for a verification
 command. The dereference is one `git rev-list -n1`, and that is what the generator
-does:
+does. Note that this command reads **`refs/tags`**, i.e. your clone: it is here to
+explain the dereference, not to be run as the check. The check asks the remote.
 
 ```sh
-# WHAT THE GENERATOR RUNS, and the one command worth remembering:
-git for-each-ref --sort=creatordate --format='%(refname:short)%09%(objecttype)' refs/tags |
-  while IFS="$(printf '\t')" read -r tag kind; do
-    printf '| `%s` | %s | `%s` | %s |\n' "$tag" "$kind" \
-      "$(git rev-list -n1 "$tag" | cut -c1-7)" "$(git log -1 --format=%s "$tag")"
-  done
+# WHAT THE GENERATOR RUNS. Two questions, because one cannot answer both:
+git ls-remote --tags origin                       # which tags the REPOSITORY has
+git fetch --no-tags --force origin \
+    '+refs/tags/*:refs/ircserve-docstruth/tags/*'  # and the objects to read them from
+git for-each-ref --sort=creatordate \
+    --format='%(refname:short)%09%(objecttype)' refs/ircserve-docstruth/tags
 
 # OR, WHICH IS THE SAME THING WITH THE BOOKKEEPING DONE FOR IT:
-make docs        # rewrites the table above in place
+make docs        # rewrites the table above in place, from origin
 make gate        # and fails if it is stale
 ```
 
 **AND THE TAGS ARE NOT RELEASES, and the newest one is not a phase tag.** The newest
-tag by `creatordate` is `safety-net`, which records a safety marker rather than a
-phase boundary; before it are the three `backup-before-*-rewrite` tags. The newest
+tag by `creatordate` **on `origin`** is `backup-before-claude-rewrite-3`, which records a
+safety marker from the history rewrite rather than a phase boundary. The newest
 *phase* tag is `v0.7.0-messaging` and the project is at a much later phase — the
 number in a tag names the *phase*, which is also why the version in
 `src/core/server.h` and the number in these tags are two different series that will
@@ -212,6 +239,13 @@ the limit of what generating it can check. A generator can make the ROWS true; i
 cannot make the ARGUMENT made about them true. Prose is not checkable the way `#error`
 checks code, and the honest position is that the rows are verified and this sentence is
 not.
+
+The two `backup-before-*-rewrite` tags that are in this table are the ones `origin` has.
+A `backup-before-attrib-rewrite` and a `safety-net` tag also existed in one developer's
+clone, and they are deliberately **absent**: a tag nobody can fetch is not a rollback
+point for anybody reading this document, and listing it would make the sentence above
+true on one machine and false everywhere else — which is the defect this section is
+about.
 
 ### Finding the last good state
 

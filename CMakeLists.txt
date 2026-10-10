@@ -102,29 +102,39 @@ option(BUILD_TESTING "Build tests" ON)
 option(BUILD_BENCHMARK "Build benchmarks" ON)
 
 # ---------------------------------------------------------------------------
-# IRC_LSAN_PROBE: build the test that proves LeakSanitizer is working at all
+# IRC_LSAN_PROBE: build the tests that prove the sanitizers are working at all
 # ---------------------------------------------------------------------------
 # OFF by default, and it is the only option here whose default exists to keep the gate's
 # numbers unchanged rather than because the feature is unfinished.
 #
-# WHAT IT TURNS ON: tests/integration/lsan_probe.c, which leaks 64 KiB on purpose in a
-# child process and FAILS unless LeakSanitizer reports the leak and exits non-zero.
+# WHAT IT TURNS ON, which is TWO probes and not one, and the name is narrower than
+# what the switch does:
 #
-# WHY IT IS OPT-IN. The probe is red on any platform without working leak detection --
-# that is what makes it a probe. Leaving it in the default gate would mean shipping a
-# test that fails on macOS, or passing an option that makes 13 cells lie about which
-# tests ran, or neutering the probe until it passes everywhere and therefore proves
-# nothing. scripts/gate.sh's Linux cell passes -DIRC_LSAN_PROBE=ON because that cell is
-# the only place in this project where the answer exists.
+#   * tests/integration/lsan_probe.c -- leaks 64 KiB in a child process on purpose and
+#     FAILS unless LeakSanitizer reports it and exits non-zero. Registered as a CTest
+#     test.
+#   * tests/integration/asan_coverage_probe.c -- provokes one finding per Address-
+#     Sanitizer error class this project reports a count for and FAILS unless
+#     AddressSanitizer names each one. Deliberately NOT registered with ctest; the
+#     Linux cell runs it directly and prints one COVER line per class. See
+#     tests/integration/CMakeLists.txt for why the asymmetry with lsan_probe is right.
 #
-# WHAT IT COSTS WHEN OFF: one `if()` in tests/integration/CMakeLists.txt and one unused
-# source file. What it costs when ON: one executable to build and one process that leaks
-# 64 KiB per run. Neither is worth paying by default.
+# WHY IT IS OPT-IN. The probes are red on any platform without the coverage they
+# assert -- that is what makes them probes. Leaving them in the default gate would
+# mean shipping tests that fail on macOS, or passing an option that makes 13 cells
+# lie about which tests ran, or neutering the probes until they pass everywhere and
+# therefore prove nothing. scripts/gate.sh's Linux cell passes -DIRC_LSAN_PROBE=ON
+# because that cell is the only place in this project where the answer exists.
 #
-# IT IS NOT A SUBSTITUTE FOR THE SUITE RUNNING UNDER LSan, which is the thing that
-# actually finds leaks in this tree's 100 tests. This option only answers the prior
-# question -- is the thing that finds them switched on.
-option(IRC_LSAN_PROBE "Build the deliberate-leak probe that proves LeakSanitizer is live" OFF)
+# WHAT IT COSTS WHEN OFF: two `if()`s in tests/integration/CMakeLists.txt and two
+# unused source files. What it costs when ON: two executables to build, one process
+# that leaks 64 KiB per run and four that provoke a memory error on purpose. Neither
+# is worth paying by default.
+#
+# IT IS NOT A SUBSTITUTE FOR THE SUITE RUNNING UNDER THE SANITIZERS, which is the
+# thing that actually finds defects in this tree's 100 tests. This option only answers
+# the prior question -- is the thing that finds them switched on.
+option(IRC_LSAN_PROBE "Build the deliberate-leak and ASan-class probes that prove the sanitizers are live" OFF)
 
 # ---------------------------------------------------------------------------
 # IRC_FORTIFY: -D_FORTIFY_SOURCE=2, opt-in, and READ THIS BEFORE TRUSTING IT

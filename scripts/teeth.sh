@@ -214,6 +214,165 @@ run_source_fault() {
     PASS=$((PASS + 1))
 }
 
+# ---------------------------------------------------------------------------
+# run_command_fault: the SAME PROTOCOL, for a fault some OTHER instrument has to catch.
+#
+# WHY A THIRD FUNCTION AND NOT A PARAMETER ON run_source_fault. run_source_fault is
+# hardcoded to `python3 scripts/check-packaging.py`, which is right for the five
+# packaging faults and wrong for one this pass added: a shell self-test that renders
+# `scripts/gate-linux-cell.sh`'s report and asserts the report still carries its
+# coverage statement. It needs the same discipline -- stage, apply, build, verify 0
+# errors / 0 warnings and a fresh binary, then require RED FOR THE RIGHT REASON -- and
+# it is not check-packaging.py.
+#
+# The command is passed as a single string and run with `sh -c` in the staged copy.
+# A string rather than a word list because the instrument is `sh scripts/x.sh --flag`,
+# which is shell-shaped; threading that through a parameterised form to avoid one
+# `sh -c` would be the more complicated change.
+# ---------------------------------------------------------------------------
+run_command_fault() {
+    name=$1
+    script=$2
+    expect=$3
+    cmd=$4
+
+    stage_tree
+    if ! (cd "$WORK" && python3 "$TEETH/$script"); then
+        note "FAULT NOT APPLIED: $name ($script)"
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(apply)"
+        return
+    fi
+
+    if ! (cd "$WORK" && cmake -S . -B b -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON \
+            -DWITH_TLS=OFF >"$WORK/cmake.log" 2>&1 \
+            && cmake --build b -j8 >"$WORK/build.log" 2>&1); then
+        note "FAULT $name DID NOT COMPILE -- a fault that does not build proves nothing"
+        tail -5 "$WORK/build.log" 2>/dev/null || true
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(build)"
+        return
+    fi
+
+    # Counted on the BUILD LOG, so a cell that built nothing cannot report "0 errors"
+    # by having produced no log at all. Same rule as run_source_fault.
+    errs=$(grep -c 'error:' "$WORK/build.log" || true)
+    warns=$(grep -c 'warning:' "$WORK/build.log" || true)
+    if [ "$errs" != "0" ] || [ "$warns" != "0" ]; then
+        note "FAULT $name: build printed errors=$errs warnings=$warns"
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(build:$errs/$warns)"
+        return
+    fi
+
+    # The mtime gate, same rule as run_fault: the newest source must be older than the
+    # binary, so a stale object file cannot pass for a fresh one.
+    bin="$WORK/b/src/irc-serve"
+    if [ ! -x "$bin" ]; then
+        note "FAULT $name: no built binary at $bin"
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(nobin)"
+        return
+    fi
+    newest_src=$(find "$WORK" -name '*.c' -o -name '*.h' | xargs ls -t 2>/dev/null | head -1)
+    if [ "$newest_src" -nt "$bin" ]; then
+        note "FAULT $name: the binary is NOT newer than the newest source"
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(stale)"
+        return
+    fi
+
+    if (cd "$WORK" && sh -c "$cmd" >"$WORK/instrument.log" 2>&1); then
+        note "FAULT $name NOT CAUGHT: the instrument is still GREEN"
+        sed -n '1,8p' "$WORK/instrument.log" | sed 's/^/      /'
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(green)"
+        return
+    fi
+
+    # The right failure, not merely a failure.
+    if ! grep -Fq "$expect" "$WORK/instrument.log"; then
+        note "FAULT $name: the instrument went red for the WRONG REASON (no line"
+        note "  matching: $expect)"
+        sed -n '1,12p' "$WORK/instrument.log" | sed 's/^/      /'
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(wrongreason)"
+        return
+    fi
+
+    note "ok: $name -> the instrument went red, naming the expected finding"
+    PASS=$((PASS + 1))
+}
+
+# ---------------------------------------------------------------------------
+# run_input_fault: a fault that is an ARGUMENT rather than an edit, and the reason it
+# does not use the copy protocol.
+#
+# `scripts/check-docs-truth.py` is now asked WHICH REPOSITORY to read, and pointing it
+# at the local clone with DOCS_TRUTH_REMOTE=. reproduces the original defect exactly.
+# Nothing is edited in the tree to do that, so there is no source change for a stale
+# build to hide behind -- which is the entire reason the other three runners copy the
+# tree first. Staging a copy here would be WORSE than not staging one: the defect is
+# about what the CLONE'S git state says, and a copy has its own (absent) git state, so
+# the staged fault would fail for "there is no repository here" and prove nothing
+# about reading the wrong one.
+#
+# What is still verified, and it is what the copy protocol buys in the other runners:
+# a FRESH build tree, built with 0 errors and 0 warnings, so `ctest -N` can be asked a
+# question and the instrument is not run against a stale count.
+# ---------------------------------------------------------------------------
+run_input_fault() {
+    name=$1
+    expect=$2
+    cmd=$3
+
+    rm -rf "$WORK"
+    mkdir -p "$WORK"
+    if ! (cd "$ROOT" && cmake -S . -B "$WORK/b" -DCMAKE_BUILD_TYPE=Debug \
+            -DBUILD_TESTING=ON -DWITH_TLS=OFF >"$WORK/cmake.log" 2>&1 \
+            && cmake --build "$WORK/b" -j8 >"$WORK/build.log" 2>&1); then
+        note "FAULT $name: the tree did not build, so the instrument had no build to ask"
+        tail -5 "$WORK/build.log" 2>/dev/null || true
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(build)"
+        return
+    fi
+    errs=$(grep -c 'error:' "$WORK/build.log" || true)
+    warns=$(grep -c 'warning:' "$WORK/build.log" || true)
+    if [ "$errs" != "0" ] || [ "$warns" != "0" ]; then
+        note "FAULT $name: build printed errors=$errs warnings=$warns"
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(build:$errs/$warns)"
+        return
+    fi
+    # Freshness, in the only form that means anything for a Python check: the build
+    # tree it is about to read was configured and built by THIS run, seconds ago.
+    if [ ! -f "$WORK/b/CTestTestfile.cmake" ]; then
+        note "FAULT $name: no configured build tree at $WORK/b"
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(nobuildtree)"
+        return
+    fi
+
+    if (cd "$ROOT" && sh -c "$cmd" >"$WORK/instrument.log" 2>&1); then
+        note "FAULT $name NOT CAUGHT: the instrument is still GREEN"
+        sed -n '1,10p' "$WORK/instrument.log" | sed 's/^/      /'
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(green)"
+        return
+    fi
+    if ! grep -Fq "$expect" "$WORK/instrument.log"; then
+        note "FAULT $name: the instrument went red for the WRONG REASON (no line"
+        note "  matching: $expect)"
+        sed -n '1,12p' "$WORK/instrument.log" | sed 's/^/      /'
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name(wrongreason)"
+        return
+    fi
+    note "ok: $name -> the instrument went red, naming the expected finding"
+    PASS=$((PASS + 1))
+}
+
 # `test_nick_utf8` AND NOT `test_control_bytes`: the latter covers the MODE `472` and
 # BATCH `NO_SIGN` fields, which are a different filter at a different site, so naming
 # it here would be claiming coverage that fault does not touch. Naming a test that
@@ -374,7 +533,85 @@ run_source_fault source-format-opens-with-a-comment-block \
     "dpkg-source reads this"
 
 note ""
-note "teeth: $PASS of 21 faults caught, $FAIL not."
+# ---------------------------------------------------------------------------
+# 22-24. THIS PASS'S THREE FAULTS, and what they have in common.
+#
+# Each of the shapes this project keeps finding is a check that answered from the wrong
+# thing: a gate that is not an oracle for the platform it ships on, a sanitizer cell
+# that reported a count of findings in a class it was not watching, and a
+# documentation check that read a clone instead of a repository. These three teeth are
+# the same shape again one level up -- which is the point of grouping them here. None
+# adds a test to the suite; all three are fault injections against instruments that
+# already run.
+#
+# 24 runs against the REAL repository's git state, because that is the state the
+# defect was about. 22 and 23 stage a copy, because they are edits to shipped files.
+# ---------------------------------------------------------------------------
+
+# The coverage statement deleted from gate-linux-cell.sh's report. If this did NOT go
+# red, the report's coverage block is decorative, and a "0 findings" line with nothing
+# under it saying what was watched comes back and nobody is told.
+run_command_fault linux-cell-report-coverage-statement-removed \
+    report_coverage_statement_removed.py \
+    "carries NO COVERAGE STATEMENT" \
+    "sh scripts/gate-linux-cell.sh --report-selftest"
+
+# The docs-truth check pointed at the local clone again, by faulting the DEFAULT the
+# other three runners cannot reach. The machine this runs on carries tags `origin`
+# does not -- measured: 11 in the clone, 9 on the remote -- so the fault has something
+# real to find rather than a contrived difference, and the expected line is one of
+# them. A check that could not read ANY repository would also go red here, which is why
+# the expected substring is the tag-list finding and not merely the word "FAIL".
+run_input_fault docs-truth-reads-the-local-clone \
+    "in the remote but not in the table" \
+    "DOCS_TRUTH_REMOTE=. python3 scripts/check-docs-truth.py --build $WORK/b"
+
+# AND THE OTHER HALF OF THE SAME FAULT, as its own tooth, because it is a POSITIVE
+# check and the one above is not sufficient on its own. The first tooth proves the
+# check is SENSITIVE to the clone, and a check that simply refused to answer would be
+# sensitive to it too. This one proves the check is ANCHORED to the remote: with a tag
+# in the clone that the remote does not have, the verdict must not move. A fault this
+# project has already collected once -- sensitive to the wrong input is not the same
+# property as anchored to the right one.
+note ""
+note "teeth: (positive) a local-only tag does not change the docs-truth verdict"
+rm -rf "$WORK"; mkdir -p "$WORK"
+if (cd "$ROOT" && cmake -S . -B "$WORK/b" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON \
+        -DWITH_TLS=OFF >"$WORK/cmake.log" 2>&1 \
+        && cmake --build "$WORK/b" -j8 >"$WORK/build.log" 2>&1); then
+    errs=$(grep -c 'error:' "$WORK/build.log" || true)
+    warns=$(grep -c 'warning:' "$WORK/build.log" || true)
+    if [ "$errs" != "0" ] || [ "$warns" != "0" ]; then
+        note "teeth: (positive) build printed errors=$errs warnings=$warns"
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST local-tag-changes-the-verdict(build:$errs/$warns)"
+    else
+        _probe_tag="teeth-local-only-tag-$$"
+        git -C "$ROOT" tag "$_probe_tag" "a tag that exists only in this clone" 2>/dev/null || true
+        if (cd "$ROOT" && python3 scripts/check-docs-truth.py --build "$WORK/b" \
+                >"$WORK/instrument.log" 2>&1); then
+            note "ok: local-tag-cannot-change-the-verdict -> still green with a local-only tag"
+            PASS=$((PASS + 1))
+        else
+            note "teeth: (positive) FAILED -- a tag that exists only in this clone changed the verdict"
+            sed -n '1,12p' "$WORK/instrument.log" | sed 's/^/      /'
+            FAIL=$((FAIL + 1))
+            FAILED_LIST="$FAILED_LIST local-tag-changes-the-verdict(red)"
+        fi
+        git -C "$ROOT" tag -d "$_probe_tag" >/dev/null 2>&1 || true
+    fi
+else
+    note "teeth: (positive) the tree did not build"
+    FAIL=$((FAIL + 1))
+    FAILED_LIST="$FAILED_LIST local-tag-changes-the-verdict(build)"
+fi
+# Leave the private tag namespace as the last thing that read it found, so a run that
+# ends here does not leave the NEXT run's answer depending on this one.
+git -C "$ROOT" fetch --quiet --no-tags --force --prune origin \
+    '+refs/tags/*:refs/ircserve-docstruth/tags/*' 2>/dev/null || true
+
+note ""
+note "teeth: $PASS of 24 faults caught, $FAIL not."
 if [ "$FAIL" != "0" ]; then
     note "not caught:$FAILED_LIST"
     exit 1
