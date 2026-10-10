@@ -162,14 +162,31 @@ option(IRC_LSAN_PROBE "Build the deliberate-leak and ASan-class probes that prov
 # already exists and already caught this; it is the gate for this class, and
 # ci_macos is not a slower version of it -- it is blind to it.
 #
-# What the option does buy is narrow and worth stating precisely: it makes the
-# fortify define part of a configuration the developer actually builds and runs
-# the suite in, so a future diagnostic that IS reachable from a -D flag is
-# reached here rather than first in CI, and the flag set stays visibly in step
-# with the Linux one. It also would catch a real overflow bug in the fortified
-# string calls -- just not on this platform, where those calls are not fortified.
+# WHAT THE OPTION ACTUALLY DOES TODAY, corrected because this block used to claim
+# something that was not true of it.
 #
-# OFF by default so no existing configuration changes: the same argument as
+# IT WAS: "it makes the fortify define part of a configuration the developer
+# actually builds and runs the suite in". Nothing built it. Measured on this tree:
+# `scripts/gate.sh`, `scripts/gate-linux-cell.sh` and every job in
+# `.github/workflows/ci.yml` pass no -DIRC_FORTIFY at all, and no Makefile target
+# does either. The one place the flag was forwarded is `local-ci.sh`, which passes
+# `-DIRC_FORTIFY="${IRC_FORTIFY:-OFF}"` -- so `IRC_FORTIFY=1 ./local-ci.sh` does
+# build and run the whole suite with the define, and nothing else does. The sentence
+# described a command a developer can type and implied a cell that runs on its own.
+#
+# WHY NO CELL WAS ADDED INSTEAD, which is the part that is a decision rather than an
+# observation. A gate cell here would build and run the suite a thirteenth time to
+# assert something the paragraph above already MEASURED to be unobservable on this
+# platform: the SDK declares no __*_chk entry points, so _FORTIFY_SOURCE selects no
+# code. That is a cell with no oracle behind it -- it cannot fail for the reason it
+# exists, and a gate that carries cells which cannot fail teaches the next reader
+# that gate cells are cheap. The gate for this class is `ci_linux_cachyos` and
+# `scripts/gate.sh --linux`, on glibc, where the define does have effect; that job
+# already exists and already caught the defect this option was added for.
+#
+# So the option stays as what it is: a documented way to build the suite with the
+# define on a machine where fortify does something, reached by naming the variable.
+# It is OFF by default so no existing configuration changes -- the same argument as
 # IRC_SANITIZE below.
 option(IRC_FORTIFY "Build with -D_FORTIFY_SOURCE=2 (see the note above: no-op on macOS)" OFF)
 if(IRC_FORTIFY)

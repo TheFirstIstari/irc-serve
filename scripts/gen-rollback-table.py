@@ -43,6 +43,26 @@ fetch that writes the repository's own `refs/tags` would reintroduce exactly tha
 Nothing outside this file reads that namespace, and `git ls-remote` is re-run every
 time, so a tag deleted on the remote disappears from the table rather than lingering.
 
+AND THE HALF OF THAT WHICH WAS STILL TRUE OF THE CLONE
+------------------------------------------------------
+The paragraph above was written as though the change had been completed, and for a while
+it had not been. The tag LIST moved to `ls-remote` and the DATES and SUBJECTS moved to the
+namespace, and the COMMIT column -- `git rev-list -n1 <tag>`, with a BARE tag name --
+stayed where it was, because a bare name is what git resolves against `refs/tags`. So the
+rows were assembled from two repositories: the name and the order from the remote, the
+commit from whatever the machine running `make docs` happened to have checked out under
+that name.
+
+Measured on the two machines this was fixed on, ONE remote, nine tags: eight of the nine
+SHAs differed between them, and the committed table matched the machine whose clone held
+the answer. The second machine was a CLEAN clone of nine tags -- exactly `origin`'s set --
+so this never needed a local-only tag to happen; it needed a clone whose `refs/tags` had
+been moved, which is what a history rewrite leaves behind when the remote's tags were
+re-created afterwards. The tag-list half of the teeth stayed green throughout, because
+that half had been fixed; a check that covers the list and not the column is a check that
+covers half of the claim the table makes, and it reported CLEAN while the defect it is
+named for was present.
+
 WHAT IS GENERATED, AND THE HONEST LIMIT OF IT
 ---------------------------------------------
 The ROWS. One row per tag, ordered by `creatordate`, with:
@@ -53,8 +73,11 @@ The ROWS. One row per tag, ordered by `creatordate`, with:
     `%(objectname:short)` on an ANNOTATED tag yields the TAG OBJECT rather than the
     commit, so the old first command printed seven SHAs that were all wrong while the
     table beside it was right;
-  * the COMMIT's short SHA, from `git rev-list -n1 <tag>` -- the dereference, which is
-    the whole correction;
+  * the COMMIT's short SHA, from `git rev-list -n1 refs/ircserve-docstruth/tags/<tag>`
+    -- the dereference, which is the whole correction, AND the namespace, which is the
+    other half of it: a BARE `<tag>` resolves against this clone's `refs/tags`, so
+    spelling the dereference that way is what left the commit column answering for the
+    clone while the tag list answered for the remote. See `rows()`;
   * the commit's subject, from that same commit rather than from the tag object.
 
 THE LIMIT, stated because a generator is easy to over-claim: **a generator can only
@@ -229,9 +252,20 @@ def rows(remote):
     namespace = sync_tag_objects(remote)
     verify_tag_objects(remote, names, namespace)
 
+    # `%(refname)`, THE FULL REFNAME, and not `%(refname:short)`. `:short` shortens a ref
+    # outside refs/heads and refs/tags by dropping the leading components, so it printed
+    # `ircserve-docstruth/tags/v0.1.0-preserved` and the code below had to recover the tag
+    # name with `split("/")[-1]`. That recovery is what made the SHA column unreadable:
+    # the only name left over was the BARE tag name, which is what `git rev-list` resolves
+    # against this clone's `refs/tags` rather than against the namespace. Keeping the full
+    # refname means `rev-list` is handed the same string the ordering and the objecttype
+    # were read from, so the commit, the KIND and the position are three attributes of ONE
+    # ref in ONE repository and there is no longer a step where a local ref can be
+    # substituted for the remote's. `:short` also would not have been wrong on its own --
+    # it is that discarding the namespace made the SHA unaddressable that mattered.
     refs = git("for-each-ref",
                "--sort=creatordate",
-               "--format=%(refname:short)\t%(objecttype)",
+               "--format=%(refname)\t%(objecttype)",
                namespace)
     out = []
     seen = set()
@@ -239,11 +273,35 @@ def rows(remote):
         if not line.strip():
             continue
         full, objtype = line.split("\t", 1)
-        name = full.split("/")[-1]
+        # The prefix, stripped exactly. `for-each-ref` was scoped to the namespace, so
+        # every refname here begins with it, and slicing by its length is a statement
+        # about that rather than a guess at where the tag name starts.
+        name = full[len(namespace) + 1:]
         if name not in names or name in seen:
             continue
         seen.add(name)
-        sha = git("rev-list", "-n1", name).strip()[:7]
+        # THE FULL REFNAME, and this is the whole of this function's last change.
+        #
+        # It used to be `git rev-list -n1 <name>` -- a BARE tag name -- which git resolves
+        # against the repository's ordinary refs, i.e. this clone's `refs/tags`. Every
+        # other answer in this function came from the namespace and this one came from the
+        # clone, so the commit column was the local clone's tag answering a question about
+        # the remote. Measured, two machines, ONE remote: `origin`'s
+        # `v0.1.0-preserved` peels to `738f254` and one developer's clone answers `1e0bbe4`
+        # for the same tag, and the table that was committed said `1e0bbe4` -- because it
+        # had been generated on that machine. The same remote, two published SHAs.
+        #
+        # The tag LIST was already immune, which is why the teeth that cover this file
+        # (`scripts/teeth/docs_truth_reads_local_clone.py`) stayed GREEN against it: it
+        # faults the REMOTE, and the remote default is the only place the list came from.
+        # A check that covers the tag list and not the commit column is a check that
+        # covers half of the claim the table makes.
+        #
+        # WHAT IT COSTS: nothing measurable. One format atom changed from `:short` to the
+        # full refname, and a 21-byte refname instead of a 13-byte one on the `rev-list`
+        # command line, in a function that already runs `git log` per row. The `for-each-ref`
+        # and `rev-list` calls still number the same and no network round trip was added.
+        sha = git("rev-list", "-n1", full).strip()[:7]
         subject = git("log", "-1", "--format=%s", sha).strip()
         # The KIND column, taken from what the remote said rather than from the local
         # clone's view of the object: the two can only disagree if the object was

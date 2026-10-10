@@ -148,14 +148,14 @@ lookup rather than an archaeology exercise.
 <!-- BEGIN GENERATED: rollback-table (scripts/gen-rollback-table.py; `make docs`) -->
 | Tag | Kind | Commit | Subject |
 |---|---|---|---|
-| `v0.1.0-preserved` | tag | `1e0bbe4` | Preserve prior work, correct docs, and adopt a federation-native design (#84) |
-| `v0.2.0-tokenizer` | tag | `4e01501` | Phase 1: message tokenizer, tag format, nick charset rule (#87) |
-| `v0.3.0-core` | tag | `d33bbf0` | Phase 2: server core - poll loop, conn_t framing, registries (#89) |
-| `v0.4.0-registration` | tag | `dc871d3` | feat(core): registration, 001-005 numerics, and the reply() invariant (#90) |
-| `v0.5.0-channels` | tag | `cbf1eeb` | Phase 4: channels, final struct shapes, and the single-writer rule (#96) |
-| `v0.6.0-docs` | tag | `7166382` | docs: traefik-style README, CONTRIBUTING, SECURITY, and a runner-script fix (#95) |
-| `v0.7.0-messaging` | tag | `6757d4e` | feat(core): PRIVMSG, NOTICE, WHO, WHOIS, ISON, AWAY - the working-server line (#99) |
-| `backup-before-claude-rewrite-2` | commit | `89d13b0` | Merge pull request #116 from TheFirstIstari/ci/test_fed_resync-fix |
+| `v0.1.0-preserved` | tag | `738f254` | Preserve prior work, correct docs, and adopt a federation-native design (#84) |
+| `v0.2.0-tokenizer` | tag | `8d8c416` | Phase 1: message tokenizer, tag format, nick charset rule (#87) |
+| `v0.3.0-core` | tag | `e958ea9` | Phase 2: server core - poll loop, conn_t framing, registries (#89) |
+| `v0.4.0-registration` | tag | `cbb1d16` | feat(core): registration, 001-005 numerics, and the reply() invariant (#90) |
+| `v0.5.0-channels` | tag | `7d0fe4b` | Phase 4: channels, final struct shapes, and the single-writer rule (#96) |
+| `v0.6.0-docs` | tag | `5291c85` | docs: traefik-style README, CONTRIBUTING, SECURITY, and a runner-script fix (#95) |
+| `v0.7.0-messaging` | tag | `acdaf65` | feat(core): PRIVMSG, NOTICE, WHO, WHOIS, ISON, AWAY - the working-server line (#99) |
+| `backup-before-claude-rewrite-2` | commit | `8bf5bdd` | Merge pull request #116 from TheFirstIstari/ci/test_fed_resync-fix |
 | `backup-before-claude-rewrite-3` | commit | `14d64cd` | Merge pull request #118 from TheFirstIstari/phase/10-ircv3 |
 <!-- END GENERATED: rollback-table -->
 
