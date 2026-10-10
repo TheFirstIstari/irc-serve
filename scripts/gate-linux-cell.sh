@@ -275,9 +275,20 @@ finish_report() {
     # the /bin/sh variants this file gets run under (measured: it is a syntax error
     # under macOS /bin/sh), and a marker that only renders under one shell is a marker
     # that can be missing exactly when somebody is reading a failure.
-    local dirty=0
+    #
+    # `unknown` AND NOT `0` FOR AN UNATTESTABLE TREE. Measured, on the staged copies
+    # scripts/teeth-linux.sh builds: those are `git ls-files` + `cp -P` without a .git,
+    # so they are not repositories and the descriptor says UNATTESTABLE. Pairing that
+    # with `dirty=0` prints a cleanliness claim the cell has no evidence for -- a bare
+    # number beside a word that means "I do not know", and the more legible of the two
+    # is the one it had no business asserting. The real cell never reaches this state
+    # (the attestation refusal is before every build), so this only ever renders in
+    # --report-render, --report-selftest and the teeth' staged trees, which is exactly
+    # where being honest about not knowing is worth the byte.
+    local dirty=unknown
     case "$tree" in
         *DIRTY) dirty=1 ;;
+        *clean) dirty=0 ;;
     esac
     printf '    report-complete: build=%s coverage=%s tree=%s dirty=%s\n' "$bt" \
         "$([ "$complete" = "1" ] && echo complete || echo INCOMPLETE)" \
@@ -432,8 +443,22 @@ report_selftest() {
     tree_now=$(tree_descriptor)
     case "$tree_now" in
         *DIRTY|*clean) ;;
-        *) echo "gate-linux-cell.sh --report-selftest: FAIL -- tree_descriptor() returned '$tree_now' for the repository this file lives in; the report's tree marker cannot be checked" >&2
-           fail=1 ;;
+        UNATTESTABLE)
+            # NOT A FAILURE, AND NOT SILENT. This self-test runs from wherever the
+            # caller is, and scripts/teeth.sh stages a copy with `git ls-files` and
+            # `cp -P` and NO .git -- so here there is no repository and the VALUE of
+            # the marker cannot be checked, only that the marker renders. Reporting a
+            # failure for that would be the worse of the two mistakes: it would be a
+            # red that says "your tree is wrong" when the truth is "there is no tree to
+            # be wrong about", and it would fire on every staged fault run. Saying so
+            # in one line is what the rest of this file does everywhere else.
+            echo "gate-linux-cell.sh --report-selftest: note -- this copy is not a git" \
+                 "repository, so the tree VALUE cannot be checked here; only that the" \
+                 "marker renders. The UNATTESTABLE direction is still checked below." ;;
+        *)
+            echo "gate-linux-cell.sh --report-selftest: FAIL -- tree_descriptor() returned an unrecognised '$tree_now'; the report's tree marker cannot be checked at all" >&2
+            fail=1
+            ;;
     esac
     case "$out" in
         *"tree="*) ;;
@@ -445,7 +470,12 @@ report_selftest() {
     esac
     case "$out" in
         *"$tree_now"*) ;;
-        *) echo "gate-linux-cell.sh --report-selftest: FAIL -- the rendered report names tree '$tree_now' nowhere" >&2; fail=1 ;;
+        *)
+            if [ "$tree_now" != "UNATTESTABLE" ]; then
+                echo "gate-linux-cell.sh --report-selftest: FAIL -- the rendered report names tree '$tree_now' nowhere" >&2
+                fail=1
+            fi
+            ;;
     esac
     # AND THE REFUSAL. tree_descriptor() against a directory that is not a repository
     # must say UNATTESTABLE, because that is the input the cell refuses to run on and
