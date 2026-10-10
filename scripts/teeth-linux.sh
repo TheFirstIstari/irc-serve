@@ -73,11 +73,14 @@ cleanup() {
         note "teeth-linux: scratch trees kept at $WORK"
         return
     fi
-    for d in "$WORK"/fault-*; do
+    # EVERY staged tree, not just the fault ones: the control's build is also made by
+    # the container as root, so a glob that skips it leaves a root-owned directory that
+    # makes the SECOND run's cleanup the thing that fails.
+    for d in "$WORK"/*; do
         [ -d "$d" ] || continue
         docker run --rm -v "$d:/w" "$IMAGE" rm -rf /w >/dev/null 2>&1 || rm -rf "$d" || true
     done
-    rm -rf "$WORK" 2>/dev/null || true
+    rmdir "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
 
