@@ -38,12 +38,26 @@ FAILED_LIST=""
 note() { printf '%s\n' "$*"; }
 
 # The tracked tree, without the build directory, so the build is from THESE sources.
+#
+# `-P` below, and it is not tidiness: the tree tracks `debian` as a SYMLINK to
+# `packaging/debian` (which is tracked separately), and a bare `cp` of a symlink whose
+# target is a directory fails with "is a directory (not copied)" and returns 1. Under
+# this script's `set -e` that aborts stage_tree, so EVERY fault below dies on its first
+# call before a single line is applied. Measured on main (2f21b1e) with nothing else
+# changed: the staging step exits 1 on the very first fault, so this instrument has been
+# reporting nothing at all since that symlink landed.
+#
+# `-P` copies the link itself rather than following it, which is what the tree means:
+# `debian -> packaging/debian` is RELATIVE, so it resolves inside the staged copy
+# because `packaging/debian` is staged with it. `-r` would also silence the error and
+# would be wrong in the other direction -- it dereferences, so the staged tree would
+# carry a second copy of the packaging directory under two paths.
 stage_tree() {
     rm -rf "$WORK"
     mkdir -p "$WORK"
     (cd "$ROOT" && git ls-files -z | while IFS= read -r -d '' f; do
         mkdir -p "$WORK/$(dirname "$f")"
-        cp "$ROOT/$f" "$WORK/$f"
+        cp -P "$ROOT/$f" "$WORK/$f"
     done)
 }
 

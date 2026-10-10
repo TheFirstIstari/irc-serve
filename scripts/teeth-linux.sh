@@ -64,7 +64,7 @@ command -v docker >/dev/null 2>&1 || { note "teeth-linux.sh: SKIP -- no docker o
 docker info >/dev/null 2>&1 || { note "teeth-linux.sh: SKIP -- the docker daemon is not reachable"; exit 3; }
 docker image inspect "$IMAGE" >/dev/null 2>&1 || { note "teeth-linux.sh: SKIP -- the image $IMAGE is not present locally; scripts/gate-linux-cell.sh says how to build it"; exit 3; }
 
-note "teeth-linux: host $(uname -sr), image $IMAGE, gcc $(docker run --rm "$IMAGE" gcc -dumpversion 2>/dev/null || echo '?')"
+note "teeth-linux: host $(uname -sr), image $IMAGE, gcc $(docker run --rm "$IMAGE" gcc -dumpfullversion 2>/dev/null || echo '?')"
 note "teeth-linux: scratch $WORK"
 note
 
@@ -96,9 +96,12 @@ run_asan_option_fault() {
 
     rm -rf "$d"
     mkdir -p "$d"
+    # `-P` for the reason scripts/teeth.sh's stage_tree gives at length: `debian` is a
+    # tracked symlink to `packaging/debian`, and a bare `cp` of it fails and takes the
+    # staging step down with it. The link is relative, so it resolves in the staged copy.
     (cd "$root" && git ls-files -z | while IFS= read -r -d '' f; do
         mkdir -p "$d/$(dirname "$f")"
-        cp "$root/$f" "$d/$f"
+        cp -P "$root/$f" "$d/$f"
     done)
 
     if ! (cd "$d" && python3 "$TEETH/$script"); then
@@ -202,9 +205,12 @@ control_green() {
 
     rm -rf "$d"
     mkdir -p "$d"
+    # `-P` for the reason scripts/teeth.sh's stage_tree gives at length: `debian` is a
+    # tracked symlink to `packaging/debian`, and a bare `cp` of it fails and takes the
+    # staging step down with it. The link is relative, so it resolves in the staged copy.
     (cd "$root" && git ls-files -z | while IFS= read -r -d '' f; do
         mkdir -p "$d/$(dirname "$f")"
-        cp "$root/$f" "$d/$f"
+        cp -P "$root/$f" "$d/$f"
     done)
     if ! docker run --rm -v "$d:/build" -w /build "$IMAGE" \
             sh -c 'cmake -B b -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \

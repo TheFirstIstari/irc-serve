@@ -158,6 +158,14 @@ static int run_as_child(void)
      * fact about the stack frame that has returned, rather than a store somebody could
      * later undo. */
     g_probe_block = NULL;  /* audit-teardown: DELIBERATE LEAK block -- this file exists to leak */
+    /* AND READ IT BACK, which is what keeps upstream clang's -Weverything clean. The
+     * global is deliberately written and never otherwise used -- that is the whole
+     * point of it, see the comment above -- and clang's -Wunused-but-set-global is in
+     * -Weverything, so this file did not compile under upstream clang at all. MEASURED:
+     * gcc 16.2, Apple clang 21 and gcc 12.2 in the Linux cell's container build this
+     * file clean; upstream clang 23 refuses it. Nothing in the gate or in CI passes
+     * -DIRC_LSAN_PROBE=ON, which is how a file nobody compiles can fail to compile. */
+    (void)g_probe_block;
     fprintf(stderr, "lsan_probe: child leaked %d bytes on purpose\n",
             PROBE_LEAK_BYTES);
     /* Return from main() normally, so LSan's atexit handler runs. This is the whole

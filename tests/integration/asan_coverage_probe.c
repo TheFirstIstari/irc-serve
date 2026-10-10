@@ -147,9 +147,27 @@ static int *keep_address(int *p)
  * because -Wreturn-local-addr fires on the direct form and gcc 12 then compiles the
  * return value to a LITERAL NULL at -O2 -- measured, not assumed. The probe then
  * provoked a SEGV on the zero page instead of the class it exists to prove, and a
- * probe that reports the wrong class is worse than no probe, because it is green. */
+ * probe that reports the wrong class is worse than no probe, because it is green.
+ *
+ * NO_DANGLING_POINTER IS LOAD-BEARING AND NOT COSMETIC. Storing the address of a local
+ * that is about to die is EXACTLY what this case must do, and it is exactly what gcc's
+ * -Wdangling-pointer reports: MEASURED, -Wdangling-pointer fires on the line below at
+ * gcc 16.2 on this project's own -Wall -Wextra -Werror, and this tree builds clean on
+ * gcc 16 in the 12-cell gate. The attribute is the compiler's own opt-out for exactly
+ * this case, and it is guarded because gcc 12.2 -- the compiler in the container the
+ * Linux cell runs in, measured clean without it -- predates the attribute entirely. */
+#if defined(__has_attribute)
+#  if __has_attribute(no_dangling_pointer)
+#    define ASAN_PROBE_NO_DANGLING __attribute__((no_dangling_pointer))
+#  endif
+#endif
+#ifndef ASAN_PROBE_NO_DANGLING
+#  define ASAN_PROBE_NO_DANGLING
+#endif
+
 static int *g_returned_block;
 
+ASAN_PROBE_NO_DANGLING
 __attribute__((noinline))
 static void stash_address(void)
 {

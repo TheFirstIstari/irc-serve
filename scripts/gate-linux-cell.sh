@@ -716,7 +716,7 @@ echo "GATE LINUX CELL: PASS  ($ran of 2 configurations, ASan + LSan + UBSan)"
 # rather than decoration: the numbers above were produced by ONE gcc in ONE pinned
 # image, and a second toolchain's libasan is a different implementation of the same
 # checks, so this is not the whole of what a sanitizer can say about this tree.
-echo "MEASURED ON: $(uname -sr), $(docker run --rm "$IMAGE" sh -c 'cat /etc/debian_version 2>/dev/null' 2>/dev/null || echo 'debian bookworm'), gcc $(docker run --rm "$IMAGE" gcc -dumpversion 2>/dev/null || echo '?')"
+echo "MEASURED ON: $(uname -sr), $(docker run --rm "$IMAGE" sh -c 'cat /etc/debian_version 2>/dev/null' 2>/dev/null || echo 'debian bookworm'), gcc $(docker run --rm "$IMAGE" gcc -dumpfullversion 2>/dev/null || echo '?')"
 echo "COVERAGE CLAIM: $cov_fail of $ran configurations with an unproved class; every ASan error"
 echo "  class this cell names was proved live by a deliberate finding in this run, under"
 echo "  ASAN_OPTIONS=$ASAN_RUN_OPTS, in a $BUILD_TYPE build. A different image or a"
