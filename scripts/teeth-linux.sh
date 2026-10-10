@@ -80,7 +80,10 @@ cleanup() {
         [ -d "$d" ] || continue
         docker run --rm -v "$d:/w" "$IMAGE" rm -rf /w >/dev/null 2>&1 || rm -rf "$d" || true
     done
-    rmdir "$WORK" 2>/dev/null || true
+    # `rm -rf` rather than `rmdir`, because the per-fault LOGS live in $WORK itself
+    # rather than inside the staged tree -- they are the evidence a failed run needs,
+    # and under --keep they are exactly what the run leaves behind.
+    rm -rf "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
 
