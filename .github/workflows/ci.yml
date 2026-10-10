@@ -799,7 +799,12 @@ jobs:
           grep '^COVER ' build/asan-coverage.log || true
           echo
           echo "ci_sanitizers coverage statement -- the counts this job reported apply to these classes only:"
-          sh scripts/gate-linux-cell.sh --report-render <build/asan-coverage.log
+          # BASH, NOT sh, and this is measured rather than stylistic: the renderer is
+          # `#!/usr/bin/env bash` and begins with `set -uo pipefail`, and /bin/sh on
+          # ubuntu-22.04 is dash, which fails that with "Illegal option -o pipefail".
+          # It rendered fine on macOS, where /bin/sh is bash -- which is the whole
+          # reason it has to be spelled here rather than discovered.
+          bash scripts/gate-linux-cell.sh --report-render <build/asan-coverage.log
 
   # --- The opt-in probes get COMPILED in CI, and that is the whole job -------
   # WHY THIS JOB EXISTS. `-DIRC_LSAN_PROBE=ON` builds two executables that no
@@ -894,7 +899,14 @@ jobs:
           fi
           echo "opt-in targets declared by IRC_LSAN_PROBE:"
           echo "$list" | sed 's/^/  /'
-          echo "targets=$list" >> "$GITHUB_OUTPUT"
+          # ONE LINE, because GITHUB_OUTPUT's `key=value` form cannot carry a newline
+          # and a multi-line value is rejected with "Invalid format" -- measured, and it
+          # is the second thing this step got wrong on its first CI run. Newlines become
+          # spaces so that `${{ steps.targets.outputs.targets }}` word-splits into two
+          # arguments to `--target`, which is what cmake wants. Target names come out of
+          # `add_executable(NAME ...)` and are therefore [A-Za-z0-9_]+, so flattening
+          # them onto one line cannot smuggle a shell metacharacter into a later step.
+          echo "targets=$(printf '%s' "$list" | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
       # A build directory of its own, and NOT `build`: this job configures with
       # -DIRC_LSAN_PROBE=ON, and reusing the directory any other job wrote would
       # mean a cached configuration whose option state is not the one below. A
@@ -1016,6 +1028,15 @@ jobs:
     timeout-minutes: 60
     environment:
       name: ${{ github.actor == 'TheFirstIstari' && 'self-hosted-auto' || 'self-hosted' }}
+    # SCHEDULE AND DISPATCH ONLY, and the reason is exposure rather than taste. This
+    # job runs fault-injection scripts out of the tree onto a personal machine inside a
+    # container, and ci_linux_cachyos already draws that line for the same machine: it
+    # is `if: github.event_name == 'push' && github.ref == 'refs/heads/main'`, so a pull
+    # request -- whose head is attacker-writable in the general case -- never reaches
+    # the runner. A nightly plus a dispatch gets this instrument running automatically,
+    # which was the whole point of item 3, without making it a pull-request gate that
+    # costs minutes of container time on every push and executes unreviewed code.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
       - name: Machine and image

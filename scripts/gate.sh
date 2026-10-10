@@ -350,7 +350,7 @@ asan_cell_selftest() {
     # all -- which is the failure mode this file exists to end, committed to a new
     # place.
     out=$(printf 'COVER heap-use-after-free PROVED\nCOVER stack-use-after-scope PROVED\nCOVER heap-buffer-overflow PROVED\nCOVER stack-use-after-return PROVED\n' \
-          | sh "$renderer" --report-render 2>&1) || true
+          | bash "$renderer" --report-render 2>&1) || true
     case "$out" in
         *"sanitizer coverage"*) ;;
         *) echo "gate.sh --asan-selftest: FAIL -- the shared renderer carries NO COVERAGE STATEMENT: a findings count beside nothing that says what was watched is the failure this pass exists to end" >&2
@@ -362,7 +362,7 @@ asan_cell_selftest() {
            fail=1 ;;
     esac
     out=$(printf 'COVER heap-use-after-free PROVED\nCOVER stack-use-after-scope NOT-COVERED (needs -fsanitize-address-use-after-scope)\n' \
-          | sh "$renderer" --report-render 2>&1) || true
+          | bash "$renderer" --report-render 2>&1) || true
     case "$out" in
         *"SANITIZER COVERAGE INCOMPLETE"*) ;;
         *) echo "gate.sh --asan-selftest: FAIL -- an unproved class did not produce the loud banner, so a bare count would read as a result" >&2
@@ -817,7 +817,7 @@ if [ "$RUN_ASAN" = "1" ]; then
             "asan+ubsan $(basename "$gccbin")" Release ON "$asan_opts"
         ASAN_OPTIONS="$asan_opts" "$ad/tests/integration/asan_coverage_probe" \
             > "$ad.cov.log" 2>&1 || true
-        if sh "$root/scripts/gate-linux-cell.sh" --report-render < "$ad.cov.log" \
+        if bash "$root/scripts/gate-linux-cell.sh" --report-render < "$ad.cov.log" \
                 > "$ad.covreport.log" 2>&1; then
             cov_ok=1
         else

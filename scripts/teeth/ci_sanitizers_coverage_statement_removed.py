@@ -45,7 +45,7 @@ TARGET = ".github/workflows/ci.yml"
 # The step's identifying line: the call into the shared renderer. This is the LAST
 # such call in the workflow and it sits inside ci_sanitizers, which is why the
 # workflow as a whole is a safe place to look for it: there is exactly one.
-RENDER_CALL = "sh scripts/gate-linux-cell.sh --report-render <build/asan-coverage.log"
+RENDER_CALL = "bash scripts/gate-linux-cell.sh --report-render <build/asan-coverage.log"
 
 STEP_NAME = "State what the sanitizers were watching"
 

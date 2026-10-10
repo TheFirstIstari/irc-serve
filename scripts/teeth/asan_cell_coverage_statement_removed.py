@@ -54,7 +54,7 @@ PROBE_RUN = '''ASAN_OPTIONS="$asan_opts" "$ad/tests/integration/asan_coverage_pr
             > "$ad.cov.log" 2>&1 || true
 '''
 
-RENDER_CALL = '''if sh "$root/scripts/gate-linux-cell.sh" --report-render < "$ad.cov.log" \\
+RENDER_CALL = '''if bash "$root/scripts/gate-linux-cell.sh" --report-render < "$ad.cov.log" \\
                 > "$ad.covreport.log" 2>&1; then
 '''
 
