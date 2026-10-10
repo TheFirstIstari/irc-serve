@@ -51,6 +51,11 @@ set -euo pipefail
 CTEST_JOBS_BUILD=8      # cmake --build --parallel; the machine's cores, capped
 CTEST_JOBS_TEST=""      # ctest -j; defaults to the build job count when empty
 RUN_ASAN=1
+# ASAN_SELFTEST means "describe this gate's sanitizer cell's coverage contract and
+# exit". It is declared HERE for the same reason RUN_LINUX is declared twice: the
+# argument parser assigns to a variable whose first declaration is three hundred lines
+# further down, which reads as if the flag does nothing.
+ASAN_SELFTEST=0
 # RUN_LINUX is INITIALISED HERE and again to 0 further down, where the cell itself is.
 # The second assignment is the load-bearing one and the first exists so that the
 # argument parser above has a variable to set: a parser that assigns to a variable first
@@ -65,6 +70,11 @@ while [ $# -gt 0 ]; do
         -j*)  CTEST_JOBS_TEST="${1#-j}" ;;
         --no-asan) RUN_ASAN=0 ;;
         --linux)   RUN_LINUX=1 ;;
+        # Describe this gate's ASan cell's coverage contract and exit, without
+        # building anything. The teeth for that contract are measured against it, and
+        # they need the answer in about a second on a machine that may not have three
+        # compilers installed.
+        --asan-selftest) ASAN_SELFTEST=1 ;;
         # Extra arguments for the Linux cell, passed through verbatim. This exists so a
         # developer bisecting a Linux-only failure can say `--linux --linux-args=--no-probe`
         # without this file growing a second Linux-related flag; and it is a single
@@ -286,6 +296,160 @@ fi
 GATE_BUILD_ROOT=${GATE_BUILD_ROOT:-"$root/build-gate"}
 mkdir -p "$GATE_BUILD_ROOT"
 
+# ---------------------------------------------------------------------------
+# asan_cell_selftest: THIS GATE'S OWN SANITIZER CELL STATES ITS COVERAGE, and it
+# can be checked without running a sanitizer.
+#
+# WHY IT EXISTS AT ALL, because the Linux cell's argument applies here verbatim and
+# this cell had the identical defect. The Darwin ASan+UBSan cell printed a count of
+# findings and nothing about what was watching, and the count was about three of the
+# four ASan classes the project names -- stack-use-after-return, the class that found
+# the real nf_free() defect, is off by default in Homebrew gcc 16 on macOS. A count
+# beside nothing is the shape of a claim nobody can check. The fix is a coverage
+# statement; a coverage statement that is only ever checked by the cell that produces
+# it is a statement nobody re-checks, because editing it costs a full sanitized build
+# to notice.
+#
+# WHAT IT CHECKS, and the three directions are the three ways the statement can go
+# missing without anything turning red:
+#
+#   1. THE RENDERER still emits it. A canned complete ledger and a canned incomplete
+#      one go through scripts/gate-linux-cell.sh --report-render -- the same call this
+#      cell makes at run time -- and the coverage block, the incomplete banner and
+#      the machine-readable trailer must all still be there. Deleting the coverage
+#      block from the shared renderer turns this red HERE and in the Linux cell and
+#      in ci_sanitizers, because all three call it. That direction has its own fault,
+#      report_coverage_statement_removed.py.
+#   2. THIS CELL STILL CALLS IT. Removing the call -- the easiest edit of all, since
+#      it deletes code rather than changing it -- must be red. Its fault is
+#      asan_cell_coverage_statement_removed.py.
+#   3. CI'S CELL STILL CALLS IT, for the same reason and in the same direction. Two
+#      cells in two files reporting sanitizer counts are two chances to lose the
+#      statement, and this pass exists because one of them had already. Its fault is
+#      ci_sanitizers_coverage_statement_removed.py.
+#
+# WHAT IT IS NOT: it does not prove any class is watched here. That needs a real ASan
+# run, which is what this cell and scripts/gate-linux-cell.sh do. This is the FORMAT
+# contract, checked where it is cheap, which is the split the Linux cell's header
+# already argues for and which is why it runs on macOS at all.
+# ---------------------------------------------------------------------------
+asan_cell_selftest() {
+    local fail=0 out
+
+    local renderer="$root/scripts/gate-linux-cell.sh"
+    if [ ! -x "$renderer" ]; then
+        echo "gate.sh --asan-selftest: FAIL -- $renderer is missing or not executable, so" \
+             "the coverage statement this cell prints cannot be rendered at all" >&2
+        return 1
+    fi
+
+    # `|| true` on both assignments is LOAD-BEARING and not defensive tidiness:
+    # --report-render's exit status IS the completeness verdict, so the second one is
+    # non-zero BY CONSTRUCTION, and this script runs under `set -e`. Without it the
+    # self-test would die on the very failure it is constructing and print nothing at
+    # all -- which is the failure mode this file exists to end, committed to a new
+    # place.
+    out=$(printf 'COVER heap-use-after-free PROVED\nCOVER stack-use-after-scope PROVED\nCOVER heap-buffer-overflow PROVED\nCOVER stack-use-after-return PROVED\n' \
+          | bash "$renderer" --report-render 2>&1) || true
+    case "$out" in
+        *"sanitizer coverage"*) ;;
+        *) echo "gate.sh --asan-selftest: FAIL -- the shared renderer carries NO COVERAGE STATEMENT: a findings count beside nothing that says what was watched is the failure this pass exists to end" >&2
+           fail=1 ;;
+    esac
+    case "$out" in
+        *"coverage=complete"*) ;;
+        *) echo "gate.sh --asan-selftest: FAIL -- the all-proved report does not record coverage=complete" >&2
+           fail=1 ;;
+    esac
+    out=$(printf 'COVER heap-use-after-free PROVED\nCOVER stack-use-after-scope NOT-COVERED (needs -fsanitize-address-use-after-scope)\n' \
+          | bash "$renderer" --report-render 2>&1) || true
+    case "$out" in
+        *"SANITIZER COVERAGE INCOMPLETE"*) ;;
+        *) echo "gate.sh --asan-selftest: FAIL -- an unproved class did not produce the loud banner, so a bare count would read as a result" >&2
+           fail=1 ;;
+    esac
+    case "$out" in
+        *"coverage=INCOMPLETE"*) ;;
+        *) echo "gate.sh --asan-selftest: FAIL -- the completeness marker does not record the incomplete state" >&2
+           fail=1 ;;
+    esac
+
+    # 2 and 3. Both cells still ask for it.
+    #
+    # COMMENTS ARE FILTERED OUT, and that is not a nicety -- it is the first of two
+    # ways this check was wrong when it was first written. Both call sites are NAMED in
+    # the prose of the file that contains them ("reused rather than reimplemented", "the
+    # same call this cell makes at run time"), so a plain grep for the call was
+    # satisfied by a comment describing a call that no longer existed.
+    #
+    # They are source checks, and the messages say so. They cannot know whether the
+    # step that was deleted would have worked; they know it is gone.
+    #
+    # NO PIPELINE, and this is the second time this repository has learned it:
+    # ci_sanitizers' `ldd | grep -q` step carries a comment saying that under
+    # pipefail a `cmd | grep -q` can fail on SIGPIPE when grep exits first, and turn
+    # a passing check into a spurious failure. `grep -v ... | grep -q` has exactly
+    # that shape and it failed here for exactly that reason -- on the UNFAULTED tree,
+    # which is the worst way for a check to be wrong. So the filter and the match are
+    # separate statements, and the match is a shell substring test on the filtered
+    # text: no pipe, no SIGPIPE, and no regex to misread.
+    #
+    # THE NEEDLES ARE ASSEMBLED AT RUN TIME AND NOT WRITTEN AS LITERALS, for the same
+    # reason. The first version of this check matched the string
+    # `gate-linux-cell.sh" --report-render` and the line doing the matching CONTAINED
+    # that string, so the check was satisfied by itself and reported green against a
+    # fault that had deleted the cell's call -- the second time this check was wrong in
+    # the same way. Splitting the needle means no line in this file spells it out, so
+    # the only place the string can appear is the code being checked. A self-test that
+    # satisfied itself. Splitting the needle means no line in this file spells it out, so
+    # the only place the string can appear is the code being checked. A self-test that
+    # satisfies its own assertion is worse than one that does not run: it converts a
+    # missing check into a reported pass.
+    #
+    # All three faults -- this comment's two ways, above, and the `set -e` death in the
+    # canned-incomplete render -- were caught by running each tooth against the
+    # UNFAULTED tree before believing it. A check written and not immediately
+    # adversarially exercised is a check whose first exercise is somebody else's
+    # problem.
+    _tail='gate-linux-cell.sh'
+    _needle_cell="$_tail\" --report-render"
+    _needle_ci="$_tail --report-render"
+    _cell_code=$(grep -v '^[[:space:]]*#' "$root/scripts/gate.sh")
+    case "$_cell_code" in
+        *"$_needle_cell"*) ;;
+        *)
+            echo "gate.sh --asan-selftest: FAIL -- this gate's ASan cell no longer calls the coverage" \
+                 "renderer, so its sanitizer findings count is being printed with nothing that" \
+                 "says which classes were being watched. That is the defect this check exists for." >&2
+            fail=1
+            ;;
+    esac
+    _ci_code=$(grep -v '^[[:space:]]*#' "$root/.github/workflows/ci.yml")
+    case "$_ci_code" in
+        *"$_needle_ci"*) ;;
+        *)
+            echo "gate.sh --asan-selftest: FAIL -- .github/workflows/ci.yml's ci_sanitizers job no longer" \
+                 "calls the coverage renderer, so that job's sanitizer findings count is being printed" \
+                 "with nothing that says which classes were being watched." >&2
+            fail=1
+            ;;
+    esac
+
+    if [ "$fail" != "0" ]; then
+        return 1
+    fi
+    echo "gate.sh --asan-selftest: OK -- the ASan+UBSan cell states its coverage per class through the shared renderer, and both this gate's cell and ci_sanitizers still ask for it."
+    return 0
+}
+
+# --asan-selftest EXITS HERE: before the banner, before the source-wide checks and
+# before every cell. It is a statement about text, and it is most in question on the
+# machine that cannot run the cell it describes.
+if [ "$ASAN_SELFTEST" = "1" ]; then
+    asan_cell_selftest
+    exit $?
+fi
+
 echo "irc-serve gate"
 echo "  source        : $root"
 echo "  build root    : $GATE_BUILD_ROOT"
@@ -419,6 +583,23 @@ else
     FAILED_CHECKS=$((FAILED_CHECKS + 1))
     SUMMARY="${SUMMARY}linux-cell report contract FAILED\n"
 fi
+
+# THE SAME ARGUMENT, APPLIED TO THIS GATE'S OWN SANITIZER CELL, WHICH HAD THE SAME
+# DEFECT: a count of findings and nothing about what was watching. See
+# asan_cell_selftest's comment for why a coverage statement nobody re-checks is not a
+# coverage statement. It is a FAILED CHECK and not a failed CELL for the reason the
+# ones above are: it is neither a build problem nor a source problem, it is a
+# statement about what a report says.
+echo "--- this gate's ASan-cell coverage contract (source-wide) ---"
+if asan_cell_selftest > "$GATE_BUILD_ROOT/asanreport.log" 2>&1; then
+    sed -n '1p' "$GATE_BUILD_ROOT/asanreport.log" | sed 's/^/  /'
+    SUMMARY="${SUMMARY}asan-cell coverage contract OK\n"
+else
+    printf '  %-26s %s\n' "gate.sh --asan-selftest" "FAILED"
+    sed -n '1,40p' "$GATE_BUILD_ROOT/asanreport.log" | sed 's/^/      /'
+    FAILED_CHECKS=$((FAILED_CHECKS + 1))
+    SUMMARY="${SUMMARY}asan-cell coverage contract FAILED\n"
+fi
 echo
 
 # ---------------------------------------------------------------------------
@@ -538,6 +719,37 @@ done
 # project is ci_sanitizers' WITH_TLS=ON cell on Linux, and no local script can
 # replace it. What this cell checks here is the memory-error half of ASan plus
 # UBSan, both of which do run on Darwin.
+#
+# WHAT THIS CELL NOW STATES ABOUT WHAT IT WAS WATCHING, because before this change
+# it printed a count of findings and nothing else, and a count of zero is only a
+# statement about what was being watched. The specific gap, measured on this
+# machine on 2026-10-10 with the shipped tests/integration/asan_coverage_probe:
+#
+#   toolchain                    ASAN_OPTIONS                            verdict
+#   ---------------------------  --------------------------------------  -----------------------
+#   Homebrew gcc 16.2.0          detect_leaks=0                          stack-use-after-return NOT-COVERED
+#   Homebrew gcc 16.2.0          detect_leaks=0:...after_return=1       all four classes PROVED
+#   Apple clang 21.0.0           detect_leaks=0:...after_return=1       stack-use-after-SCOPE NOT-COVERED
+#   Homebrew clang 23.1.2        detect_leaks=0:...after_return=1       stack-use-after-SCOPE NOT-COVERED
+#
+# TWO CONCLUSIONS, AND THE SECOND ONE IS NOT FIXED HERE. First, detect_leaks=0
+# alone left this cell watching three of the four classes it could watch -- and
+# stack-use-after-return is the class that found this project's real nf_free()
+# registry defect, so this cell was reporting a clean bill of health for exactly
+# the failure mode that had already bitten the tree. That is fixed, below, by
+# passing the option explicitly. Second, NEITHER CLANG watches stack-use-after-scope
+# unless the build carries -fsanitize-address-use-after-scope, which nothing in this
+# repository passes. That is a COMPILE flag: turning it on would change what the
+# whole suite is instrumented to find, which is a decision with its own cost and is
+# not this change's to make. It is stated here, and it is the reason the coverage
+# block below names classes individually instead of printing one number.
+#
+# The cell therefore BUILDS the opt-in probes beside the suite
+# (-DIRC_LSAN_PROBE=ON) and RUNS the coverage one directly, with the cell's own
+# ASAN_OPTIONS, and prints the SAME per-class statement the Linux cell prints --
+# rendered by the same function, scripts/gate-linux-cell.sh --report-render, so
+# there is one answer to "is this coverage complete" in this repository rather than
+# three. `scripts/gate.sh --asan-selftest` checks that the call is still there.
 # ---------------------------------------------------------------------------
 if [ "$RUN_ASAN" = "1" ]; then
     echo
@@ -564,15 +776,63 @@ if [ "$RUN_ASAN" = "1" ]; then
 
     ad="$GATE_BUILD_ROOT/asan_tlsON_Release"
     rm -rf "$ad"
+    # -DIRC_LSAN_PROBE=ON BUILDS THE TWO OPT-IN PROBES BESIDE THE SUITE, and this is
+    # the reason: before it, this cell could not say what it was watching, because
+    # nothing in the cell was built that could say it. The header above has the
+    # measurement for why that was not a formality.
+    #
+    # IT ADDS NO TEST TO THE RUN, and ctest is told so explicitly below with -E. The
+    # switch registers `LeakSanitizerProbe` as a CTest test, and that probe FAILS BY
+    # DESIGN on Darwin -- LeakSanitizer does not exist here, which is the whole reason
+    # this cell passes detect_leaks=0. A test that is red on purpose in the normal
+    # gate stops being distinguishable from a test that is red because something
+    # broke. So it is BUILT (which is what proves the sanitizer toolchain can compile
+    # the probe) and EXCLUDED FROM CTEST (which is what keeps the run honest). The
+    # class probe beside it is run directly instead.
     if cmake -B "$ad" -S "$root" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
-            -DWITH_TLS=ON -DIRC_SANITIZE=ON -DCMAKE_C_COMPILER="$gccpath" \
+            -DWITH_TLS=ON -DIRC_SANITIZE=ON -DIRC_LSAN_PROBE=ON \
+            -DCMAKE_C_COMPILER="$gccpath" \
             > "$ad.configure.log" 2>&1 \
        && cmake --build "$ad" --parallel "$CTEST_JOBS_BUILD" > "$ad.build.log" 2>&1; then
         errs=$(grep -c 'error:' "$ad.build.log" || true)
         warns=$(grep -c 'warning:' "$ad.build.log" || true)
-        if [ "$errs" = "0" ] && [ "$warns" = "0" ]; then
-            if ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
-               ctest --test-dir "$ad" -j "$CTEST_JOBS_TEST" --timeout 200 > "$ad.test.log" 2>&1; then
+
+        # ---------------------------------------------------------------------
+        # WHAT THIS CELL WAS WATCHING, MEASURED IN THIS RUN.
+        #
+        # The probe runs DIRECTLY and under the cell's own ASAN_OPTIONS, never through
+        # ctest, for the reason tests/integration/CMakeLists.txt gives at length: ctest
+        # reports one thing -- "a test failed" -- and here a failure means "this
+        # toolchain was not watching a class", which is a fact about the GATE and not
+        # about the software. Printing that as a red suite line is the misleading
+        # report this project keeps finding.
+        #
+        # The renderer is scripts/gate-linux-cell.sh's, so "is this coverage complete"
+        # has ONE answer in this repository: the Linux cell, this cell, and
+        # ci_sanitizers all call the same function, and its exit status is the verdict.
+        # ---------------------------------------------------------------------
+        asan_opts="detect_leaks=0:detect_stack_use_after_return=1"
+        cov_ok=1
+        printf '  %-26s %-7s tls=%-3s coverage: ASAN_OPTIONS=%s\n' \
+            "asan+ubsan $(basename "$gccbin")" Release ON "$asan_opts"
+        ASAN_OPTIONS="$asan_opts" "$ad/tests/integration/asan_coverage_probe" \
+            > "$ad.cov.log" 2>&1 || true
+        if bash "$root/scripts/gate-linux-cell.sh" --report-render < "$ad.cov.log" \
+                > "$ad.covreport.log" 2>&1; then
+            cov_ok=1
+        else
+            cov_ok=0
+        fi
+        sed -n '/sanitizer coverage/,$p' "$ad.covreport.log" | sed 's/^/      /'
+        # MACHINE AND TOOLCHAIN, because a coverage claim is a claim about a toolchain
+        # and a reader who does not know which cannot make it.
+        printf '      measured on: %s, %s, Release, ASAN_OPTIONS=%s\n' \
+            "$(uname -sr)" "$gccbin (macOS)" "$asan_opts"
+
+        if [ "$errs" = "0" ] && [ "$warns" = "0" ] && [ "$cov_ok" = "1" ]; then
+            if ASAN_OPTIONS="$asan_opts" UBSAN_OPTIONS=halt_on_error=1 \
+               ctest --test-dir "$ad" -j "$CTEST_JOBS_TEST" --timeout 200 \
+                     -E '^LeakSanitizerProbe$' > "$ad.test.log" 2>&1; then
                 if "$root/scripts/check-skips.sh" -b "$ad" "$ad.test.log" > "$ad.skips.log" 2>&1; then
                     printf '  %-26s %-7s tls=%-3s build OK  0 errors 0 warnings  %s  [skips OK]\n' \
                         "asan+ubsan $(basename "$gccbin")" Release ON \
@@ -590,6 +850,20 @@ if [ "$RUN_ASAN" = "1" ]; then
                 FAILED_CELLS=$((FAILED_CELLS + 1))
                 SUMMARY="${SUMMARY}asan+ubsan tls=ON TESTS FAILED\n"
             fi
+        elif [ "$cov_ok" != "1" ]; then
+            # THE CELL BUILT CLEAN AND THE SUITE WOULD HAVE PASSED, AND IT IS STILL
+            # RED, because "0 findings" under an incomplete coverage statement is not
+            # a result. This is the same decision scripts/gate-linux-cell.sh makes and
+            # for the same stated reason: the cell's job is the claim that it watched
+            # something, and a run that cannot show what it watched has not done that
+            # job. The lines above name the class; the clang rows in this cell's
+            # header comment say which toolchains land here (either clang leaves
+            # stack-use-after-scope unwatched, because nothing in this tree passes
+            # -fsanitize-address-use-after-scope).
+            printf '  %-26s %-7s tls=%-3s SANITIZER COVERAGE INCOMPLETE -- the counts above do not mean what they look like\n' \
+                "asan+ubsan $(basename "$gccbin")" Release ON
+            FAILED_CELLS=$((FAILED_CELLS + 1))
+            SUMMARY="${SUMMARY}asan+ubsan tls=ON COVERAGE INCOMPLETE\n"
         else
             printf '  %-26s %-7s tls=%-3s build OK but errors=%s warnings=%s\n' \
                 "asan+ubsan $(basename "$gccbin")" Release ON "$errs" "$warns"

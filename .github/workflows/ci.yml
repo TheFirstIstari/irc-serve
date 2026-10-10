@@ -5,6 +5,24 @@ on:
     branches: [main, feat/*, fix/*, phase/*, docs/*, ci/*]
   pull_request:
     branches: [main]
+  # TWO SCHEDULED / MANUAL TRIGGERS, and both exist for ONE job: ci_teeth_linux.
+  #
+  # scripts/teeth-linux.sh is the only instrument that can answer "does THIS image's
+  # ASan watch stack-use-after-return", and the question has a different answer on every
+  # platform -- measured across five toolchains, and the class is off by default in
+  # three of them. An instrument that nothing ever runs stops being an instrument: the
+  # next change to the cell's ASAN_OPTIONS would ship unverified because running the
+  # check required remembering to run it. `schedule` is the part that makes it automatic
+  # rather than optional; `workflow_dispatch` is the part that lets a change to the
+  # options be verified BEFORE it merges, which is the whole point of wiring it here.
+  #
+  # The `cron` is 04:17 UTC rather than 04:00 because the minute is a load-shaping
+  # choice, not a claim: every public workflow that can be scheduled lands on the hour
+  # and GitHub's scheduler is busiest at the top of the hour. Nothing here depends on
+  # WHEN it runs.
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -395,6 +413,66 @@ jobs:
       - name: Unit Tests
         working-directory: build
         run: ctest --output-on-failure --timeout 60 -j 2
+      # THE THIRD COMPILER FAMILY FOR THE OPT-IN PROBES. ci_optin_probes builds
+      # them under gcc and upstream clang; this step builds them under Apple
+      # clang, which is the compiler this repository's own warning set is
+      # strictest under (-Weverything) and the one that reported the
+      # `-Wnewline-eof` defect in lsan_probe.c.
+      #
+      # IT IS ONE OF FOUR CELLS AND NOT FOUR, because compiling two translation
+      # units is seconds and because a check repeated four times reports the same
+      # thing four times. The Release / WITH_TLS=OFF cell is where it lives; the
+      # probes do not use TLS and do not use the suite, so the cheapest cell is
+      # the honest place for them. Its own build directory, because the cell's
+      # `build` was configured WITHOUT -DIRC_LSAN_PROBE and reusing it would test
+      # a cached configuration rather than this one.
+      #
+      # BUILDING, NOT RUNNING, and ci_optin_probes says at length why: both probes
+      # fail by design on a platform that is not watching the class they assert.
+      # macOS is exactly such a platform for lsan_probe -- LeakSanitizer does not
+      # exist on Darwin -- so running it here would be a guaranteed red tick about
+      # the platform rather than about the tree.
+      - name: Compile the opt-in sanitizer probes (Apple clang)
+        if: matrix.build_type == 'Release' && matrix.with_tls == 'OFF'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "  cc : $(cc --version | head -1)"
+          targets=$(awk '
+            /^if\(IRC_LSAN_PROBE\)/ { inblk = 1; next }
+            inblk && /^[[:space:]]*add_executable\(/ {
+              line = $0
+              sub(/^[[:space:]]*add_executable\(/, "", line)
+              sub(/[^A-Za-z0-9_].*$/, "", line)
+              print line
+              next
+            }
+            inblk && /^endif\(\)/ { inblk = 0; next }
+            inblk { next }
+          ' tests/integration/CMakeLists.txt)
+          if [ -z "$targets" ]; then
+            echo "::error::no add_executable() inside the if(IRC_LSAN_PROBE) block; this step would compile nothing and report success" >&2
+            exit 1
+          fi
+          echo "  opt-in targets: $(echo $targets)"
+          cmake -B build-probes -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+            -DBUILD_BENCHMARK=OFF -DWITH_TLS=OFF -DIRC_LSAN_PROBE=ON \
+            2>&1 | tail -3
+          cmake --build build-probes --parallel $(sysctl -n hw.ncpu) --target $targets \
+            2>&1 | tee build-probes.build.log
+          errs=$(grep -c 'error:' build-probes.build.log || true)
+          warns=$(grep -c 'warning:' build-probes.build.log || true)
+          echo "  build: errors=$errs warnings=$warns"
+          [ "$errs" = "0" ] && [ "$warns" = "0" ] || {
+            grep -m8 -E 'error:|warning:' build-probes.build.log >&2
+            exit 1
+          }
+          for t in $targets; do
+            bin="build-probes/tests/integration/$t"
+            [ -x "$bin" ] || { echo "::error::$bin was not produced" >&2; exit 1; }
+            echo "  $bin built"
+          done
+          echo "OK: the opt-in probes compile clean under Apple clang (built, not run)"
       - name: Verify Spec References
         shell: bash
         run: |
@@ -614,7 +692,33 @@ jobs:
           # UBSan diagnostic into a failed run rather than a line in a log that
           # nobody reads: a sanitizer configured to print and carry on is a
           # sanitizer nobody acts on.
-          ASAN_OPTIONS: detect_leaks=1
+          #
+          # detect_stack_use_after_return=1 IS ADDED IN THIS CHANGE and the two
+          # numbers in the job's name are why. This job printed a count of
+          # AddressSanitizer findings and never said what it was watching, and
+          # `stack-use-after-return` -- the class that found this project's real
+          # nf_free() registry defect -- defaults to OFF in the gcc on
+          # ubuntu-22.04 (measured: with detect_leaks=1 alone, a deliberate
+          # use-after-return of a returned frame is SILENT, the read returns its
+          # value and the process exits 0). A bare `AddressSanitizer 0` above a
+          # count of leaks therefore said nothing about the one class this
+          # project has actually been bitten by. The default differs by
+          # toolchain, so passing it explicitly is what makes the claim a
+          # configuration's rather than an image's.
+          #
+          # MEASURED, 2026-10-10, on this runner image and on the maintainer's
+          # macOS machine, with the shipped asan_coverage_probe:
+          #   ubuntu-22.04 gcc 11.4   detect_leaks=1                      -> stack-use-after-return NOT-COVERED
+          #   macOS Homebrew gcc 16.2  detect_leaks=0                      -> stack-use-after-return NOT-COVERED
+          #   macOS Homebrew gcc 16.2  detect_leaks=0:+=return=1          -> all four classes PROVED
+          #   macOS Apple clang 21.0   detect_leaks=0:+=return=1          -> stack-use-after-SCOPE NOT-COVERED
+          # The scope row is a real gap and it is NOT closed here: it is a COMPILE
+          # flag (-fsanitize-address-use-after-scope), it changes what the whole
+          # suite is instrumented to find, and turning it on is a separate
+          # decision with its own cost. It is named here so that the coverage
+          # statement below is read as a per-class claim, which is the only honest
+          # form of it, rather than as one number about everything.
+          ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1
           UBSAN_OPTIONS: halt_on_error=1
         # `shell: bash` and not the default, for the reason ci_test gives: the
         # default is `bash -e {0}`, which has no pipefail, so `ctest | tee` would
@@ -640,6 +744,341 @@ jobs:
       # block as unreadable.
       - name: Skip gate (ratchet)
         run: ./scripts/check-skips.sh -b build build/ctest.log
+
+      # -------------------------------------------------------------------------
+      # WHAT THIS JOB WAS WATCHING, STATED PER CLASS.
+      #
+      # Everything above reports "0 leaks" and "0 AddressSanitizer findings". A count
+      # of zero is only a statement about what was being watched, so this job said
+      # nothing and a reader had to assume. That assumption was wrong for one class
+      # until the ASAN_OPTIONS change above; the general form of the defect is that a
+      # count cannot distinguish "clean" from "not looking", and this step is the
+      # answer to that.
+      #
+      # IT RUNS THE PROBE DIRECTLY AND NOT THROUGH CTEST, and the reason is written
+      # down in tests/integration/CMakeLists.txt: ctest reports one thing -- "a test
+      # failed" -- and here a failure means "this image was not watching a class",
+      # which is a fact about the GATE rather than about the software. Printing that
+      # as a red suite line would be the misleading report this project keeps finding.
+      # scripts/gate-linux-cell.sh's Linux cell does exactly this and reads as
+      # intended; this job does the same thing.
+      #
+      # THE RENDERER IS scripts/gate-linux-cell.sh --report-render, reused rather than
+      # reimplemented, and its EXIT STATUS is the completeness verdict. Three copies
+      # of "is this report complete" is three answers, which is precisely how the
+      # Linux cell came to have one answer too few. One renderer means a coverage
+      # statement edited out of it takes this job red as well as taking the Linux
+      # cell red.
+      #
+      # MACHINE AND TOOLCHAIN ARE NAMED because this is the only sanitizer claim in
+      # this repository about a hosted Linux image, and it is about THIS one.
+      # -------------------------------------------------------------------------
+      - name: State what the sanitizers were watching
+        env:
+          ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1
+        run: |
+          set -euo pipefail
+          probe=build/tests/integration/asan_coverage_probe
+          test -x "$probe" || {
+            echo "::error::$probe was not built, so this job cannot state what it was watching." >&2
+            echo "::error::The Configure step above passes -DIRC_LSAN_PROBE=ON; that is what builds it." >&2
+            exit 1
+          }
+          echo "  host     : $(uname -srm)"
+          echo "  gcc      : $(gcc --version | head -1)"
+          echo "  ctest    : $(ctest --version | head -1)"
+          echo "  probe    : $probe"
+          echo "  ASAN_OPTIONS: $ASAN_OPTIONS"
+          echo
+          # The probe's exit status is deliberately NOT propagated here. It is
+          # non-zero exactly when a class is unproved, and the render below turns
+          # that into a sentence naming the class and the option -- which is the
+          # difference between a red job a reader can act on and a red job they
+          # have to bisect.
+          "$probe" >build/asan-coverage.log 2>&1 || true
+          grep '^COVER ' build/asan-coverage.log || true
+          echo
+          echo "ci_sanitizers coverage statement -- the counts this job reported apply to these classes only:"
+          # BASH, NOT sh, and this is measured rather than stylistic: the renderer is
+          # `#!/usr/bin/env bash` and begins with `set -uo pipefail`, and /bin/sh on
+          # ubuntu-22.04 is dash, which fails that with "Illegal option -o pipefail".
+          # It rendered fine on macOS, where /bin/sh is bash -- which is the whole
+          # reason it has to be spelled here rather than discovered.
+          bash scripts/gate-linux-cell.sh --report-render <build/asan-coverage.log
+
+  # --- The opt-in probes get COMPILED in CI, and that is the whole job -------
+  # WHY THIS JOB EXISTS. `-DIRC_LSAN_PROBE=ON` builds two executables that no
+  # default configuration builds: tests/integration/lsan_probe.c and
+  # tests/integration/asan_coverage_probe.c. Both are the only thing standing
+  # between this project's sanitizer claims and a number that means nothing, and
+  # both had been shipped for a pass with defects in them that no build ever saw:
+  # a missing newline at EOF (Apple clang, -Wnewline-eof) and a set-but-unused
+  # global (upstream clang, -Wunused-but-set-global). Neither was caught because
+  # NOTHING COMPILED THE FILE. A source file that no configuration builds is not
+  # tested code; it is text, and it can fail to compile for ever.
+  #
+  # ADDED IN THIS CHANGE, and the defect it immediately found is the reason to
+  # believe the rest: `asan_coverage_probe.c` did not compile under gcc 16.2 at
+  # all, because of `[-Werror=dangling-pointer=]` on a store the case is REQUIRED
+  # to make. The mitigation already in the file -- an `__attribute__((no_dangling_pointer))`
+  # guarded by `__has_attribute` -- expanded to NOTHING on all three compilers the
+  # gate uses, because none of them answers true for it. So it suppressed nothing
+  # anywhere, and the file had been unbuildable by one of the project's three
+  # compilers for the whole of its life. See the comment at that store.
+  #
+  # WHY IT BUILDS AND DOES NOT RUN. ctest cannot distinguish "this toolchain was
+  # not watching" from "this build found a defect", which is exactly why
+  # scripts/gate-linux-cell.sh runs the coverage probe DIRECTLY and prints a COVER
+  # line per class. Running them here would reintroduce the ambiguity this
+  # project keeps paying for: a red job that means "no LeakSanitizer on this
+  # image" and a red job that means "your node leaks" would be the same line.
+  # BUILDING is the minimum that removes the defect class, and it is the whole
+  # class: a file that will not compile is a file nobody can run either.
+  #
+  # WHY TWO COMPILERS HERE AND A THIRD IN ci_macos. This job gets gcc and upstream
+  # clang, which are the two compilers ubuntu-22.04 ships; ci_macos builds the
+  # same two probes under Apple clang. Between the three jobs every compiler
+  # family this project gates on compiles the opt-in sources on every push and
+  # every pull request. The compilers are not the versions the local gate uses
+  # (gcc 16.2 / clang 23.1.2 / Apple clang 21.0.0 on the maintainer's macOS
+  # machine); they are the compilers CI has, and a diagnostic that only one
+  # version reports is better caught by three families than by three exact
+  # versions nobody can install in a hosted runner.
+  ci_optin_probes:
+    name: ci_optin_probes ${{ matrix.compiler }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      # NO SILENT SKIP. A missing compiler must be a red job, not a green one
+      # with a note: this job's entire content is "these two files compile", and
+      # a job that quietly declines to compile them is the defect this job
+      # exists to remove, wearing a new hat.
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          echo "  host   : $(uname -srm)"
+          echo "  cmake  : $(cmake --version | head -1)"
+          command -v ${{ matrix.compiler }} >/dev/null 2>&1 || {
+            echo "::error::${{ matrix.compiler }} is not on this runner image; this job cannot compile the opt-in probes with it" >&2
+            exit 1
+          }
+          echo "  cc     : $(${{ matrix.compiler }} --version | head -1)"
+      # THE TARGET LIST IS READ OUT OF THE CMAKE BLOCK, not written here. Three
+      # copies of "which executables does IRC_LSAN_PROBE build" is three answers,
+      # and a fourth probe added to that block tomorrow would otherwise compile
+      # in the Linux cell and nowhere else -- which is the entire failure mode
+      # this job was added for. An EMPTY derivation is a failure too: deleting the
+      # block, or renaming the option, must not turn this job into one that
+      # cheerfully compiles nothing.
+      - name: Resolve the opt-in target list from the CMake block
+        id: targets
+        run: |
+          set -euo pipefail
+          list=$(awk '
+            /^if\(IRC_LSAN_PROBE\)/ { inblk = 1; next }
+            inblk && /^[[:space:]]*add_executable\(/ {
+              line = $0
+              sub(/^[[:space:]]*add_executable\(/, "", line)
+              sub(/[^A-Za-z0-9_].*$/, "", line)
+              print line
+              next
+            }
+            inblk && /^endif\(\)/ { inblk = 0; next }
+            inblk { next }
+          ' tests/integration/CMakeLists.txt)
+          if [ -z "$list" ]; then
+            echo "::error::no add_executable() was found inside the if(IRC_LSAN_PROBE) block of tests/integration/CMakeLists.txt, so this job would compile nothing and report success" >&2
+            exit 1
+          fi
+          echo "opt-in targets declared by IRC_LSAN_PROBE:"
+          echo "$list" | sed 's/^/  /'
+          # ONE LINE, because GITHUB_OUTPUT's `key=value` form cannot carry a newline
+          # and a multi-line value is rejected with "Invalid format" -- measured, and it
+          # is the second thing this step got wrong on its first CI run. Newlines become
+          # spaces so that `${{ steps.targets.outputs.targets }}` word-splits into two
+          # arguments to `--target`, which is what cmake wants. Target names come out of
+          # `add_executable(NAME ...)` and are therefore [A-Za-z0-9_]+, so flattening
+          # them onto one line cannot smuggle a shell metacharacter into a later step.
+          echo "targets=$(printf '%s' "$list" | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+      # A build directory of its own, and NOT `build`: this job configures with
+      # -DIRC_LSAN_PROBE=ON, and reusing the directory any other job wrote would
+      # mean a cached configuration whose option state is not the one below. A
+      # typo in an option name is the exact failure the ci_sanitizers "Verify the
+      # instrumented build" step documents, and the same defence applies.
+      - name: Configure
+        run: |
+          set -euo pipefail
+          cmake -B build-probes -S . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=ON \
+            -DBUILD_BENCHMARK=OFF \
+            -DWITH_TLS=OFF \
+            -DIRC_LSAN_PROBE=ON \
+            -DCMAKE_C_COMPILER=${{ matrix.compiler }}
+      # THE TARGET NAMES ARE REAL. `cmake --build . --target <typo>` does fail on
+      # a name that matches nothing, so this is belt and braces rather than the
+      # only defence -- but the artefact assertion below is the decisive one,
+      # because it is the only assertion that cannot be satisfied by a build that
+      # decided there was nothing to do. The listing is printed so that a reader
+      # of the log can see what the names were resolved against.
+      - name: Assert the target names are real before building them
+        run: |
+          set -euo pipefail
+          (cmake --build build-probes --target help 2>&1 || true) > build-probes.targets.txt
+          for t in ${{ steps.targets.outputs.targets }}; do
+            if grep -q -- "$t" build-probes.targets.txt; then
+              echo "  target $t: declared by the build system"
+            else
+              echo "::error::target '$t' does not appear in 'cmake --build --target help' for this compiler." >&2
+              echo "::error::A name that matches no target must fail loudly here rather than compile nothing." >&2
+              exit 1
+            fi
+          done
+      - name: Build the opt-in probes
+        run: |
+          set -euo pipefail
+          cmake --build build-probes --parallel $(nproc) --target ${{ steps.targets.outputs.targets }} \
+            2>&1 | tee build-probes.build.log
+      # 0 ERRORS AND 0 WARNINGS, COUNTED ON THE BUILD LOG rather than taken from
+      # the exit code. The tree compiles with -Wall -Wextra -Werror and, under
+      # Clang, -Weverything, so -Werror already makes a diagnostic fatal on the
+      # compilers that have it; the count is here for the shape of the check the
+      # rest of this project uses (scripts/gate.sh counts on the log for the same
+      # reason: a build that produced no log must not report "0 warnings").
+      - name: Assert the probes built clean, exist, and are newer than every source
+        run: |
+          set -euo pipefail
+          errs=$(grep -c 'error:' build-probes.build.log || true)
+          warns=$(grep -c 'warning:' build-probes.build.log || true)
+          echo "build: errors=$errs warnings=$warns"
+          if [ "$errs" != "0" ] || [ "$warns" != "0" ]; then
+            grep -m8 -E 'error:|warning:' build-probes.build.log >&2
+            exit 1
+          fi
+          for t in ${{ steps.targets.outputs.targets }}; do
+            bin="build-probes/tests/integration/$t"
+            if [ ! -x "$bin" ]; then
+              echo "::error::$bin was not produced. A target that builds to nothing must not report success." >&2
+              exit 1
+            fi
+            # THE QUESTION IS ASKED DIRECTLY rather than computed from a sorted list.
+            # The first version built `newest_src` with find | xargs ls -t | head and
+            # compared with `-nt`, and it failed CI with xargs' exit 123 -- the code
+            # for "one of my invocations exited non-zero" -- which says nothing about
+            # whether the probe was fresh. Three pipelines were doing one comparison:
+            # `find . -newer "$bin" -print -quit` IS the comparison, and it cannot
+            # return a status that means anything other than the answer. The -not is
+            # inside the parentheses this time, so the build directory is genuinely
+            # excluded rather than excluded only for the .h branch of an -o -- which is
+            # what the first version did when it passed "$PWD" and therefore emitted
+            # absolute paths that -not -path './build-probes/*' could never match.
+            stale=$(find . \( -name '*.c' -o -name '*.h' \) \
+                      -not -path './build-probes/*' -newer "$bin" -print -quit)
+            if [ -n "$stale" ]; then
+              echo "::error::$stale is newer than $bin, so $bin was not rebuilt from this tree." >&2
+              exit 1
+            fi
+            echo "  $bin built, newer than every source in the tree"
+          done
+      - name: The probes are not RUN here, and here is why
+        run: |
+          set -euo pipefail
+          cat <<'EOF'
+          Not a no-op: the probes are deliberately not executed in this job.
+            lsan_probe FAILS BY DESIGN wherever LeakSanitizer is absent or off, and
+            asan_coverage_probe FAILS BY DESIGN wherever a class it proves is not
+            being watched. Both facts belong to the GATE, not to the software, and
+            ctest -- and this job's step model -- cannot express that difference.
+          The place they run is scripts/gate-linux-cell.sh, which runs the coverage
+          probe directly with the cell's own ASAN_OPTIONS and prints one COVER line
+          per class, and ci_sanitizers above, which does the same against a hosted
+          Linux image. This job's whole claim is that the two files COMPILE under
+          three compiler families. A file that will not compile is a file nobody can
+          run either, and that is the defect this job removes.
+          EOF
+
+  # --- scripts/teeth-linux.sh gets a home, and it is an automatic one -------
+  # THE PROBLEM. scripts/teeth-linux.sh is the only instrument in this repository
+  # that can answer "does THIS image's ASan actually watch stack-use-after-return",
+  # and it is the only thing standing between a change to the Linux cell's
+  # ASAN_OPTIONS and an unverified claim. It was in no workflow and no Makefile,
+  # which means a change to those options would not be re-checked by any
+  # automated run until a human remembered. An instrument nothing runs is a
+  # comment, and the failure it permits is exactly the one this pass is about: a
+  # cell that reports a count of findings in a class nobody watched.
+  #
+  # WHY THE SELF-HOSTED RUNNER AND NOT ubuntu-22.04. The script refuses to start
+  # anywhere but Linux with docker and one specific image present, and the image is
+  # a debian:bookworm this project builds by hand. Running it on a hosted image
+  # would mean rebuilding that image on every run and would then be measuring a
+  # DIFFERENT image's ASan while the file's whole claim is about this one.
+  # cachyos-x8664 already runs ci_linux, already has the image, and already has
+  # docker. The exposure note in this file's header applies unchanged: anything
+  # that reaches this runner executes code there, which is why the environment
+  # below is the same one ci_linux_cachyos uses and why the schedule is the
+  # default path.
+  #
+  # WHY IT IS NOT ON EVERY PUSH. It builds a sanitized tree inside a container for
+  # a control and a fault, which is minutes of work, and scripts/teeth.sh is not on
+  # a push either for the same reason. A nightly is the right cadence: it is slow
+  # enough to be cheap and frequent enough that a change to ASAN_OPTIONS is
+  # verified within a day rather than at the next release.
+  #
+  # `workflow_dispatch` IS THE PART THAT MAKES IT USEFUL BEFORE A MERGE rather than
+  # after one: it is how a change to the options gets proven before it lands.
+  ci_teeth_linux:
+    name: ci_teeth_linux (nightly)
+    runs-on: [self-hosted, Linux, X64, cachyos-x8664]
+    timeout-minutes: 60
+    environment:
+      name: ${{ github.actor == 'TheFirstIstari' && 'self-hosted-auto' || 'self-hosted' }}
+    # SCHEDULE AND DISPATCH ONLY, and the reason is exposure rather than taste. This
+    # job runs fault-injection scripts out of the tree onto a personal machine inside a
+    # container, and ci_linux_cachyos already draws that line for the same machine: it
+    # is `if: github.event_name == 'push' && github.ref == 'refs/heads/main'`, so a pull
+    # request -- whose head is attacker-writable in the general case -- never reaches
+    # the runner. A nightly plus a dispatch gets this instrument running automatically,
+    # which was the whole point of item 3, without making it a pull-request gate that
+    # costs minutes of container time on every push and executes unreviewed code.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Machine and image
+        run: |
+          set -euo pipefail
+          echo "  host   : $(uname -srm)"
+          echo "  distro : $(. /etc/os-release && echo "$PRETTY_NAME")"
+          echo "  docker : $(docker --version)"
+          docker image inspect "${GATE_LINUX_IMAGE:-ircserve-lsan:bookworm}" >/dev/null 2>&1 || {
+            echo "::error::the pinned sanitizer image is not present on this runner; scripts/teeth-linux.sh would SKIP and a skip is not a result" >&2
+            exit 1
+          }
+      # THE EXIT STATUS IS PROPAGATED and never rewritten. This script has THREE
+      # outcomes on purpose -- 0 caught, 1 not caught, 3 could not run -- and the
+      # third is not a success. A workflow step that turned 3 into 0 would be the
+      # same class of defect as a report that prints a count of findings in a
+      # class nobody watched: a green tick about work that did not happen.
+      - name: Run the Linux teeth
+        env:
+          GATE_LINUX_IMAGE: ircserve-lsan:bookworm
+        run: |
+          set -uo pipefail
+          ./scripts/teeth-linux.sh
+          rc=$?
+          case "$rc" in
+            0) echo "::notice::teeth-linux: every fault caught and every control green" ;;
+            3) echo "::error::teeth-linux: SKIPPED -- no docker, no image, or not Linux. That is not a pass." >&2
+               exit 1 ;;
+            *) echo "::error::teeth-linux: at least one fault was NOT caught. See the log above." >&2
+               exit 1 ;;
+          esac
 
   # --- Advisory only, hosted ---------------------------------------------
   # Benchmark and compliance run on the hosted runner rather than the

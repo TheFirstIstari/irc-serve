@@ -10,7 +10,7 @@ BUILD_DIR := build-testing
 BENCH_BUILD_DIR := build-benchmark
 CTEST_TIMEOUT := 60
 
-.PHONY: all build test benchmark local-ci gate clean help docs-check docs
+.PHONY: all build test benchmark local-ci gate gate-linux clean help docs-check docs
 .DEFAULT_GOAL := help
 
 help:
@@ -22,6 +22,10 @@ help:
 	@echo "  gate         Run ./scripts/gate.sh — 3 compilers x Release/Debug x"
 	@echo "               WITH_TLS ON/OFF, plus an ASan+UBSan cell. SLOW: 13"
 	@echo "               fresh builds. Pass extra args, e.g. 'make gate GATE_ARGS=-j2'"
+	@echo "  gate-linux   Run ./scripts/gate.sh --linux: glibc + ASan + LSan + UBSan"
+	@echo "               in a pinned debian container. Needs docker."
+	@echo "  teeth-linux  Run ./scripts/teeth-linux.sh — the fault injections that"
+	@echo "               need a pinned Linux image. Needs docker AND Linux."
 	@echo "  clean        Remove build directories"
 
 # `build` mirrors `local-ci.sh` lines 1-2 and CI job `ci_test`.
@@ -83,6 +87,33 @@ gate:
 		exit 1; \
 	fi
 	./scripts/gate.sh $(GATE_ARGS)
+
+# `gate-linux` and `teeth-linux` are separate targets because they cost DIFFERENT
+# things and refuse on different grounds. gate-linux is this gate plus the pinned
+# container: two full sanitized builds of the whole suite. teeth-linux is a control
+# and a fault, each its own sanitized container build, and it REFUSES to start
+# anywhere but Linux with the image present -- which is why it is a target of its own
+# rather than a flag on gate: a target that silently did nothing on a laptop would
+# report the same "green" as one that ran.
+#
+# NEITHER IS THE AUTOMATIC VERIFICATION. The automatic run is the `ci_teeth_linux`
+# job in .github/workflows/ci.yml, on a schedule and on workflow_dispatch. These
+# targets exist so that "wired so it actually runs somewhere automatic" has a manual
+# counterpart a person can reach, and so the nightly's command line is written down
+# somewhere other than the workflow file.
+gate-linux:
+	@if [ ! -x ./scripts/gate.sh ]; then \
+		echo "[Makefile] scripts/gate.sh missing or not executable"; \
+		exit 1; \
+	fi
+	./scripts/gate.sh --linux $(GATE_ARGS)
+
+teeth-linux:
+	@if [ ! -x ./scripts/teeth-linux.sh ]; then \
+		echo "[Makefile] scripts/teeth-linux.sh missing or not executable"; \
+		exit 1; \
+	fi
+	./scripts/teeth-linux.sh
 
 clean:
 	rm -rf $(BUILD_DIR) $(BENCH_BUILD_DIR) build-gate
