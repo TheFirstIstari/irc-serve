@@ -173,14 +173,6 @@ static void stash_address(void)
 {
     int local = 7;
 
-    /* codeql[js/cpp/using-expired-stack-address] -- the second of exactly two
-     * suppressions in this file, and deliberately the same rule as the first. See
-     * provoke_stack_use_after_scope() for why the alternatives are worse; this one is
-     * the RETURN variant rather than the SCOPE variant, and it is the class whose
-     * runtime option is off by default in three of the five toolchains in the header.
-     * CodeQL flagged it as a second alert when the first was suppressed, which is the
-     * evidence that the suppression is line-scoped rather than a blanket on the file. */
-    // codeql[js/cpp/using-expired-stack-address]
     g_returned_block = &local;
 }
 
@@ -217,31 +209,9 @@ static void provoke_stack_use_after_scope(void)
     {
         int local = 7;
 
-        /* codeql[js/cpp/using-expired-stack-address] -- DELIBERATE. The escape
-         * below IS the defect this probe exists to provoke: `local` has left its
-         * scope, and the read of it in the caller is what AddressSanitizer's
-         * stack-use-after-scope reports. CodeQL is right -- that is exactly what the
-         * code does -- and it is right about a function whose entire contract is to
-         * be wrong in that one specific way and to stop there. The alternative shapes
-         * are worse:
-         *
-         *   * FIXING IT would delete the case. A stack-use-after-scope claim that is
-         *     never exercised is a claim in a comment.
-         *   * HIDING THE FILE from CodeQL would hide every FUTURE finding in it too,
-         *     including a real one, and this file is a few hundred lines of
-         *     deliberate defects.
-         *   * OBFUSCATING the escape so the scanner cannot follow it -- through a
-         *     function pointer, say -- would make the case harder to read and the
-         *     sanitizer report's source line less useful, in exchange for nothing.
-         *
-         * THESE ARE THE ONLY TWO CODEQL SUPPRESSIONS IN THE TREE, they are on two
-         * lines, and each names the class it is provoking. The second one is
-         * `g_returned_block = &local` in stash_address(), for stack-use-after-return.
-         * Suppressing one of them and not the other was not a choice: it was tried,
-         * and the scan went red on the second alert, which is the useful thing about
-         * a narrowly-scoped suppression -- it does not quietly swallow the rest of
-         * the file. If somebody deleted either line here, the build would still pass
-         * and the probe would still pass, and the scan would go red again. */
+        /* See THE TWO CODEQL SUPPRESSIONS IN THIS FILE, above the class table. The
+         * reported line for this case is this one -- the STORE, where the address of a
+         * local leaves its scope -- and not the dereference below it. */
         // codeql[js/cpp/using-expired-stack-address]
         escaped = keep_address(&local);
     }
@@ -251,6 +221,13 @@ static void provoke_stack_use_after_scope(void)
 static void provoke_stack_use_after_return(void)
 {
     stash_address();
+    /* THE SECOND OF THE TWO SUPPRESSIONS, and on THIS line rather than on the store
+     * above -- measured, not assumed: CodeQL reports this rule at the store for the
+     * scope case and at the USE for the return case, so a suppression placed on the
+     * symmetric line does not suppress it. That asymmetry is also the evidence that
+     * the suppressions are line-scoped rather than a blanket on the file: the first
+     * one left this alert open, and only this line closes it. */
+    // codeql[js/cpp/using-expired-stack-address]
     fprintf(stderr, "asan_coverage_probe: uar read %d\n", *g_returned_block);
 }
 
@@ -285,6 +262,35 @@ static const struct asan_class CLASSES[] = {
 };
 
 #define N_CLASSES ((int)(sizeof CLASSES / sizeof CLASSES[0]))
+
+/* ---------------------------------------------------------------------------
+ * THE TWO CODEQL SUPPRESSIONS IN THIS FILE, and why there are exactly two.
+ *
+ * CodeQL is RIGHT about both of them. Each of the two stack cases below lets the
+ * address of a local outlive it, and that is precisely the defect the case exists to
+ * provoke -- so the alert is a true positive about a function whose entire contract is
+ * to be wrong in one specific way and to stop there. The alternatives were considered
+ * and all three are worse:
+ *
+ *   * FIXING IT deletes the case. A stack-use-after-scope or stack-use-after-return
+ *     claim that is never exercised is a claim in a comment.
+ *   * HIDING THIS FILE from CodeQL hides every FUTURE finding in it too, including a
+ *     real one. There is no per-directory or per-rule alternative that narrows this to
+ *     two lines.
+ *   * OBFUSCATING the escapes -- through a function pointer, a union, or an arithmetic
+ *     detour -- so the scanner cannot follow them makes the cases harder to read and
+ *     the sanitizer's own report less useful, and buys nothing: the scanner is not
+ *     wrong here, the code is wrong on purpose, and a probe that hides its own shape
+ *     is a probe nobody can check.
+ *
+ * TWO LINES, ONE RULE, AND THE ASYMMETRY IS THE POINT. CodeQL reports
+ * cpp/using-expired-stack-address at the STORE for the scope case and at the USE for
+ * the return case, so the two suppressions are not on symmetric lines and a symmetric
+ * one does not work. That was measured by putting one suppression on and watching the
+ * scan stay red on the other, which is the evidence that these are line-scoped: if
+ * somebody deleted either of them the build would still pass, the probe would still
+ * pass, and the scan would go red on exactly one case.
+ * --------------------------------------------------------------------------- */
 
 /* ---------------------------------------------------------------------------
  * Run one class in a child and answer two questions: did the sanitizer name the
