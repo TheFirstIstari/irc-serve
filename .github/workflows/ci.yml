@@ -1015,7 +1015,7 @@ jobs:
     runs-on: [self-hosted, Linux, X64, cachyos-x8664]
     timeout-minutes: 60
     environment:
-      name: ${{ github.actor == 'TheFirstIstari' && 'self-hosted-auto' || 'self-hosted' }
+      name: ${{ github.actor == 'TheFirstIstari' && 'self-hosted-auto' || 'self-hosted' }}
     steps:
       - uses: actions/checkout@v4
       - name: Machine and image
