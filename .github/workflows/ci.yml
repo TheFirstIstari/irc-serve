@@ -962,16 +962,27 @@ jobs:
             grep -m8 -E 'error:|warning:' build-probes.build.log >&2
             exit 1
           fi
-          newest_src=$(find "$PWD" \( -name '*.c' -o -name '*.h' \) -not -path './build-probes/*' \
-            -print0 | xargs -0 ls -t 2>/dev/null | head -1)
           for t in ${{ steps.targets.outputs.targets }}; do
             bin="build-probes/tests/integration/$t"
             if [ ! -x "$bin" ]; then
               echo "::error::$bin was not produced. A target that builds to nothing must not report success." >&2
               exit 1
             fi
-            if [ "$newest_src" -nt "$bin" ]; then
-              echo "::error::$bin is older than $newest_src, so it was not rebuilt from this tree." >&2
+            # THE QUESTION IS ASKED DIRECTLY rather than computed from a sorted list.
+            # The first version built `newest_src` with find | xargs ls -t | head and
+            # compared with `-nt`, and it failed CI with xargs' exit 123 -- the code
+            # for "one of my invocations exited non-zero" -- which says nothing about
+            # whether the probe was fresh. Three pipelines were doing one comparison:
+            # `find . -newer "$bin" -print -quit` IS the comparison, and it cannot
+            # return a status that means anything other than the answer. The -not is
+            # inside the parentheses this time, so the build directory is genuinely
+            # excluded rather than excluded only for the .h branch of an -o -- which is
+            # what the first version did when it passed "$PWD" and therefore emitted
+            # absolute paths that -not -path './build-probes/*' could never match.
+            stale=$(find . \( -name '*.c' -o -name '*.h' \) \
+                      -not -path './build-probes/*' -newer "$bin" -print -quit)
+            if [ -n "$stale" ]; then
+              echo "::error::$stale is newer than $bin, so $bin was not rebuilt from this tree." >&2
               exit 1
             fi
             echo "  $bin built, newer than every source in the tree"
