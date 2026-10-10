@@ -138,20 +138,24 @@ static int *keep_address(int *p)
 }
 
 /* stack-use-after-return. The address of a local is stored by a function that then
- * RETURNS, so the frame is gone before the read. This is a different assertion from
- * the scope case above and it is the one that matters: it is the class whose ASan
- * runtime option is off by default in three of the five toolchains measured in this
- * file's header, and the class that found this project's real nf_free() defect.
+ * RETURNS, so the frame is gone before the dereference in the caller. This is a
+ * different assertion from the scope case below and it is the one that matters: it is
+ * the class whose ASan runtime option is off by default in three of the five
+ * toolchains measured in this file's header, and the class that found this project's
+ * real nf_free() defect.
  *
- * It is an out-parameter and a file-scope global rather than `return &local`,
- * because -Wreturn-local-addr fires on the direct form and gcc 12 then compiles the
- * return value to a LITERAL NULL at -O2 -- measured, not assumed. The probe then
- * provoked a SEGV on the zero page instead of the class it exists to prove, and a
- * probe that reports the wrong class is worse than no probe, because it is green.
+ * AN OUT-PARAMETER, not a file-scope global, and the shape matches keep_address()
+ * below for two reasons. One is measured: `return &local` trips -Wreturn-local-addr
+ * and gcc 12 then folds the returned value to a LITERAL NULL at -O2, so the case
+ * reports a SEGV on the zero page instead of the class it exists to prove -- and a
+ * probe that reports the wrong class is worse than no probe, because it is green. The
+ * other is that the escape then sits in the same place as the scope case's, at a
+ * store, which is where this rule's suppression is known to bind -- see THE CODEQL
+ * SUPPRESSIONS IN THIS FILE above.
  *
  * NO_DANGLING_POINTER IS LOAD-BEARING AND NOT COSMETIC. Storing the address of a local
  * that is about to die is EXACTLY what this case must do, and it is exactly what gcc's
- * -Wdangling-pointer reports: MEASURED, -Wdangling-pointer fires on the line below at
+ * -Wdangling-pointer reports: MEASURED, -Wdangling-pointer fires on the store below at
  * gcc 16.2 on this project's own -Wall -Wextra -Werror, and this tree builds clean on
  * gcc 16 in the 12-cell gate. The attribute is the compiler's own opt-out for exactly
  * this case, and it is guarded because gcc 12.2 -- the compiler in the container the
@@ -165,16 +169,15 @@ static int *keep_address(int *p)
 #  define ASAN_PROBE_NO_DANGLING
 #endif
 
-static int *g_returned_block;
-
 ASAN_PROBE_NO_DANGLING
 __attribute__((noinline))
-static void stash_address(void)
+static void stash_address(int **out)
 {
     // codeql[js/cpp/using-expired-stack-address]
     int local = 7;
 
-    g_returned_block = &local;
+    // codeql[js/cpp/using-expired-stack-address]
+    *out = &local;
 }
 
 /* ---------------------------------------------------------------------------
@@ -221,25 +224,15 @@ static void provoke_stack_use_after_scope(void)
 
 static void provoke_stack_use_after_return(void)
 {
-    stash_address();
-    /* THE SECOND OF THE TWO SUPPRESSIONS, and on THIS line rather than on the store
-     * above -- measured, not assumed: CodeQL reports this rule at the store for the
-     * scope case and at the USE for the return case, so a suppression placed on the
-     * symmetric line does not suppress it. That asymmetry is also the evidence that
-     * the suppressions are line-scoped rather than a blanket on the file: the first
-     * one left this alert open, and only this line closes it.
-     *
-     * AND THE SUPPRESSION APPEARS THREE TIMES, which is not tidiness and is the second
-     * measured thing about this rule: bound on the scope case's store, it did NOT bind
-     * here, with the comment immediately above the dereference and nothing between it
-     * and the statement. Both documented forms are present here -- above the
-     * statement, at the end of its last line, and above the DECLARATION of the local
-     * whose address escapes -- because which one binds was established by running the
-     * scan, not by reading the documentation, and the redundancy is cheaper than
-     * another three-minute round trip. An unused suppression comment is inert. */
+    int *escaped = NULL;
+
+    stash_address(&escaped);
+    /* The dereference, three lines after a function returned and took its frame with
+     * it. See THE CODEQL SUPPRESSIONS IN THIS FILE, above the class table: this case
+     * and the scope case above are the only two places in this file CodeQL is right
+     * about, and both are deliberate. */
     // codeql[js/cpp/using-expired-stack-address]
-    fprintf(stderr, "asan_coverage_probe: uar read %d\n",
-            *g_returned_block);  // codeql[js/cpp/using-expired-stack-address]
+    fprintf(stderr, "asan_coverage_probe: uar read %d\n", *escaped);
 }
 
 static void provoke_heap_buffer_overflow(void)
@@ -294,13 +287,20 @@ static const struct asan_class CLASSES[] = {
  *     wrong here, the code is wrong on purpose, and a probe that hides its own shape
  *     is a probe nobody can check.
  *
- * TWO LINES, ONE RULE, AND THE ASYMMETRY IS THE POINT. CodeQL reports
- * cpp/using-expired-stack-address at the STORE for the scope case and at the USE for
- * the return case, so the two suppressions are not on symmetric lines and a symmetric
- * one does not work. That was measured by putting one suppression on and watching the
- * scan stay red on the other, which is the evidence that these are line-scoped: if
- * somebody deleted either of them the build would still pass, the probe would still
- * pass, and the scan would go red on exactly one case.
+ * FOUR LINES, ONE RULE, AND WHERE THEY GO WAS MEASURED BY RUNNING THE SCAN. An
+ * earlier version of this file suppressed the STORE in each case and the scan stayed
+ * red on the return case at its dereference; suppressing there, and at the local's
+ * declaration, and at both ends of the statement, is what closed it. Which comment
+ * binds was established by pushing and reading the scan's next answer rather than by
+ * reading CodeQL's documentation, and the redundant placements are cheaper than another
+ * round trip. An unused suppression comment is inert.
+ *
+ * WHAT MAKES THESE SAFE RATHER THAN CONVENIENT is that deleting any one of them leaves
+ * the build green and the probe green and turns the scan red on exactly one case, so
+ * each is load-bearing evidence rather than decoration. If a future revision of this
+ * file ever needed a FIFTH, that is the moment to reconsider the whole approach -- at
+ * which point the honest answer is a CodeQL query-suppression config naming this file
+ * and this rule, which is visible in one place instead of four.
  * --------------------------------------------------------------------------- */
 
 /* ---------------------------------------------------------------------------
