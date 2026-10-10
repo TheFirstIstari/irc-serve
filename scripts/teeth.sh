@@ -387,6 +387,138 @@ run_input_fault() {
     PASS=$((PASS + 1))
 }
 
+# ---------------------------------------------------------------------------
+# run_repo_fault: a fault that must be applied to AND UNDONE IN THE REAL TREE,
+# because what it corrupts is a REF and the refs belong to the clone.
+#
+# WHY A FOURTH RUNNER AND NOT A PARAMETER ON run_input_fault. run_input_fault's own
+# header gives the reason a staged copy is wrong for a git-state fault -- "the defect is
+# about what the CLONE'S git state says, and a copy has its own (absent) git state" --
+# and it gets away with editing nothing because `DOCS_TRUTH_REMOTE=.` is an ARGUMENT.
+# The commit-column defect is not an argument: `rows()` has to be made to resolve a bare
+# tag name again, and that is an edit to a SHIPPED FILE in the real tree. So this runner
+# edits `$ROOT` and then has to put it back.
+#
+# WHY IT PUTS IT BACK ON EVERY PATH, which is the whole reason it is a separate function
+# rather than three more lines at the call site. A teeth run that faults the real checkout
+# and dies before restoring leaves a developer's repository edited, and this project has a
+# rule about exactly that shape: a check that cannot ask the question must FAIL rather
+# than quietly report clean. Symmetrically, a fault that cannot be undone must not be
+# applied at all. So there is ONE restore point, after the verdict is computed and before
+# it is printed, and the verdict is computed into variables rather than returned from the
+# middle.
+#
+# THE RESTORE IS VERIFIED, not assumed. A `cp -P` back that silently failed would leave the
+# fault in place and report "ok", so the restored file is compared against the saved copy
+# and the decoy ref is read back; either still present is a FAILURE of this tooth, not a
+# warning, because whatever runs next would then be reading a faulted tree.
+# ---------------------------------------------------------------------------
+run_repo_fault() {
+    name=$1
+    script=$2
+    expect=$3
+    target=$4
+    cmd=$5
+
+    rm -rf "$WORK"
+    mkdir -p "$WORK"
+    _rf_fail=""
+    _rf_note=""
+    _rf_ok=""
+
+    # --- stage a copy and build it, so the instrument has a FRESH tree to ask about ---
+    # `stage_tree` uses `cp -P`; see its own header for why a bare `cp` of the `debian`
+    # symlink aborts this script on the first fault.
+    stage_tree
+    if ! (cd "$WORK" && cmake -S . -B b -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON \
+            -DWITH_TLS=OFF >"$WORK/cmake.log" 2>&1 \
+            && cmake --build b -j8 >"$WORK/build.log" 2>&1); then
+        _rf_note="FAULT $name: the tree did not build, so the instrument had no build to ask"
+        tail -5 "$WORK/build.log" 2>/dev/null || true
+        _rf_fail="build"
+    fi
+
+    if [ -z "$_rf_fail" ]; then
+        # Counted on the BUILD LOG, so a cell that built nothing cannot report "0 errors"
+        # by having produced no log at all.
+        errs=$(grep -c 'error:' "$WORK/build.log" || true)
+        warns=$(grep -c 'warning:' "$WORK/build.log" || true)
+        if [ "$errs" != "0" ] || [ "$warns" != "0" ]; then
+            _rf_note="FAULT $name: build printed errors=$errs warnings=$warns"
+            _rf_fail="build:$errs/$warns"
+        fi
+    fi
+
+    # EVERY BINARY NEWER THAN THE NEWEST SOURCE, and the strict form of it: the OLDEST
+    # executable the build produced, not just `src/irc-serve`. A tooth whose result is
+    # read against a tree whose binaries are older than its sources proves nothing, and
+    # checking one convenient binary is how that slips through.
+    if [ -z "$_rf_fail" ]; then
+        if [ ! -f "$WORK/b/CTestTestfile.cmake" ]; then
+            _rf_note="FAULT $name: no configured build tree at $WORK/b"
+            _rf_fail="nobuildtree"
+        else
+            newest_src=$(find "$WORK" -name '*.c' -o -name '*.h' | xargs ls -t 2>/dev/null | head -1)
+            oldest_bin=$(find "$WORK/b" -type f -perm -u+x 2>/dev/null | xargs ls -t 2>/dev/null | tail -1)
+            if [ -z "$oldest_bin" ]; then
+                _rf_note="FAULT $name: the build produced no executable to compare against"
+                _rf_fail="nobin"
+            elif [ "$newest_src" -nt "$oldest_bin" ]; then
+                _rf_note="FAULT $name: the OLDEST binary is NOT newer than the newest source"
+                _rf_fail="stale"
+            fi
+        fi
+    fi
+
+    # --- apply to the real tree, run the instrument, and do not return from here ---
+    if [ -z "$_rf_fail" ]; then
+        mkdir -p "$WORK/state"
+        cp -P "$ROOT/$target" "$WORK/saved-target"
+        if ! (cd "$ROOT" && TEETH_STATE_DIR="$WORK/state" python3 "$TEETH/$script"); then
+            _rf_note="FAULT NOT APPLIED: $name ($script)"
+            _rf_fail="apply"
+        elif (cd "$ROOT" && sh -c "$cmd" >"$WORK/instrument.log" 2>&1); then
+            _rf_note="FAULT $name NOT CAUGHT: the instrument is still GREEN"
+            sed -n '1,10p' "$WORK/instrument.log" | sed 's/^/      /'
+            _rf_fail="green"
+        elif ! grep -Fq "$expect" "$WORK/instrument.log"; then
+            _rf_note="FAULT $name: the instrument went red for the WRONG REASON (no line"
+            _rf_note="  matching: $expect)"
+            sed -n '1,12p' "$WORK/instrument.log" | sed 's/^/      /'
+            _rf_fail="wrongreason"
+        else
+            _rf_ok="ok: $name -> the instrument went red, naming the expected finding"
+        fi
+    fi
+
+    # --- THE ONE RESTORE POINT, on every path, verified before anything is reported ---
+    if [ -f "$WORK/saved-target" ]; then
+        cp -P "$WORK/saved-target" "$ROOT/$target" 2>/dev/null || true
+        if ! cmp -s "$WORK/saved-target" "$ROOT/$target" 2>/dev/null; then
+            _rf_fail="restore:$target"
+            _rf_note="FAULT $name: $target could NOT be restored; the fault is still in"
+            _rf_note="  your working tree. Re-check out the file before running anything else."
+        fi
+    fi
+    if [ -f "$WORK/state/decoy.ref" ]; then
+        _decoy=$(cut -d' ' -f1 "$WORK/state/decoy.ref")
+        git -C "$ROOT" update-ref -d "$_decoy" >/dev/null 2>&1 || true
+        if git -C "$ROOT" show-ref --verify --quiet "$_decoy"; then
+            _rf_fail="restore:$_decoy"
+            _rf_note="FAULT $name: the decoy ref $_decoy could NOT be removed."
+        fi
+    fi
+
+    if [ -n "$_rf_fail" ]; then
+        note "$_rf_note"
+        FAIL=$((FAIL + 1))
+        FAILED_LIST="$FAILED_LIST $name($_rf_fail)"
+    else
+        note "$_rf_ok"
+        PASS=$((PASS + 1))
+    fi
+}
+
 # `test_nick_utf8` AND NOT `test_control_bytes`: the latter covers the MODE `472` and
 # BATCH `NO_SIGN` fields, which are a different filter at a different site, so naming
 # it here would be claiming coverage that fault does not touch. Naming a test that
@@ -558,7 +690,7 @@ note ""
 # adds a test to the suite; all three are fault injections against instruments that
 # already run.
 #
-# 24 runs against the REAL repository's git state, because that is the state the
+# 24 and 25 run against the REAL repository's git state, because that is the state the
 # defect was about. 22 and 23 stage a copy, because they are edits to shipped files.
 # ---------------------------------------------------------------------------
 
@@ -579,6 +711,31 @@ run_command_fault linux-cell-report-coverage-statement-removed \
 run_input_fault docs-truth-reads-the-local-clone \
     "in the remote but not in the table" \
     "DOCS_TRUTH_REMOTE=. python3 scripts/check-docs-truth.py --build $WORK/b"
+
+# THE OTHER COLUMN, as its own tooth, because the one above and this one are two columns
+# of the same table and the defect lived in exactly the gap between them.
+#
+# `rows()` resolved the commit with `git rev-list -n1 <BARE TAG NAME>`, and a bare name is
+# what git resolves against this clone's `refs/tags` -- not against the namespace the file
+# fetches the remote into. The tooth above faults the REMOTE and covers the tag LIST, and
+# it stayed GREEN for the whole life of this defect, because the list half had been fixed
+# and the column half had not.
+#
+# IT MANUFACTURES ITS OWN DIVERGENCE, and that is the part worth reading: the tooth above
+# depends on this checkout carrying tags `origin` does not, which was true of ONE machine.
+# On a clean clone the bare-name fault is invisible -- both refs peel to the same commit,
+# the regeneration matches the committed table byte for byte, and the tooth passes for the
+# wrong reason. This one plants a decoy at `refs/<tag>`, which git resolves AHEAD of
+# `refs/tags/<tag>`, so bare-name resolution has something local to find on any machine and
+# `refs/tags/` itself is never touched.
+#
+# `run_repo_fault` and not `run_input_fault`: this one has to edit a shipped file and plant
+# a ref in the REAL clone, so its runner restores both afterwards and verifies it did.
+run_repo_fault docs-truth-sha-column-reads-the-local-clone \
+    docs_truth_sha_column_reads_local_clone.py \
+    "the rollback table's contents" \
+    scripts/gen-rollback-table.py \
+    "python3 scripts/check-docs-truth.py --build $WORK/b"
 
 # AND THE OTHER HALF OF THE SAME FAULT, as its own tooth, because it is a POSITIVE
 # check and the one above is not sufficient on its own. The first tooth proves the
@@ -626,7 +783,7 @@ git -C "$ROOT" fetch --quiet --no-tags --force --prune origin \
 
 note ""
 # ---------------------------------------------------------------------------
-# 25-28. THE OPT-IN SURFACE'S OWN FOUR FAULTS.
+# 25-29. THE OPT-IN SURFACE AND THE REF-RESOLUTION FAULTS.
 #
 # One shape, four places: something this project claims about itself was true by
 # assertion and not by construction, and each of these removes one of the assertions.
@@ -703,7 +860,7 @@ run_command_fault linux-cell-dirty-tree-flag-suppressed \
     "sh scripts/gate-linux-cell.sh --report-selftest"
 
 note ""
-note "teeth: $PASS of 28 faults caught, $FAIL not."
+note "teeth: $PASS of 29 faults caught, $FAIL not."
 if [ "$FAIL" != "0" ]; then
     note "not caught:$FAILED_LIST"
     exit 1
