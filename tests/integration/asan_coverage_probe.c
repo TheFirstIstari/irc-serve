@@ -226,9 +226,15 @@ static void provoke_stack_use_after_return(void)
      * scope case and at the USE for the return case, so a suppression placed on the
      * symmetric line does not suppress it. That asymmetry is also the evidence that
      * the suppressions are line-scoped rather than a blanket on the file: the first
-     * one left this alert open, and only this line closes it. */
-    // codeql[js/cpp/using-expired-stack-address]
-    fprintf(stderr, "asan_coverage_probe: uar read %d\n", *g_returned_block);
+     * one left this alert open, and only this line closes it.
+     *
+     * THE SUPPRESSION IS A TRAILING COMMENT ON THE REPORTED LINE rather than a
+     * comment above it, and that is the second measured thing about this rule: the
+     * preceding-line form bound on the scope case and did NOT bind here, with the
+     * comment immediately above and nothing between it and the statement. Both forms
+     * are documented by CodeQL; this is where the difference showed. */
+    fprintf(stderr, "asan_coverage_probe: uar read %d\n",
+            *g_returned_block);  // codeql[js/cpp/using-expired-stack-address]
 }
 
 static void provoke_heap_buffer_overflow(void)
