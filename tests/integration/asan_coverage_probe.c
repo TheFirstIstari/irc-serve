@@ -171,6 +171,7 @@ ASAN_PROBE_NO_DANGLING
 __attribute__((noinline))
 static void stash_address(void)
 {
+    // codeql[js/cpp/using-expired-stack-address]
     int local = 7;
 
     g_returned_block = &local;
@@ -228,11 +229,15 @@ static void provoke_stack_use_after_return(void)
      * the suppressions are line-scoped rather than a blanket on the file: the first
      * one left this alert open, and only this line closes it.
      *
-     * THE SUPPRESSION IS A TRAILING COMMENT ON THE REPORTED LINE rather than a
-     * comment above it, and that is the second measured thing about this rule: the
-     * preceding-line form bound on the scope case and did NOT bind here, with the
-     * comment immediately above and nothing between it and the statement. Both forms
-     * are documented by CodeQL; this is where the difference showed. */
+     * AND THE SUPPRESSION APPEARS THREE TIMES, which is not tidiness and is the second
+     * measured thing about this rule: bound on the scope case's store, it did NOT bind
+     * here, with the comment immediately above the dereference and nothing between it
+     * and the statement. Both documented forms are present here -- above the
+     * statement, at the end of its last line, and above the DECLARATION of the local
+     * whose address escapes -- because which one binds was established by running the
+     * scan, not by reading the documentation, and the redundancy is cheaper than
+     * another three-minute round trip. An unused suppression comment is inert. */
+    // codeql[js/cpp/using-expired-stack-address]
     fprintf(stderr, "asan_coverage_probe: uar read %d\n",
             *g_returned_block);  // codeql[js/cpp/using-expired-stack-address]
 }
