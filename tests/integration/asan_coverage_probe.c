@@ -209,6 +209,30 @@ static void provoke_stack_use_after_scope(void)
     {
         int local = 7;
 
+        /* codeql[js/cpp/using-expired-stack-address] -- DELIBERATE, AND THIS IS THE
+         * ONLY SUPPRESSION IN THE TREE. The escape below IS the defect this probe
+         * exists to provoke: `local` has left its scope, and the read of it in the
+         * caller is what AddressSanitizer's stack-use-after-scope reports. CodeQL is
+         * right -- that is exactly what the code does -- and it is right about a
+         * function whose entire contract is to be wrong in that one specific way and
+         * to stop there. The alternative shapes are worse:
+         *
+         *   * FIXING IT would delete the probe. A stack-use-after-scope claim that is
+         *     never exercised is a claim in a comment.
+         *   * HIDING THE FILE from CodeQL would hide every FUTURE finding in it too,
+         *     including a real one, and this file is 200 lines of deliberate defects.
+         *   * OBFUSCATING the escape so the scanner cannot follow it -- through a
+         *     function pointer, say -- would make the case harder to read and the
+         *     sanitizer report's source line less useful, in exchange for nothing.
+         *
+         * What makes the suppression safe rather than convenient is that it is not
+         * the only thing standing between this file and a green scan: `stash_address`
+         * below provokes the RETURN variant and is NOT suppressed, and the same rule
+         * fires there as a second alert whenever CodeQL's analysis improves enough to
+         * reach it. If somebody deleted this line, the build still passed, the probe
+         * still passed, and the scan would go red on the one function this comment
+         * is claiming is deliberate. */
+        // codeql[js/cpp/using-expired-stack-address]
         escaped = keep_address(&local);
     }
     fprintf(stderr, "asan_coverage_probe: sas read %d\n", *escaped);
