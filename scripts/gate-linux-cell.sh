@@ -206,7 +206,7 @@ coverage_complete() {
     return 0
 }
 
-# emit_cell_report <build-type> <ctest-totals> <findings-line> <coverage-ledger>
+# emit_cell_report <build-type> <ctest-totals> <findings-line> <coverage-ledger> <tree>
 #
 # The ledger is the probe's own COVER lines, already formatted, so the report does not
 # re-derive a verdict the probe produced. THE ORDER OF THE ARGUMENTS IS THE ORDER OF
@@ -214,7 +214,7 @@ coverage_complete() {
 # numbers it contains are only meaningful next to each other, so nothing between them
 # moves.
 emit_cell_report() {
-    local bt="$1" totals="$2" findings="$3" ledger="$4"
+    local bt="$1" totals="$2" findings="$3" ledger="$4" tree="$5"
 
     printf '    %s\n' "$totals"
     printf '    sanitizer findings: %s\n' "$findings"
@@ -234,14 +234,24 @@ emit_cell_report() {
     printf '%s\n' "$ledger" | sed '/^$/d;s/^/      /'
 }
 
-# finish_report <build-type> <coverage-complete:0|1>
+# finish_report <build-type> <coverage-complete:0|1> <tree>
 #
 # The banner and the trailer. The trailer is machine-readable ON PURPOSE and is what
 # --report-selftest asserts on: a report whose coverage statement has been edited out
 # has to be visibly incomplete to something other than a reader's memory, or removing
 # it is a change nobody would notice.
+#
+# THE TREE GOES IN THE SAME TRAILER for the same reason and one more. This cell
+# rsyncs the WORKING TREE (see the copy block: the comment there used to claim
+# `git archive`, which is the committed tree and is not what runs), so a result is
+# about a commit PLUS whatever was uncommitted at the moment of the copy. A coverage
+# statement without a tree is a statement about an unknown source: "all four classes
+# proved, 0 findings" is a claim, and this is the half that says which claim it is.
+# TREE_DIRTY is therefore a first-class word in the trailer and not a parenthetical,
+# because the failure it guards against -- a fault injected in a staged copy and a
+# result produced from the clean tree beside it -- is invisible in every other line.
 finish_report() {
-    local bt="$1" complete="$2"
+    local bt="$1" complete="$2" tree="$3"
 
     if [ "$complete" = "1" ]; then
         printf '    COVERAGE STATEMENT: %s classes, all proved live this run.\n' \
@@ -258,29 +268,74 @@ finish_report() {
         printf '    See the NOT-COVERED lines above for the class and the option.\n'
         printf '\n'
     fi
-    printf '    report-complete: build=%s coverage=%s\n' "$bt" \
-        "$([ "$complete" = "1" ] && echo complete || echo INCOMPLETE)"
+    printf '    tree             : %s  (this cell rsyncs the WORKING TREE, not the commit;\n' "$tree"
+    printf '                       DIRTY means the result is about UNCOMMITTED code)\n'
+    # The flag is a variable rather than a `case` inside the printf's argument list:
+    # a command substitution whose body is a multi-line `case` is not portable across
+    # the /bin/sh variants this file gets run under (measured: it is a syntax error
+    # under macOS /bin/sh), and a marker that only renders under one shell is a marker
+    # that can be missing exactly when somebody is reading a failure.
+    local dirty=0
+    case "$tree" in
+        *DIRTY) dirty=1 ;;
+    esac
+    printf '    report-complete: build=%s coverage=%s tree=%s dirty=%s\n' "$bt" \
+        "$([ "$complete" = "1" ] && echo complete || echo INCOMPLETE)" \
+        "$tree" "$dirty"
 }
 
-# render_report <build-type> <ledger> <totals> <findings> -- the whole report, and the
-# single place that decides whether it is complete. One function so that the cell's own
-# run, the self-test and --report-render cannot drift apart: three copies of "is this
-# report complete" is three answers, and this file's defect was one answer too few.
+# render_report <build-type> <ledger> <totals> <findings> [tree] -- the whole report,
+# and the single place that decides whether it is complete. One function so that the
+# cell's own run, the self-test and --report-render cannot drift apart: three copies
+# of "is this report complete" is three answers, and this file's defect was one answer
+# too few. The tree is optional and DEFAULTS TO THE REAL ONE, because --report-render
+# and --report-selftest describe this renderer rather than run a build, and a mode
+# that refused to print would be a mode that could not be checked.
 #
 # Exit status is the completeness verdict, so a caller that pipes this into `&&` gets
 # the gate behaviour for free. The `local` on the argument matters because
 # coverage_complete reads its argument from a pipeline in a subshell.
 render_report() {
     local bt="$1" ledger="$2" totals="$3" findings="$4"
+    local tree="${5:-$(tree_descriptor)}"
 
-    emit_cell_report "$bt" "$totals" "$findings" "$ledger"
+    emit_cell_report "$bt" "$totals" "$findings" "$ledger" "$tree"
     if coverage_complete "$ledger"; then
-        finish_report "$bt" 1
+        finish_report "$bt" 1 "$tree"
     else
-        finish_report "$bt" 0
+        finish_report "$bt" 0 "$tree"
         return 1
     fi
 }
+
+# ---------------------------------------------------------------------------
+# tree_descriptor [dir] -- WHAT TREE IS THIS, in one word a report can carry.
+#
+# Prints either "<12-char sha> clean", "<12-char sha> DIRTY", or UNATTESTABLE. The
+# dirty flag covers UNTRACKED files as well as unstaged and staged changes, because an
+# untracked header is as much a part of "the tree this cell built" as a modified one:
+# rsync above copies it and `git archive` would not, and a result that quietly
+# depended on it is a result about a tree that no commit names.
+#
+# WHY IT IS A FUNCTION AND NOT INLINE `git` CALLS. It is called from three places --
+# the cell's banner, the report's machine-readable trailer, and --report-selftest --
+# and the last of those runs on macOS where the tree may not be a repository at all.
+# One function means one answer to "is this result about committed code", which is
+# the answer the previous version of this file did not give at all.
+# ---------------------------------------------------------------------------
+tree_descriptor() {
+    local dir="${1:-$root}" sha
+
+    sha=$(git -C "$dir" rev-parse --verify HEAD 2>/dev/null) || { echo UNATTESTABLE; return 0; }
+    if [ -z "$sha" ]; then echo UNATTESTABLE; return 0; fi
+    sha=${sha:0:12}
+    if [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]; then
+        printf '%s DIRTY\n' "$sha"
+    else
+        printf '%s clean\n' "$sha"
+    fi
+}
+
 
 # probe_declared_classes: the class list AS THE PROBE DECLARES IT, read out of its
 # source rather than out of this file.
@@ -361,6 +416,51 @@ report_selftest() {
         *"coverage=INCOMPLETE"*) ;;
         *) echo "gate-linux-cell.sh --report-selftest: FAIL -- the completeness marker does not record the incomplete state" >&2; fail=1 ;;
     esac
+    # THE TREE THE REPORT IS ABOUT. The cell rsyncs the WORKING TREE -- the comment
+    # above the copy used to claim `git archive`, which is the COMMITTED tree and is
+    # not what runs -- so a report that does not name its commit and its dirty flag is
+    # a claim about an unknown source. Both halves are checked, because they fail
+    # independently: the commit alone does not say whether the build included an
+    # uncommitted edit, and the dirty flag alone does not say which commit.
+    #
+    # A CLEAN TREE IS ASSERTED HERE RATHER THAN PASSED IN, so the check cannot be
+    # satisfied by a caller that hands the renderer whatever it likes. The fault this
+    # exists for is a report that stopped saying so, and a self-test whose input
+    # carried the answer would be that fault rebuilt inside the instrument meant to
+    # catch it -- the same argument probe_declared_classes() makes.
+    local tree_now
+    tree_now=$(tree_descriptor)
+    case "$tree_now" in
+        *DIRTY|*clean) ;;
+        *) echo "gate-linux-cell.sh --report-selftest: FAIL -- tree_descriptor() returned '$tree_now' for the repository this file lives in; the report's tree marker cannot be checked" >&2
+           fail=1 ;;
+    esac
+    case "$out" in
+        *"tree="*) ;;
+        *) echo "gate-linux-cell.sh --report-selftest: FAIL -- the machine-readable trailer does not name the TREE this report is about. This cell copies the working tree, so a result with no tree is a result about unknown source." >&2; fail=1 ;;
+    esac
+    case "$out" in
+        *"dirty="*) ;;
+        *) echo "gate-linux-cell.sh --report-selftest: FAIL -- the trailer carries no dirty flag: a cell that copies the WORKING TREE must say whether the result is about uncommitted code, or a fault injected in a staged copy reads exactly like a clean one" >&2; fail=1 ;;
+    esac
+    case "$out" in
+        *"$tree_now"*) ;;
+        *) echo "gate-linux-cell.sh --report-selftest: FAIL -- the rendered report names tree '$tree_now' nowhere" >&2; fail=1 ;;
+    esac
+    # AND THE REFUSAL. tree_descriptor() against a directory that is not a repository
+    # must say UNATTESTABLE, because that is the input the cell refuses to run on and
+    # a descriptor that returned a commit for a non-repository would turn the refusal
+    # into dead code. It is a real call against a real empty directory rather than a
+    # grep for the word, so it fails if the behaviour changes and not only if the
+    # spelling does.
+    _notrepo=$(mktemp -d "${TMPDIR:-/tmp}/irc-notarepo.XXXXXX" 2>/dev/null || echo "")
+    if [ -n "$_notrepo" ]; then
+        case "$(tree_descriptor "$_notrepo")" in
+            UNATTESTABLE) ;;
+            *) echo "gate-linux-cell.sh --report-selftest: FAIL -- tree_descriptor() on a directory that is not a repository did not say UNATTESTABLE, so the cell's attestation refusal is dead code" >&2; fail=1 ;;
+        esac
+        rmdir "$_notrepo" 2>/dev/null || true
+    fi
     # EVERY class must be named -- and the list is the PROBE's, read from its source,
     # not this file's. See probe_declared_classes(): with this file's own list, a class
     # dropped from COVERAGE_CLASSES would delete the check on it, which is the defect
@@ -467,6 +567,40 @@ case "$(uname -s)" in
     *) skip_reason "this cell must run on Linux: it is $(uname -s), and LeakSanitizer,
 glibc's __wur and ASan's stack-use-after-return default have no equivalent here" ;;
 esac
+# ---------------------------------------------------------------------------
+# THE ATTESTATION REFUSAL, and it is the second refusal in the file rather than a
+# line further down because it is the one that was missing.
+#
+# THE HAZARD, stated as it actually bit. The copy this cell builds is an `rsync` of
+# the working tree (the comment above used to say `git archive`, which it is not).
+# That is a deliberate choice -- it is what lets a developer test a change before
+# committing it -- and it has a consequence that has to be paid for explicitly: a
+# result from this cell is a claim about SOMETHING, and the something is named by a
+# commit plus however many uncommitted edits were lying in the directory at the
+# moment of the copy. Without a name, the result is unattributable. The last pass
+# lost a whole fault-injection run to that confusion: a staged COPY's script built
+# the clean tree sitting next to it and reported PASS for a fault that was never in
+# the build, and the log said nothing that would have caught the substitution.
+#
+# SO THE CELL REFUSES TO REPORT A RESULT FOR A TREE IT CANNOT NAME. "Cannot name"
+# means: not a git repository, no HEAD, or git cannot be run. That is a REFUSAL and
+# not a fallback -- the same three outcomes this file already distinguishes, where
+# the third is deliberately neither success nor failure, because a check that
+# reports success for work it did not do is the failure this project keeps finding.
+#
+# A DIRTY TREE IS NOT A REFUSAL. A developer has to be able to test an uncommitted
+# change, or the cell is only usable at the wrong moment. What a dirty tree buys is
+# a loud word: TREE_DIRTY appears in the banner, in every per-configuration report,
+# in the machine-readable trailer, and in the final PASS line, so no reader can
+# mistake the result for one about committed code.
+# ---------------------------------------------------------------------------
+_tree=$(tree_descriptor)
+if [ "$_tree" = "UNATTESTABLE" ]; then
+    skip_reason "this cell cannot say WHICH TREE it built: $root is not a git repository with
+a readable HEAD, so a sanitizer result from it could not be attributed to a commit or
+to a set of uncommitted edits. Refusing rather than reporting an unattributable result.
+Copy the tree into a repository, or run scripts/gate-linux-cell.sh from one."
+fi
 command -v docker >/dev/null 2>&1 || skip_reason "docker is not on PATH, so there is
 no way to reach a glibc userspace from this machine"
 docker info >/dev/null 2>&1 || skip_reason "the docker daemon is not reachable
@@ -506,16 +640,39 @@ trap cleanup EXIT
 #     leave root-owned directories in the developer's checkout;
 #   * a bind mount of the working tree means the container's gcc and the host's cmake
 #     disagree about file ownership, and `ctest` writes its own logs there.
-# The copy is `git archive`, so it is the COMMITTED tree -- the same thing CI builds and
-# the same thing the .orig.tarball is made from. It also means this cell cannot be
-# affected by an uncommitted local change, which is a feature for a gate: it answers
-# "does the commit build on Linux", not "does this checkout build on Linux".
+#
+# IT IS `rsync` AND NOT `git archive`, and this file used to say `git archive` in a
+# comment directly above a line that runs rsync -- so the comment described a
+# property the cell does not have, and the difference is not cosmetic:
+#
+#   * `git archive` yields the COMMITTED tree. An uncommitted edit is invisible to it.
+#   * `rsync` yields the WORKING TREE, committed or not, including files git does not
+#     track and excluding only what --exclude names.
+#
+# The previous comment claimed this cell "cannot be affected by an uncommitted local
+# change" and "answers 'does the commit build on Linux'". It did not, and it did not,
+# and the last pass of this work lost a whole fault-injection run to precisely that
+# confusion: a STAGED COPY's script built the CLEAN tree beside it and reported PASS
+# for a fault that was never in the build. A comment that overstates what a gate is
+# looking at is the same defect as a report that overstates what a sanitizer watched,
+# and it costs the same.
+#
+# RSYNC OF A DIRTY WORKING TREE IS THEREFORE INTENTIONAL, and the cost is paid in
+# open: every report this cell prints now carries the commit AND a dirty flag, in the
+# per-configuration report, in the banner and in the final line. A result is never
+# silently about uncommitted code -- if it is, it says so on the same screen. The
+# alternative, staging the committed tree instead, would be defensible too, but it
+# would make the cell unable to test a change before it is committed, which is the
+# thing a developer reaches for it for.
 rsync -a --exclude '.git' --exclude 'build-gate' --exclude '__pycache__' \
       "$root/" "$work/irc-serve/" 2>/dev/null \
     || skip_reason "could not copy the tree into a scratch directory"
 
 echo "irc-serve Linux cell (glibc, ASan + LSan + UBSan)"
 echo "  source      : $root"
+echo "  tree        : $(tree_descriptor)   <- rsync copies the WORKING TREE, not the commit."
+echo "                        A DIRTY flag means this result is about UNCOMMITTED code."
+echo "                        A tree this cell cannot name is a result it refuses to report."
 echo "  scratch     : $work"
 echo "  image       : $IMAGE"
 echo "  build type  : $BUILD_TYPE  (a sanitizer result is a claim about THIS build;"
@@ -681,7 +838,12 @@ for tls in OFF ON; do
 
     # render_report decides completeness and prints the banner; the cell only has to
     # notice the exit status. cfg_cov_incomplete is kept for the final summary line.
-    if render_report "$BUILD_TYPE" "$ledger" "$totals" "$findings"; then
+    # $_tree, PASSED rather than re-derived: the cell computed it once, before the copy,
+    # and re-reading the repository per configuration would let the report name a
+    # different tree than the one that was actually rsync'd if anything changed on disk
+    # while the container was building. The number the report carries has to be the
+    # number the run was decided on.
+    if render_report "$BUILD_TYPE" "$ledger" "$totals" "$findings" "$_tree"; then
         cfg_cov_incomplete=0
     else
         cfg_cov_incomplete=1
@@ -712,6 +874,9 @@ if [ "$total_fail" != "0" ] || [ "$cov_fail" != "0" ]; then
     exit "$RC_FAIL"
 fi
 echo "GATE LINUX CELL: PASS  ($ran of 2 configurations, ASan + LSan + UBSan)"
+echo "TREE: $_tree  <- rsync copies the WORKING TREE. DIRTY means this PASS is about"
+echo "  UNCOMMITTED code, not about commit ${_tree%% *}. This cell refuses to report a"
+echo "  result for a tree it cannot name at all (see the attestation refusal above)."
 # NAMED MACHINE AND TOOLCHAIN, and the sentence below is the scope of the claim
 # rather than decoration: the numbers above were produced by ONE gcc in ONE pinned
 # image, and a second toolchain's libasan is a different implementation of the same

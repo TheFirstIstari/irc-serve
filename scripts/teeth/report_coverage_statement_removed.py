@@ -46,8 +46,9 @@ COVERAGE_BLOCK = """    printf '    sanitizer coverage -- what was being watched
     printf '%s\\n' "$ledger" | sed '/^$/d;s/^/      /'
 """
 
-TRAILER_BLOCK = """    printf '    report-complete: build=%s coverage=%s\\n' "$bt" \\
-        "$([ "$complete" = "1" ] && echo complete || echo INCOMPLETE)"
+TRAILER_BLOCK = """    printf '    report-complete: build=%s coverage=%s tree=%s dirty=%s\\n' "$bt" \\
+        "$([ "$complete" = "1" ] && echo complete || echo INCOMPLETE)" \\
+        "$tree" "$dirty"
 """
 
 

@@ -625,7 +625,85 @@ git -C "$ROOT" fetch --quiet --no-tags --force --prune origin \
     '+refs/tags/*:refs/ircserve-docstruth/tags/*' 2>/dev/null || true
 
 note ""
-note "teeth: $PASS of 24 faults caught, $FAIL not."
+# ---------------------------------------------------------------------------
+# 25-28. THE OPT-IN SURFACE'S OWN FOUR FAULTS.
+#
+# One shape, four places: something this project claims about itself was true by
+# assertion and not by construction, and each of these removes one of the assertions.
+#
+#   25  a file no configuration compiles stops compiling under one compiler
+#   26  a cell's coverage statement deleted from the cell
+#   27  a cell's coverage statement deleted from CI
+#   28  a result's tree deleted from the result
+#
+# 25 is the important one and it is not hypothetical. `asan_coverage_probe.c` HAD
+# this defect -- `[-Werror=dangling-pointer=]` under gcc 16 -- for the whole of its
+# life, and the reason this fault exists is that the reason it survived was
+# structural: no configuration built the file, so no compiler ever said so.
+# ---------------------------------------------------------------------------
+
+# 25. THE COMPILE-MATRIX FAULT. The instrument configures a SECOND build directory
+# with -DIRC_LSAN_PROBE=ON -- the option nothing used to pass anywhere -- and builds
+# `asan_coverage_probe` with ONE compiler, which is exactly what the fault targets.
+# The compiler is DISCOVERED rather than hardcoded, for the reason scripts/gate.sh's
+# discovery section gives at length: /usr/bin/gcc, /usr/bin/clang and /usr/bin/cc are
+# all Apple's clang on macOS, so a name is not an identity and the version string is
+# the only honest test. TEETH_CC overrides it for a machine whose GCC is elsewhere.
+_fault_cc=""
+for _c in ${TEETH_CC:-} gcc-16 gcc-15 gcc-14 gcc-13 gcc; do
+    command -v "$_c" >/dev/null 2>&1 || continue
+    case "$("$_c" --version 2>/dev/null | head -1)" in
+        *gcc*|*GCC*) _fault_cc="$_c"; break ;;
+    esac
+done
+if [ -z "$_fault_cc" ]; then
+    # NOT A SKIP. A tooth that quietly does not run reports a count of faults caught
+    # that is smaller than the number of faults, and a smaller number reads as
+    # success. This fails the run and says how to point it somewhere.
+    note "no GCC found for the compile-matrix tooth; set TEETH_CC=/path/to/gcc and re-run"
+    FAIL=$((FAIL + 1))
+    FAILED_LIST="$FAILED_LIST optin-probe-unbuildable-under-one-compiler(nocc)"
+else
+    note "ok: the compile-matrix tooth will build asan_coverage_probe with $( "$_fault_cc" --version | head -1 )"
+    run_command_fault optin-probe-unbuildable-under-one-compiler \
+        probe_unbuildable_under_one_compiler.py \
+        "_teeth_fault_undeclared" \
+        "cmake -S . -B bprobe -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DWITH_TLS=OFF -DBUILD_BENCHMARK=OFF -DIRC_LSAN_PROBE=ON -DCMAKE_C_COMPILER=$(command -v "$_fault_cc") 2>&1 && cmake --build bprobe --target asan_coverage_probe -j8 2>&1"
+fi
+
+# 26 and 27. THE TWO COVERAGE STATEMENTS. Both cells print sanitizer counts, both now
+# render through ONE function, and the two faults delete the two CALL SITES rather
+# than the renderer. Three copies of "is this report complete" would be three
+# answers; what is actually dangerous is the renderer being edited until nobody asks
+# for it, and only a fault that removes the asking can measure that.
+#
+# scripts/gate.sh --asan-selftest needs no compiler, no docker and no build, which is
+# why these two cost seconds and run on every machine rather than on the one with
+# the container.
+run_command_fault asan-cell-coverage-statement-removed \
+    asan_cell_coverage_statement_removed.py \
+    "no longer calls the coverage" \
+    "bash scripts/gate.sh --asan-selftest"
+
+run_command_fault ci-sanitizers-coverage-statement-removed \
+    ci_sanitizers_coverage_statement_removed.py \
+    "no longer" \
+    "bash scripts/gate.sh --asan-selftest"
+
+# 28. THE DIRTY FLAG. scripts/gate-linux-cell.sh rsyncs the WORKING TREE while the
+# comment above that line claimed `git archive` and claimed the cell could not be
+# affected by an uncommitted change. The comment is fixed and every report now carries
+# the commit AND the flag; this fault puts the flag back to always-clean and requires
+# the same --report-selftest that already proves the coverage block is still there to
+# go red. Both live in the same self-test because they are the same class: a report
+# claiming something about its own subject that the subject can contradict.
+run_command_fault linux-cell-dirty-tree-flag-suppressed \
+    linux_cell_dirty_flag_suppressed.py \
+    "dirty" \
+    "sh scripts/gate-linux-cell.sh --report-selftest"
+
+note ""
+note "teeth: $PASS of 28 faults caught, $FAIL not."
 if [ "$FAIL" != "0" ]; then
     note "not caught:$FAILED_LIST"
     exit 1

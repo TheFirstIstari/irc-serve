@@ -155,11 +155,62 @@ static int *keep_address(int *p)
  *
  * NO_DANGLING_POINTER IS LOAD-BEARING AND NOT COSMETIC. Storing the address of a local
  * that is about to die is EXACTLY what this case must do, and it is exactly what gcc's
- * -Wdangling-pointer reports: MEASURED, -Wdangling-pointer fires on the store below at
- * gcc 16.2 on this project's own -Wall -Wextra -Werror, and this tree builds clean on
- * gcc 16 in the 12-cell gate. The attribute is the compiler's own opt-out for exactly
- * this case, and it is guarded because gcc 12.2 -- the compiler in the container the
- * Linux cell runs in, measured clean without it -- predates the attribute entirely. */
+ * -Wdangling-pointer reports.
+ *
+ * THE MEASUREMENT THAT FORCED THIS BLOCK, taken 2026-10-10 on this machine by building
+ * THIS FILE with -Wall -Wextra -Werror -Wpedantic -std=c11 under each of the three
+ * compilers the gate uses, and it is why the block is a pragma rather than the
+ * attribute the earlier version of this comment described:
+ *
+ *   compiler                          __has_attribute(no_dangling_pointer)
+ *   --------------------------------  --------------------------------------
+ *   gcc 16.2.0 (Homebrew, this box)   false   -> the macro expanded to NOTHING
+ *   clang 23.1.2 (Homebrew, this box) false   -> the macro expanded to NOTHING
+ *   Apple clang 21.0.0 (this box)     false   -> the macro expanded to NOTHING
+ *
+ * So on every compiler this project builds the probes with, the attribute suppressed
+ * nothing at all, because it was never emitted. The store below was therefore
+ * UNGUARDED under all three -- and gcc 16.2 rejects it outright:
+ *
+ *   asan_coverage_probe.c:180:10: error: storing the address of local variable
+ *   'local' in '*out' [-Werror=dangling-pointer=]
+ *
+ * That is not a hypothetical: it is the state this file was in, and it survived every
+ * gate run and every CI run because no configuration in this project ever compiled it.
+ * The reason is in CMakeLists.txt's IRC_LSAN_PROBE comment and it is the same reason
+ * this pragma block had to be written at all: an opt-in file that nothing builds is
+ * not tested code, it is text. .github/workflows/ci.yml now builds both opt-in probes
+ * on every push and pull request under gcc, upstream clang and Apple clang, which is
+ * the only reason this defect is a commit instead of a finding nobody made.
+ *
+ * WHY A PRAGMA AND NOT THE ATTRIBUTE. `__has_attribute(no_dangling_pointer)` is false
+ * on gcc 16.2 even though gcc HAS a -Wdangling-pointer diagnostic, so the attribute
+ * cannot be the guard: it is not a spelling gcc 16 accepts. The pragma is.
+ *
+ * WHY __GNUC__ >= 15 AND NOT A __has_warning() PROBE. Measured, `__has_warning` is
+ * also false on gcc 16.2 for this option: GCC only answers for a fixed list of its own
+ * spellings, so asking it "do you have -Wdangling-pointer?" gets "no" from the one
+ * compiler that does. The version test is the question that is actually answerable at
+ * preprocessing time. GCC 15 is the boundary because that is where -Wdangling-pointer
+ * was broadened to fire on a store through a non-attributed out-parameter -- which is
+ * the shape of `*out = &local` below -- and it is a boundary read off GCC's changelog
+ * rather than measured here, because this project has no gcc 15. The cost of the
+ * boundary being one version late is that gcc 13 and 14, if they also fire here, would
+ * need the guard lowered; the cost of it being one version early is a #pragma naming a
+ * warning option those compilers do have.
+ *
+ * WHY THE CONTAINER'S gcc IS EXCLUDED RATHER THAN SUPPRESSED. gcc 12.2.0 -- the
+ * compiler in debian:bookworm, the image scripts/gate-linux-cell.sh builds in -- has
+ * no -Wdangling-pointer to silence at this store, and naming an option a compiler does
+ * not have is itself a diagnostic under -Werror. So the guard is a floor, not a
+ * version table: gcc below 15 gets no pragma and no unknown-option risk.
+ *
+ * THE ATTRIBUTE IS KEPT ANYWAY, on the same reasoning as the pragma: if GCC ever
+ * implements no_dangling_pointer, __has_attribute will start answering true, the
+ * attribute will be emitted, and it will bind at the declaration the way this comment
+ * always said it would. It costs four lines and it is the difference between a guard
+ * that is right now and one that is right whenever the compiler catches up. Both
+ * mechanisms are needed in the meantime; neither alone was doing anything. */
 #if defined(__has_attribute)
 #  if __has_attribute(no_dangling_pointer)
 #    define ASAN_PROBE_NO_DANGLING __attribute__((no_dangling_pointer))
@@ -167,6 +218,10 @@ static int *keep_address(int *p)
 #endif
 #ifndef ASAN_PROBE_NO_DANGLING
 #  define ASAN_PROBE_NO_DANGLING
+#endif
+
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 15
+#  pragma GCC diagnostic ignored "-Wdangling-pointer"
 #endif
 
 ASAN_PROBE_NO_DANGLING
