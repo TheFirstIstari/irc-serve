@@ -383,4 +383,37 @@ int fed_nickreg_resolve_local(server_t *s, const char *nick, uint64_t now_ms);
 int fed_nickreg_next_name(const server_t *s, const char *nick, char *out,
                           size_t cap);
 
+/* ---------------------------------------------------------------------------
+ * nickreg_ident_ok(): THE RULE FOR A HOSTMASK COMPONENT, ASKED BY BOTH PATHS
+ * ---------------------------------------------------------------------------
+ * Returns 1 when `s` may be stored in a `<user>` or `<host>` field of a
+ * `nick!user@host` hostmask and 0 when it may not. The definition in nickreg.c
+ * carries the whole argument; what matters HERE is who asks.
+ *
+ * IT IS ASKED BY THE PEER PATH (`nickreg_learn()`, on a peer's SBURSTN record)
+ * AND BY THE CLIENT PATH (`handle_user()` in core/commands.c, on a client's
+ * `USER`), and it is one function for both for the reason connection.h gives for
+ * `conn_realname_check()`: a value with two writers needs the writers to agree,
+ * and the alternative -- each caller deciding for itself -- is a second opinion
+ * about what may be stored, which is how the two come to disagree. This tree has
+ * now been bitten by exactly that in three places, and one of them was this
+ * predicate's other half: `conn_t::user` had NO predicate on the client side at
+ * all while `fed_rnick::user` had this one, so the same hostmask slot was governed
+ * by a rule on one path and by nothing on the other.
+ *
+ * AN EMPTY VALUE IS "NOT TOLD", NOT "BAD". This returns 0 for it, and every
+ * caller that means to allow absence tests `s[0] != '\0'` itself. That is
+ * spelled out at the definition and it is load-bearing in both directions: an
+ * empty ident is a legal state on the client path (a registration whose USER was
+ * refused completes with an empty one), and an absent host is a normal state on a
+ * peer record.
+ *
+ * `cap` is the WIDTH of the destination field, not of the source: a value that
+ * does not fit the struct it is going into is refused rather than truncated,
+ * which is 3.2's rule about never delivering a silently shortened parameter.
+ *
+ * COST: one pass over at most CONN_MAX_HOST bytes, on a path that runs once per
+ * registration and once per burst nick record -- not once per message. */
+int nickreg_ident_ok(const char *s, size_t cap);
+
 #endif /* IRC_FEDERATION_NICKREG_H */

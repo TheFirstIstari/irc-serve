@@ -76,9 +76,17 @@ size_t sasl_store_count(const sasl_store_t *store)
  * outcome depend on which one the client happened to type. */
 static int authcid_eq(const char *a, const char *b)
 {
-    while (*a != '\0' && *b != '\0') {
-        char ca = *a;
-        char cb = *b;
+    size_t la = (a != NULL) ? strlen(a) : 0u;
+    size_t lb = (b != NULL) ? strlen(b) : 0u;
+    size_t n = (la > lb) ? la : lb;
+    size_t i;
+    unsigned diff = (la != lb) ? 1u : 0u;
+
+    /* Constant-time: a fixed walk over the longer input, no early return, so
+     * the comparison cost does not reveal the matching prefix or the length. */
+    for (i = 0u; i < n; i++) {
+        char ca = (i < la) ? a[i] : (char)0;
+        char cb = (i < lb) ? b[i] : (char)0;
 
         if (ca >= 'A' && ca <= 'Z') {
             ca = (char)(ca - 'A' + 'a');
@@ -86,13 +94,9 @@ static int authcid_eq(const char *a, const char *b)
         if (cb >= 'A' && cb <= 'Z') {
             cb = (char)(cb - 'A' + 'a');
         }
-        if (ca != cb) {
-            return 0;
-        }
-        a++;
-        b++;
+        diff |= (unsigned)(ca ^ cb);
     }
-    return *a == '\0' && *b == '\0';
+    return diff == 0u;
 }
 
 int sasl_store_add(sasl_store_t *store, const char *authcid, const char *password)

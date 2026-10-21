@@ -28,6 +28,13 @@
 #include "core/channel.h"
 #include "core/reply.h"
 #include "core/server.h"
+/* For `nickreg_ident_ok()`, the rule for a hostmask component, asked by both the
+ * peer path (`nickreg_learn()`) and the client path (`handle_user()`). The resume
+ * store asks it a third time because `resume_window::ident` is a copy of
+ * `conn_t::user` and this file prints that value raw at seven sites -- see
+ * `resume_ident_copy()` below. nickreg.h includes core/server.h, so this is not a
+ * cycle. */
+#include "federation/nickreg.h"
 
 /* ---------------------------------------------------------------------------
  * The record
@@ -57,6 +64,7 @@ struct resume_window {
     char     nick[IRC_MAX_NICK + 1];
     char     ident[CONN_USER_MAX + 1];
     char     host[CONN_HOST_MAX + 1];
+    char     account[CONN_MAX_ACCOUNT + 1];
     uint64_t dropped_ms;
     /* 0 while the window is RESUMABLE, and the stamp at which it stopped being
      * so once it is not. The window's whole life has two stages and this is the
@@ -164,6 +172,68 @@ static int resume_copy(char *dst, size_t cap, const char *src)
 }
 
 /* ---------------------------------------------------------------------------
+ * THE IDENT HALF OF resume_copy(), AND WHY IT IS A FUNCTION OF ITS OWN
+ * ---------------------------------------------------------------------------
+ * `resume_window::ident` is a copy of `conn_t::user`, and `conn_t::user` is the
+ * `<user>` slot of a `nick!user@host` hostmask -- the field that reached every
+ * co-member's terminal with no predicate at all until `handle_user()` started
+ * asking `nickreg_ident_ok()` at ingest. This store prints that value raw at
+ * SEVEN sites (`session_resume_note:`, `session_resume_hold:`,
+ * `session_resume_retire:`, `session_resume_free:`, `session_resume_miss:` and
+ * `session_resume:`), so an ident this node had not checked would be an
+ * operator-log injection that outlived the connection that sent it -- a window
+ * is two minutes of replayable screen-rewriting, and the client that caused it
+ * can be long gone.
+ *
+ * SO THE SAME PREDICATE IS ASKED HERE, and that is the whole of the fix rather
+ * than a second rule. It is `nickreg_ident_ok()` -- the project's own rule for a
+ * hostmask component, applied on the peer path by `nickreg_learn()` and on the
+ * client path by `handle_user()`. Asking it a third time here is what makes the
+ * resume store a consumer of the ingest guarantee rather than a place the
+ * guarantee has to be re-argued for.
+ *
+ * WHY IT IS NOT A FILTER ON THE SEVEN PRINT SITES. That is the same decision
+ * `handle_user()` records at length and the same three reasons apply: the safety
+ * would live in seven places instead of one, every new print site would silently
+ * inherit the hazard, and the value would still be UNSAFE in every consumer
+ * nobody has enumerated. Validating the copy means the stored ident is safe
+ * wherever it goes, including the next reader.
+ *
+ * WHAT HAPPENS WHEN IT SAYS NO, and why the answer is "store empty" rather than
+ * "refuse the window". An empty ident is a LEGAL KEY -- `nick!@host` with an
+ * empty `<user>` is what a client that sent no ident already looks like, and a
+ * reconnecting client that also has no ident matches it -- so degrading to empty
+ * keeps the session recoverable and produces the same key a client whose
+ * `USER` was refused at ingest will present. Refusing the whole window instead
+ * would take a session away from a client over a field this node can simply
+ * decline to store, which is the failure mode this file's own comment on
+ * eviction is written against: a store that can refuse is a store that can break
+ * a client command.
+ *
+ * UNREACHABLE ON TODAY'S TREE, and the reason it is here anyway: `handle_user()`
+ * is the only writer of `conn_t::user` (`CHGHOST` is deliberately
+ * unimplemented) and it has already run this predicate, so `c->user` is either
+ * empty or a legal ident when either caller gets it. The guard is for the
+ * invariant MOVING -- a second writer, a future field, a resume path reached
+ * from somewhere this file does not know about -- and the shape of that
+ * regression is a STORED BYTE rather than a crash, so nothing else in the tree
+ * would say so. It is silent rather than counted for the same reason: a
+ * `server_t` counter is published in the one `[fixture] stats` line every
+ * integration test parses, and an event that cannot happen does not deserve a
+ * column there. If it ever fires, the ingest guard that should have caught it
+ * first is the thing to look at.
+ *
+ * COST: one pass over at most CONN_USER_MAX bytes, once per drop and once per
+ * registration-with-a-window, on a path that already walks three copies. */
+static int resume_ident_copy(char *dst, size_t cap, const char *src)
+{
+    if (src != NULL && src[0] != '\0' && nickreg_ident_ok(src, cap) == 0) {
+        dst[0] = '\0';
+        return 1;
+    }
+    return resume_copy(dst, cap, src);
+}
+/* ---------------------------------------------------------------------------
  * Table access
  * ---------------------------------------------------------------------------
  *
@@ -241,7 +311,8 @@ static const struct resume_window *resume_find_const(const server_t *s,
         const struct resume_window *w = &s->resume_windows[i];
 
         if (!same_folded(w->nick, c->nick) || !same_folded(w->ident, c->user) ||
-            !same_folded(w->host, c->host)) {
+            !same_folded(w->host, c->host) ||
+            !same_folded(w->account, c->account)) {
             continue;
         }
         if (now_ms < w->dropped_ms || (now_ms - w->dropped_ms) >= g_window_ms) {
@@ -268,7 +339,8 @@ static struct resume_window *resume_find(server_t *s, const conn_t *c,
         struct resume_window *w = &s->resume_windows[i];
 
         if (!same_folded(w->nick, c->nick) || !same_folded(w->ident, c->user) ||
-            !same_folded(w->host, c->host)) {
+            !same_folded(w->host, c->host) ||
+            !same_folded(w->account, c->account)) {
             continue;
         }
         /* THE KEY AND NOTHING ELSE, and that is the difference from
@@ -382,8 +454,10 @@ void resume_note(server_t *s, const conn_t *c, uint64_t now_ms)
     w->nchans = 0u;
     w->dropped_ms = now_ms;
     if (!resume_copy(w->nick, sizeof w->nick, c->nick) ||
-        !resume_copy(w->ident, sizeof w->ident, c->user) ||
-        !resume_copy(w->host, sizeof w->host, c->host)) {
+        !resume_ident_copy(w->ident, sizeof w->ident, c->user) ||
+        !resume_copy(w->host, sizeof w->host, c->host) ||
+        !resume_copy(w->account, sizeof w->account,
+                    (c->account[0] != '\0') ? c->account : "")) {
         /* Unreachable: every field was accepted by the struct it is being
          * copied into, which is the same width. Handled rather than asserted
          * because a window whose key is half-built matches a connection whose
@@ -558,7 +632,7 @@ int resume_apply(server_t *s, conn_t *c, uint64_t now_ms)
      * it shifts the array and the connection's own fields are the only other
      * place they exist. */
     (void)resume_copy(nick, sizeof nick, c->nick);
-    (void)resume_copy(ident, sizeof ident, c->user);
+    (void)resume_ident_copy(ident, sizeof ident, c->user);
 
     /* THE FINDER, NOT A SECOND COPY OF ITS COMPARISON. resume_apply() needs the
      * INDEX as well as the entry -- it has to take the window and it has to
@@ -674,6 +748,16 @@ int resume_apply(server_t *s, conn_t *c, uint64_t now_ms)
             continue;
         }
         flags = resume_flags_for(s, ch, chans[i].flags);
+        /* THE ACCOUNT BINDING, which is the half of the key that makes the
+         * restore safe across an authenticated reconnect: a window recorded for
+         * an authenticated identity is only restored when the reconnecting
+         * client authenticated as the SAME identity. A window recorded without
+         * an account (an unauthenticated session) keeps the old behaviour, so
+         * the feature still works for clients that do not use SASL; the
+         * residual shared-host risk for those is documented in SECURITY.md. */
+        if (w->account[0] != '\0' && !same_folded(w->account, c->account)) {
+            flags = 0u;
+        }
         if (chans[i].flags != 0u && flags != chans[i].flags) {
             /* THE ONE LINE THAT MAKES THE FEATURE HONEST about privilege: it
              * names a channel where the client held a prefix the channel did not

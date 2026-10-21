@@ -781,6 +781,55 @@ size_t conn_text_logsafe(char *out, size_t cap, const char *s);
  */
 #define CONN_MAX_ACCOUNT 63
 
+/* ---------------------------------------------------------------------------
+ * THE PER-CONNECTION CHANNEL CAP, AND THE NUMBER 128
+ * ---------------------------------------------------------------------------
+ * `conn_t::chans` grew by doubling with no ceiling, and the only limit on how
+ * many channels one connection could hold was the node's global registry
+ * (server.c's strtab is STRTAB_BUCKETS = 1024 slots). That is a shared, bounded
+ * resource, and a per-connection bound equal to it is a bound nobody can hold
+ * against anybody: one registered client could create 1024 channels, consume the
+ * entire registry, and deny channel creation to every other user on the node.
+ * Measured, that cost 12,202 bytes of attacker input and returned 872 KiB of
+ * RSS -- 73 bytes per byte -- and the same 1024 entries made a 10-byte `AWAY`
+ * cost 9.6 ms of event-loop time, because the away-notification walks the
+ * connection's own list.
+ *
+ * WHY 128, AND WHY IT IS NOT THE REGISTRY'S OWN SIZE.
+ *   - THE REGISTRY IS SHARED. 1024 / 8 = 128 is the widest slice a single
+ *     connection may hold of the only such resource, so it would take eight
+ *     saturated clients rather than one to exhaust it. A cap at 1024 would be a
+ *     cap in name only: it would permit exactly the denial it is written to
+ *     prevent, because the one client that reached it would already have won.
+ *   - NO LEGITIMATE CLIENT HOLDS 128 CHANNELS. The extreme real cases are a
+ *     bouncer or a service bot, and channel counts there are in the tens. The
+ *     cap is chosen to be above every measured legitimate use and far below the
+ *     registry, which is the only interval that is both safe and harmless.
+ *   - IT BOUNDS BOTH WALKS. Every per-connection channel walk on this node --
+ *     away-notify, the JOIN fan-out, PART's teardown, the resume restore --
+ *     becomes O(128) at worst, so a constant replaces an attacker-chosen
+ *     number. That is the point: the cost is no longer a function of input.
+ *
+ * WHAT A REFUSED JOIN LOOKS LIKE. 405 (RFC 1459's ERR_TOOMANYCHANNELS), which
+ * is the number the specification defines for exactly this and which no other
+ * site on this node uses, so it cannot be confused with 437's "cannot join
+ * channel" or 474's "banned". The refusal is also counted on an `[observable]`
+ * line, because a JOIN that silently does nothing is indistinguishable from one
+ * the client never sent.
+ *
+ * COST: one integer comparison per admission, on a path that already reallocs.
+ * ---------------------------------------------------------------------------
+ * WHERE IT IS ENFORCED, AND WHY IN chan_admit() AND NOT IN chan_attach_conn()
+ * ---------------------------------------------------------------------------
+ * `chan_admit()` is the ONE place a resolved channel becomes local membership --
+ * both `JOIN` and resume's re-join go through it -- and it is the only one of
+ * the two with a `server_t` in hand. `chan_attach_conn()` is the writer of the
+ * array, so it is the natural place to guard, but it has no registry to compare
+ * against and a per-connection constant is not the bound this cap is about.
+ * Putting the check in the one function that both paths share also means a
+ * resume cannot rejoin a channel the cap would have refused. */
+#define CONN_MAX_CHANNELS 128
+
 /* conn_t::away, the AWAY message. Empty means "not away", the same idiom
  * nick[0]/user[0] already use for "this fact is not established yet", so no
  * separate flag is needed and the two can never disagree.
@@ -860,12 +909,38 @@ typedef struct conn {
     char        host[128];
     char        realname[256];
     int         state;             /* CONN_REG_* | CONN_CLOSING */
+    /* THE "A USER ARRIVED" FLAG, AND WHY IT EXISTS NOW WHEN IT DID NOT BEFORE.
+     * `have_user()` used to be `c->user[0] != '\0'`, and that was sound for as
+     * long as an empty ident was the ONLY way `c->user` could be empty: a
+     * client that had not sent USER had no ident, and a client that had sent
+     * one always had a non-empty one, so the field carried the fact.
+     *
+     * The two came apart the moment `handle_user()` started REFUSING an ident
+     * at ingest (`nickreg_ident_ok()`, the hostmask-component rule). A client
+     * that sends `USER <ESC>[2J... 0 * :x` now registers with an EMPTY ident,
+     * which is the documented consequence -- and under the old `have_user()`
+     * that client could never register at all, because the state projection
+     * would read "no user" for ever and CONN_REG_READY would never be reached.
+     * The fix would have stranded exactly the clients it was written to
+     * protect, silently, with no 001 and no refusal. That is what the state
+     * enum's own comment means by "the underlying facts are still the fields":
+     * the projection is only honest while the fields carry the facts, and a
+     * field that can be emptied by a refusal is no longer a fact.
+     *
+     * So the fact moves to where facts about a command's ARRIVAL live -- beside
+     * `cap_negotiating` and `sasl`, which are also "what happened on this
+     * connection" rather than "what the client asserted". It is an ADDITION and
+     * not a rearrangement, for the reason the account fields above give: the
+     * struct's Phase 2 layout is untouched and the new field is set in exactly
+     * one place, `handle_user()`, on the same path that stores the ident. */
+    int         user_seen;         /* a USER command arrived; ident may be empty */
     char        away[CONN_MAX_AWAY + 1];
     time_t      signon_at;         /* accept time; 317's <signon time> */
     time_t      last_active;       /* last byte read; 317's <idle> */
     unsigned    caps;              /* negotiated capabilities; core/cap.h bits */
     int         cap_negotiating;   /* CAP LS/REQ in flight; CAP END clears it */
     int         sasl;              /* sasl_state_t; FAILED is terminal */
+    int         sasl_failures;      /* bad-credential attempts on this connection */
     /* Phase 10.1: the account identity, which is what `c->sasl` was missing.
      * An ADDITION and not a rearrangement, like the three fields above, and for
      * the same reason: it is a fact another module has to ask about and one
