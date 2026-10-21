@@ -420,20 +420,125 @@ static void check_no_raw_params_in_printf(void)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * THE RULE: EVERY WRITE TO fanout_target_t::name GOES THROUGH ONE STORE
+ * ---------------------------------------------------------------------------
+ * `fanout_target_t::name` is a target a client named, and it is PRINTED -- at
+ * msg_verbs.c's `msg:` observable, at every refusal that names the target, at
+ * every reply that echoes it. `fanout_resolve()` used to write it with three bare
+ * `memcpy()` calls guarded by a chain of three conditions, and every one of those
+ * conditions is a fact about ROUTING ("is this a channel", "does the registry
+ * hold that nick", "is that a local user") rather than a fact about RENDERING.
+ * The chain works today; the shape is what does not survive a refactor, because
+ * the day one guard is loosened -- a channel charset widened, a registry lookup
+ * made more permissive, a lenient-accept edit -- the byte is in a struct with
+ * nothing between it and a log line.
+ *
+ * So the validation moved to the STRUCT: `fanout_name_store()` is the only writer
+ * of `out->name`, it refuses rather than copies, and it asks
+ * `conn_text_display_check()` -- the same walk `valid_nick()` asks for
+ * `conn_t::nick` and `conn_realname_check()` asks for `conn_t::realname`, which
+ * are the other two fields that are stored and re-rendered into every line their
+ * owner sends.
+ *
+ * What this check asserts is the SHAPE, not the predicate: that the raw stores
+ * are gone, that the helper exists, that every call site routes through it, and
+ * that the helper asks a predicate at all. A future edit that adds a fourth
+ * branch with a fourth `memcpy` therefore fails here rather than passing until
+ * somebody reaches the byte from a socket -- which is the whole difference
+ * between this check and the sweep's, and the reason the sweep did not find the
+ * `nick@server` site in the first place: the audit that named it could not get a
+ * control byte through the guard chain either. */
+static void check_target_is_validated_at_the_struct(void)
+{
+    char code[TF_SRC_MAX];
+    size_t stores;
+    size_t i;
+
+    read_src(code, sizeof code, "src/core/fanout.c");
+    squash(code);
+
+    /* THE HELPER EXISTS, and it is not a stub: it must consult a predicate. The
+     * predicate's own name is not pinned, because the RIGHT walk is a decision
+     * this file should not make twice -- what is asserted is that the store asks
+     * SOMETHING before it copies, and that the something is the display walk the
+     * two other stored identity fields use. */
+    TF_CHECK_MSG(has(code, "static int fanout_name_store("),
+                 "fanout.c no longer defines fanout_name_store(). It is the one "
+                 "place a byte gets into fanout_target_t::name, and without it the "
+                 "safety of that field is back to whichever guard chain a reader "
+                 "can reconstruct -- which is the shape the audit named.");
+    TF_CHECK_MSG(has(code, "conn_text_display_check( src )") ||
+                 has(code, "conn_text_display_check(src)"),
+                 "fanout_name_store() no longer asks conn_text_display_check(). "
+                 "That walk is the same one valid_nick() asks for conn_t::nick and "
+                 "conn_realname_check() asks for conn_t::realname, because all "
+                 "three fields are stored and re-rendered into every line their "
+                 "owner sends. A store that validates against a different set is a "
+                 "second answer to the same question, and this tree has been bitten "
+                 "by that three times.");
+
+    /* THE RAW STORES ARE GONE. The count is of `memcpy(out->name ...` rather
+     * than of every memcpy in the file, so the store's own copy is the one that
+     * has to be the only one: it lives immediately after the predicate, inside
+     * the helper, and a second copy anywhere else in the file is a writer that
+     * does not go through it. */
+    stores = 0u;
+    for (i = 0u; code[i] != '\0'; i++) {
+        if (strncmp(&code[i], "memcpy( out->name", 17u) == 0 ||
+            strncmp(&code[i], "memcpy(out->name", 16u) == 0) {
+            stores++;
+        }
+    }
+    TF_CHECK_MSG(stores == 1u,
+                 "fanout.c holds %lu memcpy() call(s) into out->name and exactly "
+                 "one is allowed: the one inside fanout_name_store(), immediately "
+                 "after the predicate. A second one is a writer that does not go "
+                 "through the store, and it is the writer a future refactor will "
+                 "loosen first.", (unsigned long)stores);
+
+    /* AND IT IS ACTUALLY ASKED, rather than defined and ignored. The resolution
+     * function has four branches -- channel, `nick@server` naming this node, the
+     * registry's remote pair, and a bare local nick -- and every one of them
+     * resolves through the same store, so the call count has to reach all four.
+     * The count is a FLOOR for the same reason test_relay_shape.c's is: a new
+     * branch that resolves legitimately adds one, and a test that fails on an
+     * addition is a test that gets deleted rather than updated. */
+    stores = 0u;
+    for (i = 0u; code[i] != '\0'; i++) {
+        if (strncmp(&code[i], "fanout_name_store( out", 22u) == 0 ||
+            strncmp(&code[i], "fanout_name_store(out", 21u) == 0) {
+            stores++;
+        }
+    }
+    /* One call per resolution branch, plus the definition itself, plus the call
+     * inside the definition is not counted -- the needles above are for calls,
+     * and the definition is `static int fanout_name_store(` which the first
+     * needle (`fanout_name_store( out`) does not match. */
+    TF_CHECK_MSG(stores >= 4u,
+                 "fanout_name_store() is called %lu time(s) and fanout_resolve() "
+                 "has four resolution branches, each of which must store its "
+                 "target through the one store. Fewer means a branch writes "
+                 "out->name some other way, and that branch is the one the next "
+                 "refactor will loosen.", (unsigned long)stores);
+}
+
 int main(void)
 {
     check_width_is_derived();
     check_fields_are_arrays();
     check_render_is_three_fields();
     check_no_raw_params_in_printf();
+    check_target_is_validated_at_the_struct();
 
-    /* THE FOURTH CHECK HAS SOMETHING TO FIND, and saying so is what stops the
-     * "a check that cannot fail is worse than none" failure: the loop above was
-     * written against a file that HAD a violation, and a reader who wants to know
-     * whether it can pass vacuously can apply `scripts/teeth/msg_params_in_printf.py`
-     * and watch it go red. */
+    /* THE FIFTH CHECK HAS SOMETHING TO FIND, and saying so is what stops the
+     * "a check that cannot fail is worse than none" failure: `msg_params_printed_
+     * raw.py` was written against a file that HAD the violation the fourth check
+     * now refuses, and `memcpy_target_printed_raw.py` was written against the one
+     * the fifth refuses. A reader who wants to know whether either can pass
+     * vacuously can apply those and watch them go red. */
     {
-        /* WHAT IS STILL WORTH SAYING AFTER THE FOUR CHECKS, and it is deliberately
+        /* WHAT IS STILL WORTH SAYING AFTER THE FIVE CHECKS, and it is deliberately
          * WEAK, so it is labelled weak here rather than dressed up.
          *
          * These two needles are identifiers and a call name, not string literals,

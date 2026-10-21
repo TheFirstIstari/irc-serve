@@ -124,6 +124,17 @@ int chan_name_valid(const char *name)
             return 0;
         }
     }
+    /* AND THE RENDERABILITY, which is the rule the wire already enforces and
+     * that fanout_name_store() asks again. A name that reaches the registry
+     * must be renderable in every numeric and state-change form, including
+     * 353/311/319 where it is a middle parameter. Refusing here makes JOIN
+     * answer 403 instead of admitting a member into a channel it can never
+     * address or PART. Valid UTF-8 remains allowed -- conn_text_display_check()
+     * is the project's renderability rule, and it is the same one valid_nick()
+     * and realname use. */
+    if (conn_text_display_check(name) != CONN_DISPLAY_OK) {
+        return 0;
+    }
     return 1;
 }
 

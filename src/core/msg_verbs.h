@@ -75,6 +75,36 @@
  * One number, two readers. */
 #define MSG_MAX_TARGETS 1
 
+/* ---------------------------------------------------------------------------
+ * AWAY_NOTIFY_MAX_CHANNELS: THE BOUND ON ONE AWAY'S NOTIFICATION WALK
+ * ---------------------------------------------------------------------------
+ * `notify_away()` walks the setter's own channel list, and the walk is the most
+ * expensive thing a ten-byte line can cause: each iteration resolves a channel
+ * in the registry and fans out to that channel's member list. With no bound at
+ * all, a client holding 1024 channels made `AWAY :x` cost 9.6 ms of event-loop
+ * time, and nothing rate-limited the verb, so the ratio was ten bytes in to
+ * nearly ten milliseconds out.
+ *
+ * THE VALUE IS CONN_MAX_CHANNELS, and that is not a coincidence chosen for
+ * tidiness: it is the SAME bound expressed at the walk instead of at
+ * membership. `chan_admit()` refuses a JOIN that would take a connection past
+ * CONN_MAX_CHANNELS, so a connection cannot legitimately hold more than this
+ * many, which means a client that is below the cap is notified in FULL and the
+ * bound never truncates a legitimate operator. What the bound is for is the case
+ * the cap cannot see -- a second writer of `conn_t::chans`, a future federation
+ * path that populates local membership, a resume restore that re-joins more than
+ * the cap -- where the walk would otherwise cost an attacker-chosen number
+ * again.
+ *
+ * WHY A BOUND AND NOT A RATE LIMIT. A rate limit suppresses the notification for
+ * a real user toggling their away state, and away-notify is a specification
+ * feature whose value is that it is not approximate. A bound caps what ONE event
+ * may cost, which is the failure mode that was measured, and it cannot break a
+ * client that is below the cap by construction. Both halves are reported on the
+ * `away_notify:` line -- `walked=` and `truncated=1` -- so a walk that stopped
+ * early is visible rather than silently smaller. */
+#define AWAY_NOTIFY_MAX_CHANNELS CONN_MAX_CHANNELS
+
 /* The command surface. Each is a `command_t::fn`, and each obeys the shape above.
  * The declarations are here rather than static in commands.c for the reason
  * chan_verbs.h gives: the verb table stays where it is, and the handlers are
