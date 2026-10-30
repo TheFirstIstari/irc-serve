@@ -124,7 +124,12 @@ void fed_obs(const char *fmt, ...)
     va_start(ap, fmt);
     for (const char *p = fmt; *p != '\0'; p++) {
         if (*p != '%') {
-            (void)fputc((int)*p, stdout);
+            const char *span = p;
+
+            while (p[1] != '\0' && p[1] != '%') {
+                p++;
+            }
+            (void)fwrite(span, 1u, (size_t)(p - span + 1), stdout);
             continue;
         }
         if (p[1] == '%') {

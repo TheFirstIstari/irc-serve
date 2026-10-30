@@ -197,14 +197,25 @@ static int out_append(nf_node_t *n, const char *bytes, size_t len)
  * nothing was available, -1 on a hard read error. */
 static int out_read(nf_node_t *n)
 {
-    char chunk[4096];
-    ssize_t got;
+    char chunk[16384];
+    int any = 0;
 
-    got = read(n->out_fd, chunk, sizeof chunk);
-    if (got <= 0) {
-        return 0; /* child closed stdout, or nothing yet */
+    for (;;) {
+        int queued = 0;
+        ssize_t got = read(n->out_fd, chunk, sizeof chunk);
+
+        if (got <= 0) {
+            break; /* child closed stdout, or nothing yet */
+        }
+        if (out_append(n, chunk, (size_t)got) != 0) {
+            return -1;
+        }
+        any = 1;
+        if (ioctl(n->out_fd, FIONREAD, &queued) != 0 || queued <= 0) {
+            break;
+        }
     }
-    return (out_append(n, chunk, (size_t)got) == 0) ? 1 : -1;
+    return any;
 }
 
 /* ---------------------------------------------------------------------------
