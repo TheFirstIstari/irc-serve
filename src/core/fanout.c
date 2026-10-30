@@ -905,6 +905,224 @@ static void fanout_form_for(const conn_t *dst, const fanout_form_t *extended,
     *nparams = extended->nparams;
 }
 
+/* ---------------------------------------------------------------------------
+ * ST-2: THE PRE-FORMATTED EMISSION
+ * ---------------------------------------------------------------------------
+ * write_to_members() and fanout_deliver_union_local_gated() used to build AND
+ * render a message once per member: a message_build() malloc plus a
+ * message_format() scan for every destination of every emission. The bytes
+ * were the same for almost every member -- the prefix, the verb and the
+ * parameters are facts about the EMISSION, not about the destination -- so
+ * the work is hoisted instead:
+ *
+ *   - the LINE BODY (":prefix VERB params...", no tags, no terminator) is
+ *     rendered ONCE per shape (plain always, extended lazily on first use),
+ *     by fanout_render_body() below;
+ *   - the two tag VALUES (the `msgid` pair and the `account` pair) are
+ *     computed ONCE per emission, by fanout_precompute_tags();
+ *   - per member only the SELECTION still happens: which shape (plain or
+ *     extended, the same fanout_form_for() question as before) and which of
+ *     the block combinations the member's capabilities ask for.
+ *
+ * WHAT STAYS PER MEMBER, and why the hoist is a selection rather than a
+ * single line: the CAPABILITY gates are per connection. Two members of one
+ * channel may disagree about `message-tags`/`draft/message-ids`
+ * (cap_message_ids_enabled()'s double gate) and about `account-tag`
+ * (cap_account_tag_enabled()'s double gate plus the non-empty-name rule), so
+ * the block is one of four combinations and picking it is per destination.
+ * fanout_pick_block() asks the same two predicates fanout_tag_block() asks,
+ * over the same precomputed values, so the bytes agree with the old path by
+ * construction rather than by review.
+ *
+ * WHAT TAKES THE SLOW PATH, and why it is not a second behaviour: a member
+ * carrying per-destination label/batch state -- a live `label` owed a
+ * response (and not suppressed for a self-message), an open batch reference,
+ * or a one-shot batch reference -- is rendered by today's per-member
+ * send_line_tagged() call, unchanged. The label hook MINTS state (it opens
+ * the labeled-response batch and queues the BATCH + line) and the batch hook
+ * CONSUMES state (the one-shot reference), so their outcome cannot be
+ * precomputed without performing it; and an open batch reference differs per
+ * connection, so it is not one bucket but one per member. member_needs_slow_path()
+ * reads the same three fields the two hooks read and routes those members to
+ * the old code, which is why the gates are preserved EXACTLY rather than
+ * approximately: the members that have any are never on the fast path.
+ *
+ * ECHO is not a tag and needs no bucket: it is the `exclude` parameter, asked
+ * before any rendering here exactly as before (msg_verbs.c sets it from
+ * CAP_ECHO_MESSAGE). There is no server-time tag in this tree to preserve;
+ * the capability does not exist (see cap.h's list), so there is no gate for
+ * it on either path.
+ *
+ * FAILURE FALLS BACK, never forward: when the shared body will not render
+ * (an unrepresentable parameter -- a CR in a field -- which the per-member
+ * path reports on n_reply_refused) or the tag values will not compute (the
+ * unreachable stamp/escape failure both old arms report loudly), the hoist
+ * marks itself unusable and every member takes the slow path -- which IS the
+ * old code, so the refusals and their counts are the ones the suite already
+ * pins. The fast path therefore only ever runs when it can produce bytes,
+ * and it produces them by memcpy: "@" block " " body CRLF, or body CRLF.
+ *
+ * No wire text and no log text changes: the observables below are the same
+ * strings, and the slow path emits them at the same sites. A hoist-time
+ * failure prints nothing itself; the slow path it defers to reports exactly
+ * as it always did.
+ */
+
+/* Render ":prefix VERB all..." with NO tags and NO terminator into `out`,
+ * returning the byte count or 0 on failure. The same build-then-format the
+ * per-member path performs, done once: a NULL prefix falls back to the
+ * node's own name exactly as emit_built_ex() does, and `cap` keeps reply.c's
+ * reserve-two for the CRLF the caller appends. */
+static size_t fanout_render_body(server_t *s, const char *prefix, const char *verb,
+                                 const char *const *all, int nall,
+                                 char *out, size_t cap)
+{
+    message_t m;
+    size_t len;
+
+    if (s == NULL || verb == NULL || out == NULL || cap < 2u) {
+        return 0;
+    }
+    if ((all == NULL && nall != 0) || nall < 0 || nall > IRC_MAX_PARAMS) {
+        return 0;
+    }
+    if (message_build(&m, NULL, (prefix != NULL) ? prefix : s->name, verb,
+                      all, nall) != 0) {
+        return 0;
+    }
+    len = message_format(&m, out, cap - 2u);
+    message_free(&m);
+    return len;
+}
+
+/* Compute the emission's two client-visible tag values once: `msgid` holds
+ * "msgid=<v>", `acct` holds the whole "account=<v>" pair, `both` holds them
+ * joined -- each "" when there is nothing of that kind to say. Returns 1
+ * when the values are usable and 0 when they are not, in which case every
+ * caller routes all members to the slow path: the per-member renderer then
+ * reports the failure exactly as it always did, so this function itself
+ * prints nothing. */
+static int fanout_precompute_tags(const irc_serve_tags_t *ident, const char *account,
+                                  char *msgid, size_t mcap,
+                                  char *acct, size_t acap,
+                                  char *both, size_t bcap)
+{
+    char idval[IRC_MAX_MSGTAG + 1u];
+    char acctpair[ACCOUNT_TAG_MAX];
+    int w;
+
+    if (msgid == NULL || acct == NULL || both == NULL ||
+        mcap == 0u || acap == 0u || bcap == 0u) {
+        return 0;
+    }
+    msgid[0] = '\0';
+    acct[0] = '\0';
+    both[0] = '\0';
+    /* The same legality gate the per-member renderer stamps under: the stamp
+     * came from fanout_stamp(), so this fails only for a stamp 2.4 would
+     * refuse -- unreachable, and routed to the slow path rather than
+     * believed. */
+    if (irc_serve_msgid_value(ident, idval, sizeof idval) == 0u) {
+        return 0;
+    }
+    w = snprintf(msgid, mcap, "%s=%s", IRCV3_TAG_MSGTAG, idval);
+    if (w <= 0 || (size_t)w >= mcap) {
+        return 0;
+    }
+    if (account == NULL || account[0] == '\0') {
+        return 1; /* anonymous emission: the msgid pair is the whole block */
+    }
+    if (account_tag_block(account, acctpair, sizeof acctpair) == 0u) {
+        return 0;
+    }
+    w = snprintf(acct, acap, "%s", acctpair);
+    if (w <= 0 || (size_t)w >= acap) {
+        return 0;
+    }
+    w = snprintf(both, bcap, "%s;%s", msgid, acctpair);
+    if (w <= 0 || (size_t)w >= bcap) {
+        return 0;
+    }
+    return 1;
+}
+
+/* WHICH OF THE PRECOMPUTED BLOCKS DOES THIS DESTINATION GET, or NULL for
+ * none. The same two double-gates the per-member renderer asks -- msgids
+ * need `message-tags` too, and the account tag needs a name to assert as
+ * well as its own capability -- asked about this member, over the values
+ * computed once above. An empty slot reads as "absent" so a combination
+ * that was never built is never emitted. */
+static const char *fanout_pick_block(const conn_t *m, const char *account,
+                                     const char *tag_msgid, const char *tag_acct,
+                                     const char *tag_both)
+{
+    int want_ids;
+    int want_acct;
+
+    if (m == NULL) {
+        return NULL;
+    }
+    want_ids = cap_message_ids_enabled(m);
+    want_acct = (account != NULL && account[0] != '\0' &&
+                 cap_account_tag_enabled(m) != 0) ? 1 : 0;
+    if (want_ids != 0 && want_acct != 0) {
+        return (tag_both[0] != '\0') ? tag_both : NULL;
+    }
+    if (want_ids != 0) {
+        return (tag_msgid[0] != '\0') ? tag_msgid : NULL;
+    }
+    if (want_acct != 0) {
+        return (tag_acct[0] != '\0') ? tag_acct : NULL;
+    }
+    return NULL;
+}
+
+/* Does this member's line carry per-destination label/batch state, which only
+ * the per-member path can render? The three fields are the ones the two hooks
+ * read: a live label owed a response (a self-message suppresses it with no
+ * side effect, so it stays fast), an open batch reference (a pure read, but
+ * a value that differs per connection), and a one-shot reference (consumed
+ * by the line that carries it). Anything set routes the member to the slow
+ * path, which performs -- not probes -- the hooks. */
+static int member_needs_slow_path(const conn_t *m)
+{
+    if (m == NULL) {
+        return 1;
+    }
+    if (m->label_live != 0 && m->label_self == 0) {
+        return 1;
+    }
+    if (m->batch_ref[0] != '\0' || m->batch_once[0] != '\0') {
+        return 1;
+    }
+    return 0;
+}
+
+/* Queue bytes that are already a complete wire line (CRLF included). The
+ * guards are emit_to_client()'s -- a peer target and a CLOSING target never
+ * take bytes -- without its reports: member selection above (chan_member_live()
+ * filters CLOSING before any rendering) makes both arms unreachable, and an
+ * unreachable arm that counted would be a counter that can only ever be
+ * wrong. Saturation still travels the honest road: server_queue() marks
+ * CLOSING, prints writeq_overflow and counts, exactly as the per-member
+ * path reaches it. */
+static int queue_prebuilt(server_t *s, conn_t *m, const char *line, size_t len)
+{
+    if (m == NULL || line == NULL || len == 0u) {
+        return -1;
+    }
+    if (m->kind == CONN_SERVER) {
+        return -1;
+    }
+    if (m->state == CONN_CLOSING) {
+        return -1;
+    }
+    if (server_queue(s, m, line, len) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 /* Write one line to every local member of `t->chan`, minus `exclude`.
  *
  * The same chan_member_live() rule every other member walk applies, for the
@@ -963,13 +1181,46 @@ static int write_to_members(server_t *s, const fanout_target_t *t,
      * emissions with two separate destinations. */
     const char *all[IRC_MAX_PARAMS + 1];
     int n = 0;
+    /* ST-2: the emission rendered once -- the plain body always, the extended
+     * body lazily on first use, the tag values once. Any hoist step that
+     * fails (or inputs it cannot render) leaves its flag clear and every
+     * member takes the slow path below, which is the old code verbatim. */
+    const char *base[IRC_MAX_PARAMS + 1];
+    char body[IRC_MAX_LINE + 2u];
+    size_t bodylen = 0;
+    int body_ok = 0;
+    char extbody[IRC_MAX_LINE + 2u];
+    size_t extlen = 0;
+    int ext_state = 0; /* 0 unrendered, 1 ready, -1 failed */
+    char tag_msgid[FANOUT_TAG_BLOCK_MAX + 1u];
+    char tag_acct[FANOUT_TAG_BLOCK_MAX + 1u];
+    char tag_both[FANOUT_TAG_BLOCK_MAX + 1u];
+    int tags_ok = 0;
 
     if (t->chan == NULL || nparams < 0 || nparams >= IRC_MAX_PARAMS) {
         return 0;
     }
+    /* The hoist renders only inputs it can: a NULL parameter list with a
+     * non-zero count is today's per-member refusal (counted on
+     * n_reply_refused), not a body, so it is left to the slow path -- as is
+     * a NULL stamp, which the per-member renderer reports per member. */
+    if ((params != NULL || nparams == 0) && ident != NULL) {
+        base[0] = t->name;
+        for (int k = 0; k < nparams; k++) {
+            base[k + 1] = params[k];
+        }
+        bodylen = fanout_render_body(s, prefix, verb, base, nparams + 1,
+                                     body, sizeof body);
+        body_ok = (bodylen > 0) ? 1 : 0;
+        tags_ok = fanout_precompute_tags(ident, account,
+                                         tag_msgid, sizeof tag_msgid,
+                                         tag_acct, sizeof tag_acct,
+                                         tag_both, sizeof tag_both);
+    }
     for (size_t i = 0; i < t->chan->nmembers; i++) {
         conn_t *m = t->chan->members[i].c;
         char tags[FANOUT_TAG_BLOCK_MAX + 1u];
+        char line[IRC_MAX_LINE + FANOUT_TAG_BLOCK_MAX + 4u];
         const char *const *use = params;
         int nuse = nparams;
 
@@ -993,14 +1244,15 @@ static int write_to_members(server_t *s, const fanout_target_t *t,
         if (gate != NULL && gate(m, gate_ctx) == 0) {
             continue;
         }
-        /* PER MEMBER, and the buffer is per member too rather than hoisted: the
-         * tag is rendered inside the walk because the capability is per
-         * connection, and two members of one channel are free to disagree about
-         * it. Hoisting the render would be wrong for a second reason too -- the
-         * block is a pointer into this frame, so one buffer re-used across the
-         * walk is a buffer whose contents change while the previous member's
-         * line is already queued (which is harmless) but whose NUL is assumed by
-         * send_line_tagged() (which is not, and would be the bug).
+        /* THE BLOCK IS SELECTED PER MEMBER, from values computed once above:
+         * the capability is per connection, and two members of one channel
+         * are free to disagree about it, so the CHOICE of combination is the
+         * one thing the hoist does not make. What it does not do is RENDER
+         * per member: the values under the choice are the emission's own,
+         * identical for every destination here and for the forward below --
+         * and a buffer re-used across the walk is now safe, because nothing
+         * queued still points at it: each member's line is complete bytes
+         * before the next member is considered.
          *
          * `account` IS NOT PER MEMBER, and that is the point of the whole
          * function: it is the SAME resolved name for every destination here and
@@ -1022,12 +1274,71 @@ static int write_to_members(server_t *s, const fanout_target_t *t,
                    "nparams=%d\n", verb, t->name, nuse);
             continue;
         }
-        /* AND `all` IS BUILT PER MEMBER, INSIDE the walk, which it did not have to
-         * be before this pass. It is the target plus whichever of the two shapes
-         * this member gets, so hoisting it would have baked in whichever shape the
-         * function was called with and quietly given every member the same one --
-         * which is the bug fanout_form_for()'s comment says this shape decision
-         * exists to prevent, reached by the other road. */
+        /* ST-2 FAST PATH: the member's line is bytes already -- the shared
+         * body in the member's shape, the selected block in front, CRLF
+         * behind -- queued with no build and no render. Members carrying
+         * per-destination label/batch state, and every member when the hoist
+         * above produced no bytes, take the slow path: the old per-member
+         * render, kept verbatim so its refusals and counts are unchanged. */
+        if (body_ok != 0 && tags_ok != 0 && member_needs_slow_path(m) == 0) {
+            const char *shape = body;
+            size_t shapelen = bodylen;
+            int ready = 1;
+
+            if (extended != NULL && use != params) {
+                if (ext_state == 0) {
+                    const char *xall[IRC_MAX_PARAMS + 1];
+
+                    xall[0] = t->name;
+                    for (int k = 0; k < nuse; k++) {
+                        xall[k + 1] = use[k];
+                    }
+                    extlen = fanout_render_body(s, prefix, verb, xall, nuse + 1,
+                                                extbody, sizeof extbody);
+                    ext_state = (extlen > 0) ? 1 : -1;
+                }
+                if (ext_state == 1) {
+                    shape = extbody;
+                    shapelen = extlen;
+                } else {
+                    ready = 0;
+                }
+            }
+            if (ready != 0) {
+                const char *block = fanout_pick_block(m, account, tag_msgid,
+                                                      tag_acct, tag_both);
+                const size_t taglen = (block != NULL) ? strlen(block) : 0u;
+
+                /* Unfailable for bytes the hoist produced -- the body fits
+                 * IRC_MAX_LINE by render and the block fits its own bound --
+                 * and checked anyway, so a bound that ever moves degrades to
+                 * the slow path rather than overrunning the frame. */
+                if (taglen <= (size_t)FANOUT_TAG_BLOCK_MAX &&
+                    shapelen + taglen + 4u <= sizeof line) {
+                    char *w = line;
+
+                    if (block != NULL) {
+                        *w++ = '@';
+                        memcpy(w, block, taglen);
+                        w += taglen;
+                        *w++ = ' ';
+                    }
+                    memcpy(w, shape, shapelen);
+                    w += shapelen;
+                    *w++ = '\r';
+                    *w++ = '\n';
+                    (void)queue_prebuilt(s, m, line, (size_t)(w - line));
+                    n++;
+                    continue;
+                }
+            }
+        }
+        /* THE SLOW PATH: `all` IS BUILT PER MEMBER, and so is the line. It is
+         * the target plus whichever of the two shapes this member gets --
+         * hoisting it would have baked in whichever shape the function was
+         * called with and quietly given every member the same one, which is
+         * the bug fanout_form_for()'s comment says this shape decision exists
+         * to prevent, reached by the other road. */
         all[0] = t->name;
         for (int k = 0; k < nuse; k++) {
             all[k + 1] = use[k];
@@ -1164,6 +1475,18 @@ int fanout_deliver_union_local_gated(server_t *s, struct chan *const *chans,
     int relayed = 0;
     const char *account;
     int n = 0;
+    /* ST-2 hoist state; see write_to_members() for the contract. The extended
+     * body renders lazily inside the walk; everything else renders above. */
+    char body[IRC_MAX_LINE + 2u];
+    size_t bodylen = 0;
+    int body_ok = 0;
+    char extbody[IRC_MAX_LINE + 2u];
+    size_t extlen = 0;
+    int ext_state = 0; /* 0 unrendered, 1 ready, -1 failed */
+    char tag_msgid[FANOUT_TAG_BLOCK_MAX + 1u];
+    char tag_acct[FANOUT_TAG_BLOCK_MAX + 1u];
+    char tag_both[FANOUT_TAG_BLOCK_MAX + 1u];
+    int tags_ok = 0;
 
     if (s == NULL || chans == NULL || verb == NULL || plain == NULL) {
         return 0;
@@ -1186,6 +1509,29 @@ int fanout_deliver_union_local_gated(server_t *s, struct chan *const *chans,
      * channel would give one SETNAME two msgids. */
     fanout_stamp(s, NULL, &ident, &relayed);
     account = fanout_emitter_account(s, prefix, relayed);
+    /* ST-2: the emission rendered once, as in write_to_members() -- the plain
+     * body up front, the extended body lazily, the tag values once. NO target
+     * is prepended here (see below), so the plain body is the caller's list
+     * itself. Any hoist step that fails leaves every member on the slow path,
+     * which is the old code verbatim. */
+    {
+        char plainbody[IRC_MAX_LINE + 2u];
+        size_t plainlen = fanout_render_body(s, prefix, verb, plain->params,
+                                             plain->nparams, plainbody,
+                                             sizeof plainbody);
+
+        if (plainlen == 0) {
+            body_ok = 0;
+        } else {
+            memcpy(body, plainbody, plainlen + 1u);
+            bodylen = plainlen;
+            body_ok = 1;
+        }
+        tags_ok = fanout_precompute_tags(&ident, account,
+                                         tag_msgid, sizeof tag_msgid,
+                                         tag_acct, sizeof tag_acct,
+                                         tag_both, sizeof tag_both);
+    }
 
     for (size_t i = 0; i < nchans; i++) {
         chan_t *ch = chans[i];
@@ -1198,6 +1544,7 @@ int fanout_deliver_union_local_gated(server_t *s, struct chan *const *chans,
             const char *const *use = plain->params;
             int nuse = plain->nparams;
             char tags[FANOUT_TAG_BLOCK_MAX + 1u];
+            char line[IRC_MAX_LINE + FANOUT_TAG_BLOCK_MAX + 4u];
             int already = 0;
 
             /* THE ORDER IS THE SAME FOUR QUESTIONS write_to_members() asks, in the
@@ -1267,8 +1614,56 @@ int fanout_deliver_union_local_gated(server_t *s, struct chan *const *chans,
                        "nparams=%d\n", verb, nuse);
                 continue;
             }
-            /* NO `all[]`, and the absence is the point: there is no target to
-             * prepend, so the caller's list IS the line. */
+            /* ST-2 FAST PATH: the member's line is bytes already -- the shared
+             * body in the member's shape, the selected block in front, CRLF
+             * behind. NO `all[]`, and the absence is the point: there is no
+             * target to prepend, so the caller's list IS the line. Members
+             * with per-destination label/batch state, and every member when
+             * the hoist above produced no bytes, take the slow path. */
+            if (body_ok != 0 && tags_ok != 0 && member_needs_slow_path(m) == 0) {
+                const char *shape = body;
+                size_t shapelen = bodylen;
+                int ready = 1;
+
+                if (extended != NULL && use != plain->params) {
+                    if (ext_state == 0) {
+                        extlen = fanout_render_body(s, prefix, verb, use, nuse,
+                                                    extbody, sizeof extbody);
+                        ext_state = (extlen > 0) ? 1 : -1;
+                    }
+                    if (ext_state == 1) {
+                        shape = extbody;
+                        shapelen = extlen;
+                    } else {
+                        ready = 0;
+                    }
+                }
+                if (ready != 0) {
+                    const char *block = fanout_pick_block(m, account, tag_msgid,
+                                                          tag_acct, tag_both);
+                    const size_t taglen = (block != NULL) ? strlen(block) : 0u;
+
+                    if (taglen <= (size_t)FANOUT_TAG_BLOCK_MAX &&
+                        shapelen + taglen + 4u <= sizeof line) {
+                        char *w = line;
+
+                        if (block != NULL) {
+                            *w++ = '@';
+                            memcpy(w, block, taglen);
+                            w += taglen;
+                            *w++ = ' ';
+                        }
+                        memcpy(w, shape, shapelen);
+                        w += shapelen;
+                        *w++ = '\r';
+                        *w++ = '\n';
+                        (void)queue_prebuilt(s, m, line, (size_t)(w - line));
+                        n++;
+                        continue;
+                    }
+                }
+            }
+            /* THE SLOW PATH: today's per-member render, kept verbatim. */
             (void)send_line_tagged(s, m, prefix, verb, use, nuse,
                                    fanout_tag_block(m, &ident, account, tags,
                                                     sizeof tags));

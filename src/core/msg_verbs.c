@@ -24,21 +24,13 @@
 /* ---------------------------------------------------------------------------
  * PRIVMSG and NOTICE
  * ---------------------------------------------------------------------------
- * One implementation, two verbs, and the ONLY difference is the `exclude`
- * argument handed to fanout_deliver(). That is not a simplification for its own
- * sake: RFC 2812 3.3.2 defines NOTICE as PRIVMSG with a non-reply guarantee,
- * and the guarantee belongs in the one place that writes lines rather than in
- * two handlers that could drift.
- */
-
-/* ---------------------------------------------------------------------------
- * PRIVMSG and NOTICE
- * ---------------------------------------------------------------------------
  * One implementation, two verbs. The echo difference is the `exclude` argument
  * handed to fanout_deliver(), and the membership difference is the one `if`
  * below; everything else -- arity, the line cap, 401, 403 -- is shared, which is
  * what makes "the two verbs behave alike except where the RFC says they must
- * not" a property of the code rather than a claim about it.
+ * not" a property of the code rather than a claim about it. Per RFC 2812 3.3.2,
+ * NOTICE is PRIVMSG with a non-reply guarantee, and the guarantee belongs in
+ * the one place that writes lines rather than in two handlers that could drift.
  */
 static void send_message(server_t *s, conn_t *c, const message_t *m,
                          const char *verb, int is_notice)
