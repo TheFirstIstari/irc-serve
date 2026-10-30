@@ -1796,35 +1796,24 @@ const char *server_chan_lookup(const server_t *s, const char *name)
  */
 int server_chan_attach(server_t *s, chan_t *ch)
 {
-    if (s == NULL || ch == NULL) {
+    if (s == NULL || ch == NULL || ch->name[0] == '\0') {
         return -1;
     }
     if (server_chan_get(s, ch->name) != NULL) {
         return -1; /* the name is taken */
-    }
-    if (server_chan_add(s, ch->name) != 0) {
-        return -1;
-    }
-    /* Install the value now that the key is reserved. strtab_put on an
-     * existing key overwrites rather than refusing, which is exactly the
-     * re-claim case and is why attach can be written in this order. */
-    if (strtab_put(s->chans, ch->name, ch) != 0) {
-        server_chan_remove(s, ch->name);
-        return -1;
     }
     if (s->nchan_objs == s->chan_objs_cap) {
         size_t want = (s->chan_objs_cap == 0) ? 8u : s->chan_objs_cap * 2u;
         chan_t **grown = (chan_t **)realloc(s->chan_objs, want * sizeof *grown);
 
         if (grown == NULL) {
-            /* Undo the registry entry, so a failure here cannot leave a channel
-             * that LIST can enumerate and JOIN cannot find. The two indexes
-             * agreeing is an invariant, not a nicety. */
-            server_chan_remove(s, ch->name);
             return -1;
         }
         s->chan_objs = grown;
         s->chan_objs_cap = want;
+    }
+    if (strtab_put(s->chans, ch->name, ch) != 0) {
+        return -1;
     }
     s->chan_objs[s->nchan_objs++] = ch;
     return 0;
@@ -1843,9 +1832,6 @@ chan_t *server_chan_get(const server_t *s, const char *name)
      * does not have. */
     (void)chan_name_upper(canonical, sizeof canonical, name);
     if (canonical[0] == '\0') {
-        return NULL;
-    }
-    if (!strtab_contains(s->chans, canonical)) {
         return NULL;
     }
     return (chan_t *)strtab_get(s->chans, canonical);

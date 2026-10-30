@@ -495,8 +495,8 @@ void handle_notice(server_t *s, conn_t *c, const message_t *m)
  * is reported as the higher of the two -- a lossy answer, and the same lossy
  * answer it gets in 353 without the capability. That is what the capability is
  * for. */
-static void who_flags(char *out, size_t cap, const conn_t *c, const chan_t *ch,
-                      int multiprefix)
+static void who_flags(char *out, size_t cap, const conn_t *c,
+                      unsigned member_flags, int multiprefix)
 {
     size_t n = 0;
 
@@ -506,15 +506,15 @@ static void who_flags(char *out, size_t cap, const conn_t *c, const chan_t *ch,
         /* INDEPENDENT TESTS, not an `else if` chain: +o and +v are
          * independent bits and an op+voice member is exactly the case the
          * capability exists for. In PREFIX order, for the reason cap.h gives. */
-        if (ch != NULL && chan_has_flag(ch, c, CHAN_MEMBER_OP)) {
+        if ((member_flags & CHAN_MEMBER_OP) != 0u) {
             out[n++] = '@';
         }
-        if (ch != NULL && chan_has_flag(ch, c, CHAN_MEMBER_VOICE)) {
+        if ((member_flags & CHAN_MEMBER_VOICE) != 0u) {
             out[n++] = '+';
         }
-    } else if (ch != NULL && chan_has_flag(ch, c, CHAN_MEMBER_OP)) {
+    } else if ((member_flags & CHAN_MEMBER_OP) != 0u) {
         out[n++] = '@';
-    } else if (ch != NULL && chan_has_flag(ch, c, CHAN_MEMBER_VOICE)) {
+    } else if ((member_flags & CHAN_MEMBER_VOICE) != 0u) {
         out[n++] = '+';
     }
     if (n >= cap) {
@@ -546,14 +546,15 @@ static const char *user_or_dash(const conn_t *c)
  * the socket for has been forwarded nowhere. A node answering 1 here would be
  * claiming a relay that did not happen. */
 static void who_entry(server_t *s, conn_t *dst, const conn_t *who,
-                      const char *channel, const chan_t *ch, int multiprefix)
+                      const char *channel, unsigned member_flags,
+                      int multiprefix)
 {
     /* Five bytes, not four: 'G' or 'H', then '@', then '+', then the NUL. The
      * fourth byte the old four-byte buffer had was room for ONE sigil, and
      * multi-prefix is two. */
     char flags[5];
 
-    who_flags(flags, sizeof flags, who, ch, multiprefix);
+    who_flags(flags, sizeof flags, who, member_flags, multiprefix);
     (void)reply(s, dst, "352",
                 (const char *const[]){ (channel != NULL) ? channel : "*",
                                         user_or_dash(who), who->host, s->name, who->nick,
@@ -610,7 +611,8 @@ void handle_who(server_t *s, conn_t *c, const message_t *m)
                 ch->members[i].c->nick[0] == '\0') {
                 continue;
             }
-            who_entry(s, c, ch->members[i].c, ch->name, ch, multiprefix);
+            who_entry(s, c, ch->members[i].c, ch->name, ch->members[i].flags,
+                      multiprefix);
         }
         (void)reply(s, c, "315", (const char *const[]){ ch->name }, 1,
                     "End of WHO list");
@@ -642,7 +644,7 @@ void handle_who(server_t *s, conn_t *c, const message_t *m)
         if (fanout_mask_match(mask, who->nick) == 0) {
             continue;
         }
-        who_entry(s, c, who, NULL, NULL, multiprefix);
+        who_entry(s, c, who, NULL, 0u, multiprefix);
     }
     (void)reply(s, c, "315", (const char *const[]){ mask }, 1,
                 "End of WHO list");
