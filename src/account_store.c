@@ -35,9 +35,16 @@ struct account_store {
  * client authenticated as would then decide what other users are shown. */
 static int name_eq(const char *a, const char *b)
 {
-    while (*a != '\0' && *b != '\0') {
-        char ca = *a;
-        char cb = *b;
+    size_t la = (a != NULL) ? strlen(a) : 0u;
+    size_t lb = (b != NULL) ? strlen(b) : 0u;
+    size_t n = (la > lb) ? la : lb;
+    size_t i;
+    unsigned diff = (la != lb) ? 1u : 0u;
+
+    /* Constant-time, like sasl_framework.c's authcid_eq(). */
+    for (i = 0u; i < n; i++) {
+        char ca = (i < la) ? a[i] : (char)0;
+        char cb = (i < lb) ? b[i] : (char)0;
 
         if (ca >= 'A' && ca <= 'Z') {
             ca = (char)(ca - 'A' + 'a');
@@ -45,13 +52,9 @@ static int name_eq(const char *a, const char *b)
         if (cb >= 'A' && cb <= 'Z') {
             cb = (char)(cb - 'A' + 'a');
         }
-        if (ca != cb) {
-            return 0;
-        }
-        a++;
-        b++;
+        diff |= (unsigned)(ca ^ cb);
     }
-    return *a == '\0' && *b == '\0';
+    return diff == 0u;
 }
 
 /* Parse a decimal integer that must consume the WHOLE string. strtol() alone

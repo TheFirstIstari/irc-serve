@@ -852,6 +852,46 @@ irc_add_integration_test(test_relay_shape test_relay_shape.c)
 # UTF-8 that collides with it), and the announcement decision.
 irc_add_integration_test(test_msg_text test_msg_text.c)
 
+# THE IDENT, AND WHY IT IS A FILE OF ITS OWN RATHER THAN A CASE IN THE SWEEP.
+# `conn_t::user` was the one field of this node's five identity fields with no
+# predicate at all: `copy_field()` bounded its length and nothing else, so
+# `USER <ESC>[2J... 0 * :x` stored the bytes and `conn_hostmask()` rendered them
+# into the PREFIX of every line that client sent, to every co-member of every
+# channel it joined. Anonymous, pre-registration, no credential. A raw `0x9B`
+# survived it too, which is the byte class the peer->client pass had already
+# removed.
+#
+# It is a separate file because the claim is not a property of the reachable
+# surface (that is the sweep's job, and the sweep now reaches it through a
+# STATEFUL probe) but the exact content of one hostmask on one witness socket.
+# The sweep asserts "no marker byte appears anywhere"; this file asserts
+# `:atk!@127.0.0.1` and, against it, `:mac!ā@127.0.0.1` byte for byte. That
+# second assertion is the one that matters most, because a predicate widened to
+# "refuse every byte >= 0x80" would pass the first and silently eat every
+# accented Latin, Greek and Cyrillic ident on the network -- and a mangled value
+# the user cannot see happening is worse than the injection it was meant to
+# stop. The sweep's whole-buffer walk cannot express "this multi-byte value must
+# arrive INTACT"; only an exact line comparison can.
+irc_add_integration_test(test_ident_injection test_ident_injection.c)
+
+# THE PER-CONNECTION CHANNEL CAP. `conn_t::chans` grew by doubling with no
+# ceiling, so the only limit on how many channels one connection could hold was
+# the node's global registry -- a SHARED resource, which meant one client could
+# create every channel the node can hold and deny channel creation to everybody
+# else on it. Measured: 12,202 bytes of input for 872 KiB of RSS, and the same
+# 1024 entries made a ten-byte `AWAY` cost 9.6 ms of event-loop time, because the
+# away-notification walks the connection's own list.
+#
+# Its own file because the claim is three-sided and the sides need each other:
+# the cap refuses at its exact edge with 405 and an `[observable]` count; the cap
+# is on MEMBERSHIP rather than on the command, so a PART frees a slot; and the
+# away walk is bounded by a constant that must equal the membership cap, which is
+# the invariant that makes the bound a safety net for a second writer of
+# `conn_t::chans` rather than a behaviour change for a legitimate operator. A
+# test of only the first would pass against a cap that locked a client out of its
+# own channels.
+irc_add_integration_test(test_channel_cap test_channel_cap.c)
+
 # ---------------------------------------------------------------------------
 # THE LEAKSANITIZER PROBE: OPT-IN, AND THE OPT-IN IS THE DESIGN
 # ---------------------------------------------------------------------------

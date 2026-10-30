@@ -47,6 +47,34 @@
  *      and refuses every member of the set.
  *
  * ===========================================================================
+ * AND THE TWO CLASSES A VERB SWEEP STRUCTURALLY CANNOT SEE
+ * ===========================================================================
+ * Everything above drives each verb with SINGLE-LINE, SINGLE-VERB shapes. That
+ * is blind to two whole classes, and BOTH of this pass's live leaks were in
+ * them:
+ *
+ *   (a) A VALUE THAT ONLY EXISTS ACROSS TWO MESSAGES OF STATE. `AUTHENTICATE
+ *       ESC` is a single parameter, and a single parameter with no exchange in
+ *       progress is parsed as a MECHANISM NAME and refused at 908 -- so
+ *       `authcid`, which exists only after `AUTHENTICATE PLAIN` has been
+ *       answered with a `+` and a payload has come back, was unreachable from
+ *       every shape in the table. It was reachable from a socket,
+ *       pre-registration, with no credential at all, and it printed raw.
+ *   (b) A FIELD STORED NOW AND RENDERED LATER ON A DIFFERENT VERB. `USER
+ *       <marker>` is not itself a leak: the value sits in `conn_t::user` and
+ *       nothing renders it until that client's next JOIN, PRIVMSG or QUIT. A
+ *       sweep that sends one line and reads one line cannot see that, and
+ *       `c->user` -- the one field of this node's five identity fields with no
+ *       predicate -- reached every co-member's terminal that way.
+ *
+ * So `k_stateful[]` below is the CLASS, not a patch for two sites. Each row
+ * declares which kind of state it needs, so the next field that is stored on
+ * one verb and rendered on another has a row to be written into rather than an
+ * argument about whether the sweep already covers it. The rows are counted and
+ * the count is asserted in main(), which is what makes a stateful phase that
+ * reaches nothing FAIL rather than pass.
+ *
+ * ===========================================================================
  * THE MARKER SET, AND THE THREE BYTES THAT ARE NOT IN IT
  * ===========================================================================
  * The set is `[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f]` -- every C0 control
@@ -1440,6 +1468,484 @@ static void probe_pre_registration(nf_node_t *node)
 }
 
 /* ---------------------------------------------------------------------------
+ * THE STATEFUL PROBES, AND THE CLASS OF LEAK THE SHAPE TABLE CANNOT REACH
+ * ---------------------------------------------------------------------------
+ * Everything above drives each verb with SINGLE-LINE, SINGLE-VERB shapes
+ * (`emit_shape()`), and that is structurally blind to two whole classes:
+ *
+ *   (a) A VALUE THAT ONLY EXISTS ACROSS TWO MESSAGES OF STATE. `AUTHENTICATE
+ *       ESC` is a single parameter, and a single parameter with no exchange in
+ *       progress is parsed as a MECHANISM NAME and refused at 908 -- so
+ *       `authcid`, which only exists after `AUTHENTICATE PLAIN` has been
+ *       answered with a `+` and a payload has come back, was unreachable from
+ *       every shape in the table. It was reachable from a socket, pre-
+ *       registration, with no credential at all, and it printed raw.
+ *
+ *   (b) A FIELD THAT IS STORED NOW AND RENDERED LATER ON A DIFFERENT VERB.
+ *       `USER <marker>` is not itself a leak: the value sits in `conn_t::user`
+ *       and nothing renders it until the client's next JOIN, PRIVMSG or QUIT.
+ *       A sweep that sends one line and reads one line cannot see that, and
+ *       `c->user` -- the one field of this node's five identity fields with no
+ *       predicate -- reached every co-member's terminal that way.
+ *
+ * BOTH LIVE LEAKS WERE IN THAT BLIND SPOT, and that is the finding rather than
+ * the two lines: a reachability sweep that enumerates VERBS is not a
+ * reachability sweep over STATE. So these probes are the class, not a patch for
+ * two sites. Each row declares WHICH KIND of state it needs, so the next field
+ * that is stored on one verb and rendered on another has a row to be written
+ * into rather than an argument about whether the sweep already covers it.
+ *
+ * THE ROWS ARE COUNTED AND THE COUNT IS ASSERTED IN main(): a probe that stops
+ * reaching its target is a probe that reports nothing, and a sweep that silently
+ * covers less is the failure mode this whole file is written against. A blank
+ * stateful phase fails rather than passes.
+ */
+enum sw_state_kind {
+    SW_ST_NONE = 0, /* one line is enough: the shape table already covers it */
+    SW_ST_MESSAGES, /* the value exists only across TWO messages of state */
+    SW_ST_STORED    /* the field is stored by one verb and rendered by a later one */
+};
+
+struct sw_stateful {
+    const char *name;    /* attribution, the job a probe's nick does above */
+    int needs_state;     /* 0 if a single line would reach it, 1 if it would not */
+    int kind;            /* one of the three kinds above, and never SW_ST_NONE */
+    const char *covers;  /* what this row reaches that the shape table cannot */
+};
+
+static const struct sw_stateful k_stateful[] = {
+    /* (a). The two-message exchange RFC 4422 specifies and every real client
+     * uses: name the mechanism, take the `+` this node answers it with, then
+     * send the payload. `authcid` is inside the payload, which must be a REAL
+     * base64 encoding -- `sasl_b64_decode()` refuses a byte outside the
+     * alphabet, so a malformed payload is answered BAD_PAYLOAD and never
+     * reaches the field at all. The measure of the claim is the log line's
+     * `authcid_len=`/`authcid_bad_bytes=` pair, which only exists on the site
+     * that now measures the field: with the measurement reverted the line
+     * carries the raw byte and no length, and this probe goes red on that
+     * site specifically. */
+    { "sasl-plain-authcid", 1, SW_ST_MESSAGES,
+      "`authcid`, which only exists across `AUTHENTICATE PLAIN` / "
+      "`AUTHENTICATE <payload>`; the one-line form is a mechanism name and is "
+      "refused at 908 before anything is stored" },
+    /* (b). The stored field, rendered on a LATER verb to a CO-MEMBER. The
+     * hostile value is offered to `USER`, stored in `conn_t::user`, and
+     * rendered into the hostmask of a JOIN echo and of a relayed PRIVMSG --
+     * three different verbs, one stored field. The co-member's socket is the
+     * surface under test, because that is the one a client cannot see for
+     * itself. */
+    { "stored-ident-render", 1, SW_ST_STORED,
+      "a field stored by `USER` and rendered by `JOIN` and `PRIVMSG` into "
+      "another client's hostmask, which no single-line probe can observe" },
+};
+#define SW_STATEFUL ((int)(sizeof k_stateful / sizeof k_stateful[0]))
+
+/* How many stateful probes PROVED they reached their target, as opposed to
+ * having sent something into a socket -- and how many each PLANNED. The two are
+ * compared in main() and inside each probe, which is what makes a stateful
+ * phase that reaches nothing fail rather than pass. */
+static int g_stateful_reached;
+static int g_stateful_planned;
+
+/* RFC 4648 base64, with padding, and it has to be a REAL encoding: the probe's
+ * whole point is to reach a field behind a decoder that refuses a malformed
+ * payload. Written here rather than borrowed because the harness has no
+ * encoder and a test-local helper with one caller is a helper nobody
+ * maintains. */
+static const char sw_b64_alpha[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static size_t sw_b64_encode(const unsigned char *in, size_t n, char *out,
+                            size_t cap)
+{
+    size_t o = 0u;
+    size_t i = 0u;
+
+    while (i + 3u <= n) {
+        unsigned long v = ((unsigned long)in[i] << 16) |
+                          ((unsigned long)in[i + 1u] << 8) |
+                          (unsigned long)in[i + 2u];
+
+        if (o + 4u > cap) {
+            return 0;
+        }
+        out[o++] = sw_b64_alpha[(v >> 18) & 63u];
+        out[o++] = sw_b64_alpha[(v >> 12) & 63u];
+        out[o++] = sw_b64_alpha[(v >> 6) & 63u];
+        out[o++] = sw_b64_alpha[v & 63u];
+        i += 3u;
+    }
+    if (n - i == 1u) {
+        unsigned long v = (unsigned long)in[i] << 16;
+
+        if (o + 4u > cap) {
+            return 0;
+        }
+        out[o++] = sw_b64_alpha[(v >> 18) & 63u];
+        out[o++] = sw_b64_alpha[(v >> 12) & 63u];
+        out[o++] = '=';
+        out[o++] = '=';
+    } else if (n - i == 2u) {
+        unsigned long v = ((unsigned long)in[i] << 16) |
+                          ((unsigned long)in[i + 1u] << 8);
+
+        if (o + 4u > cap) {
+            return 0;
+        }
+        out[o++] = sw_b64_alpha[(v >> 18) & 63u];
+        out[o++] = sw_b64_alpha[(v >> 12) & 63u];
+        out[o++] = sw_b64_alpha[(v >> 6) & 63u];
+        out[o++] = '=';
+    }
+    if (o + 1u > cap) {
+        return 0;
+    }
+    out[o] = '\0';
+    return o;
+}
+
+/* RFC 4616's PLAIN payload, built with the marker as the WHOLE authcid.
+ *
+ * The authzid is empty -- RFC 4013 says that means "the same as the
+ * authentication identity", and it is what irssi sends, so it is the shape a
+ * real client produces. The password is two letters. And the authcid is ONE
+ * byte, deliberately, so the measurement the node reports back is exact and a
+ * reader can check it by hand rather than trusting the node's arithmetic.
+ *
+ * THE ONE MARKER NEITHER PROBE CAN USE IS 0x00, and the reason is structural
+ * rather than convenient, so it is written down rather than left as a gap in
+ * the walk: `message_parse_n()` REFUSES a line holding a NUL anywhere in it,
+ * because a NUL is how a C string ends and a parameter is not one. So a NUL is
+ * not a parameter byte on this wire at all -- it cannot reach `authcid` (where
+ * it is also the payload's own field separator, so the byte that terminates
+ * the field cannot be inside it) and it cannot reach `conn_t::user` (where the
+ * line carrying it is discarded before anything is stored). Both probes ask
+ * `sw_param_marker_ok()` rather than each deciding for itself, which is the
+ * same one-predicate rule the node itself applies: a value with two writers
+ * needs the writers to agree, and here the "writers" are the two probe walks.
+ *
+ * It returns 0 for that one marker, so the caller's planned count and its walk
+ * agree about what is being exercised. */
+static int sw_param_marker_ok(unsigned char m)
+{
+    return (m != 0u) ? 1 : 0;
+}
+
+static size_t sw_plain_payload(unsigned char marker, unsigned char *buf,
+                               size_t cap)
+{
+    size_t n = 0u;
+
+    if (cap < 6u) {
+        return 0;
+    }
+    buf[n++] = 0u;     /* authzid: absent */
+    buf[n++] = marker; /* authcid: the byte under test */
+    buf[n++] = 0u;     /* the separator before the password */
+    buf[n++] = 'p';
+    buf[n++] = 'w';
+    return n;
+}
+
+/* ---------------------------------------------------------------------------
+ * PROBE (a): THE TWO-MESSAGE SASL EXCHANGE
+ * ---------------------------------------------------------------------------
+ * One connection per marker. The exchange is restarted rather than reused
+ * because a refusal leaves the connection in SASL_FAILED, and a probe whose
+ * second iteration is answered differently from its first is a probe measuring
+ * the failure state rather than the site.
+ *
+ * WHAT IS ASSERTED, and it is the whole reason this is a probe rather than a
+ * burst: the node must ANSWER the `+` (proving message one was understood), it
+ * must answer the payload with the abort (proving message two was decoded), and
+ * the operator's log must carry the `authcid_len=`/`authcid_bad_bytes=`
+ * MEASUREMENT -- which exists only on the site that now measures the field, so
+ * a node that prints the raw byte back again reports no length at all and this
+ * fails on that site rather than somewhere else. */
+static void probe_sasl_authcid(nf_node_t *node)
+{
+    const char *nick = "ss01";
+    int reached = 0;
+    int planned = 0;
+
+    for (unsigned m = 0x00u; m <= 0xffu; m++) {
+        test_client_t c;
+        unsigned char payload[8];
+        char b64[64];
+        char line[192];
+        char want[64];
+        size_t plen;
+        size_t blen;
+        size_t log_mark;
+        unsigned expect_bad;
+
+        if (marker_in_set((unsigned char)m) == 0 ||
+            sw_param_marker_ok((unsigned char)m) == 0) {
+            continue;
+        }
+        planned++;
+        g_stateful_planned++;
+        plen = sw_plain_payload((unsigned char)m, payload, sizeof payload);
+        TF_CHECK_MSG(plen == 5u, "the PLAIN payload builder produced %lu bytes",
+                     (unsigned long)plen);
+        blen = sw_b64_encode(payload, plen, b64, sizeof b64);
+        TF_CHECK_MSG(blen == 8u,
+                     "the base64 of a 5-byte PLAIN payload is 8 bytes and this "
+                     "one produced %lu, so the encoder is wrong and the payload "
+                     "the node would decode is not the one this file built",
+                     (unsigned long)blen);
+
+        /* A FRESH CONNECTION, and 001 is NOT waited for: the attack is
+         * pre-registration and pre-credential, and that is the instance the
+         * measurement has to hold on. `log_mark` is taken after draining any
+         * earlier output so an earlier C0 exchange cannot satisfy a later
+         * marker's assertion. */
+        drain_node_pipe(node);
+        log_mark = node->out_len;
+        tc_init(&c);
+        TF_CHECK_MSG(tc_connect(&c, node->port) == 0,
+                     "the sasl probe could not connect");
+        (void)snprintf(line, sizeof line, "NICK %s", nick);
+        TF_CHECK_MSG(tc_send(&c, line) == 0, "the sasl probe NICK send failed");
+
+        /* MESSAGE ONE. A single parameter with no exchange in progress is a
+         * MECHANISM NAME, which is exactly why a one-line probe cannot reach
+         * the payload: without this line the next one is read as a mechanism
+         * and refused at 908, and nothing downstream of it runs. The answer's
+         * shape is RFC 4422's `AUTHENTICATE +` with this node's own prefix and
+         * the connection's nick in front of it. */
+        TF_CHECK_MSG(tc_send(&c, "AUTHENTICATE PLAIN") == 0,
+                     "the sasl mechanism send failed");
+        (void)snprintf(line, sizeof line, "AUTHENTICATE %s +\r\n", nick);
+        TF_CHECK_MSG(tc_expect(&c, line, T_IO_MS) == 0,
+                     "the node never asked for the payload, so message two below "
+                     "would be parsed as a mechanism name and the probe would "
+                     "reach nothing. This is the state the shape table cannot "
+                     "produce: a second line whose meaning depends on the "
+                     "first.\n  %s saw: %s", nick, tc_buffer(&c));
+
+        /* MESSAGE TWO, and it carries the marker inside a REAL encoding. */
+        (void)snprintf(line, sizeof line, "AUTHENTICATE %s", b64);
+        TF_CHECK_MSG(tc_send(&c, line) == 0, "the sasl payload send failed");
+        /* RFC 4422's server-chosen abort is the one line in this exchange a
+         * client reads with a byte comparison, so it is what proves the payload
+         * was decoded rather than rejected as malformed. */
+        TF_CHECK_MSG(tc_expect(&c, "AUTHENTICATE *\r\n", T_IO_MS) == 0,
+                     "the node did not abort the exchange, so the payload was "
+                     "not decoded and `authcid` never existed for this "
+                     "marker.\n  %s saw: %s", nick, tc_buffer(&c));
+
+        /* THE MEASUREMENT, which is the reachability claim. With the field
+         * measured, a one-byte authcid is `authcid_len=1` with
+         * `authcid_bad_bytes=1` for C0/DEL and `authcid_bad_bytes=0` for C1
+         * (`conn_text_bad_count()` counts C0 and DEL only, while
+         * `conn_text_logsafe()` withholds any non-ASCII byte too); with the
+         * measurement reverted the line carries the raw byte and no length at
+         * all, so this assertion names the site that regressed. */
+        /* BOTH ENDS ARE KEPT MOVING, and this is not tidiness: the node's stdout
+         * is a 64 KiB pipe and a node that fills it blocks inside write(), at
+         * which point it stops accepting and stops answering. `pump_node()`
+         * asks both questions -- is there anything to read on the socket, is
+         * there anything in the pipe -- rather than guessing how long the other
+         * side takes. `log_line_has()` below reads `node->out` directly, so the
+         * pipe has to be empty for the line to be there at all. */
+        pump_node(node, &c);
+        expect_bad = (m <= 0x1fu || m == 0x7fu) ? 1u : 0u;
+        (void)snprintf(want, sizeof want, "authcid_len=1 authcid_bad_bytes=%u",
+                       expect_bad);
+        TF_CHECK_MSG(log_line_has(node->out, log_mark, "[observable] sasl:", want) == 1,
+                     "the node did not report measuring a ONE-BYTE authcid on the "
+                     "SASL rejection path (marker 0x%02x). Either the probe never "
+                     "reached the site -- which would mean the two-message "
+                     "exchange above is not what it looks like -- or the site "
+                     "prints the field raw again, which is the regression this "
+                     "probe exists to catch. The whole-buffer scan would also "
+                     "find the byte, but it would not say WHICH site put it "
+                     "there.\n  node said: %s", m, node->out + log_mark);
+        reached++;
+        g_stateful_reached++;
+
+        assert_probe_socket_clean(&c, nick);
+        tc_close(&c);
+    }
+    /* THE PROBE'S OWN COVERAGE CLAIM, and it is local rather than left to
+     * main() so that a red names the SITE that stopped being reached. A probe
+     * that planned 61 exchanges and reached none of them is a probe whose
+     * two-message state has stopped being built, and the only honest report is
+     * that it covered nothing at all. */
+    TF_CHECK_MSG(reached == planned && planned > 0,
+                 "the stateful SASL probe reached its target %d times out of %d "
+                 "planned (the authcid measurement on the SASL rejection path). "
+                 "A stateful probe that reaches nothing reports that surface "
+                 "clean, which is worse than no probe: the single-line sweep "
+                 "cannot reach `authcid` at all, so this row IS the coverage.",
+                 reached, planned);
+}
+
+/* ---------------------------------------------------------------------------
+ * PROBE (b): A FIELD STORED BY ONE VERB AND RENDERED BY A LATER ONE
+ * ---------------------------------------------------------------------------
+ * A hostile ident at `USER`, then a JOIN, then a PRIVMSG into a channel a
+ * co-member is also in. Three verbs, one stored field, and the co-member's
+ * socket is the surface under test because it is the one the sender cannot see
+ * for itself.
+ *
+ * BOTH SOCKETS ARE SCANNED, and the split matters: the mIRC allowlist excuses
+ * eight bytes on any line carrying `" PRIVMSG "`, so the eight mIRC
+ * formatting bytes are NOT excused on the JOIN echo -- which carries no
+ * `PRIVMSG` at all -- but would be on the relayed message. Scanning only the
+ * co-member's socket would lose eight markers of coverage to a legitimate
+ * allowlist entry; scanning only the sender's would lose the cross-client
+ * shape entirely. Neither surface is optional.
+ */
+static void probe_stored_ident_render(nf_node_t *node)
+{
+    const char *atk_nick = "sa01";
+    const char *wit_nick = "sw01";
+    char chan[32];
+    test_client_t wit;
+    char line[256];
+    int reached = 0;
+    int planned = 0;
+
+    (void)snprintf(chan, sizeof chan, "#SWID");
+
+    /* The co-member is registered ONCE, with a clean ident: it is the surface
+     * the stored field is rendered onto, and a hostile value in its own
+     * registration would make a finding ambiguous about whose field it came
+     * from. */
+    open_probe(node, &wit, wit_nick, chan);
+
+    for (unsigned m = 0x00u; m <= 0xffu; m++) {
+        test_client_t atk;
+        char ident[8];
+
+        if (marker_in_set((unsigned char)m) == 0 ||
+            sw_param_marker_ok((unsigned char)m) == 0) {
+            continue;
+        }
+        planned++;
+        g_stateful_planned++;
+        /* THE WHOLE IDENT IS ONE MARKER BYTE, so the hostmask that renders it
+         * is exactly `nick!<byte>@host` and a reader can see which byte
+         * arrived without decoding a compound payload. */
+        ident[0] = (char)m;
+        ident[1] = '\0';
+
+        tc_init(&atk);
+        TF_CHECK_MSG(tc_connect(&atk, node->port) == 0,
+                     "the stored-ident probe could not connect");
+        (void)snprintf(line, sizeof line, "NICK %s", atk_nick);
+        TF_CHECK_MSG(tc_send(&atk, line) == 0,
+                     "the stored-ident probe NICK send failed");
+        /* THE `USER` LINE IS SENT RAW, and that is not a shortcut: 0x00 is a
+         * member of the marker set and it is the ONE marker a `%s`-built line
+         * cannot carry, because every C string ends at it. Building the line
+         * with snprintf would silently turn `USER <NUL>` into `USER ` -- an
+         * empty parameter, a refused registration, and a probe that reports
+         * nothing while looking like it measured something. So the byte is put
+         * in the buffer by hand and the length is passed explicitly. */
+        {
+            int n = snprintf(line, sizeof line, "USER ");
+            size_t used;
+
+            line[n++] = (char)m;
+            line[n++] = ' ';
+            (void)snprintf(line + n, sizeof line - (size_t)n, "0 * :probe");
+            used = strlen(line);
+            line[used++] = '\r';
+            line[used++] = '\n';
+            TF_CHECK_MSG(used < sizeof line,
+                         "the stored-ident USER line did not fit its buffer");
+            TF_CHECK_MSG(tc_send_raw(&atk, line, used) == 0,
+                         "the stored-ident probe USER send failed");
+        }
+        /* THE STORING VERB COMPLETES. A registration that did not complete
+         * would leave the field unset, and a probe that could not tell "the
+         * field was refused" from "the client was never registered" would be
+         * measuring nothing. */
+        pump_node(node, &atk);
+        TF_CHECK_MSG(tc_expect(&atk, " 001 ", T_IO_MS) == 0,
+                     "the hostile ident stranded the client instead of "
+                     "registering it with an empty one (marker 0x%02x).\n"
+                     "  %s saw: %s", (unsigned)m, atk_nick, tc_buffer(&atk));
+        pump_node(node, &atk);
+
+        /* THE RENDERING VERB, and a different one from the one that stored the
+         * field. The JOIN echo carries the hostmask back to the sender. */
+        (void)snprintf(line, sizeof line, "JOIN %s", chan);
+        TF_CHECK_MSG(tc_send(&atk, line) == 0, "the stored-ident JOIN failed");
+        (void)snprintf(line, sizeof line, " JOIN %s\r\n", chan);
+        TF_CHECK_MSG(tc_expect(&atk, line, T_IO_MS) == 0,
+                     "the JOIN never echoed, so the stored field was never "
+                     "rendered on the sender's own socket and the rest of this "
+                     "probe would be asserting about nothing.\n  %s saw: %s",
+                     atk_nick, tc_buffer(&atk));
+        /* AND THE SECOND RENDERING VERB, which is the cross-client shape: the
+         * value goes to somebody else's terminal. */
+        (void)snprintf(line, sizeof line, "PRIVMSG %s :hi there", chan);
+        TF_CHECK_MSG(tc_send(&atk, line) == 0, "the stored-ident PRIVMSG failed");
+        /* AND THE WITNESS'S SOCKET TOO: it is the surface under test and the
+         * node writes one relayed line per marker into it, so a parent that
+         * only drains the attacker's socket fills the witness's buffer and
+         * wedges the node exactly the way `pump_node()`'s own comment describes
+         * in the other direction. */
+        pump_node(node, &atk);
+        pump_node(node, &wit);
+
+        /* BOTH SOCKETS DRAINED TO A PROVABLY COMPLETE STATE before either is
+         * scanned: the PONG proves everything sent before it was dispatched,
+         * and the co-member's PRIVMSG is one of those things. */
+        make_token(line, sizeof line);
+        {
+            char ping[128];
+            char relay[64];
+
+            (void)snprintf(ping, sizeof ping, "PING :%s", line);
+            TF_CHECK_MSG(tc_send(&atk, ping) == 0, "the stored-ident PING failed");
+            TF_CHECK_MSG(drain_for_pong(&atk, line, T_IO_MS) >= 0,
+                         "the stored-ident probe stopped answering");
+            (void)snprintf(relay, sizeof relay, "PRIVMSG %s :hi there", chan);
+            TF_CHECK_MSG(drain_for_pong(&wit, relay, T_IO_MS) >= 0,
+                         "the co-member never received the relayed message, so the "
+                         "cross-client hostmask this probe exists to scan was never "
+                         "rendered. A probe that cannot reach the surface is worse "
+                         "than no probe: it reports the surface clean.\n"
+                         "  %s saw: %s", wit_nick, tc_buffer(&wit));
+        }
+
+        assert_probe_socket_clean(&atk, atk_nick);
+        reached++;
+        g_stateful_reached++;
+        tc_close(&atk);
+    }
+    /* THE PROBE'S OWN COVERAGE CLAIM, local for the same reason the SASL probe's
+     * is: a red here names the surface that stopped rendering. 62 markers over a
+     * field that is stored by one verb and rendered by two others. */
+    TF_CHECK_MSG(reached == planned && planned > 0,
+                 "the stateful stored-field probe reached its target %d times out "
+                 "of %d planned (a co-member receiving the stored ident in a "
+                 "relayed hostmask). A probe that reaches nothing reports that "
+                 "surface clean, and the single-line sweep cannot see a field "
+                 "that is only rendered on a LATER verb, so this row IS the "
+                 "coverage.", reached, planned);
+    drain_node_pipe(node);
+    /* THE STORED FIELD IS MEASURED ON THE OPERATOR'S LINE TOO, which is the
+     * third surface `c->user` reaches and the one a co-member's socket cannot
+     * show: a refusal is reported as a length and a bad-byte count, and the
+     * operator's own `user:` line withholds the value. */
+    TF_CHECK_MSG(log_line_has(node->out, 0u, "user_refused:", "len=1") == 1,
+                 "the node did not report refusing a one-byte ident, so the "
+                 "ingest predicate either never ran or the report does not "
+                 "measure what it refused.\n  node said: %s", node->out);
+    /* The co-member is scanned LAST, once, over the whole of what it
+     * accumulated: its final drain is the PONG inside the loop's last
+     * iteration, which is what makes this buffer provably complete. */
+    assert_probe_socket_clean(&wit, wit_nick);
+    tc_close(&wit);
+}
+
+/* ---------------------------------------------------------------------------
  * THE SCAN POINT, restated where it is used
  * ---------------------------------------------------------------------------
  * `nf_stop()` reaps the child and then drains "best effort". `pump_node()` after it
@@ -1499,6 +2005,50 @@ int main(void)
                  "the first subject-bearing shape template does not mention the "
                  "subject escape, so the split point is wrong");
 
+    /* THE STATEFUL TABLE'S OWN INVARIANTS, asserted before anything runs: every
+     * row must name a kind of state and must declare that it NEEDS state (a row
+     * that does not is a row the shape table already covers, and a duplicate is
+     * coverage that looks like coverage), and the two verbs the probes depend
+     * on must be in the dispatch table this file derived. Without the last
+     * check a probe would be asserting against a node that has no such verb and
+     * reporting the empty result as a pass. */
+    TF_CHECK_MSG(SW_STATEFUL >= 2,
+                 "the stateful probe table holds %d rows, so the class of leak "
+                 "that only exists across two messages or across two verbs is "
+                 "not covered at all -- and both of this pass's live leaks were "
+                 "in it", SW_STATEFUL);
+    for (int e = 0; e < SW_STATEFUL; e++) {
+        TF_CHECK_MSG(k_stateful[e].needs_state == 1,
+                     "stateful probe `%s` declares needs_state=0, so it is a row "
+                     "the single-line shape table already covers and it is not "
+                     "the class this table exists for", k_stateful[e].name);
+        TF_CHECK_MSG(k_stateful[e].kind != SW_ST_NONE,
+                     "stateful probe `%s` does not name WHICH kind of state it "
+                     "needs, so a reader cannot tell what it covers",
+                     k_stateful[e].name);
+        TF_CHECK_MSG(k_stateful[e].name != NULL && k_stateful[e].covers != NULL,
+                     "stateful probe row %d has no name or no coverage text, so "
+                     "a finding it produced could not be attributed", e);
+    }
+    {
+        int has_authenticate = 0;
+        int has_user = 0;
+
+        for (size_t i = 0; i < g_nverbs; i++) {
+            if (strcmp(g_verbs[i].verb, "AUTHENTICATE") == 0) {
+                has_authenticate = 1;
+            }
+            if (strcmp(g_verbs[i].verb, "USER") == 0) {
+                has_user = 1;
+            }
+        }
+        TF_CHECK_MSG(has_authenticate == 1 && has_user == 1,
+                     "the stateful probes depend on AUTHENTICATE and USER and one "
+                     "of them is not in the derived dispatch table, so the "
+                     "stateful phase would be probing verbs this node does not "
+                     "have and reporting the empty result as clean");
+    }
+
     TF_CHECK_MSG(nf_spawn_binary(&node) == 0, "could not spawn the node");
 
     for (size_t i = 0; i < g_nverbs; i++) {
@@ -1506,6 +2056,32 @@ int main(void)
     }
     probe_unknown_verb(&node);
     probe_pre_registration(&node);
+    /* THE STATEFUL PHASE, LAST, and the order is not arbitrary: it leaves the
+     * node holding a channel and a co-member connection that every earlier
+     * phase's own channels are independent of, and running it last means its
+     * assertions are about a node nothing else is driving. */
+    probe_sasl_authcid(&node);
+    probe_stored_ident_render(&node);
+    /* AND THE COVERAGE CLAIM. `g_stateful_reached` is bumped only AFTER a probe
+     * has proved it reached its target -- the `+` answer, the abort, the
+     * measurement, the JOIN echo, the relayed message -- and `g_stateful_planned`
+     * is bumped once per marker a probe set out to exercise. A stateful probe
+     * that regressed into sending something into a socket and reading nothing
+     * back therefore leaves the two unequal, and a phase that was deleted
+     * altogether plans nothing. The second clause is what makes the floor a
+     * floor: with no probes at all the equality holds trivially, so the total
+     * must at least be one exercised marker per row of the table. */
+    TF_CHECK_MSG(g_stateful_reached == g_stateful_planned,
+                 "the stateful phase planned %d exercises and proved %d of them. "
+                 "A stateful probe that reaches nothing is a probe that reports "
+                 "the surface clean, which is worse than no probe.",
+                 g_stateful_planned, g_stateful_reached);
+    TF_CHECK_MSG(g_stateful_planned >= SW_STATEFUL,
+                 "the stateful phase planned %d exercises across %d rows, so it "
+                 "exercised less than one marker per row. Both classes of leak "
+                 "this table exists for were live, and a phase that covers none "
+                 "of them is a phase that has stopped existing.",
+                 g_stateful_planned, SW_STATEFUL);
 
     TF_CHECK_MSG(nf_stop(&node) == 0,
                  "the node did not exit cleanly; see above. A non-zero exit means "
@@ -1523,11 +2099,13 @@ int main(void)
      * predicate at startup and `SH_ALL` from the shape table, so neither can drift
      * out of step with the code that sent the lines. */
     printf("ok: %lu bytes of node stdout and %lu client sockets swept clean; "
-           "%lu markers x %d shapes x %lu derived verbs, plus the unknown-verb and "
-           "pre-registration phases; %d exception entries, %d of them exercised\n",
+           "%lu markers x %d shapes x %lu derived verbs, plus the unknown-verb, "
+           "pre-registration and %d stateful probes; %d exception entries, %d of "
+           "them exercised\n",
            (unsigned long)node.out_len, (unsigned long)g_sockets,
            (unsigned long)(SW_MARKERS * (g_nverbs + 1u)), (int)SH_ALL,
-           (unsigned long)g_nverbs, SW_EXCEPTIONS, g_exc_used_count());
+           (unsigned long)g_nverbs, SW_STATEFUL, SW_EXCEPTIONS,
+           g_exc_used_count());
     nf_free(&node);
     tf_done("test_terminal_sweep");
     return 0;
