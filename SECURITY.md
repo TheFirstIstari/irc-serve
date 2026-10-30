@@ -484,16 +484,23 @@ an access control, and it should not be relied on as one.
 
 ### Session resume (Phase 9)
 
-The restore key is `(nick, ident, observed host)`. `ident` is client-asserted
-and `host` is the observed peer address, so a client that shares the victim's
-observed host (NAT, office, carrier CGNAT, shared bouncer, Tor exit) and that
-can guess the victim's nick and ident (both visible in any shared channel) can
-attempt to resume the victim's window within the 120 s window and inherit its
-channel memberships. Prefixes (`+o`) are re-granted only when the window was
-recorded for an authenticated identity and the reconnecting client authenticated
-as the same identity; unauthenticated windows do not re-grant prefixes, but
-still inherit membership. Operators who need stronger assurance should require
-SASL authentication on channels whose membership is sensitive.
+The restore key is `(nick, ident, observed host, account)`, compared
+case-insensitively (`account` is empty for unauthenticated sessions). A window
+recorded for an authenticated SASL account only matches a reconnecting client
+that authenticated as the same account; an unauthenticated client on the same
+host cannot match or consume it. For unauthenticated sessions (`account` empty),
+`ident` is client-asserted and `host` is the observed peer address, so a client
+that shares the victim's observed host (NAT, office, carrier CGNAT, shared
+bouncer, Tor exit) and presents the victim's nick and ident (both visible in
+any shared channel) without authenticating can resume the victim's window
+within the 120 s window. Restoring a matched window rejoins its channels and
+re-grants recorded prefixes (`+o`) on locally owned channels for both
+authenticated and unauthenticated windows (authenticated windows additionally
+verify that the reconnecting client's `account` matches before re-granting;
+non-origin nodes never re-grant prefixes on federated channels). Consequently,
+an unauthenticated window resumed by a same-host attacker inherits both channel
+memberships and any recorded prefixes on locally owned channels. Operators who
+need stronger assurance should require SASL authentication.
 
 ### SASL
 

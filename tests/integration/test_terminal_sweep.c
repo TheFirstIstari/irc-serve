@@ -1676,6 +1676,8 @@ static void probe_sasl_authcid(nf_node_t *node)
         char want[64];
         size_t plen;
         size_t blen;
+        size_t log_mark;
+        unsigned expect_bad;
 
         if (marker_in_set((unsigned char)m) == 0 ||
             sw_param_marker_ok((unsigned char)m) == 0) {
@@ -1695,7 +1697,11 @@ static void probe_sasl_authcid(nf_node_t *node)
 
         /* A FRESH CONNECTION, and 001 is NOT waited for: the attack is
          * pre-registration and pre-credential, and that is the instance the
-         * measurement has to hold on. */
+         * measurement has to hold on. `log_mark` is taken after draining any
+         * earlier output so an earlier C0 exchange cannot satisfy a later
+         * marker's assertion. */
+        drain_node_pipe(node);
+        log_mark = node->out_len;
         tc_init(&c);
         TF_CHECK_MSG(tc_connect(&c, node->port) == 0,
                      "the sasl probe could not connect");
@@ -1730,10 +1736,12 @@ static void probe_sasl_authcid(nf_node_t *node)
                      "marker.\n  %s saw: %s", nick, tc_buffer(&c));
 
         /* THE MEASUREMENT, which is the reachability claim. With the field
-         * measured, a one-byte authcid is `authcid_len=1 authcid_bad_bytes=1`
-         * and the value itself is withheld; with the measurement reverted the
-         * line carries the raw byte and no length at all, so this assertion
-         * names the site that regressed. */
+         * measured, a one-byte authcid is `authcid_len=1` with
+         * `authcid_bad_bytes=1` for C0/DEL and `authcid_bad_bytes=0` for C1
+         * (`conn_text_bad_count()` counts C0 and DEL only, while
+         * `conn_text_logsafe()` withholds any non-ASCII byte too); with the
+         * measurement reverted the line carries the raw byte and no length at
+         * all, so this assertion names the site that regressed. */
         /* BOTH ENDS ARE KEPT MOVING, and this is not tidiness: the node's stdout
          * is a 64 KiB pipe and a node that fills it blocks inside write(), at
          * which point it stops accepting and stops answering. `pump_node()`
@@ -1742,8 +1750,10 @@ static void probe_sasl_authcid(nf_node_t *node)
          * side takes. `log_line_has()` below reads `node->out` directly, so the
          * pipe has to be empty for the line to be there at all. */
         pump_node(node, &c);
-        (void)snprintf(want, sizeof want, "authcid_len=1 authcid_bad_bytes=1");
-        TF_CHECK_MSG(log_line_has(node->out, 0u, "[observable] sasl:", want) == 1,
+        expect_bad = (m <= 0x1fu || m == 0x7fu) ? 1u : 0u;
+        (void)snprintf(want, sizeof want, "authcid_len=1 authcid_bad_bytes=%u",
+                       expect_bad);
+        TF_CHECK_MSG(log_line_has(node->out, log_mark, "[observable] sasl:", want) == 1,
                      "the node did not report measuring a ONE-BYTE authcid on the "
                      "SASL rejection path (marker 0x%02x). Either the probe never "
                      "reached the site -- which would mean the two-message "
@@ -1751,7 +1761,7 @@ static void probe_sasl_authcid(nf_node_t *node)
                      "prints the field raw again, which is the regression this "
                      "probe exists to catch. The whole-buffer scan would also "
                      "find the byte, but it would not say WHICH site put it "
-                     "there.\n  node said: %s", m, node->out);
+                     "there.\n  node said: %s", m, node->out + log_mark);
         reached++;
         g_stateful_reached++;
 

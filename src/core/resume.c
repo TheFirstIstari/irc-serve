@@ -617,6 +617,7 @@ int resume_apply(server_t *s, conn_t *c, uint64_t now_ms)
 {
     char nick[IRC_MAX_NICK + 1];
     char ident[CONN_USER_MAX + 1];
+    char account[CONN_MAX_ACCOUNT + 1];
     struct resume_chan chans[IRC_RESUME_MAX_CHANS];
     size_t nchans = 0u;
     size_t dropped = 0u;
@@ -707,6 +708,8 @@ int resume_apply(server_t *s, conn_t *c, uint64_t now_ms)
      * shifts underneath the pointer. The copy is onto the STACK at the bound
      * rather than a heap allocation, which is what lets this function have no
      * failure mode of its own. */
+    (void)resume_copy(account, sizeof account,
+                      s->resume_windows[idx].account);
     nchans = s->resume_windows[idx].nchans;
     dropped = s->resume_windows[idx].dropped_chans;
     for (i = 0; i < nchans; i++) {
@@ -755,7 +758,7 @@ int resume_apply(server_t *s, conn_t *c, uint64_t now_ms)
          * an account (an unauthenticated session) keeps the old behaviour, so
          * the feature still works for clients that do not use SASL; the
          * residual shared-host risk for those is documented in SECURITY.md. */
-        if (w->account[0] != '\0' && !same_folded(w->account, c->account)) {
+        if (account[0] != '\0' && !same_folded(account, c->account)) {
             flags = 0u;
         }
         if (chans[i].flags != 0u && flags != chans[i].flags) {

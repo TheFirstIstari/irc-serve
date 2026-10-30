@@ -30,12 +30,12 @@ src = open(PATH).read()
 
 opener = "    if (m->params[0][0] != '\\0' &&\n        nickreg_ident_ok(m->params[0], sizeof c->user) == 0) {"
 start = src.index(opener)
-end = src.index(CLOSE, start) + len(CLOSE)
-# Keep the else arm's body, re-indented two spaces fewer, as a plain statement.
-else_start = src.index("    } else {", end)
-body_start = end
-body_end = src.index(CLOSE, else_start)
-body = src[body_start + len("    } else {\n"):body_end]
-src = src[:start] + "    " + body.lstrip(" ").lstrip("\n") + src[else_start + len("    } else {\n"):]
+else_start = src.index("\n    } else {\n", start)
+body_start = else_start + len("\n    } else {\n")
+body_end = src.index(CLOSE, body_start)
+end = body_end + len(CLOSE)
+# Keep the else arm's body, re-indented four spaces fewer, as a plain statement.
+body = src[body_start:body_end]
+src = src[:start] + "    " + body.lstrip(" ").lstrip("\n") + "\n" + src[end:]
 
 open(PATH, "w").write(src)
