@@ -1818,7 +1818,6 @@ static void probe_stored_ident_render(nf_node_t *node)
 
     for (unsigned m = 0x00u; m <= 0xffu; m++) {
         test_client_t atk;
-        char ident[8];
 
         if (marker_in_set((unsigned char)m) == 0 ||
             sw_param_marker_ok((unsigned char)m) == 0) {
@@ -1829,8 +1828,6 @@ static void probe_stored_ident_render(nf_node_t *node)
         /* THE WHOLE IDENT IS ONE MARKER BYTE, so the hostmask that renders it
          * is exactly `nick!<byte>@host` and a reader can see which byte
          * arrived without decoding a compound payload. */
-        ident[0] = (char)m;
-        ident[1] = '\0';
 
         tc_init(&atk);
         TF_CHECK_MSG(tc_connect(&atk, node->port) == 0,
