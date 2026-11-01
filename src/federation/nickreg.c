@@ -338,8 +338,76 @@ static struct fed_rnick *nickreg_append(server_t *s)
  * host that renders as the peer spelled it. That is the honest bound on a cache.
  *
  * COST: one pass over a value at most CONN_MAX_HOST bytes, once per burst nick record,
- * on a path that runs once per resync rather than once per message. */
-static int nickreg_ident_ok(const char *s, size_t cap)
+ * on a path that runs once per resync rather than once per message.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY IT IS NO LONGER `static`
+ * ---------------------------------------------------------------------------
+ * It was file-private, applied on the PEER side only. `conn_t::user` -- the same
+ * `<user>` slot of the same `nick!user@host` hostmask -- had no predicate at all on the
+ * CLIENT side, and that gap was an anonymous, pre-registration, cross-client terminal
+ * injection: `USER <ESC>[2J... 0 * :x` stored the bytes in `c->user`, and
+ * `conn_hostmask()` then put them in the PREFIX of every line that client sent to every
+ * co-member of every channel it joined. See handle_user() in core/commands.c for the
+ * full argument and for why the answer is refusing at ingest rather than filtering at
+ * render.
+ *
+ * The blunt way to close it would have been a second predicate next to this one, and
+ * that is the mistake this tree has already made three times: two functions answering
+ * "which bytes may a hostmask component hold" is how they come to disagree, and the
+ * disagreement is invisible until one of them is the one an attacker reaches. So this
+ * one is exported and ASKED BY BOTH PATHS -- `nickreg_learn()` on a peer's SBURSTN
+ * record, `handle_user()` on a client's `USER` -- and the same reasoning that settled
+ * `SMODES` against client `MODE` applies: one predicate, asked twice, and a test that
+ * the two agree.
+ *
+ * ---------------------------------------------------------------------------
+ * THE SECOND HALF OF THE BYTE TEST, AND IT WAS MISSING
+ * ---------------------------------------------------------------------------
+ * The loop below is `ch <= 0x20 || ch == 0x7f`, which is a PARAMETER-shape rule and a
+ * good one: a byte a message parameter cannot carry is a byte `nick!user@host` cannot
+ * carry. It is also, on its own, blind to the exact byte class this project has now
+ * spent two passes removing from the rest of the tree. `0x9B` is 0x9B: it is not <=
+ * 0x20, it is not 0x7f, and on an 8-bit terminal it IS CSI. A raw `0x9B` in
+ * `fed_rnick::user` was therefore accepted by this predicate, stored, and rendered
+ * into a hostmask by every path that reads the registry -- and the same byte in
+ * `conn_t::user` was accepted by NOTHING AT ALL and rendered into a hostmask by
+ * `conn_hostmask()`, which is the reported vulnerability.
+ *
+ * SO IT ALSO ASKS `conn_text_display_check()`, which is the walk `valid_nick()` uses
+ * for `conn_t::nick` and `conn_realname_check()` uses for `conn_t::realname`. That is
+ * the same decision realname made for the same reason: a value STORED and re-rendered
+ * into every line its owner sends must be about CODE POINTS and not bytes, or a
+ * byte-range test refuses `ā` (`0xC4 0x81`, whose second byte is 0x81) and silently
+ * eats every accented Latin, Greek and Cyrillic ident on the network. A filter that
+ * mangles valid UTF-8 is worse than the injection it was meant to stop, because the
+ * user cannot see it happen.
+ *
+ * WHAT THE SECOND HALF ADDS, exactly:
+ *   CONN_DISPLAY_CONTROL  C0 and DEL -- already refused above, so this is redundant.
+ *   CONN_DISPLAY_C1       U+0080-U+009F as a bare 0x80-0x9F byte or as 0xC2 0x80-0x9F.
+ *                         THIS IS THE LIVE HOLE. U+009B is CSI whatever the encoding.
+ *   CONN_DISPLAY_UTF8     invalid or truncated UTF-8 -- a bare continuation byte, an
+ *                         overlong 0xC0/0xC1, a surrogate half, a sequence that stops
+ *                         early. A stored value that is not a character has no honest
+ *                         rendering and no way to be told apart from a typo.
+ *
+ * The two halves are an INTERSECTION, not a union, and that is deliberate: the loop
+ * refuses SPACE and TAB which the display walk permits, and the display walk refuses
+ * C1 and invalid UTF-8 which the loop permits. An ident is one of three NAMED slots in
+ * a `nick!user@host`, so it is not free text and it gets the stricter of the two rules
+ * on every axis.
+ *
+ * WHAT IT COSTS THE PEER PATH, stated because it is a behaviour change on a surface
+ * that was already shipped: a peer whose SBURSTN carries a user or host holding a raw
+ * C1 byte, an encoded C1 pair or a malformed UTF-8 sequence now has that FIELD REFUSED
+ * where it used to be stored. The record is kept -- `nickreg_learn()` keeps it -- and
+ * `nickreg_ident_refused()` reports the refusal as a length and a bad-byte count, so a
+ * peer sending such a value was already generating a finding. A conforming peer
+ * reports idents its own clients asserted through `USER`, and a client ident now goes
+ * through this same predicate, so the two sides of a link agree by construction.
+ */
+int nickreg_ident_ok(const char *s, size_t cap)
 {
     size_t i;
 
@@ -369,6 +437,23 @@ static int nickreg_ident_ok(const char *s, size_t cap)
         if (ch <= 0x20u || ch == 0x7fu) {
             return 0;
         }
+        /* Hostmask delimiters, which RFC 1459 2.3 does not allow in <user>
+         * and which would make the rendered `nick!user@host` prefix ambiguous:
+         * a delimiter inside the ident would forge or split the prefix as seen
+         * by a client that parses it, so the value is refused rather than
+         * stored. `~`, `-`, `_`, `.` and alphanumerics remain allowed, along
+         * with valid UTF-8. */
+        if (ch == (unsigned char)'!' || ch == (unsigned char)'@' ||
+            ch == (unsigned char)':' || ch == (unsigned char)';') {
+            return 0;
+        }
+    }
+    /* AND THE SECOND HALF, which is why this function is no longer sufficient on
+     * its own. See the block at the definition for what it adds and why it is the
+     * SAME walk `valid_nick()` and `conn_realname_check()` use rather than a
+     * second spelling of "renderable". */
+    if (conn_text_display_check(s) != CONN_DISPLAY_OK) {
+        return 0;
     }
     return 1;
 }

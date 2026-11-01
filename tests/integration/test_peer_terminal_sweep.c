@@ -1022,6 +1022,7 @@ int main(void)
     char chan[16];
     char join_line[32];
     char join_echo[32];
+    char part_line[32];
     char token[64];
     int listen_fd;
     unsigned probes = 0;
@@ -1194,6 +1195,35 @@ int main(void)
             ps_expect_verdict(&node, from, &k_shapes[i], (unsigned char)b,
                               (size_t)i);
             probes++;
+
+            /* LEAVE THE CHANNEL AGAIN, AND THE REASON IS A CAP RATHER THAN
+             * TIDINESS. This sweep held every channel it ever created -- one per
+             * probe, 489 of them by the end of a run -- which is precisely the
+             * unbounded per-connection growth `CONN_MAX_CHANNELS` exists to
+             * bound, and a sweep that cannot finish under the product's own
+             * bound is a sweep that has become a measurement of its own bad
+             * habit. PARTing after the probe's assertions keeps its footprint
+             * constant without changing what it observes: the client is a MEMBER
+             * at the moment the probe goes out, which is the only moment
+             * membership matters, and the channel is destroyed on the way out,
+             * so the node's registry holds one at a time.
+             *
+             * NO SJOIN OR SNICK ROW EXISTS IN THE SHAPE TABLE (the file's own
+             * header says so), so nothing remote lingers in a channel the client
+             * has left and the channel really does go away. If a future row adds
+             * one, the PART will stop emptying the channel and this sweep will
+             * start accumulating again -- at which point the cap makes that
+             * visible as a 405, which is the right way for a test to find out.
+             *
+             * The PART echo is NOT waited for, and deliberately: the next
+             * iteration's JOIN names a different channel, so the two cannot be
+             * confused, and a wait here would be a wait for a line nothing in
+             * this sweep asserts about. */
+            (void)snprintf(part_line, sizeof part_line, "PART %s", chan);
+            TF_CHECK_MSG(tc_send(&client, part_line) == 0,
+                         "the PART of %s could not be sent, so this sweep would "
+                         "accumulate one channel per probe and hit the "
+                         "per-connection channel cap", chan);
 
             /* Read the peer's socket, non-blocking, and SCAN WHAT COMES BACK
              * BEFORE IT IS DROPPED. A peer socket nobody reads eventually stops the

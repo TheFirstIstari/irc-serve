@@ -29,9 +29,8 @@
 /* ---------------------------------------------------------------------------
  * THE STATE ENUM IS A PROJECTION OF TWO FACTS
  * ---------------------------------------------------------------------------
- * conn_t's shape is final as of Phase 2 (2.1), so there are no got_nick /
- * got_user flags to add and the state enum has to carry both. It can, because
- * there are four combinations and four states:
+ * conn_t's shape is final as of Phase 2 (2.1), so the state enum has to carry
+ * both facts, and it can, because there are four combinations and four states:
  *
  *   no nick,  no  user  ->  CONN_REG_PASS   the entry state
  *   nick,     no  user  ->  CONN_REG_NICK
@@ -39,24 +38,34 @@
  *                                           exists for exactly this client
  *   nick,     user      ->  CONN_REG_READY  and the welcome burst has gone
  *
- * The underlying facts are still the fields, not the enum -- c->nick[0] and
- * c->user[0] -- so the projection is recomputed after every command rather
- * than incremented, and a client that sends its lines in an unusual order ends
- * up in the same state as one that does not. Reading it the other way round
- * ("the state counts how far it has got") is what makes a "USER before NICK"
- * client regress, and this enum has no value to regress INTO.
+ * The underlying facts are the fields -- c->nick[0] for the nick and
+ * c->user_seen for the user -- so the projection is recomputed after every
+ * command rather than incremented, and a client that sends its lines in an
+ * unusual order ends up in the same state as one that does not. Reading it the
+ * other way round ("the state counts how far it has got") is what makes a
+ * "USER before NICK" client regress, and this enum has no value to regress
+ * INTO.
  *
  * PASS does not appear in the table because it is neither fact. It is
  * recorded, not remembered: see handle_pass().
- */
+ *
+ * AND `have_user()` ASKS A FLAG RATHER THAN THE FIELD, which is a change to the
+ * two-facts shape and the reason is above: an ident can now be REFUSED at
+ * ingest (nickreg_ident_ok(), the hostmask-component rule), and a client whose
+ * ident was refused registers with an EMPTY one. Reading `c->user[0]` for "a
+ * USER arrived" would then mean that client never reaches CONN_REG_READY --
+ * no 001, no refusal, and no way to tell it apart from a client that stopped
+ * mid-registration. `c->user_seen` is set on the same path that stores the
+ * ident, in handle_user(), so the flag and the field are written together and
+ * cannot disagree. */
+static int have_user(const conn_t *c)
+{
+    return c->user_seen != 0;
+}
+
 static int have_nick(const conn_t *c)
 {
     return c->nick[0] != '\0';
-}
-
-static int have_user(const conn_t *c)
-{
-    return c->user[0] != '\0';
 }
 
 int commands_registered(const conn_t *c)
@@ -394,9 +403,11 @@ void commands_state_update(server_t *s, conn_t *c)
      * alternative -- registering it unauthenticated -- would make a client that
      * mistyped a password indistinguishable from one that chose not to
      * authenticate, and it is the second of those two that a server must be
-     * able to tell apart from the first. handle_authenticate() marks the
-     * connection CLOSING after the 464, so this arm is the belt to that
-     * braces: it holds for any path that sets SASL_FAILED without closing. */
+     * able to tell apart from the first. Only the malformed-payload arm of
+     * handle_authenticate() marks the connection CLOSING; the bad-credential
+     * arm leaves it open so the 464 is actually written (poll_loop.c does not
+     * pump the write queue of a CLOSING connection). This arm therefore holds
+     * for the credential-failure path, which is the one that reaches here. */
     if (state == CONN_REG_READY && c->sasl == (int)SASL_FAILED) {
         printf("[observable] reg_held: fd=%d reason=SASL_FAILED\n", c->fd);
         return;
@@ -453,7 +464,9 @@ static void copy_field(char *dst, size_t cap, const char *src, int *trunc)
 
     if (n >= cap) {
         n = cap - 1u;
-        *trunc = 1;
+        if (trunc != NULL) {
+            *trunc = 1;
+        }
     }
     memcpy(dst, src, n);
     dst[n] = '\0';
@@ -744,7 +757,6 @@ static void handle_nick(server_t *s, conn_t *c, const message_t *m)
  * can still be refused (417/empty) rather than silently truncated. */
 static void handle_user(server_t *s, conn_t *c, const message_t *m)
 {
-    int trunc_user = 0;
     int trunc_real = 0;
     conn_realname_verdict_t v;
     size_t asserted_len;
@@ -765,7 +777,118 @@ static void handle_user(server_t *s, conn_t *c, const message_t *m)
                             "Not enough parameters");
         return;
     }
-    copy_field(c->user, sizeof c->user, m->params[0], &trunc_user);
+    /* ------------------------------------------------------------------------
+     * THE IDENT, AND WHY IT IS VALIDATED AT INGEST RATHER THAN FILTERED AT RENDER
+     * ------------------------------------------------------------------------
+     * `c->user` was the one field of this node's five identity fields with no
+     * predicate at all. `copy_field()` bounds LENGTH and nothing else, and
+     * `CHGHOST` is deliberately unimplemented, so `handle_user()` was the single
+     * writer -- and `conn_hostmask()` was the reader that put the bytes in the
+     * PREFIX of every line the client sent, to every co-member of every channel it
+     * joined. One pre-registration line, no credential, no second client needed to
+     * ring or rewrite somebody else's terminal:
+     *
+     *     USER \033[2J\033[31m...\033[0m 0 * :x     then JOIN and speak
+     *
+     * A raw `0x9B` survived it too, which is the exact byte class an earlier pass
+     * removed from the peer->client path. The other four identity fields --
+     * `nick` (`valid_nick()`), `realname` (`conn_realname_check()`), `account`
+     * (`account_name_wire_safe()`) and `host` (OBSERVED, never client-asserted) --
+     * are all validated at ingest. This one was the hole.
+     *
+     * THE DECISION IS INGEST, AND THERE ARE THREE REASONS. They are recorded here
+     * rather than in a commit message because the obvious "simplification" a future
+     * reader will reach for is to move this into `conn_hostmask()`, and that would
+     * be a regression:
+     *
+     *   1. RENDER-TIME FILTERING PUTS THE SAFETY IN ONE PLACE USED BY ~20 CALL
+     *      SITES. Every one of them then depends on it being correct, and any new
+     *      call site silently inherits the hazard. That fragile shape has bitten
+     *      this project repeatedly -- `handle_topic()` broadcast and stored two
+     *      different copies of one field, and `handle_mode()` had three.
+     *
+     *   2. INGEST MEANS THE VALUE IS SAFE EVERYWHERE IT GOES, including paths
+     *      nobody has enumerated. `c->user` reaches `resume.c`'s ident, the
+     *      operator log, and every hostmask -- three surfaces an audit found by
+     *      READING, and there may be more.
+     *
+     *   3. `conn_realname_check()` IS THE DIRECT PRECEDENT: the same field-list
+     *      argument, refusing so registration completes with an empty field. A
+     *      client that sends a control byte registers with no ident -- same
+     *      consequence as an over-long realname, which this function already
+     *      accepts.
+     *
+     * THE RULE IS `nickreg_ident_ok()`, which is THE PROJECT'S OWN RULE FOR A
+     * HOSTMASK COMPONENT -- nickreg.c's header calls it exactly that -- and which
+     * was applied on the peer side only. It is now asked here too, so the two
+     * paths agree rather than the project owning two hostmask rules. Its second
+     * half is `conn_text_display_check()`, the same walk `valid_nick()` and
+     * `conn_realname_check()` use, which is what makes a UTF-8 ident (`ā`,
+     * Cyrillic) acceptable while a raw `0x9B` is not: it is about CODE POINTS, not
+     * bytes, and a byte-range refusal here would silently eat every non-ASCII
+     * ident on the network. That is the direction that matters -- a filter that
+     * mangles valid UTF-8 is worse than the original bug, because it is silent.
+     *
+     * WHAT THE CLIENT SEES: nothing. The registration completes, 001 arrives, and
+     * the ident is empty. There is no numeric for "your ident was refused", and
+     * inventing one would be a wire change for a value no real client sends a
+     * control byte in. What a CO-MEMBER sees is a hostmask with an empty `<user>`
+     * slot -- `nick!@host` -- which is the same thing they see for a client that
+     * sent `USER  0 * :x` and nothing this node would call an ident.
+     *
+     * IT IS REPORTED, because the failure is otherwise invisible: the only
+     * observable difference between "the client sent no ident" and "the client
+     * sent something this node threw away" would be a missing ident in every later
+     * roster, which is exactly the discrepancy the observable output exists to make
+     * findable. And it is reported as a MEASUREMENT -- a length and a bad-byte
+     * count -- never as the bytes, which is the same contract
+     * `nickreg_ident_refused()` keeps on the peer side and the same rule the
+     * `<servername>` refusal below follows.
+     *
+     * LENGTH IS REFUSED, not truncated. An ident that is too long for the field
+     * is refused (the field is emptied) rather than silently shortened, because a
+     * truncated ident would be a value the client never sent -- which is the same
+     * reason the control-byte case is refused. `USERLEN` therefore stays out of
+     * the 005 token list: this node refuses over-long idents instead of applying
+     * a bound, so advertising a number would promise a limit it does not apply.
+     *
+     * `user_seen` IS SET ON EVERY PATH BELOW, including the refusal, because the
+     * state projection asks "did a USER arrive" and not "is the ident non-empty":
+     * see have_user() at the top of this file for why the two came apart and what
+     * a client whose ident was refused would otherwise have lost. */
+    c->user_seen = 1;
+    if (m->params[0][0] != '\0' &&
+        nickreg_ident_ok(m->params[0], sizeof c->user) == 0) {
+        /* `bad_bytes=` IS A FLOOR AND NOT A CENSUS, and naming that matters
+         * because a reader will otherwise treat 0 as "nothing was wrong".
+         * `conn_text_bad_count()`'s set is C0 and DEL and connection.h argues at
+         * length why it excludes every byte >= 0x80 -- those are UTF-8
+         * continuation bytes, and a count that included them would eat every
+         * non-ASCII value on the node. The predicate that refused this ident is
+         * STRICTER: `nickreg_ident_ok()`'s second half asks
+         * `conn_text_display_check()`, which also refuses a raw C1 byte and
+         * invalid UTF-8. So the byte that makes a payload dangerous on an 8-bit
+         * terminal (0x9B) is refused and NOT counted, and an ident refused with
+         * `bad_bytes=0` is one whose problem was a code point rather than a
+         * control byte. The reason token beside it is what names the rule.
+         * WidenING the count instead would break the documented UTF-8 decision
+         * for every other caller of the same function, so the honest answer is
+         * to say what the number covers rather than to change it. */
+        if (strlen(m->params[0]) >= sizeof c->user) {
+            printf("[observable] user_refused: fd=%d nick=%s verb=USER field=user "
+                   "reason=FIELD_TOO_LONG len=%zu bad_bytes=%zu\n",
+                   c->fd, c->nick, strlen(m->params[0]),
+                   conn_text_bad_count(m->params[0]));
+        } else {
+            printf("[observable] user_refused: fd=%d nick=%s verb=USER field=user "
+                   "reason=NOT_A_PARAMETER_BYTE len=%zu bad_bytes=%zu\n",
+                   c->fd, c->nick, strlen(m->params[0]),
+                   conn_text_bad_count(m->params[0]));
+        }
+        c->user[0] = '\0';
+    } else {
+        copy_field(c->user, sizeof c->user, m->params[0], NULL);
+    }
     /* THE REALNAME IS CHECKED BY THE SAME PREDICATE `SETNAME` USES, and it is
      * checked BEFORE the field is written rather than after, so a refused value is
      * never briefly stored. conn_realname_check()'s argument is at its definition;
@@ -869,18 +992,52 @@ static void handle_user(server_t *s, conn_t *c, const message_t *m)
     asserted_len = strlen(m->params[2]);
     asserted_ok = irc_serve_server_name_valid(m->params[2]);
     asserted_bad = conn_text_bad_count(m->params[2]);
-    printf("[observable] user: fd=%d user=%s realname_trunc=%d "
-           "asserted_host_len=%zu asserted_host_wellformed=%d "
-           "asserted_host_bad_bytes=%zu host=%s host_source=observed\n",
-           c->fd, c->user, trunc_real, asserted_len, asserted_ok, asserted_bad,
-           c->host);
+    /* ------------------------------------------------------------------------
+     * `user=` IS RENDERED THROUGH `conn_text_logsafe()`, AND THAT IS NOT REDUNDANT
+     * WITH THE INGEST CHECK ABOVE
+     * ------------------------------------------------------------------------
+     * It is the same argument the `mech=`/`authcid=` sites in handle_authenticate()
+     * give, and it applies here with a difference worth naming. The ingest check
+     * has already refused every byte a terminal executes, so the value that
+     * reaches this line is not an injection. It is not, however, necessarily
+     * PRINTABLE ASCII -- a UTF-8 ident is `ā` as `0xC4 0x81`, and `0x81` is inside
+     * the C1 range this node's own sweep treats as a marker. So a raw `%s` here
+     * would print a byte class this project has spent two passes removing from
+     * every other surface, on a line an operator reads.
+     *
+     * The alternative -- printing it because the ingest check ran -- would mean
+     * the safety of this line depends on the reader knowing that it ran. That is
+     * the shape the render-time-filtering decision is written against, one level
+     * down: a site that is safe only because of an invariant established a
+     * hundred lines earlier is a site that stops being safe when that invariant
+     * moves. So the line is MEASURED rather than trusted, which is
+     * `conn_text_logsafe()`'s contract: verbatim when every byte is printable
+     * ASCII, and `-` with the true `len=` beside it otherwise.
+     *
+     * THE COST, named: a UTF-8 ident prints as `-` on this line. The value is
+     * still stored, still rendered into every hostmask, and still legible to
+     * every client -- the withholding is on the OPERATOR'S diagnostic and nowhere
+     * else, and `user_len=` is what says how long the real value was. Every other
+     * verbatim-or-`-` site on this node pays the same price for the same reason.
+     *
+     * `trunc_user` is refused in the same breath: an ident truncated to fit the
+     * field is a field the client did not send, and the line below says so by
+     * name. */
+    {
+        char shown[CONN_LOG_FIELD_MAX + 1u];
+
+        (void)conn_text_logsafe(shown, sizeof shown, c->user);
+        printf("[observable] user: fd=%d user=%s user_len=%zu "
+               "realname_trunc=%d "
+               "asserted_host_len=%zu asserted_host_wellformed=%d "
+               "asserted_host_bad_bytes=%zu host=%s host_source=observed\n",
+               c->fd, shown, strlen(c->user), trunc_real, asserted_len,
+               asserted_ok, asserted_bad, c->host);
+    }
     if (asserted_bad != 0u) {
         printf("[observable] asserted_host: fd=%d reason=BAD_BYTES dropped=%zu "
                "detail=SUMMARISED_ONLY\n",
                c->fd, asserted_bad);
-    }
-    if (trunc_user != 0) {
-        printf("[observable] field_truncated: fd=%d field=user\n", c->fd);
     }
     update_state(s, c);
 }
@@ -2132,6 +2289,22 @@ static void handle_authenticate(server_t *s, conn_t *c, const message_t *m)
      * STARTTLS sends STARTTLS. */
     c->credential_seen = 1;
 
+    /* PER-CONNECTION THROTTLE. After three failed credential verifications this
+     * connection stops verifying and refuses every further AUTHENTICATE with
+     * 464, so a single connection cannot run an unbounded online dictionary
+     * attack. The connection is deliberately NOT closed: poll_loop.c does not
+     * pump the write queue of a CLOSING connection, so closing here would
+     * discard the 464 queued above and leave the client with a bare FIN. The
+     * client is already unable to register (SASL_FAILED is terminal), so the
+     * connection is effectively dead and will be reaped on disconnect/timeout. */
+    if (c->sasl_failures >= 3) {
+        (void)reply_refused(s, c, "AUTHENTICATE", "ERR_AUTHENTICATIONFAILED", "464",
+                            NULL, 0, "SASL authentication failed: too many attempts");
+        printf("[observable] sasl: fd=%d outcome=REJECTED reason=TOO_MANY_ATTEMPTS\n",
+               c->fd);
+        return;
+    }
+
     /* AUTHENTICATE * is the ABORT (RFC 4422 3.1), and it is answered before any
      * parsing: a client abandoning an exchange must not have to supply a
      * well-formed one to be allowed to stop. It leaves the connection
@@ -2260,6 +2433,7 @@ static void handle_authenticate(server_t *s, conn_t *c, const message_t *m)
         const int no_store = (sasl_store_count(s->sasl_store) == 0u);
 
         c->sasl = (int)SASL_FAILED;
+        c->sasl_failures++;
         s->n_sasl_fail++;
         params[0] = "*";
         (void)send_line(s, c, NULL, "AUTHENTICATE", params, 1);
@@ -2276,8 +2450,43 @@ static void handle_authenticate(server_t *s, conn_t *c, const message_t *m)
                             NULL, 0, "SASL authentication failed: %s",
                             no_store ? "this node holds no client credential store"
                             : "the credentials did not verify");
-        printf("[observable] sasl: fd=%d authcid=%s outcome=REJECTED reason=%s\n",
-               c->fd, authcid, no_store ? "NO_STORE" : "BAD_CREDENTIAL");
+        /* ------------------------------------------------------------------------
+         * `authcid=` IS MEASURED, NOT PRINTED, AND IT WAS THE ONE SITE OF SIX
+         * WITHOUT `conn_text_logsafe()`
+         * ------------------------------------------------------------------------
+         * `sasl_plain_parse()` validates LENGTH and nothing else, so `authcid` is
+         * whatever the client base64-encoded: a pre-registration, unauthenticated
+         * line could put ESC and CSI into the operator's terminal. Three sibling
+         * sites in this same function already call `conn_text_logsafe()` -- the
+         * `mech=` refusal above, the `account_set()` refusal below and the
+         * COMPLETED line -- and this one did not, which is why it survived the
+         * sweep: the sweep drives each verb with a single line, and `authcid` only
+         * exists across TWO messages of state (`AUTHENTICATE PLAIN` then
+         * `AUTHENTICATE <payload>`), because the payload of a one-line exchange is
+         * parsed as a MECHANISM NAME and refused at 908 before anything is stored.
+         *
+         * The fix is the same call the other five make, which is the whole of why
+         * it is one line: the pattern is already established in this file and a
+         * site that departs from it is the one that leaks. `conn_text_logsafe()`
+         * writes the value verbatim when every byte is printable ASCII and `-`
+         * otherwise, so the reading below pairs it with the two counts that say
+         * what was withheld and how long it really was. A UTF-8 authcid prints as
+         * `-` here; it is still stored, still used to look the account up, and
+         * still legible to the client, and this line is the operator's diagnostic
+         * rather than the account.
+         *
+         * The credential itself -- `passwd` -- is never printed anywhere on this
+         * path, and adding `authzid` would have been adding the other half of a
+         * credential to a log for no diagnostic gain. Neither changes. */
+        {
+            char shown[CONN_LOG_FIELD_MAX + 1u];
+
+            (void)conn_text_logsafe(shown, sizeof shown, authcid);
+            printf("[observable] sasl: fd=%d authcid=%s authcid_len=%zu "
+                   "authcid_bad_bytes=%zu outcome=REJECTED reason=%s\n",
+                   c->fd, shown, strlen(authcid), conn_text_bad_count(authcid),
+                   no_store ? "NO_STORE" : "BAD_CREDENTIAL");
+        }
         return;
     }
 

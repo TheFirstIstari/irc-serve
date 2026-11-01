@@ -747,6 +747,36 @@ static void deliver_state_change(server_t *s, conn_t *c, chan_t *ch,
     deliver_state_change_forms(s, c, ch, verb, prefix, &plain, NULL);
 }
 
+/* Refuse a JOIN because the connection already holds CONN_MAX_CHANNELS, in the
+ * ONE spelling both call sites use.
+ *
+ * IT IS A HELPER RATHER THAN TWO PRINTFS because the message, the numeric and the
+ * observable are one fact: a client has hit the per-connection cap. The cap is
+ * checked once in handle_join(), BEFORE a new channel is created, and again in
+ * chan_admit(), which is the one place local membership is written and therefore
+ * covers an EXISTING channel and resume's re-join. Both refusals must be
+ * indistinguishable on the wire and in the log, or an operator reading one cannot
+ * tell which check fired.
+ *
+ * THE CHANNEL NAME GOES THROUGH conn_text_logsafe(). The name is now guaranteed
+ * renderable by chan_name_valid() -- that is the point of asking
+ * conn_text_display_check() there -- but this line is a diagnostic, and a
+ * diagnostic that is safe only because an invariant established elsewhere still
+ * holds is the shape this tree has removed from every other log site. The
+ * helper withholds rather than filters, so a name with a byte the log cannot
+ * carry prints as `-` beside the true held/cap numbers. */
+static void refuse_join_too_many(server_t *s, conn_t *c, const char *name)
+{
+    char shown[CONN_LOG_FIELD_MAX + 1u];
+
+    (void)reply(s, c, "405", (const char *const[]){ name }, 1,
+                "You have joined too many channels");
+    (void)conn_text_logsafe(shown, sizeof shown, name);
+    printf("[observable] chan_join_refused: channel=%s nick=%s held=%zu cap=%d "
+           "reason=TOO_MANY_CHANNELS\n",
+           shown, c->nick, c->nchans, CONN_MAX_CHANNELS);
+}
+
 /* ---------------------------------------------------------------------------
  * JOIN
  * ---------------------------------------------------------------------------
@@ -802,6 +832,26 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
         }
         ch = server_chan_get(s, canonical);
         if (ch == NULL) {
+            /* THE CAP BOUNDS CREATION AS WELL AS MEMBERSHIP, and this check has
+             * to be BEFORE chan_new() for that sentence to be true. The same
+             * check remains inside chan_admit() because it is the one place local
+             * membership is written and it also has to cover an EXISTING channel
+             * and resume's re-join. But a check that lives only there is too late
+             * for a channel that does not exist yet: the creation, the registry
+             * attach and the topic restore all happen above admission, so every
+             * refused JOIN would leave a zero-member chan_t attached for ever --
+             * the cap would bound membership while the ghost registry entries
+             * kept growing. A repeat JOIN is unaffected: a client already in the
+             * channel is short-circuited below, and a channel this node already
+             * holds does not take this branch.
+             *
+             * THE SAME 405 AND THE SAME OBSERVABLE as chan_admit()'s refusal, via
+             * one helper, so a client and an operator cannot tell which of the two
+             * checks refused them. */
+            if (c->nchans >= CONN_MAX_CHANNELS) {
+                refuse_join_too_many(s, c, canonical);
+                continue;
+            }
             /* CREATE. The first server to see a channel owns it (2.2), and on a
              * single node that is always this one -- so origin is s->name and
              * creation_epoch is s->epoch, which is the per-boot value server_t
@@ -820,18 +870,6 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
             printf("[observable] chan_create: channel=%s origin=%s epoch=%llu "
                    "creator=%s\n", ch->name, ch->origin,
                    (unsigned long long)ch->origin_epoch, c->nick);
-            /* A CHANNEL THAT WAS HERE BEFORE may have left a topic behind, and
-             * this is the one place in the node where a remembered topic can be
-             * put back: the channel did not exist, so nothing here is being
-             * overwritten and 2.2's single-writer rule has nothing to say about
-             * it. It is a restoration of this node's own record about a channel
-             * the node created, not a state change, which is why it is not a peer
-             * message and why nothing is forwarded.
-             *
-             * Order matters: the restore happens BEFORE any 332 is sent below, so
-             * the first thing the joiner sees is the topic the channel actually
-             * has rather than an empty one followed by the real thing later. */
-            (void)server_topic_restore(s, ch);
         }
         /* Authority BEFORE membership and BEFORE the ban check.
          *
@@ -871,6 +909,9 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
          * spelled out at the call rather than left to the general rule. */
         verdict = authority_ok(s, c, ch, "JOIN", 1);
         if (verdict == CHAN_VERDICT_REFUSED) {
+            if (created != 0) {
+                (void)chan_dispose_if_empty(s, ch);
+            }
             continue; /* 437 already sent; nothing has been touched */
         }
         if (chan_banned(ch, c->nick, c->user, c->host)) {
@@ -878,6 +919,9 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
                         "Cannot join channel (banned)");
             printf("[observable] chan_ban_enforced: channel=%s nick=%s host=%s\n",
                    ch->name, c->nick, c->host);
+            if (created != 0) {
+                (void)chan_dispose_if_empty(s, ch);
+            }
             continue;
         }
         if (chan_find_member(ch, c) != NULL) {
@@ -894,6 +938,9 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
             continue;
         }
 
+        if (created != 0) {
+            (void)server_topic_restore(s, ch);
+        }
         /* The member goes on the channel, the channel goes on the connection,
          * and the mesh is told. All three are ONE function -- chan_admit() --
          * and Phase 9 is why that matters: core/resume.c re-joins a client to
@@ -904,6 +951,8 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
             printf("[observable] chan_join: channel=%s nick=%s members=%zu "
                    "origin=%s\n",
                    ch->name, c->nick, ch->nmembers, ch->origin);
+        } else if (created != 0) {
+            (void)chan_dispose_if_empty(s, ch);
         }
     }
 }
@@ -1013,6 +1062,26 @@ int chan_admit(server_t *s, conn_t *c, chan_t *ch, unsigned flags)
     if (s == NULL || c == NULL || ch == NULL) {
         return -1;
     }
+    /* THE PER-CONNECTION CHANNEL CAP, AND IT IS CHECKED HERE BECAUSE THIS IS THE
+     * ONE PLACE LOCAL MEMBERSHIP IS CREATED. Both `JOIN` and resume's re-join
+     * come through chan_admit(), so both are bounded by the same number and a
+     * resume cannot rejoin what a JOIN would have been refused -- see
+     * CONN_MAX_CHANNELS for the number and the argument behind it.
+     *
+     * 405 is RFC 1459's ERR_TOOMANYCHANNELS: the number the specification defines
+     * for exactly this, and one no other site on this node emits, so a client
+     * cannot confuse it with 437 ("cannot join channel") or 474 ("banned").
+     *
+     * THE COUNT IS ON THE CONNECTION AND NOT ON THE CHANNEL, and that is
+     * deliberate: the bound is about how much of the node's shared channel
+     * registry one connection may occupy, and the registry is what a JOIN
+     * consumes. A channel the client is ALREADY in is not refused -- chan_
+     * attach_conn() reports it as already listed and this check is above that
+     * resolution, so a client at the cap may still PART and re-JOIN. */
+    if (c->nchans >= CONN_MAX_CHANNELS) {
+        refuse_join_too_many(s, c, ch->name);
+        return -1;
+    }
     if (chan_add_member(ch, c, flags) != 0) {
         (void)reply(s, c, "437", (const char *const[]){ ch->name }, 1,
                     "Cannot join channel");
@@ -1089,7 +1158,10 @@ static void announce_join_away(server_t *s, conn_t *c, chan_t *ch, const char *p
      * gives: this is not a change to the channel's state -- the roster already says
      * the user is on it -- it is an observation about that user. The class decides
      * the forward arm, and the local-only entry point has none to decide. */
-    /* FAULT: the joiner is not excluded from the join-time announcement. */
+    /* The joiner IS excluded from the join-time announcement: passing `c` here
+     * is the correct value. Changing this argument to NULL is the mutation
+     * test_away_notify.c catches (it would deliver the joiner's own AWAY back
+     * to itself). */
     delivered = fanout_deliver_local_gated(s, &t, prefix, "AWAY", &plain, NULL,
                                             cap_gate_away_notify, NULL, c);
     printf("[observable] away_notify: nick=%s join=1 channel=%s recipients=%d\n",

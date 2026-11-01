@@ -86,6 +86,13 @@
 #include "federation/nickreg.h"
 #include "federation/verbs.h"
 
+/* Reply only when there is a client to refuse to. Federation callers pass
+ * from==NULL, and replying to NULL would increment n_reply_refused, the
+ * counter reply.c holds at zero forever. */
+#define REPLY_IF(s, from, ...) \
+    do { if ((from) != NULL) (void)reply((s), (from), __VA_ARGS__); } while (0)
+
+
 /* ASCII-only case folding, deliberately: 005 advertises CASEMAPPING=ascii, so
  * this node has already told every client that []\~ and {}|^ are NOT
  * equivalent, and folding them here would break that promise in a way no test
@@ -186,6 +193,70 @@ conn_t *fanout_find_nick(server_t *s, const char *nick)
  * ---------------------------------------------------------------------------
  */
 
+/* ---------------------------------------------------------------------------
+ * fanout_name_store(): THE ONE WAY A BYTE GETS INTO `out->name`
+ * ---------------------------------------------------------------------------
+ * `fanout_target_t::name` is the target as the client wrote it, and it is
+ * printed -- at `msg_verbs.c`'s `[observable] msg:` line, at every refusal that
+ * names the target, and at every reply that echoes it. So it is a field a
+ * client-supplied byte can reach, and `fanout_resolve()` used to write it with
+ * three bare `memcpy()` calls guarded by a chain of three conditions: the name
+ * resolves as a channel, or as `nick@server` against the nickname registry, or
+ * as a local nick.
+ *
+ * That chain works. It is also exactly the shape that stops working: each guard
+ * is a fact about a DIFFERENT question ("is this a channel", "does the registry
+ * hold it", "is that a local user"), none of them is a fact about RENDERING, and
+ * the day one of them is loosened -- a channel name charset widened for a
+ * federation feature, a registry lookup made case-insensitive on the wrong axis,
+ * a "be lenient about what you accept" edit -- the byte lands in a struct with
+ * nothing between it and a log line. A guard whose safety depends on three
+ * unrelated conditions holding at once is a guard nobody can review.
+ *
+ * SO THE VALIDATION IS AT THE STRUCT, which is the same decision `handle_user()`
+ * made for `conn_t::user` and the reason is the same: the safety lives in ONE
+ * place that every write to the field must go through, not in a chain of
+ * preconditions a reader has to reconstruct. `fanout_name_store()` is the only
+ * writer of `out->name`, and it refuses rather than copies, so a future refactor
+ * that loosens a guard produces a 401 rather than a stored byte.
+ *
+ * THE PREDICATE IS `conn_text_display_check()`, the same walk `valid_nick()` asks
+ * for `conn_t::nick` and `conn_realname_check()` asks for `conn_t::realname` --
+ * because those two fields are also stored and re-rendered into every line their
+ * owner sends, which is the property `out->name` shares. It is about CODE POINTS
+ * rather than bytes, so a UTF-8 target is accepted and a raw C1 byte is not;
+ * `connection.h` argues at length why the byte-range direction is the one that
+ * mangles a legitimate user silently.
+ *
+ * THE WIDTH IS CHECKED HERE RATHER THAN ONLY AT THE TOP OF fanout_resolve(),
+ * and that is not redundancy for its own sake: the caller's check bounds the
+ * whole `arg`, while this bounds what is being STORED, and the two have been
+ * different lengths in this function for as long as it has existed (`nick` is
+ * split out of `arg` at the last '@'). A store that cannot overflow does not
+ * need its caller to be right about the arithmetic.
+ *
+ * COST: one pass over at most FANOUT_NAME_MAX bytes, on the message-delivery hot
+ * path, once per resolution. The walk is the same one `valid_nick()` runs on
+ * every NICK, so it is not a new class of work for this node.
+ */
+static int fanout_name_store(fanout_target_t *out, const char *src)
+{
+    size_t n;
+
+    if (out == NULL || src == NULL) {
+        return 0;
+    }
+    n = strlen(src);
+    if (n == 0u || n >= sizeof out->name) {
+        return 0;
+    }
+    if (conn_text_display_check(src) != CONN_DISPLAY_OK) {
+        return 0;
+    }
+    memcpy(out->name, src, n + 1u);
+    return 1;
+}
+
 int fanout_resolve(server_t *s, conn_t *from, const char *arg,
                    fanout_class_t vclass, fanout_target_t *out)
 {
@@ -218,7 +289,7 @@ int fanout_resolve(server_t *s, conn_t *from, const char *arg,
     len = strlen(arg);
     if (len >= sizeof out->name) {
         if (from != NULL) {
-            (void)reply(s, from, "401", (const char *const[]){ "<too long>" }, 1,
+            REPLY_IF(s, from, "401", (const char *const[]){ "<too long>" }, 1,
                         "No such nick/channel");
         }
         return 0;
@@ -232,11 +303,23 @@ int fanout_resolve(server_t *s, conn_t *from, const char *arg,
         chan_t *ch;
 
         chan_name_upper(canonical, sizeof canonical, arg);
-        memcpy(out->name, canonical, strlen(canonical) + 1u);
+        if (fanout_name_store(out, canonical) == 0) {
+            /* Unreachable through the current guards: a channel name that
+             * reached here passed `chan_name_valid()`, and a name holding a
+             * control byte is not one this node resolves. It is here so that the
+             * store's own rule is the thing that says so -- see the block above
+             * fanout_name_store() for why the guard chain is not left to carry
+             * that on its own. */
+            if (from != NULL) {
+                REPLY_IF(s, from, "401", (const char *const[]){ "<too long>" }, 1,
+                            "No such nick/channel");
+            }
+            return 0;
+        }
         ch = server_chan_get(s, canonical);
         if (ch == NULL) {
             if (from != NULL) {
-                (void)reply(s, from, "403", (const char *const[]){ canonical }, 1,
+                REPLY_IF(s, from, "403", (const char *const[]){ canonical }, 1,
                             "No such channel");
             }
             return 0;
@@ -290,14 +373,14 @@ int fanout_resolve(server_t *s, conn_t *from, const char *arg,
             /* A name this node could not be given, or an empty nick: no holder
              * can answer for it, so 401 rather than a parse error the client has
              * no way to act on. */
-            (void)reply(s, from, "401", (const char *const[]){ arg }, 1,
+            REPLY_IF(s, from, "401", (const char *const[]){ arg }, 1,
                         "No such nick/channel");
             return 0;
         }
         memcpy(nick, arg, nlen);
         nick[nlen] = '\0';
         if (strlen(at + 1) == 0u || strlen(at + 1) > (size_t)IRC_MAX_SERVER_NAME) {
-            (void)reply(s, from, "401", (const char *const[]){ arg }, 1,
+            REPLY_IF(s, from, "401", (const char *const[]){ arg }, 1,
                         "No such nick/channel");
             return 0;
         }
@@ -328,11 +411,18 @@ int fanout_resolve(server_t *s, conn_t *from, const char *arg,
             conn_t *lu = server_nick_lookup(s, nick);
 
             if (lu == NULL) {
-                (void)reply(s, from, "401", (const char *const[]){ arg }, 1,
+                REPLY_IF(s, from, "401", (const char *const[]){ arg }, 1,
                             "No such nick/channel");
                 return 0;
             }
-            memcpy(out->name, lu->nick, strlen(lu->nick) + 1u);
+            if (fanout_name_store(out, lu->nick) == 0) {
+                /* Unreachable through the current guards for the same reason:
+                 * `valid_nick()` asks conn_text_display_check() at NICK time, so
+                 * a local user's nick is already a value this node renders. */
+                REPLY_IF(s, from, "401", (const char *const[]){ "<too long>" }, 1,
+                            "No such nick/channel");
+                return 0;
+            }
             out->user = lu;
             out->kind = FANOUT_LOCAL_USER;
             return 1;
@@ -345,7 +435,7 @@ int fanout_resolve(server_t *s, conn_t *from, const char *arg,
          * to the named server, and a name nobody holds is a 401 rather than a
          * silent redirect to whichever of two holders came first in the table. */
         if (fed_nickreg_holder(s, nick, holder, sizeof holder, NULL) == NULL) {
-            (void)reply(s, from, "401", (const char *const[]){ arg }, 1,
+            REPLY_IF(s, from, "401", (const char *const[]){ arg }, 1,
                         "No such nick/channel");
             return 0;
         }
@@ -356,7 +446,7 @@ int fanout_resolve(server_t *s, conn_t *from, const char *arg,
          * the comment above names. It is 401 rather than a redirect because a
          * client that wanted the redirect should send the name it means. */
         if (!chan_same_name(holder, server)) {
-            (void)reply(s, from, "401", (const char *const[]){ arg }, 1,
+            REPLY_IF(s, from, "401", (const char *const[]){ arg }, 1,
                         "No such nick/channel");
             return 0;
         }
@@ -368,11 +458,26 @@ int fanout_resolve(server_t *s, conn_t *from, const char *arg,
          * nobody has a link to is a server this node cannot route to, and that
          * is the same answer for every reason it has no link. */
         if (server_find_peer(s, server) == NULL) {
-            (void)reply(s, from, "401", (const char *const[]){ arg }, 1,
+            REPLY_IF(s, from, "401", (const char *const[]){ arg }, 1,
                         "No such nick/channel");
             return 0;
         }
-        memcpy(out->name, arg, len + 1u);
+        /* THE SITE THE AUDIT NAMED, and the reason it is the one that matters:
+         * this is the only branch that stores the client's own BYTES rather than
+         * a value this node already validated -- the channel branch stores a
+         * canonicalised name and the local branch stores a nick `valid_nick()`
+         * accepted. The three guards above (the registry holds the nick, the
+         * holder is the server the client named, an established link exists) are
+         * all facts about ROUTING, none of them is a fact about what the value
+         * looks like, and a byte that satisfies all three still has to be
+         * renderable before it is stored and logged. So this one asks
+         * fanout_name_store(), which is the same one predicate the other two
+         * ask. */
+        if (fanout_name_store(out, arg) == 0) {
+            REPLY_IF(s, from, "401", (const char *const[]){ "<too long>" }, 1,
+                        "No such nick/channel");
+            return 0;
+        }
         out->kind = FANOUT_REMOTE_USER;
         return 1;
     }
@@ -380,12 +485,25 @@ int fanout_resolve(server_t *s, conn_t *from, const char *arg,
     user = fanout_find_nick(s, arg);
     if (user == NULL) {
         if (from != NULL) {
-            (void)reply(s, from, "401", (const char *const[]){ arg }, 1,
+            REPLY_IF(s, from, "401", (const char *const[]){ arg }, 1,
                         "No such nick/channel");
         }
         return 0;
     }
-    memcpy(out->name, user->nick, strlen(user->nick) + 1u);
+    /* AND THE LAST BRANCH, which is the one a bare nickname takes: the registry
+     * resolved it, so the target is a local user and the name stored is that
+     * user's own nick rather than what the client typed. `valid_nick()` already
+     * asked conn_text_display_check() about it, so this store cannot fail on a
+     * nick this node holds -- and it goes through fanout_name_store() anyway,
+     * because "this cannot fail" is a property of a guard three files away and
+     * the store is the thing that has to be right about its own buffer. */
+    if (fanout_name_store(out, user->nick) == 0) {
+        if (from != NULL) {
+            REPLY_IF(s, from, "401", (const char *const[]){ "<too long>" }, 1,
+                        "No such nick/channel");
+        }
+        return 0;
+    }
     out->user = user;
     out->kind = FANOUT_LOCAL_USER;
     return 1;

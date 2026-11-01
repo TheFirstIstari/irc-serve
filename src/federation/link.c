@@ -2054,6 +2054,15 @@ int fed_open(server_t *s, const char *secret)
                    IRC_FED_MAX_SECRET);
             return -1;
         }
+        if (len != 0u && len < 16u) {
+            /* A short shared secret is guessable online: the FEDERATE endpoint is
+             * reachable by anyone who can open a socket, and there is no lockout.
+             * Refusing would break nodes that legitimately use short test
+             * secrets, so this is a warning rather than a refusal; production
+             * deployments should use at least 16 bytes of entropy. */
+            printf("[observable] link_open_warning: reason=SECRET_SHORT len=%zu "
+                   "recommended_min=16\n", len);
+        }
         memcpy(g_secret, secret, len + 1u);
         g_secret_len = len;
     } else {

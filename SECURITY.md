@@ -151,6 +151,36 @@ client never sent.
 
 ### Not defended
 
+**0. Simultaneous dials. A symmetrically-configured mesh does not federate, and
+this is documented rather than fixed — see below.**
+
+Two nodes each given `--peer` pointing at the other never establish. Both
+connections complete at the TCP level, both links reach `HANDSHAKE_SENT`, and
+then each node's link reports `link_timeout: state=TIMED_OUT
+cause=SOCKET_GONE`, falls back to `INIT`, and dials again — for as long as the
+processes run. Re-running with the `--peer` on **one** side only establishes
+normally, which is why this is easy to mistake for a configuration error.
+
+It is a **documented availability limitation, not a security one**: nobody gains
+anything they should not have, nothing is disclosed, and the failing mode is a
+loud `link_timeout:` line on every retry rather than a silent acceptance. The
+operational rule that follows is: **give `--peer` to one side of each pair.**
+
+*Why it is documented and not fixed here.* The defect is a scheduling
+interaction between two subsystems that are each correct alone — the nonblocking
+dial FSM (`server_dial_*`, 3.4) and the listener's claim path
+(`fed_claim_accepted()`) — and the fix is a decision about which of the two
+sockets wins when both nodes dial at once: which side is the dialler, which is
+the accepter, and how the tie is broken (name order? epoch? first socket?).
+That is an architecture question about federation identity, and it is not one to
+answer inside a security pass whose subject is control bytes. The handshake FSM
+in `federation/link.c` has taken four separate corrections in this area already
+(`SOCKET_GONE`, the `NO_ANSWER` twin, the T2 arm, the missing `fed_link_set_state()`
+mirror), each of them a "belt to braces" for a race the previous correction
+exposed — which is the evidence that ad-hoc patches in this neighbourhood have
+not converged and that the next one would be a guess. The honest next step is a
+design decision recorded in `docs/SPEC_TRACKING.md`, not a fifth correction.
+
 **1. A relay strip removes bytes, and the two groups it removes are not symmetric.**
 
 `PRIVMSG`/`NOTICE` text is relayed to other clients with ESC, BEL, DEL and the
@@ -451,6 +481,43 @@ secret.
 what it is sent. It cannot, by design of the current build, reach the filesystem
 or execute anything — but that is a property of what has been implemented, not
 an access control, and it should not be relied on as one.
+
+### Session resume (Phase 9)
+
+The restore key is `(nick, ident, observed host, account)`, compared
+case-insensitively (`account` is empty for unauthenticated sessions). A window
+recorded for an authenticated SASL account only matches a reconnecting client
+that authenticated as the same account; an unauthenticated client on the same
+host cannot match or consume it. For unauthenticated sessions (`account` empty),
+`ident` is client-asserted and `host` is the observed peer address, so a client
+that shares the victim's observed host (NAT, office, carrier CGNAT, shared
+bouncer, Tor exit) and presents the victim's nick and ident (both visible in
+any shared channel) without authenticating can resume the victim's window
+within the 120 s window. Restoring a matched window rejoins its channels and
+re-grants recorded prefixes (`+o`) on locally owned channels for both
+authenticated and unauthenticated windows (authenticated windows additionally
+verify that the reconnecting client's `account` matches before re-granting;
+non-origin nodes never re-grant prefixes on federated channels). Consequently,
+an unauthenticated window resumed by a same-host attacker inherits both channel
+memberships and any recorded prefixes on locally owned channels. Operators who
+need stronger assurance should require SASL authentication.
+
+### SASL
+
+There is no per-IP rate limit and no account lockout. A single connection is
+capped at three failed credential verifications before further attempts are
+refused without verification; an attacker can still open many connections. The
+credential store is mode 0600 and is never printed. Error text does not
+distinguish an unknown account from a wrong password.
+
+### Federation
+
+One shared secret authenticates the whole mesh: any holder of it may present
+any server name that is not currently connected. The `FEDERATE` handshake
+endpoint is reachable by anyone who can open a socket to the federation port;
+it is gated by the secret, with no attempt throttling. Use a secret of at least
+16 bytes of entropy and restrict the federation port at the network layer.
+Plaintext links carry the secret on the wire.
 
 Do not expose this build to the public internet. It is a development
 milestone: Phases 1-4 of 9 are merged.

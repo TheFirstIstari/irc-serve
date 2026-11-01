@@ -133,9 +133,9 @@ typedef enum {
  *
  * The width is written as the larger of the two things a target can be, so
  * raising conn_t::nick or chan_t::name cannot leave this buffer short: a
- * nickname is IRC_MAX_NICK bytes and a channel name is CHAN_MAX_NAME, and the
- * struct widths they come from are 64 either way. */
-#define FANOUT_NAME_MAX 64
+ * nickname is IRC_MAX_NICK bytes and a server name is IRC_MAX_SERVER_NAME bytes,
+ * plus the `@` separator and the NUL, so a fully qualified `nick@server` fits. */
+#define FANOUT_NAME_MAX (IRC_MAX_NICK + 1 + IRC_MAX_SERVER_NAME + 1)
 
 typedef struct {
     fanout_kind_t  kind;
