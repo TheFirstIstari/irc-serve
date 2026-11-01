@@ -304,7 +304,7 @@ size_t message_tags_format(const message_tag_t *tags, size_t ntags,
  * ------------------------------------------------------------------------ */
 
 /* --------------------------------------------------------------------------
- * The one allocation
+ * The one buffer, and where it lives
  * --------------------------------------------------------------------------
  * buf holds two regions:
  *
@@ -319,6 +319,11 @@ size_t message_tags_format(const message_tag_t *tags, size_t ntags,
  * total at most `text`, and there are at most IRC_MAX_PARAMS + 3 of them (tags,
  * prefix, command and the params), each needing one terminator byte. The
  * region is therefore text + IRC_MAX_PARAMS + 3 bytes at most.
+ *
+ * ST-1: that buffer is the message_t's own inline scratch when it fits there
+ * and one malloc when it does not. The choice is made once, by size, at the
+ * allocation point below; everything after that only knows `buf`. msg_buf_free()
+ * beside the release sites is the one place that answers "scratch or heap".
  *
  * field_put() bounds-checks anyway and turns an overflow into a rejection, so
  * a mistake in that reasoning cannot become a heap overflow. */
@@ -357,6 +362,18 @@ static char *field_put_up(field_t *f, const char *s, size_t n)
     return dst;
 }
 
+/* Release a parse/build buffer to the right place: the heap fallback is
+ * freed, the inline scratch is not. The test is the pointer, not a flag, so
+ * there is nothing to keep in step -- `buf` either is `scratch` or it is
+ * not. A NULL buffer (a malloc that failed before anything was published)
+ * releases nothing. */
+static void msg_buf_free(message_t *out, char *buf)
+{
+    if (buf != NULL && out != NULL && buf != out->scratch) {
+        free(buf);
+    }
+}
+
 int message_parse_n(const char *line, size_t len, message_t *out)
 {
     if (out == NULL) {
@@ -390,7 +407,13 @@ int message_parse_n(const char *line, size_t len, message_t *out)
         }
     }
 
-    char *const buf = (char *)malloc(2 * text + (size_t)IRC_MAX_PARAMS + 4);
+    /* ST-1 fast path: the common line never reaches the allocator. `out` was
+     * just zeroed above, so `out->scratch` is addressable here; the fallback
+     * is exactly the one malloc this function always did. */
+    size_t need = 2 * text + (size_t)IRC_MAX_PARAMS + 4;
+    char *buf = (need <= sizeof out->scratch) ? out->scratch
+                                               : (char *)malloc(need);
+
     if (buf == NULL) {
         return -1;
     }
@@ -422,7 +445,7 @@ int message_parse_n(const char *line, size_t len, message_t *out)
         }
         const size_t blocklen = (size_t)(p - block);
         if (p == block || tag_block_valid(block, blocklen) != 1) {
-            free(buf);
+            msg_buf_free(out, buf);
             return -1;
         }
         tags = field_put(&f, block, blocklen);
@@ -440,7 +463,7 @@ int message_parse_n(const char *line, size_t len, message_t *out)
             p++;
         }
         if (p == source) {
-            free(buf); /* a source is never empty */
+            msg_buf_free(out, buf); /* a source is never empty */
             return -1;
         }
         prefix = field_put(&f, source, (size_t)(p - source));
@@ -458,7 +481,7 @@ int message_parse_n(const char *line, size_t len, message_t *out)
         p++;
     }
     if (p == cmd) {
-        free(buf); /* no command word */
+        msg_buf_free(out, buf); /* no command word */
         return -1;
     }
     command = field_put_up(&f, cmd, (size_t)(p - cmd));
@@ -501,7 +524,7 @@ int message_parse_n(const char *line, size_t len, message_t *out)
     }
 
     if (f.overflow != 0) {
-        free(buf);
+        msg_buf_free(out, buf);
         return -1;
     }
 
@@ -533,7 +556,11 @@ void message_free(message_t *m)
     if (m == NULL) {
         return;
     }
-    free(m->buf);
+    /* ST-1: only the heap fallback is freed. A scratch message's `buf` points
+     * into the struct itself, and freeing it would free the caller's stack. */
+    if (m->buf != NULL && m->buf != m->scratch) {
+        free(m->buf);
+    }
     memset(m, 0, sizeof *m);
 }
 
@@ -576,7 +603,12 @@ int message_build(message_t *out,
         need += strlen(params[i]) + 1;
     }
 
-    char *const buf = (char *)malloc(need);
+    /* ST-1 fast path, same shape as the parser's: the common message never
+     * reaches the allocator, and the fallback is exactly the one malloc this
+     * function always did. `out` was just zeroed above, so the scratch is
+     * addressable. */
+    char *buf = (need <= sizeof out->scratch) ? out->scratch
+                                               : (char *)malloc(need);
     if (buf == NULL) {
         return -1;
     }

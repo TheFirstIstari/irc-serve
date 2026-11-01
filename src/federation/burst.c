@@ -1490,44 +1490,110 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
  * ---------------------------------------------------------------------------
  */
 
-/* The host a burst's nick record announced, or NULL. A member whose nick was
- * never announced -- because the peer sent the member line and not the nick line,
- * or in the other order -- gets no host, and that is NOT an error: it is the
- * state a live SJOIN leaves a member in, and treating it as one would make a
- * perfectly correct peer look broken. */
-static const char *shadow_host(const char *nick)
+/* The commit-time index over the staged nick records, and the one lookup the
+ * member install makes.
+ *
+ * apply_end() installs up to one roster entry per (channel, member), and each
+ * of those used to walk the whole staged nick list TWICE -- once for the host
+ * and once for the ident -- for O(channels x members x nicks) folded compares
+ * on a large resync. The index is built once per commit: an array of staging
+ * positions sorted by (folded nick, staging position), so one binary search
+ * serves both fields in O(log n) and finds the FIRST staged record for a nick
+ * -- the same record the old linear walks returned, including under duplicate
+ * nick records.
+ *
+ * THE FOLD IS chan_same_name'S: ASCII-only (CASEMAPPING=ascii), which is the
+ * same partition server.c's nick table folds into, so "equal under the index"
+ * and "equal under the roster" are one answer. The search key carries staging
+ * position zero, i.e. a lower bound, which is what makes the first-staged
+ * record win rather than an arbitrary one. The hit is still confirmed with
+ * chan_same_name(), so a false positive is impossible even if a fold ever
+ * diverged; the worst case is a miss, which is the "never announced" arm
+ * below and therefore a safe direction.
+ *
+ * A member whose nick was never announced -- because the peer sent the member
+ * line and not the nick line, or in the other order -- gets no host, and that
+ * is NOT an error: it is the state a live SJOIN leaves a member in, and
+ * treating it as one would make a perfectly correct peer look broken. Hence
+ * NULL, not -1. */
+static char burst_fold(char c)
 {
-    for (size_t i = 0; i < g_shadow.nnicks; i++) {
-        if (chan_same_name(g_shadow.nicks[i].nick, nick)) {
-            return g_shadow.nicks[i].host;
-        }
+    if (c >= 'A' && c <= 'Z') {
+        return (char)(c + ('a' - 'A'));
     }
-    return NULL;
+    return c;
 }
 
-/* The IDENT a burst's nick record announced, or NULL on the same rule
- * shadow_host() has.
- *
- * IT IS A SECOND WALK RATHER THAN A THIRD FIELD RETURNED BY THE FIRST, and the
- * reason is that the two answers are asked separately and may be asked in either
- * order relative to each other -- `apply_nick()` fills the shadow before the
- * member loop runs, but nothing in this file promises that a future caller will
- * keep that order, and a function that returned both would be wrong the moment one
- * of them was wanted without the other. The walk is O(n) over the nicks a burst
- * announced, once per member of the burst, and a burst is a resync rather than a
- * hot path; the honest cost is O(n*m) on a large burst and it is paid once.
- *
- * WHY IT EXISTS AT ALL: 4.3's SBURSTN carries `<user>`, the shadow below has
- * stored it since Phase 6, and this file copied only the HOST out of it. Half a
- * hostmask was being discarded, which cost nothing until Phase 10.5's
- * `userhost-in-names` needed to draw `nick!user@host` for a member this node does
- * not host -- a remote member has no conn_t to read the pair from. */
-static const char *shadow_ident(const char *nick)
+/* Folded order on two nicknames: negative/zero/positive like strcmp. */
+static int burst_fold_cmp(const char *a, const char *b)
 {
-    for (size_t i = 0; i < g_shadow.nnicks; i++) {
-        if (chan_same_name(g_shadow.nicks[i].nick, nick)) {
-            return g_shadow.nicks[i].user;
+    size_t i = 0u;
+
+    for (;; i++) {
+        char ca = burst_fold(a[i]);
+        char cb = burst_fold(b[i]);
+
+        if (ca != cb) {
+            return (ca < cb) ? -1 : 1;
         }
+        if (ca == '\0') {
+            return 0;
+        }
+    }
+}
+
+/* qsort order for the index: folded nick first, staging position second so
+ * that the first-staged record among equals sorts first. */
+static int burst_nick_order_cmp(const void *pa, const void *pb)
+{
+    size_t ia = *(const size_t *)pa;
+    size_t ib = *(const size_t *)pb;
+    int c = burst_fold_cmp(g_shadow.nicks[ia].nick, g_shadow.nicks[ib].nick);
+
+    if (c != 0) {
+        return c;
+    }
+    if (ia < ib) {
+        return -1;
+    }
+    if (ia > ib) {
+        return 1;
+    }
+    return 0;
+}
+
+/* The staged record for `nick`, or NULL on the "never announced" rule above.
+ * `order` is the commit index, or NULL when nothing was staged or the commit
+ * could not fund one -- in which case this is the old linear walk, first
+ * staged record wins, so a commit without an index still converges. */
+static const burst_nick_t *shadow_find(const size_t *order, const char *nick)
+{
+    size_t lo = 0u;
+    size_t hi = g_shadow.nnicks;
+
+    if (nick == NULL) {
+        return NULL;
+    }
+    if (order == NULL) {
+        for (size_t i = 0; i < g_shadow.nnicks; i++) {
+            if (chan_same_name(g_shadow.nicks[i].nick, nick)) {
+                return &g_shadow.nicks[i];
+            }
+        }
+        return NULL;
+    }
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2u;
+
+        if (burst_fold_cmp(g_shadow.nicks[order[mid]].nick, nick) < 0) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo < g_shadow.nnicks &&
+        chan_same_name(g_shadow.nicks[order[lo]].nick, nick)) {
+        return &g_shadow.nicks[order[lo]];
     }
     return NULL;
 }
@@ -1558,9 +1624,25 @@ static const char *shadow_ident(const char *nick)
  * The rule is checked in BOTH directions -- a local member counts -- so the common
  * two-node case, where the origin reports a member this node itself hosts, does
  * not become a self-membership. */
-static int member_known(const chan_t *ch, const char *nick)
+static int member_known(const server_t *s, const chan_t *ch, const char *nick)
 {
-    if (chan_find_nick(ch, nick) != NULL) {
+    /* THE LOCAL ARM, through the nick table rather than the member list. A
+     * nickname is claimed once per fold (server_nick_claim), and the table
+     * folds the same ASCII fold the roster compares with, so the conn it
+     * returns for `nick` is the only conn that could match -- and a pointer
+     * probe for that conn in this channel answers the membership question
+     * without a folded compare per local member. The s == NULL arm keeps the
+     * old walk for a caller with no table to ask; apply_end() always has one. */
+    if (ch == NULL || nick == NULL) {
+        return 0;
+    }
+    if (s != NULL) {
+        conn_t *local = server_nick_lookup(s, nick);
+
+        if (local != NULL && chan_find_member(ch, local) != NULL) {
+            return 1;
+        }
+    } else if (chan_find_nick(ch, nick) != NULL) {
         return 1;
     }
     for (size_t i = 0; i < ch->nremotes; i++) {
@@ -1671,6 +1753,13 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
     size_t installed = 0u;
     size_t purged = 0u;
     size_t dropped = 0u;
+    /* THE COMMIT INDEX over the staged nick records, or NULL when nothing was
+     * staged or the commit could not fund one. Built once, read once per
+     * member below, freed when the install is done: the purge walk after it
+     * names channels, not nicks, and has nothing to ask it. NULL is not an
+     * error -- shadow_find() walks linearly instead, so the commit still
+     * converges, slowly, rather than failing for lack of an accelerator. */
+    size_t *nick_order = NULL;
     /* WHEN THE TRANSACTION WAS COMMITTED, and it is read HERE rather than inside
      * the registry call because 4.3.1's rule is that a burst's effect is dated by
      * the moment it was COMMITTED and not by any stamp a record carried. A record
@@ -1792,6 +1881,18 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
         (void)fed_nickreg_resolve_local(s, n->nick, applied_ms);
     }
 
+    /* --- the staged-nick index, built once for the install below --------- */
+    if (g_shadow.nnicks > 0u) {
+        nick_order = (size_t *)malloc(g_shadow.nnicks * sizeof *nick_order);
+        if (nick_order != NULL) {
+            for (size_t i = 0; i < g_shadow.nnicks; i++) {
+                nick_order[i] = i;
+            }
+            qsort(nick_order, g_shadow.nnicks, sizeof *nick_order,
+                  burst_nick_order_cmp);
+        }
+    }
+
     /* --- the install, channel by channel --------------------------------- */
     for (size_t i = 0; i < g_shadow.nchan_used; i++) {
         const burst_chan_t *sc = &g_shadow.chans[i];
@@ -1885,9 +1986,9 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
         }
 
         for (size_t k = 0; k < sc->nmembers; k++) {
-            const char *host;
+            const burst_nick_t *rec;
 
-            if (member_known(ch, sc->members[k].nick) != 0) {
+            if (member_known(s, ch, sc->members[k].nick) != 0) {
                 continue;
             }
             if (chan_remote_add(ch, origin, sc->members[k].server,
@@ -1906,28 +2007,26 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
              * it would forward the message to a server that does not hold bob. */
             fed_nickreg_learn_member(s, sc->members[k].nick, origin,
                                      sc->members[k].server, applied_ms);
-            host = shadow_host(sc->members[k].nick);
-            if (host != NULL) {
-                (void)chan_remote_set_host(ch, origin, sc->members[k].nick, host);
-            }
-            /* AND THE IDENT, from the same shadow record and by the same lookup,
-             * for the reason shadow_ident() gives. It is set SEPARATELY rather than
-             * as a second half of the host setter because the two have different
-             * failure modes on the wire -- 4.3's SJOIN carries neither, and a burst
-             * may announce a member line for a nick whose nick record arrived in a
-             * different order or not at all -- so one of them being absent must not
-             * cost the other. */
-            {
-                const char *ident = shadow_ident(sc->members[k].nick);
-
-                if (ident != NULL) {
-                    (void)chan_remote_set_user(ch, origin, sc->members[k].nick,
-                                               ident);
-                }
+            /* THE HOST AND THE IDENT, from the one staged record for this nick
+             * and by the one search shadow_find() documents. They are SET
+             * SEPARATELY rather than as one call because the two have different
+             * failure modes on the wire -- 4.3's SJOIN carries neither, and a
+             * burst may announce a member line for a nick whose nick record
+             * arrived in a different order or not at all -- so one of them being
+             * absent must not cost the other. The setters take the absence
+             * independently for the same reason. */
+            rec = shadow_find(nick_order, sc->members[k].nick);
+            if (rec != NULL) {
+                (void)chan_remote_set_host(ch, origin, sc->members[k].nick,
+                                           rec->host);
+                (void)chan_remote_set_user(ch, origin, sc->members[k].nick,
+                                           rec->user);
             }
             installed++;
         }
     }
+
+    free(nick_order);
 
     /* --- and the channels this origin no longer has ------------------------ */
     /* THE OTHER HALF OF REPLACE, and the half a per-channel purge cannot reach.

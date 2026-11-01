@@ -24,21 +24,13 @@
 /* ---------------------------------------------------------------------------
  * PRIVMSG and NOTICE
  * ---------------------------------------------------------------------------
- * One implementation, two verbs, and the ONLY difference is the `exclude`
- * argument handed to fanout_deliver(). That is not a simplification for its own
- * sake: RFC 2812 3.3.2 defines NOTICE as PRIVMSG with a non-reply guarantee,
- * and the guarantee belongs in the one place that writes lines rather than in
- * two handlers that could drift.
- */
-
-/* ---------------------------------------------------------------------------
- * PRIVMSG and NOTICE
- * ---------------------------------------------------------------------------
  * One implementation, two verbs. The echo difference is the `exclude` argument
  * handed to fanout_deliver(), and the membership difference is the one `if`
  * below; everything else -- arity, the line cap, 401, 403 -- is shared, which is
  * what makes "the two verbs behave alike except where the RFC says they must
- * not" a property of the code rather than a claim about it.
+ * not" a property of the code rather than a claim about it. Per RFC 2812 3.3.2,
+ * NOTICE is PRIVMSG with a non-reply guarantee, and the guarantee belongs in
+ * the one place that writes lines rather than in two handlers that could drift.
  */
 static void send_message(server_t *s, conn_t *c, const message_t *m,
                          const char *verb, int is_notice)
@@ -495,8 +487,8 @@ void handle_notice(server_t *s, conn_t *c, const message_t *m)
  * is reported as the higher of the two -- a lossy answer, and the same lossy
  * answer it gets in 353 without the capability. That is what the capability is
  * for. */
-static void who_flags(char *out, size_t cap, const conn_t *c, const chan_t *ch,
-                      int multiprefix)
+static void who_flags(char *out, size_t cap, const conn_t *c,
+                      unsigned member_flags, int multiprefix)
 {
     size_t n = 0;
 
@@ -506,15 +498,15 @@ static void who_flags(char *out, size_t cap, const conn_t *c, const chan_t *ch,
         /* INDEPENDENT TESTS, not an `else if` chain: +o and +v are
          * independent bits and an op+voice member is exactly the case the
          * capability exists for. In PREFIX order, for the reason cap.h gives. */
-        if (ch != NULL && chan_has_flag(ch, c, CHAN_MEMBER_OP)) {
+        if ((member_flags & CHAN_MEMBER_OP) != 0u) {
             out[n++] = '@';
         }
-        if (ch != NULL && chan_has_flag(ch, c, CHAN_MEMBER_VOICE)) {
+        if ((member_flags & CHAN_MEMBER_VOICE) != 0u) {
             out[n++] = '+';
         }
-    } else if (ch != NULL && chan_has_flag(ch, c, CHAN_MEMBER_OP)) {
+    } else if ((member_flags & CHAN_MEMBER_OP) != 0u) {
         out[n++] = '@';
-    } else if (ch != NULL && chan_has_flag(ch, c, CHAN_MEMBER_VOICE)) {
+    } else if ((member_flags & CHAN_MEMBER_VOICE) != 0u) {
         out[n++] = '+';
     }
     if (n >= cap) {
@@ -546,14 +538,15 @@ static const char *user_or_dash(const conn_t *c)
  * the socket for has been forwarded nowhere. A node answering 1 here would be
  * claiming a relay that did not happen. */
 static void who_entry(server_t *s, conn_t *dst, const conn_t *who,
-                      const char *channel, const chan_t *ch, int multiprefix)
+                      const char *channel, unsigned member_flags,
+                      int multiprefix)
 {
     /* Five bytes, not four: 'G' or 'H', then '@', then '+', then the NUL. The
      * fourth byte the old four-byte buffer had was room for ONE sigil, and
      * multi-prefix is two. */
     char flags[5];
 
-    who_flags(flags, sizeof flags, who, ch, multiprefix);
+    who_flags(flags, sizeof flags, who, member_flags, multiprefix);
     (void)reply(s, dst, "352",
                 (const char *const[]){ (channel != NULL) ? channel : "*",
                                         user_or_dash(who), who->host, s->name, who->nick,
@@ -610,7 +603,8 @@ void handle_who(server_t *s, conn_t *c, const message_t *m)
                 ch->members[i].c->nick[0] == '\0') {
                 continue;
             }
-            who_entry(s, c, ch->members[i].c, ch->name, ch, multiprefix);
+            who_entry(s, c, ch->members[i].c, ch->name, ch->members[i].flags,
+                      multiprefix);
         }
         (void)reply(s, c, "315", (const char *const[]){ ch->name }, 1,
                     "End of WHO list");
@@ -642,7 +636,7 @@ void handle_who(server_t *s, conn_t *c, const message_t *m)
         if (fanout_mask_match(mask, who->nick) == 0) {
             continue;
         }
-        who_entry(s, c, who, NULL, NULL, multiprefix);
+        who_entry(s, c, who, NULL, 0u, multiprefix);
     }
     (void)reply(s, c, "315", (const char *const[]){ mask }, 1,
                 "End of WHO list");
@@ -723,6 +717,8 @@ static void send_whois_channels(server_t *s, conn_t *dst, const conn_t *who)
 
     for (size_t i = 0; i < who->nchans; i++) {
         const chan_t *ch = who->chans[i];
+        const struct member *m;
+        unsigned flags;
         const char *sigil;
         size_t slen;
         size_t nlen;
@@ -730,9 +726,11 @@ static void send_whois_channels(server_t *s, conn_t *dst, const conn_t *who)
         if (ch == NULL || ch->name[0] == '\0') {
             continue; /* a chan_t this node no longer holds: nothing to name */
         }
-        if (chan_has_flag(ch, who, CHAN_MEMBER_OP) != 0) {
+        m = chan_find_member(ch, who);
+        flags = (m != NULL) ? m->flags : 0u;
+        if ((flags & CHAN_MEMBER_OP) != 0u) {
             sigil = "@";
-        } else if (chan_has_flag(ch, who, CHAN_MEMBER_VOICE) != 0) {
+        } else if ((flags & CHAN_MEMBER_VOICE) != 0u) {
             sigil = "+";
         } else {
             sigil = "";
@@ -1207,49 +1205,57 @@ static void notify_away(server_t *s, conn_t *c, const char *message)
         params[0] = message;
     }
 
-    /* ONE FANOUT CALL PER CHANNEL, and the walk is over `c->chans` -- the
+    /* ONE DIRECT TARGET PER CHANNEL, and the walk is over `c->chans` -- the
      * connection's own membership, which 2.2 keeps as a second list beside the
-     * channel's for exactly this kind of teardown-and-notification use. Each
-     * channel is resolved through `fanout_resolve()` rather than looked up in the
-     * registry, because resolution is the only place that answers "is this a
-     * channel" and a caller that went around it would have to answer the question
-     * a second way. The class is `message`: this is not a state change, it is an
-     * observation, and the class decides the forward arm -- which the local-only
-     * entry point does not have.
+     * channel's for exactly this kind of teardown-and-notification use. The
+     * target is built DIRECTLY from the chan_t in hand, not resolved through
+     * `fanout_resolve()`: the channel is already known (it is the member
+     * list being walked), so a registry resolve would answer a question with
+     * only one answer -- the per-iteration hash probe that made a ten-byte
+     * AWAY cost milliseconds at high membership. The class is `message`: this
+     * is not a state change, it is an observation, and the class decides the
+     * forward arm -- which the local-only entry point does not have.
      *
      * THE WALK IS BOUNDED, AND THE BOUND IS A CONSTANT RATHER THAN `c->nchans`.
-     * Why it exists: `AWAY` is a ten-byte line and this walk is the most
-     * expensive thing a ten-byte line can cause, because each iteration
-     * resolves a channel in the registry and fans out to that channel's member
-     * list. With no cap on `c->nchans` at all, the measured cost was 9.6 ms of
-     * event-loop time per AWAY for a client holding 1024 channels, and nothing
-     * rate-limited the verb, so the ratio was 10 bytes in to 9.6 ms out.
-     * `CONN_MAX_CHANNELS` now bounds membership (see connection.h), so the
-     * number below is the SAME bound expressed at the walk rather than a second
-     * policy: a legitimate operator holding up to the cap is notified in full,
-     * and a connection that somehow holds more -- federation filling
-     * `conn_t::chans` is the shape that would do it -- stops at the bound and
-     * SAYS SO rather than consuming an unbounded slice of the loop silently.
+     * `CONN_MAX_CHANNELS` bounds membership (see connection.h), so the bound
+     * below is the SAME bound expressed at the walk rather than a second
+     * policy: a legitimate client is notified in full, and a connection that
+     * somehow holds more -- federation filling `conn_t::chans` is the shape
+     * that would do it -- stops at the bound and SAYS SO (the `truncated=1`
+     * observable below) rather than consuming an unbounded slice of the loop
+     * silently. A bound on what one event may cost, not a rate limit: away
+     * notify is a specification feature whose whole value is that it is not
+     * approximate.
      *
-     * WHY IT IS NOT A RATE LIMIT, which is the other answer one could give here:
-     * a rate limit suppresses the NOTIFICATION for a real user toggling their
-     * away state, and away-notify is a specification feature whose whole value is
-     * that it is not approximate. A bound on what one event may cost is the
-     * failure mode the audit actually measured -- cost proportional to an
-     * attacker-chosen number -- and it is the one that cannot break a legitimate
-     * client, because a legitimate client is below it by construction. */
+     * THE NAME IS CHECKED, NOT RESOLVED. `fanout_resolve()` used to stand
+     * between this walk and `t.name`, and its `fanout_name_store()` refused
+     * unrenderable bytes before they could reach the struct -- and from there
+     * the observable log line. Building the target directly removes that
+     * checkpoint, so the walk keeps the property itself: one
+     * `conn_text_display_check()` pass over a bounded name (not a registry
+     * probe), and a name that fails it is skipped like a channel this node no
+     * longer holds. Channel creation already refuses such names centrally;
+     * this is the backstop for the federation-filled shape above. */
     {
         size_t walked = 0u;
         int truncated = (c->nchans > AWAY_NOTIFY_MAX_CHANNELS) ? 1 : 0;
 
         for (size_t i = 0; i < c->nchans && i < AWAY_NOTIFY_MAX_CHANNELS;
              i++) {
+            chan_t *ch = c->chans[i];
             fanout_target_t t;
 
-            if (c->chans[i] == NULL ||
-                fanout_resolve(s, c, c->chans[i]->name, FANOUT_MESSAGE, &t) == 0) {
+            if (ch == NULL || ch->name[0] == '\0') {
                 continue; /* a chan_t this node no longer holds: nothing to address */
             }
+            if (conn_text_display_check(ch->name) != CONN_DISPLAY_OK) {
+                continue; /* not storable in t.name: nothing safe to address */
+            }
+            memset(&t, 0, sizeof t);
+            t.kind = FANOUT_LOCAL_CHANNEL;
+            t.vclass = FANOUT_MESSAGE;
+            t.chan = ch;
+            memcpy(t.name, ch->name, sizeof t.name);
             delivered += fanout_deliver_local_gated(s, &t, prefix, "AWAY", &plain,
                                                     NULL, cap_gate_away_notify,
                                                     NULL, c);
@@ -1258,8 +1264,8 @@ static void notify_away(server_t *s, conn_t *c, const char *message)
         /* THE TRUNCATION IS REPORTED, not silently absorbed: a walk that stopped
          * early because it hit the bound is a walk whose audience was smaller than
          * the client's membership, and an operator reading `channels=40` beside
-         * `walked=8` can see it. A resolve failure is not truncation -- it is a
-         * channel this node no longer holds, and it does not count against the
+         * `walked=8` can see it. A skipped channel is not truncation -- it is a
+         * channel this node cannot address, and it does not count against the
          * bound. */
         printf("[observable] away_notify: nick=%s channels=%zu walked=%zu "
                "bound=%d recipients=%d state=%s%s\n",

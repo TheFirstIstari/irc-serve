@@ -124,7 +124,12 @@ void fed_obs(const char *fmt, ...)
     va_start(ap, fmt);
     for (const char *p = fmt; *p != '\0'; p++) {
         if (*p != '%') {
-            (void)fputc((int)*p, stdout);
+            const char *span = p;
+
+            while (p[1] != '\0' && p[1] != '%') {
+                p++;
+            }
+            (void)fwrite(span, 1u, (size_t)(p - span + 1), stdout);
             continue;
         }
         if (p[1] == '%') {
@@ -1802,12 +1807,12 @@ static void fed_in_shutdown(server_t *s, server_link_t *link, const char *prefix
         if (chan_server_remove(ch, link->name) > 0) {
             chans++;
         }
-        fed_nickreg_purge_server(s, link->name);
         disposed = chan_dispose_if_empty(s, ch);
         if (disposed == 0) {
             i++;
         }
     }
+    fed_nickreg_purge_server(s, link->name);
 
     /* 3. TELL THE OTHERS, and the excluded link is this one because its socket is
      * about to close. Everything else ESTABLISHED gets a SQUIT for the departing
@@ -2405,15 +2410,6 @@ static void fed_in_squit(server_t *s, server_link_t *link,
             continue;
         }
         purged += chan_remote_purge(ch, gone);
-        /* 2.1's REGISTRY PURGE, and it is here for the reason the roster purge is
-         * here and not in chan_remote_purge(): a SQUIT is positive evidence that
-         * every user of that server is gone, and a registry entry left behind
-         * would be one more claim about a server that announced its own
-         * departure. It is a separate call rather than a side effect of the
-         * roster purge because the two tables are keyed by different things --
-         * (server, nick) versus (nick, server) -- and only the caller knows
-         * which one a given line is about. */
-        fed_nickreg_purge_server(s, gone);
         if (chan_server_remove(ch, gone) > 0) {
             chans++;
         }
@@ -2428,6 +2424,15 @@ static void fed_in_squit(server_t *s, server_link_t *link,
             i++;
         }
     }
+    /* 2.1's REGISTRY PURGE, and it is here for the reason the roster purge is
+     * here and not in chan_remote_purge(): a SQUIT is positive evidence that
+     * every user of that server is gone, and a registry entry left behind
+     * would be one more claim about a server that announced its own
+     * departure. It is a separate call rather than a side effect of the
+     * roster purge because the two tables are keyed by different things --
+     * (server, nick) versus (nick, server) -- and only the caller knows
+     * which one a given line is about. */
+    fed_nickreg_purge_server(s, gone);
     fed_obs("[observable] fed_squit: server=%s chans=%zu purged=%zu remote=%zu server_len=%zu server_bad_bytes=%zu\n", gone,
            chans, purged, (size_t)server_chan_count(s), strlen(gone), conn_text_bad_count(gone));
 

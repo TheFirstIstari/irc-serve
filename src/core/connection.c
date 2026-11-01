@@ -879,6 +879,14 @@ static size_t conn_text_walk(char *dst, size_t cap, const char *src,
         dst[kept] = (char)u;
         kept++;
     }
+    /* A TRUNCATED SEQUENCE AT THE END is the one fault `text_step()` cannot see,
+     * because the terminator is not a byte it is ever asked about: the loop stops at
+     * the NUL and `need` is still positive. That is a real fault and it is the one
+     * a nickname must not have, so the residue is checked here rather than in a
+     * second walk. */
+    if (need > 0u && verdict != NULL) {
+        *verdict = CONN_DISPLAY_UTF8;
+    }
     if (storing != 0) {
         dst[kept] = '\0';
     }
@@ -907,34 +915,8 @@ conn_display_verdict_t conn_text_display_check(const char *s)
     if (s == NULL) {
         return CONN_DISPLAY_OK;
     }
-    /* A TRUNCATED SEQUENCE AT THE END is the one fault `text_step()` cannot see,
-     * because the terminator is not a byte it is ever asked about: the loop stops at
-     * the NUL and `*need` is still positive. That is a real fault and it is the one
-     * a nickname must not have, so the residue is checked here rather than left to
-     * be discovered as a nickname that renders differently on every hop. */
     (void)conn_text_walk(NULL, 0u, s, CONN_TEXT_WIRE, &verdict);
-    if (verdict != CONN_DISPLAY_OK) {
-        return verdict;
-    }
-    {
-        /* The same walk, one more time, asking only about the tail. Two passes over
-         * a nickname is cheap -- a nickname is at most IRC_MAX_NICK bytes and this
-         * runs once per registration and once per NICK -- and the alternative is a
-         * third copy of the "how many continuation bytes does this sequence still
-         * expect" arithmetic, which is the thing this whole refactor exists to
-         * prevent. */
-        size_t need = 0u;
-        size_t skip = 0u;
-
-        for (size_t i = 0; s[i] != '\0'; i++) {
-            (void)text_step((unsigned char)s[i], s + i, &need, &skip, CONN_TEXT_WIRE,
-                            NULL);
-        }
-        if (need > 0u) {
-            return CONN_DISPLAY_UTF8;
-        }
-    }
-    return CONN_DISPLAY_OK;
+    return verdict;
 }
 
 /* ---------------------------------------------------------------------------
@@ -962,6 +944,8 @@ conn_display_verdict_t conn_text_display_check(const char *s)
  * and the two would agree, at the cost of a second pass. */
 size_t conn_text_logsafe(char *out, size_t cap, const char *s)
 {
+    size_t i;
+
     if (out == NULL || cap < 2u) {
         return 0;
     }
@@ -970,7 +954,7 @@ size_t conn_text_logsafe(char *out, size_t cap, const char *s)
         out[1] = '\0';
         return 1u;
     }
-    for (size_t i = 0; s[i] != '\0'; i++) {
+    for (i = 0; s[i] != '\0'; i++) {
         const unsigned char u = (unsigned char)s[i];
 
         if (conn_byte_is_bad((char)u) != 0 || u > 0x7eu) {
@@ -988,6 +972,6 @@ size_t conn_text_logsafe(char *out, size_t cap, const char *s)
             return 1u;
         }
     }
-    (void)snprintf(out, cap, "%s", s);
-    return strlen(out);
+    memcpy(out, s, i + 1u);
+    return i;
 }

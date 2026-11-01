@@ -899,16 +899,18 @@ int fed_nickreg_resolve_local(server_t *s, const char *nick, uint64_t now_ms)
      * one fanout.h gives: the mesh is told ONCE, by the single SNICK below, and a
      * per-channel forward would make the number of lines a peer receives a function
      * of how many channels the user happens to be in. */
-    for (size_t ci = 0, nch = server_chan_count(s); ci < nch; ci++) {
-        chan_t *ch = server_chan_at(s, ci);
-        fanout_target_t ct;
+    if (c->nchans > 0u) {
+        for (size_t ci = 0, nch = server_chan_count(s); ci < nch; ci++) {
+            chan_t *ch = server_chan_at(s, ci);
+            fanout_target_t ct;
 
-        if (ch == NULL || chan_find_member(ch, c) == NULL) {
-            continue;
-        }
-        if (fanout_resolve(s, c, ch->name, FANOUT_STATE_CHANGE, &ct) != 0) {
-            (void)fanout_deliver_local(s, &ct, oldnick, "NICK",
-                                       (const char *const[]){ fresh }, 1, NULL);
+            if (ch == NULL || chan_find_member(ch, c) == NULL) {
+                continue;
+            }
+            if (fanout_resolve(s, c, ch->name, FANOUT_STATE_CHANGE, &ct) != 0) {
+                (void)fanout_deliver_local(s, &ct, oldnick, "NICK",
+                                           (const char *const[]){ fresh }, 1, NULL);
+            }
         }
     }
 

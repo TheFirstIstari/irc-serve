@@ -10,11 +10,18 @@
  * its nick rule.
  *
  * ---------------------------------------------------------------------------
- * MEMORY MODEL -- one allocation, documented contract
+ * MEMORY MODEL -- one buffer, heap only when it has to be
  * ---------------------------------------------------------------------------
- * message_parse() performs EXACTLY ONE heap allocation. `tags`, `prefix`,
- * `command`, `params[]` and `raw` are all pointers into that single buffer
- * (`buf`); there is nothing to free but `buf`.
+ * The fast path allocates NOTHING: parse and build pack their buffer into the
+ * message_t's own inline scratch (MESSAGE_SCRATCH bytes), and only a line that
+ * does not fit there falls back to exactly one malloc. Either way every
+ * pointer in the struct -- `tags`, `prefix`, `command`, `params[]` and `raw`
+ * -- points into that one buffer (`buf`); there is nothing else to free.
+ *
+ * Which of the two `buf` is -- scratch or heap -- is answered by POINTER, not
+ * by a flag: `buf == scratch` means inline. message_free() frees only the
+ * heap case, so a scratch message costs no allocator round-trip at all and a
+ * heap one is still released exactly once.
  *
  * The buffer holds two regions: the received line, verbatim, at the front
  * (that is what `raw` points at), and the parsed fields packed after it. The
@@ -32,7 +39,8 @@
  *     ...
  *     message_free(&m);                                  // always safe
  *
- * message_free() is idempotent: it frees buf (free(NULL) is a no-op) and
+ * message_free() is idempotent: it frees the heap buffer when there is one
+ * (free(NULL) is a no-op, and a scratch message has nothing to free) and
  * zeroes every field, so it is safe on a zeroed struct, safe on a NULL
  * pointer, and safe to call twice. There is no partially built message that
  * a caller can observe, and therefore no half-built message to free.
@@ -69,6 +77,17 @@
 /* Maximum number of parameters, per the struct definition in 3.2. The 15th
  * parameter absorbs the remainder of the line verbatim (3.2). */
 #define IRC_MAX_PARAMS 15
+
+/* ST-1 fast-path scratch: the inline buffer inside message_t that carries the
+ * common case with no heap allocation at all. Sized so the everyday line fits:
+ * message_parse_n() needs 2*text + IRC_MAX_PARAMS + 4 bytes, so 1024 covers a
+ * received line of up to 502 bytes -- every numeric, every short PRIVMSG, the
+ * whole of the ordinary traffic -- and message_build() needs the sum of its
+ * fields plus one terminator each, which is the same neighbourhood for the
+ * lines this node originates. Anything larger falls back to malloc, so the
+ * worst case is exactly today's behaviour: one heap allocation, freed by
+ * message_free(). */
+#define MESSAGE_SCRATCH 1024
 
 /* On-wire line cap, counted INCLUDING the trailing CRLF (3.2). RFC 1459 2.3
  * states a 512 floor, but irssi and weechat send 8192 and ratbox uses 8192
@@ -173,9 +192,17 @@
  *               never copy it (see the top of this file). After
  *               message_build() there is no received line, and raw points at
  *               the start of the buffer instead.
- *   buf      -- the one heap allocation. Owned by the struct; free it only
- *               through message_free().
- */
+ *   buf      -- the one buffer. Owned by the struct, released only through
+ *               message_free(), which frees it when it is heap and does
+ *               nothing when it is the inline scratch below. Never freed or
+ *               reallocated directly: the parse/build fast path answers
+ *               "scratch or heap" by comparing this pointer, and a second
+ *               opinion about it anywhere else is how a stack buffer gets
+ *               freed.
+ *   scratch  -- the ST-1 fast path: MESSAGE_SCRATCH bytes of inline storage
+ *               that carry the common case with no malloc. `buf` points here
+ *               when the message fit and at the heap fallback when it did
+ *               not; see the memory-model note at the top of this file. */
 typedef struct {
     char  *tags;
     char  *prefix;
@@ -184,6 +211,7 @@ typedef struct {
     int    nparams;
     const char *raw;
     char  *buf;
+    char   scratch[MESSAGE_SCRATCH];
 } message_t;
 
 /* A tag key/value pair, for authoring a tag block. `key` must be non-NULL and
