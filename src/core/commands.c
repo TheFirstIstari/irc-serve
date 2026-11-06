@@ -2305,6 +2305,17 @@ static void handle_authenticate(server_t *s, conn_t *c, const message_t *m)
         return;
     }
 
+    /* SASL_FAILED is terminal: a bad credential stays failed. Without this,
+     * AUTHENTICATE * (below) or a fresh AUTHENTICATE PLAIN would clear the
+     * failure and let NICK+USER register anonymously. */
+    if (c->sasl == (int)SASL_FAILED) {
+        (void)reply_refused(s, c, "AUTHENTICATE", "ERR_AUTHENTICATIONFAILED", "464",
+                            NULL, 0, "SASL authentication failed");
+        printf("[observable] sasl: fd=%d outcome=REJECTED reason=ALREADY_FAILED\n",
+               c->fd);
+        return;
+    }
+
     /* AUTHENTICATE * is the ABORT (RFC 4422 3.1), and it is answered before any
      * parsing: a client abandoning an exchange must not have to supply a
      * well-formed one to be allowed to stop. It leaves the connection

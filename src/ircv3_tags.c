@@ -32,9 +32,9 @@ static char ascii_lower(char c)
 /* Do the NUL-terminated key `a` and the `alen`-byte span `b` name the same tag?
  * The span form exists because a key inside a block being parsed is not
  * NUL-terminated -- the '=' or ';' after it is. */
-static int key_eq_span(const char *a, size_t alen, const char *b)
+static int key_eq_span(const char *a, size_t alen, const char *b, size_t blen)
 {
-    if (strlen(a) != alen) {
+    if (alen != blen) {
         return 0;
     }
     for (size_t i = 0; i < alen; i++) {
@@ -50,7 +50,7 @@ static int key_eq(const char *a, const char *b)
     if (a == NULL || b == NULL) {
         return 0;
     }
-    return key_eq_span(a, strlen(a), b);
+    return key_eq_span(a, strlen(a), b, strlen(b));
 }
 
 /* --------------------------------------------------------------------------
@@ -243,7 +243,7 @@ int ircv3_tags_parse(const char *block, ircv3_tags_t *out)
 
             for (size_t i = 0; i < out->npairs; i++) {
                 if (key_eq_span(out->pairs[i].key, strlen(out->pairs[i].key),
-                                kstart) == 0) {
+                                kstart, klen) == 0) {
                     continue;
                 }
                 dup = 1;
