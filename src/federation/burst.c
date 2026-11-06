@@ -865,6 +865,11 @@ void fed_burst_abandon(server_link_t *link)
     if (link == NULL || g_shadow.open == 0) {
         return;
     }
+    /* Only the owner abandons: a link going down must not throw away another
+     * peer's in-flight burst. */
+    if (!chan_same_name(g_shadow.origin, link->name)) {
+        return;
+    }
     printf("[observable] fed_burst_abandon: origin=%s reason=LINK_DOWN nicks=%zu "
            "chans=%zu members=%zu bytes=%zu\n",
            g_shadow.origin, g_shadow.nnicks, g_shadow.nchans, g_shadow.nmembers,
@@ -972,13 +977,19 @@ static int apply_begin(server_t *s, server_link_t *link, const message_t *m)
                link->fd, m->nparams);
         return -1;
     }
-    /* A transaction that is already open is REPLACED, not resumed. That is 4.3's
-     * own rule arriving from the other direction: a BEGIN is a statement that
-     * everything after it is the whole truth, and a truth that starts twice
-     * without ending once has no reading. This is also the guard a peer that
-     * opened a transaction and then sent a second BEGIN cannot use to make this
-     * node hold two shadows' worth of state. */
+    /* A transaction that is already open is REPLACED, not resumed -- but
+     * only by the peer that opened it. That is 4.3's own rule arriving from
+     * the other direction: a BEGIN is a statement that everything after it
+     * is the whole truth. A second BEGIN from the SAME link restarts its
+     * transaction; a BEGIN from another link while one is open is refused
+     * with BUSY, so two peers bursting at once do not destroy each other. */
     if (g_shadow.open != 0) {
+        if (!chan_same_name(g_shadow.origin, link->name)) {
+            printf("[observable] fed_burst_refused: peer=%s reason=BUSY "
+                   "owner=%s\n",
+                   link->name, g_shadow.origin);
+            return -1;
+        }
         shadow_discard(s, "SUPERSEDED", g_shadow.origin, g_shadow.nnicks,
                        g_shadow.nchans, g_shadow.nmembers);
     }
