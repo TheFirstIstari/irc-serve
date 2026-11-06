@@ -71,6 +71,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -272,6 +273,9 @@ static ssize_t tls_recv(conn_t *c, void *buf, size_t len)
     if (ssl == NULL) {
         return TRANSPORT_FATAL;
     }
+    if (len > (size_t)INT_MAX) {
+        return TRANSPORT_FATAL;
+    }
     /* No pending loop here: conn_fill() already calls this again right
      * away after n > 0, and want_read=1 keeps the next poll step reading.
      * Looping with a second SSL_read() into the same buf overwrote the
@@ -338,6 +342,9 @@ static ssize_t tls_send(conn_t *c, const void *buf, size_t len)
     if (len == 0u) {
         tls_publish(c, 1, 0);
         return 0;
+    }
+    if (len > (size_t)INT_MAX) {
+        return TRANSPORT_FATAL;
     }
     {
         int n = SSL_write(ssl, buf, (int)len);
