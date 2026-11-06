@@ -1165,6 +1165,9 @@ static void fed_in_sjoin(server_t *s, server_link_t *link, chan_t *ch,
         /* The `nparams > 1` guard is why the measurement comes from the SAME ternary
          * rather than from `params[1]`: on the branch where the guard failed,
          * params[1] does not exist. */
+        if (chan_remote_count(ch) >= (size_t)CHAN_MAX_REMOTE_MEMBERS) {
+            s->n_remote_roster_full++;
+        }
         fed_obs("[observable] fed_sjoin_reject: channel=%s member=%s server=%s "
                 "member_len=%zu member_bad_bytes=%zu\n",
                ch->name, (nparams > 1) ? params[1] : "?", link->name,

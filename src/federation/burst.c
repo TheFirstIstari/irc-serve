@@ -1994,6 +1994,9 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
             if (chan_remote_add(ch, origin, sc->members[k].server,
                                 sc->members[k].nick, sc->members[k].account,
                                 sc->members[k].flags) != 0) {
+                if (chan_remote_count(ch) >= (size_t)CHAN_MAX_REMOTE_MEMBERS) {
+                    s->n_remote_roster_full++;
+                }
                 dropped++;
                 continue;
             }
