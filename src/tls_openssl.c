@@ -1314,6 +1314,8 @@ static int tls_load_staple(const char *path, unsigned char **out, size_t *outlen
         }
         OPENSSL_free(name);
         OPENSSL_free(hdr);
+        OPENSSL_free(body);
+        body = NULL;
         ERR_clear_error();
     }
     if (probe == NULL) {
@@ -1326,6 +1328,7 @@ static int tls_load_staple(const char *path, unsigned char **out, size_t *outlen
     der_len = i2d_OCSP_RESPONSE(probe, &der);
     OCSP_RESPONSE_free(probe);
     OPENSSL_free(raw);
+    OPENSSL_free(body);
     if (der == NULL || der_len <= 0) {
         printf("[observable] tls_init: state=FAILED path=%s "
                "reason=ocsp_staple_unencodable\n",
