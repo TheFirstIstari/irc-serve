@@ -236,11 +236,10 @@ sasl_store_t *sasl_store_load(const char *path)
         size_t n = strlen(line);
         char *p = line;
 
-        /* A line with no terminator in the buffer is over-long, and it is a
-         * refusal rather than a truncated record: half a password is not a
-         * password, and a store that loaded one would refuse a user whose
-         * credential was the first half of the line. */
-        if (n > 0u && line[n - 1u] != '\n' && !feof(f)) {
+        /* A full buffer with no terminator is over-long, even at EOF:
+         * fgets only returns short on newline or EOF, so a full buffer
+         * means the line did not fit, trailing newline or not. */
+        if (n == sizeof line - 1u && line[n - 1u] != '\n') {
             printf("[observable] sasl_store: state=REFUSED path=%s "
                    "reason=line_too_long\n", path);
             sasl_store_free(store);
