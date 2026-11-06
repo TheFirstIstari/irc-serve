@@ -71,6 +71,9 @@ void poll_loop_clear_stop(void)
 static void conn_readable(server_t *s, conn_t *c)
 {
     char line[IRC_MAX_LINE];
+    /* One sender must not starve the loop: a pipelined burst is framed
+     * across ticks instead of all at once. */
+    unsigned budget = 128u;
 
     for (;;) {
         message_t m;
@@ -135,6 +138,9 @@ static void conn_readable(server_t *s, conn_t *c)
             s->dispatch(s, c, &m);
         }
         message_free(&m);
+        if (--budget == 0u) {
+            return; /* more buffered; the next POLLIN continues */
+        }
     }
 }
 
