@@ -1208,6 +1208,12 @@ int conn_fill(conn_t *c);
  * anywhere else stays inside the line and is rejected by the parser. */
 int conn_next_line(conn_t *c, char *dst, size_t dstcap, size_t *len);
 
+/* True when a full line is already buffered. The poll loop uses it to
+ * revisit a connection the per-step line budget cut off: buffered lines
+ * produce no POLLIN, so without this the remainder would sit until new
+ * bytes arrived. */
+int conn_has_line(const conn_t *c);
+
 /* Append `len` bytes to the write queue. Returns 0 on success, -1 when the
  * append would push the unsent tail past CONN_WQ_MAX, in which case nothing
  * is buffered and nothing is written: the caller marks the connection CLOSING
