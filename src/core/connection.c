@@ -178,6 +178,14 @@ int conn_fill(conn_t *c)
     }
 }
 
+int conn_has_line(const conn_t *c)
+{
+    if (c == NULL || c->rbuf == NULL || c->rlen == 0u) {
+        return 0;
+    }
+    return (memchr(c->rbuf, '\n', c->rlen) != NULL) ? 1 : 0;
+}
+
 int conn_next_line(conn_t *c, char *dst, size_t dstcap, size_t *len)
 {
     const char *nl;
