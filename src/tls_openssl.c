@@ -272,51 +272,34 @@ static ssize_t tls_recv(conn_t *c, void *buf, size_t len)
     if (ssl == NULL) {
         return TRANSPORT_FATAL;
     }
-    for (;;) {
-        int n = SSL_read(ssl, buf, (int)len);
+    /* No pending loop here: conn_fill() already calls this again right
+     * away after n > 0, and want_read=1 keeps the next poll step reading.
+     * Looping with a second SSL_read() into the same buf overwrote the
+     * first record. */
+    int n = SSL_read(ssl, buf, (int)len);
 
-        if (n > 0) {
-            /* Publish intent BEFORE returning, as the interface requires.
-             *
-             * want_write is "the write queue is non-empty": OpenSSL has no opinion
-             * about application bytes this node has not produced yet, and the queue
-             * is the only thing that knows about them. want_read is 1 because there
-             * may be more decrypted bytes, and SSL_pending() below decides whether
-             * waiting for the SOCKET is enough. */
-            tls_publish(c, 1, 0);
-            /* THE PENDING LOOP. OpenSSL can hold decrypted application bytes that
-             * the socket has already been drained of, and poll() will never report
-             * a socket that has nothing in it. So a transport that returned one
-             * record's worth and then waited for POLLIN would strand the rest of a
-             * record the peer already sent -- a line split across two TLS records
-             * would hang with the second half sitting in OpenSSL's buffer and no
-             * event that could ever wake the loop to read it.
-             *
-             * Returning them NOW is what makes that impossible, and it is legal
-             * precisely because connection.c always makes room first. */
-            if (SSL_pending(ssl) > 0) {
-                continue;
-            }
-            /* A HANDSHAKE CAN ALSO COMPLETE ON THE READ PATH -- a server-role one
-             * does, and so does a client-role one whose last flight arrived before
-             * the loop ever asked for writability. The same gate as tls_send's, for
-             * the same reason: whichever arm noticed, the check runs once. */
-            if (tls_after_handshake(c, ssl) != 0) {
-                conn_want(c, 0, 0);
-                return TRANSPORT_FATAL;
-            }
-            return n;
+    if (n > 0) {
+        /* Publish intent BEFORE returning, as the interface requires. */
+        tls_publish(c, 1, 0);
+        /* A HANDSHAKE CAN ALSO COMPLETE ON THE READ PATH -- a server-role one
+         * does, and so does a client-role one whose last flight arrived before
+         * the loop ever asked for writability. The same gate as tls_send's, for
+         * the same reason: whichever arm noticed, the check runs once. */
+        if (tls_after_handshake(c, ssl) != 0) {
+            conn_want(c, 0, 0);
+            return TRANSPORT_FATAL;
         }
-        /* SSL_read() with len 0 is legal and returns 0, which would read as EOF.
-         * connection.c never does it (it guards on room), so this cannot happen
-         * from there; it is here so the ambiguity is answered rather than
-         * assumed. */
-        if (n == 0 && len == 0u) {
-            tls_publish(c, 1, 0);
-            return 0;
-        }
-        return tls_fail(c, ssl, n, "SSL_read");
+        return n;
     }
+    /* SSL_read() with len 0 is legal and returns 0, which would read as EOF.
+     * connection.c never does it (it guards on room), so this cannot happen
+     * from there; it is here so the ambiguity is answered rather than
+     * assumed. */
+    if (n == 0 && len == 0u) {
+        tls_publish(c, 1, 0);
+        return 0;
+    }
+    return tls_fail(c, ssl, n, "SSL_read");
 }
 
 static ssize_t tls_send(conn_t *c, const void *buf, size_t len)
