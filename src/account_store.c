@@ -252,22 +252,24 @@ int account_store_add(account_store_t *store, const char *name,
 static int const_time_eq(const char *a, const char *b)
 {
     unsigned char diff = 0u;
-    size_t i = 0;
+    size_t la;
+    size_t lb;
+    size_t n;
 
     if (a == NULL || b == NULL) {
         return 0;
     }
-    for (;;) {
-        const unsigned char ca = (unsigned char)a[i];
-        const unsigned char cb = (unsigned char)b[i];
+    la = strlen(a);
+    lb = strlen(b);
+    n = (la > lb) ? la : lb;
+    diff = (la != lb) ? 1u : 0u;
+    /* Walk the longer length with zero pad, so the time does not say which
+     * side ended first. */
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char ca = (i < la) ? (unsigned char)a[i] : 0u;
+        const unsigned char cb = (i < lb) ? (unsigned char)b[i] : 0u;
 
         diff |= (unsigned char)(ca ^ cb);
-        /* Stop only when BOTH have ended: a shorter string must be walked out
-         * on the longer one, or the time the walk took would say which. */
-        if (ca == 0u || cb == 0u) {
-            break;
-        }
-        i++;
     }
     return (diff == 0u) ? 1 : 0;
 }
