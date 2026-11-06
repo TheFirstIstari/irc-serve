@@ -1069,6 +1069,9 @@ done:
     if (cid != NULL) {
         OCSP_CERTID_free(cid);
     }
+    if (bs != NULL) {
+        OCSP_BASICRESP_free(bs);
+    }
     if (resp != NULL) {
         OCSP_RESPONSE_free(resp);
     }
