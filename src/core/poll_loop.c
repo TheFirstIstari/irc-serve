@@ -392,6 +392,19 @@ int poll_loop_step(server_t *s, int timeout_ms)
     }
     nfds += dial_nfds;
 
+    /* Buffered lines produce no POLLIN. If the per-connection line budget
+     * cut one off mid-burst, do not sleep on work already in hand. */
+    if (timeout_ms > 0) {
+        for (i = 0; i < SERVER_FD_TABLE; i++) {
+            conn_t *c = s->by_fd[i];
+
+            if (c != NULL && c->state != CONN_CLOSING && conn_has_line(c)) {
+                timeout_ms = 0;
+                break;
+            }
+        }
+    }
+
     /* --- 2. wait --- */
     n = poll(pfds, nfds, timeout_ms);
     if (n < 0) {
@@ -409,7 +422,9 @@ int poll_loop_step(server_t *s, int timeout_ms)
         return -1;
     }
 
-    if (n > 0) {
+    if (n > 0 || timeout_ms == 0) {
+        /* The timeout_ms == 0 arm is the budgeted-lines case above: poll
+         * reported nothing, but full lines are already buffered. */
         /* --- 3. accept, on BOTH listeners ---
          *
          * The plain listener is index 0 when it exists, so the two arms below are
@@ -458,8 +473,10 @@ int poll_loop_step(server_t *s, int timeout_ms)
              * connection CLOSING on a fatal error, and a connection that is
              * on its way out has nothing left worth reading. A connection
              * accepted in step 3 is not in this set at all, so it is not
-             * processed here -- it gets its own iteration. */
-            if ((re & POLLIN) != 0) {
+             * processed here -- it gets its own iteration. A connection cut
+             * off by the line budget still holds full lines but gets no
+             * POLLIN for them, so conn_has_line() revisits it. */
+            if ((re & POLLIN) != 0 || conn_has_line(server_conn(s, fd))) {
                 conn_t *c = server_conn(s, fd);
 
                 if (c != NULL && c->state != CONN_CLOSING) {
