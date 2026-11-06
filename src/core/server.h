@@ -835,6 +835,10 @@ struct server {
     size_t    ntopics;
     size_t    topics_cap;
     uint64_t  n_topic_cache_full;
+    /* Remote roster members dropped because a channel was already at
+     * CHAN_MAX_REMOTE_MEMBERS. The SJOIN path logs and the burst path
+     * counts drops, but neither said it was the cap; this is that number. */
+    uint64_t  n_remote_roster_full;
 
     /* ------------------------------------------------------------------------
      * Phase 9: the client session window. core/resume.c owns the records; this
