@@ -414,11 +414,10 @@ account_store_t *account_store_load(const char *path)
         const size_t n = strlen(line);
         char *p = line;
 
-        /* A line with no terminator in the buffer is over-long, and it is a
-         * REFUSAL rather than a truncated record: half a record is not a record,
-         * and a registry that loaded one would answer for a password the
-         * operator never wrote. */
-        if (n > 0u && line[n - 1u] != '\n' && !feof(f)) {
+        /* A full buffer with no terminator is over-long, even at EOF:
+         * fgets only returns short on newline or EOF, so a full buffer
+         * means the line did not fit, trailing newline or not. */
+        if (n == sizeof line - 1u && line[n - 1u] != '\n') {
             printf("[observable] account_store: state=REFUSED path=%s "
                    "reason=line_too_long\n",
                    path);
