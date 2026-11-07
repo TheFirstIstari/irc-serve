@@ -84,11 +84,19 @@ int main(void)
                  "output.\n  node said: %s", node.out);
 
     /* And then the close: the refusal is flushed before the mark, so the 417
-     * above is already in hand and the EOF is a clean FIN, not a reset. */
+     * above is already in hand. FIN versus RST is not asserted on purpose: the
+     * burst goes out back-to-back, so part of it is still unread in the node's
+     * receive queue when the reaper closes, and a close with unread data is a
+     * RST -- while a close that lands after the last byte was read is a FIN.
+     * Which of the two it is depends on how much of the burst is still in
+     * flight at that instant, which is a scheduling race rather than a
+     * property of the limiter. The claim is that the connection is dead, and
+     * either outcome proves it (test_fdsize_reject.c accepts both for the
+     * same reason). */
     {
         int rc = tc_expect_eof(&flood, T_IO_MS);
 
-        TF_CHECK_MSG(rc == 0,
+        TF_CHECK_MSG(rc == 0 || rc == -3,
                      "the flooding connection was not closed after the 417 "
                      "(rc=%d)", rc);
     }
