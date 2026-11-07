@@ -210,25 +210,31 @@ typedef struct fed_dedup_entry {
 
 /* Has this exact (origin, epoch, id) been seen on this node before?
  *
- * Returns 1 when it has -- the message is a duplicate and must be dropped --
- * and 0 when it has not, having recorded it. The 1/0 sense is the one that
- * makes the call site safe to write as `if (fed_dedup_seen(...)) { drop; }`:
- * the drop is the thing that happens, and it is the branch a reader expects.
+ * TRI-STATE (#174): 1 when it has -- the message is a duplicate and must be
+ * dropped -- 0 when it has not, having recorded it, and -1 when the store
+ * itself failed (the table could not be allocated, or is full past eviction).
+ * -1 is NOT a duplicate: the caller counts and logs it separately
+ * (n_fed_dedup_error / fed_dedup_error), so memory pressure never masquerades
+ * as replay traffic. The >0 sense is the one that makes the call site read as
+ * `if (fed_dedup_seen(...) > 0) { drop as duplicate; }`: the drop is the thing
+ * that happens, and it is the branch a reader expects.
  *
  * Recording happens on the 0 path, BEFORE the caller has done anything with the
  * message. See the header for why.
  *
- * Two refusals, both reported as 1 because both mean "do not act on this":
- *   - `s`, `t` NULL, or `t` failing irc_serve_tags_valid(). An origin that is
- *     not a legal irc-serve-origin value cannot be a member of the key space,
- *     and the right answer to a malformed key is the same as the answer to a
- *     known one.
- *   - the table could not be allocated. Failing CLOSED is the point: a dropped
- *     message is one lost message, whereas a store that silently did not record
- *     is a loop that runs until the hop ceiling stops it, at which point the
- *     mesh is spending all its bandwidth on one message. A node that cannot
- *     allocate 416 KiB has larger problems than one message, and refusing the
- *     message is the one of them it can survive.
+ * One refusal still reported as 1 because it means "do not act on this":
+ * `s`, `t` NULL, or `t` failing irc_serve_tags_valid(). An origin that is
+ * not a legal irc-serve-origin value cannot be a member of the key space,
+ * and the right answer to a malformed key is the same as the answer to a
+ * known one.
+ *
+ * The allocation failure is the -1 path. Failing CLOSED is still the point: a
+ * dropped message is one lost message, whereas a store that silently did not
+ * record is a loop that runs until the hop ceiling stops it, at which point the
+ * mesh is spending all its bandwidth on one message. A node that cannot
+ * allocate 416 KiB has larger problems than one message, and refusing the
+ * message is the one of them it can survive -- refused AS AN ERROR, so the
+ * operator sees memory pressure and not duplicates.
  */
 int fed_dedup_seen(struct server *s, const irc_serve_tags_t *t,
                    uint64_t now_ms);

@@ -659,6 +659,11 @@ irc_add_integration_test(test_account test_account.c)
 # wire-level case on top of it.
 irc_add_integration_test(test_fanout_gate test_fanout_gate.c)
 
+# #174: the dedup store's -1 error arm (RLIMIT_AS fault injection) and G7's
+# error/dup counter split. In-process: the ceiling has to apply to the very
+# calloc the store makes, which no forked node lets a test time.
+irc_add_integration_test(test_dedup_error test_dedup_error.c)
+
 # 7/Phase 10.9: `standard-replies`, and the KICK reason bound `KICKLEN` was
 # waiting for. One file because the two halves of the commit are the same claim
 # about the same thing -- a refusal this node cannot represent must be REFUSED at
