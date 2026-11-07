@@ -705,16 +705,17 @@ account_store_t *account_store_load(const char *path)
             return NULL;
         }
     }
-    /* The line buffer held plaintext passwords; the heap holds only hashes. */
-    account_wipe(line, sizeof line);
     if (ferror(f) != 0) {
         printf("[observable] account_store: state=REFUSED path=%s "
                "reason=read_error\n",
                path);
+        account_wipe(line, sizeof line);
         account_store_free(store);
         (void)fclose(f);
         return NULL;
     }
+    /* The line buffer held plaintext passwords; the heap holds only hashes. */
+    account_wipe(line, sizeof line);
     (void)fclose(f);
 
     if (store->n == 0u) {
