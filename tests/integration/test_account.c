@@ -2059,6 +2059,11 @@ static void expect_account_set_refuses(void)
     }
     TF_CHECK_MSG(account_store_add(reg, "alice", "correct horse", 0) == 0,
                  "account_store_add() refused a valid record");
+    /* THE HEAP NEVER HOLDS THE LITERAL. The registry stores a salted hash, so
+     * no byte run in its records still equals the password that was added. */
+    TF_CHECK_MSG(account_store_holds_no_plaintext(reg, "correct horse") == 1,
+                 "the account registry still holds the literal password in "
+                 "memory; it must hold only the salted hash");
     /* THE KEY SPACE IS WHERE THE EMPTY-ACCOUNT PROPERTY IS ACTUALLY ENFORCED,
      * and this assertion is the one that says so.
      *
@@ -2134,6 +2139,12 @@ static void expect_account_set_refuses(void)
     /* THE WRONG PASSWORD, against a registry that holds the name. */
     TF_CHECK_MSG(account_set(&s, c, "alice", "wrong") == -1,
                  "account_set() accepted an account with the wrong password");
+
+    /* A PREFIX of the right password also fails, which is the case a prefix
+     * comparison would get wrong -- and the case hashing must preserve. */
+    TF_CHECK_MSG(account_set(&s, c, "alice", "correct") == -1,
+                 "account_set() accepted a password that is only a PREFIX of "
+                 "the right one");
 
     /* NO REGISTRY. The other half of the invariant, and the one that makes a node
      * with no account system indistinguishable from a client with no account. */
@@ -2215,6 +2226,42 @@ static void expect_account_set_refuses(void)
      * the wire cases assert a line for -- so this section does not leak it a
      * second way and does not create one. */
     server_shutdown(&s);
+}
+
+/* ---------------------------------------------------------------------------
+ * THE CREDENTIAL STORE HOLDS HASHES, NOT PASSWORDS
+ * ---------------------------------------------------------------------------
+ * The account-registry half of this property is asserted in-process above, on
+ * the registry the refusal cases build. This is the SASL half, on a store
+ * built the same way -- sasl_store_new() plus sasl_store_add(), which is the
+ * path sasl_state_machine() and every operator file take through the loader.
+ *
+ * Two claims, and both are about the SAME store: no byte run in it still
+ * equals the literal, and authentication against it behaves identically --
+ * correct verifies, wrong does not, a prefix of the right one does not, and
+ * an unknown authcid does not. */
+static void expect_sasl_store_hashes_passwords(void)
+{
+    sasl_store_t *store = sasl_store_new();
+
+    TF_CHECK_MSG(store != NULL, "sasl_store_new() failed");
+    if (store == NULL) {
+        return;
+    }
+    TF_CHECK_MSG(sasl_store_add(store, "alice", "correct horse") == 0,
+                 "sasl_store_add() refused a valid credential");
+    TF_CHECK_MSG(sasl_store_holds_no_plaintext(store, "correct horse") == 1,
+                 "the credential store still holds the literal password in "
+                 "memory; it must hold only the salted hash");
+    TF_CHECK_MSG(sasl_plain_verify(store, "", "alice", "correct horse") == 1,
+                 "a correct credential no longer verifies against its hash");
+    TF_CHECK_MSG(sasl_plain_verify(store, "", "alice", "wrong") == 0,
+                 "a wrong password verified against its hash");
+    TF_CHECK_MSG(sasl_plain_verify(store, "", "alice", "correct") == 0,
+                 "a password that is only a PREFIX of the right one verified");
+    TF_CHECK_MSG(sasl_plain_verify(store, "", "mallory", "correct horse") == 0,
+                 "an unknown authcid verified");
+    sasl_store_free(store);
 }
 
 /* ==========================================================================
@@ -2351,6 +2398,7 @@ int main(void)
 
     /* ---- the rules no wire sequence can reach, asserted on return values ---- */
     expect_account_set_refuses();
+    expect_sasl_store_hashes_passwords();
     expect_the_tag_charge_is_real();
 
     /* ---- the positive case, first: everything below is a contrast with it -- */
