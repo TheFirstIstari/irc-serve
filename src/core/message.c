@@ -391,8 +391,7 @@ int message_parse_n(const char *line, size_t len, message_t *out)
 
     /* One optional trailing CRLF / CR / LF is the terminator and is ignored;
      * the scan below then rejects any further CR or LF, so a second command
-     * smuggled onto the line is refused rather than parsed. Mirrors
-     * line_text_len() in protocol_parse.c. */
+     * smuggled onto the line is refused rather than parsed. */
     size_t text = len;
     if (text > 0 && line[text - 1] == '\n') {
         text--;
