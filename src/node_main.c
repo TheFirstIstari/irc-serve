@@ -220,7 +220,7 @@ static void usage(FILE *out, const char *argv0)
      * this text, the startup line, and the number CMake parsed out of the same
      * header. */
     fprintf(out, "%s\n", IRC_SERVE_VERSION);
-    fprintf(out, "usage: %s [port] [--name NAME] [--secret S]\n", argv0);
+    fprintf(out, "usage: %s [port] [--name NAME] [--secret S] [--secret-file PATH]\n", argv0);
     fprintf(out, "            [--sasl-store PATH] [--account-store PATH]\n");
     fprintf(out, "            [--peer NAME,HOST,PORT]... [--peer-tls NAME]...\n");
     fprintf(out, "            [--tls-cert PATH --tls-key PATH] [--tls-ca PATH]\n");
@@ -243,7 +243,18 @@ static void usage(FILE *out, const char *argv0)
                  "         REFUSES inbound peers -- it federates with nobody,\n"
                  "         and a claim is rejected as reason=NO_SECRET rather\n"
                  "         than as a wrong secret. Set one to federate at all.\n"
-                 "         At most %d bytes.\n",
+                 "         At most %d bytes. A command line is visible to every\n"
+                 "         local user in `ps`: prefer --secret-file. --secret\n"
+                 "         stays for compatibility and is reported as\n"
+                 "         secret_source=argv_warn.\n",
+            IRC_FED_MAX_SECRET - 1);
+    fprintf(out, "\n");
+    fprintf(out, "  --secret-file PATH\n"
+                 "         read the federation secret from PATH instead of the\n"
+                 "         command line. Same file rules as --sasl-store: a\n"
+                 "         regular file, unreadable by group or other, at most\n"
+                 "         %d bytes; one trailing newline is stripped. Refused\n"
+                 "         together with --secret.\n",
             IRC_FED_MAX_SECRET - 1);
     fprintf(out, "\n");
     fprintf(out, "  --peer NAME,HOST,PORT\n"
@@ -296,7 +307,10 @@ static void usage(FILE *out, const char *argv0)
                  "         TO CLOSE THE OTHER DIRECTION, use --tls-require, which\n"
                  "         refuses every plaintext connection at accept; or point\n"
                  "         peers at --tls-port, where every byte is TLS before\n"
-                 "         anything is interpreted. The startup line reports which\n"
+                 "         anything is interpreted. A link with require_tls set is\n"
+                 "         never dialled without TLS: if this node has none, the\n"
+                 "         dial is refused as reason=TLS_REQUIRED and no FEDERATE\n"
+                 "         is sent. The startup line reports which\n"
                  "         half each --peer-tls enforces as\n"
                  "         enforced=outbound_dial or use_tls_port_or_tls_require.\n",
             NODE_MAX_PEERS);
@@ -494,6 +508,73 @@ static int key_file_is_private(const char *path)
     return 0;
 }
 
+/* Read the federation secret from a file (--secret-file), because a command
+ * line is visible to every local user in `ps` and a secret is not a thing to
+ * show them (issue #165). OPEN-THEN-fstat in the same order and for the same
+ * reason as key_file_is_private() above, with the same mode rule: a secret a
+ * group account can read has been shared. At most cap-1 bytes; one trailing
+ * newline is stripped because operators write the file with echo. Returns 0
+ * with buf NUL-terminated, -1 with the refusal already reported. */
+static int load_secret_file(const char *path, char *buf, size_t cap)
+{
+    struct stat sb;
+    FILE *f;
+    size_t len;
+
+    if (path == NULL || path[0] == '\0' || buf == NULL || cap < 2u) {
+        return -1;
+    }
+    f = fopen(path, "re");
+    if (f == NULL) {
+        printf("[observable] secret_file: state=REFUSED path=%s reason=open\n",
+               path);
+        return -1;
+    }
+    if (fstat(fileno(f), &sb) != 0) {
+        printf("[observable] secret_file: state=REFUSED path=%s reason=fstat\n",
+               path);
+        (void)fclose(f);
+        return -1;
+    }
+    if (!S_ISREG(sb.st_mode)) {
+        printf("[observable] secret_file: state=REFUSED path=%s "
+               "reason=not_regular\n", path);
+        (void)fclose(f);
+        return -1;
+    }
+    if ((sb.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        printf("[observable] secret_file: state=REFUSED path=%s reason=mode_%03o\n",
+               path, (unsigned)(sb.st_mode & 0777));
+        (void)fclose(f);
+        return -1;
+    }
+    len = fread(buf, 1, cap - 1u, f);
+    if (ferror(f)) {
+        printf("[observable] secret_file: state=REFUSED path=%s reason=read\n",
+               path);
+        (void)fclose(f);
+        return -1;
+    }
+    /* A full buffer with bytes still behind it is a secret fed_open() would
+     * refuse as SECRET_TOO_LONG; refusing it here names the file, not the
+     * handshake. A file of exactly cap-1 bytes reads EOF on the probe. */
+    if (len == cap - 1u && fgetc(f) != EOF) {
+        printf("[observable] secret_file: state=REFUSED path=%s reason=too_long\n",
+               path);
+        (void)fclose(f);
+        return -1;
+    }
+    (void)fclose(f);
+    if (len > 0u && buf[len - 1u] == '\n') {
+        len--;
+    }
+    if (len > 0u && buf[len - 1u] == '\r') {
+        len--;
+    }
+    buf[len] = '\0';
+    return 0;
+}
+
 /* Parse the port argument. Returns 0 on success, -1 if it is not a number in
  * range, and 1 if no argument was given (which is not an error: the default
  * port applies). */
@@ -532,6 +613,8 @@ typedef struct {
 typedef struct {
     const char *name;
     const char *secret;
+    const char *secret_file;
+    int have_secret;
     /* The SASL credential store, or NULL. NULL is the DEFAULT and it means "this
      * node authenticates nobody", which is why it is a NULL and not an empty
      * path: a node that was handed a path it cannot read must be visibly
@@ -693,6 +776,7 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
             return 1;
         }
         if (strcmp(arg, "--name") == 0 || strcmp(arg, "--secret") == 0 ||
+            strcmp(arg, "--secret-file") == 0 ||
             strcmp(arg, "--peer") == 0 || strcmp(arg, "--sasl-store") == 0 ||
             strcmp(arg, "--account-store") == 0 ||
             strcmp(arg, "--peer-tls") == 0 || strcmp(arg, "--tls-cert") == 0 ||
@@ -754,6 +838,13 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
             o->name = value;
         } else if (strcmp(arg, "--secret") == 0) {
             o->secret = value;
+            o->have_secret = 1;
+        } else if (strcmp(arg, "--secret-file") == 0) {
+            if (value[0] == '\0') {
+                fprintf(stderr, "irc-serve: --secret-file needs a path\n");
+                return -1;
+            }
+            o->secret_file = value;
         } else if (strcmp(arg, "--sasl-store") == 0) {
             o->sasl_store = value;
         } else if (strcmp(arg, "--account-store") == 0) {
@@ -819,6 +910,14 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
             o->npeers++;
         }
     }
+    /* ONE SOURCE, because two is a configuration that cannot be honoured: the
+     * secret on the command line is visible in `ps`, so silently preferring
+     * either one would bless the leak or surprise the file's author. */
+    if (o->have_secret && o->secret_file != NULL) {
+        fprintf(stderr, "irc-serve: --secret and --secret-file are exclusive; "
+                        "use --secret-file\n");
+        return -1;
+    }
     return 0;
 }
 
@@ -873,6 +972,13 @@ int main(int argc, char **argv)
     int bound;
     int i;
     int rc;
+    /* What the startup line reports about the secret. Captured BEFORE fed_open()
+     * takes a copy and the file's buffer is wiped, because after the wipe the
+     * buffer reads as empty and the line would say `none` for a node that has
+     * one. `secret=` keeps its shape (`none` for NO_SECRET); `secret_source=`
+     * names where it came from, with argv flagged so `ps` exposure is visible. */
+    const char *secret_state = "none";
+    const char *secret_source = "none";
 
     /* Before any output: see the note on line buffering above. */
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -936,12 +1042,51 @@ int main(int argc, char **argv)
      * fed_open() is called even with no --peer, because a node with no
      * configured peers still has to be able to be DIALLED: 2.3 says a link
      * establishes when EITHER side connects, and the accepting side is the one
-     * half that needs no configuration. */
-    if (fed_open(&srv, opts.secret) != 0) {
-        printf("[observable] server init failed: name=%s "
-               "reason=federation_open\n", opts.name);
-        server_shutdown(&srv);
-        return 1;
+     * half that needs no configuration.
+     *
+     * The secret is read here, before the loop, for 3.4's reason: reading a
+     * file is a blocking call. fed_open() copies it, so the file's buffer is
+     * wiped the moment the copy exists. */
+    {
+        static char file_secret[IRC_FED_MAX_SECRET];
+        volatile char *wipe;
+        size_t k;
+
+        if (opts.secret_file != NULL) {
+            if (load_secret_file(opts.secret_file, file_secret,
+                                 sizeof file_secret) != 0) {
+                fprintf(stderr, "irc-serve: --secret-file %s was refused; "
+                                "refusing to start rather than federating "
+                                "with no secret\n", opts.secret_file);
+                server_shutdown(&srv);
+                return 1;
+            }
+            opts.secret = file_secret;
+        } else if (opts.have_secret) {
+            fprintf(stderr, "irc-serve: --secret is visible in `ps`; prefer "
+                            "--secret-file\n");
+        }
+        if (opts.secret_file != NULL || opts.have_secret) {
+            secret_source = (opts.secret_file != NULL) ? "file" : "argv_warn";
+        }
+        if (opts.secret[0] != '\0') {
+            secret_state = "set";
+        }
+        rc = fed_open(&srv, opts.secret);
+        /* fed_open() copied the secret, so the file's buffer must not outlive
+         * it -- wiped HERE, before the verdict is checked, so the failure
+         * path needs no second copy of it. Volatile, so the wipe is not
+         * optimised away. */
+        wipe = file_secret;
+        for (k = 0; k < sizeof file_secret; k++) {
+            wipe[k] = 0;
+        }
+        if (rc != 0) {
+            printf("[observable] server init failed: name=%s "
+                   "reason=federation_open\n", opts.name);
+            server_shutdown(&srv);
+            return 1;
+        }
     }
     srv.on_tick = fed_tick;
 
@@ -1197,11 +1342,12 @@ int main(int argc, char **argv)
                                                              : "configured");
         }
         printf("[observable] server initialized: name=%s epoch=%llu peers=%d "
-               "secret=%s sasl=%s accounts=%s tls=%s tls_port=%d "
+               "secret=%s secret_source=%s sasl=%s accounts=%s tls=%s tls_port=%d "
                "sts_duration=%u\n",
                opts.name, (unsigned long long)srv.epoch,
                (int)server_link_count(&srv),
-               (opts.secret[0] == '\0') ? "none" : "set",
+               secret_state,
+               secret_source,
                sasl_store_count(srv.sasl_store) > 0u ? "loaded" : "none",
                account_store_count(srv.account_store) > 0u ? "loaded" : "none",
                tls_state, server_tls_port(&srv),

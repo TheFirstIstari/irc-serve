@@ -18,6 +18,9 @@
 #include "core/msg_verbs.h"
 #include "core/resume.h"
 #include "core/reply.h"
+/* For transport_is_tls() -- the one question handle_authenticate() asks about a
+ * connection before accepting a PLAIN credential (#167). */
+#include "core/transport.h"
 #include "federation/nickreg.h"
 #include "federation/verbs.h"
 #include "sasl_framework.h"
@@ -2392,6 +2395,30 @@ static void handle_authenticate(server_t *s, conn_t *c, const message_t *m)
                    "mech_len=%zu mech_bad_bytes=%zu\n",
                    c->fd, shown, strlen(mech), conn_text_bad_count(mech));
         }
+        return;
+    }
+
+    /* Gate, don't encrypt (#167): PLAIN on a plaintext connection to a node
+     * with TLS configured is refused BEFORE any credential is read, so the
+     * password never crosses the wire in the clear. The client is told to
+     * upgrade with STARTTLS or reconnect on the TLS port first; cap.c has
+     * already withheld `sasl` from CAP LS here, so a client that reached this
+     * far ignored the advertisement. A node with no TLS keeps the old
+     * behaviour. The refusal marks the connection failed, so registration can
+     * never follow it. */
+    if (tls_backend_available() != 0 && s->tls != NULL &&
+        transport_is_tls(c) == 0) {
+        c->sasl = (int)SASL_FAILED;
+        c->sasl_failures++;
+        s->n_sasl_fail++;
+        params[0] = "*";
+        (void)send_line(s, c, NULL, "AUTHENTICATE", params, 1);
+        (void)reply_refused(s, c, "AUTHENTICATE", "ERR_AUTHENTICATIONFAILED",
+                            "464", NULL, 0,
+                            "SASL authentication failed: TLS is required on "
+                            "this node for SASL PLAIN");
+        printf("[observable] sasl: fd=%d outcome=REJECTED reason=TLS_REQUIRED\n",
+               c->fd);
         return;
     }
 
