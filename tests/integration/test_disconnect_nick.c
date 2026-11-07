@@ -151,7 +151,7 @@ static void connect_and_register(test_client_t *c, nf_node_t *node,
     (void)drain(c);
 }
 
-/* The 352 this node writes for `who` on a bare WHO: <channel> is the RFC's own
+/* The 352 this node writes for `who` on a WHO *o*: <channel> is the RFC's own
  * '*' placeholder, <flags> is 'H' for a user who is here, and the trailing text
  * is the hopcount (always 0 here: a user this node holds the socket for has been
  * forwarded nowhere) and the realname. Asserted as the WHOLE line including the
@@ -222,18 +222,21 @@ static void expect_absent_in_window(test_client_t *c, size_t from, size_t end,
                  "have appeared at all", what, needle, count);
 }
 
-/* One bare WHO, answered between two drains. Leaves the window in `from`/`end`
- * and asserts the list is terminated, which is what makes the window a complete
- * answer rather than a prefix of one. */
+/* One WHO *o*, answered between two drains. The mask covers both nicks under
+ * test ("ghost" and "probe" both contain 'o') while staying a filtered mask:
+ * since #170 a bare WHO answers 315 alone with no 352 sweep, so it cannot
+ * enumerate anything. Leaves the window in `from`/`end` and asserts the list
+ * is terminated, which is what makes the window a complete answer rather than
+ * a prefix of one. */
 static void who_window(test_client_t *c, size_t *from, size_t *end)
 {
     *from = drain(c);
-    TF_CHECK_MSG(tc_send(c, "WHO") == 0, "WHO send failed");
+    TF_CHECK_MSG(tc_send(c, "WHO *o*") == 0, "WHO *o* send failed");
     TF_CHECK_MSG(tc_expect(c, ":" BIN_NAME " 315 " NICK_HELD
-                                " * :End of WHO list\r\n",
+                                " *o* :End of WHO list\r\n",
                            T_IO_MS) == 0,
-                 "WHO was not terminated by 315, so the window below would not "
-                 "be the whole answer");
+                 "WHO *o* was not terminated by 315, so the window below would "
+                 "not be the whole answer");
     *end = drain(c);
     TF_CHECK_MSG(*end > *from, "the WHO window was never closed");
 }
@@ -254,7 +257,7 @@ int main(void)
     TF_CHECK(nf_spawn_binary(&node) == 0);
     TF_CHECK_MSG(node.port > 0, "the node reported no usable port");
 
-    /* Two registered clients, so a bare WHO has something correct to say before
+    /* Two registered clients, so a WHO *o* has something correct to say before
      * the disconnect and something smaller to say after it. */
     connect_and_register(&gone, &node, NICK_GONE, "Gone Without Quit");
     connect_and_register(&held, &node, NICK_HELD, "Held On Purpose");
@@ -271,13 +274,13 @@ int main(void)
                  count_352(&held, from, end));
     /* The mask columns are part of the needle and not incidental: since #121 this
      * line names a value the client chose, so it carries `mask_len` and
-     * `mask_bad_bytes` beside it, and asserting only `mask=*` would pass on a node
-     * that had started measuring a different mask. */
+     * `mask_bad_bytes` beside it, and asserting only `mask=*o*` would pass on a
+     * node that had started measuring a different mask. */
     TF_CHECK_MSG(nf_expect(&node, "[observable] who: nick=" NICK_HELD
-                                  " mask=* mask_len=1 mask_bad_bytes=0 nicks=2",
+                                  " mask=*o* mask_len=3 mask_bad_bytes=0 nicks=2",
                            T_IO_MS) == 0,
                  "the node reported the wrong enumeration size with two "
-                 "registered clients: expected nicks=2 on the mask=* line");
+                 "registered clients: expected nicks=2 on the mask=*o* line");
 
     /* --- the disconnect under test: a FIN, with no QUIT in it --- */
     /* Not a half-close and not a QUIT: a client that simply goes away, which is
@@ -306,10 +309,10 @@ int main(void)
     expect_absent_in_window(&held, from, end, "the WHO after the disconnect",
                             NICK_GONE);
     TF_CHECK_MSG(nf_expect(&node, "[observable] who: nick=" NICK_HELD
-                                  " mask=* mask_len=1 mask_bad_bytes=0 nicks=1",
+                                  " mask=*o* mask_len=3 mask_bad_bytes=0 nicks=1",
                            T_IO_MS) == 0,
                  "WHO reported the wrong enumeration size after the disconnect: "
-                 "expected nicks=1 on the mask=* line, because the connection "
+                 "expected nicks=1 on the mask=*o* line, because the connection "
                  "that went away is not one of this node's users any more");
 
     /* 1. THE COUNT, at the moment the connection was torn down. A connection
@@ -352,7 +355,7 @@ int main(void)
     expect_352_for(&held, from, end, NICK_HELD, "Held On Purpose");
     expect_352_for(&held, from, end, NICK_GONE, "Took The Name Back");
     TF_CHECK_MSG(nf_expect(&node, "[observable] who: nick=" NICK_HELD
-                                  " mask=* mask_len=1 mask_bad_bytes=0 nicks=2",
+                                  " mask=*o* mask_len=3 mask_bad_bytes=0 nicks=2",
                            T_IO_MS) == 0,
                  "the enumeration did not come back to two after the departed "
                  "connection's name was claimed by somebody else");
