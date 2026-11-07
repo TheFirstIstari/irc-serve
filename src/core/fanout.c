@@ -1487,6 +1487,9 @@ int fanout_deliver_union_local_gated(server_t *s, struct chan *const *chans,
     char tag_acct[FANOUT_TAG_BLOCK_MAX + 1u];
     char tag_both[FANOUT_TAG_BLOCK_MAX + 1u];
     int tags_ok = 0;
+    /* #171: the union de-duplication set -- one bit per registrable fd, cleared
+     * once per emission below and set channel-by-channel in the walk. */
+    unsigned char seen[SERVER_FD_TABLE / 8];
 
     if (s == NULL || chans == NULL || verb == NULL || plain == NULL) {
         return 0;
@@ -1501,6 +1504,7 @@ int fanout_deliver_union_local_gated(server_t *s, struct chan *const *chans,
         plain->nparams >= IRC_MAX_PARAMS) {
         return 0;
     }
+    memset(seen, 0, sizeof seen);
     /* ONE IDENTITY FOR THE WHOLE EMISSION, computed once above the loops for the
      * reason fanout_deliver_forms() computes it once above its switch: the 2.4
      * stamp and the account name are facts about the EMISSION, not about a
@@ -1572,30 +1576,39 @@ int fanout_deliver_union_local_gated(server_t *s, struct chan *const *chans,
              * the second is the same defect echo-message's fault was: one
              * announcement, delivered more than once.
              *
-             * THE ANSWER IS A SEARCH, NOT A SET. "Has this emission already reached
-             * `m`?" is "is `m` a member of one of the channels at a LOWER index?",
-             * and `chans` is the caller's own `conn_t::chans` -- 2.2's second index,
-             * which exists for exactly this kind of walk and is kept in step with the
-             * channel's list by chan_attach_conn()/chan_detach_conn(). So the test is
-             * a bounded search over at most `nchans * nmembers` records and there is
-             * no allocation, no cache, and therefore no teardown arm: the structure
-             * this reads is owned and freed by the channel layer.
+             * THE ANSWER IS A SET, NOT A SEARCH (#171). "Has this emission already
+             * reached `m`?" is one bit-test in `seen`: every in-range member of
+             * every earlier channel set its bit when its channel finished (see the
+             * mark loop past the member walk), so the test is O(1) per member and
+             * the emission is O(members) rather than O(channels^2 * members^2).
+             * No allocation and no teardown arm -- the bytes live on the stack.
              *
              * IT IS EXACT RATHER THAN APPROXIMATE, and that is a property of liveness
              * rather than luck: `chan_member_live()` only ever goes from 1 to 0, so a
              * member that was addressable at an earlier channel was written to, and a
-             * member that was not is not addressable now either -- so the raw pointer
-             * comparison below is sufficient and needs no second liveness test. */
-            for (size_t j = 0; j < i && already == 0; j++) {
-                chan_t *earlier = chans[j];
+             * member that was not is not addressable now either -- so the bit set by
+             * that earlier visit is sufficient and needs no second liveness test. */
+            if (m != NULL && m->fd >= 0 && m->fd < SERVER_FD_TABLE) {
+                const unsigned bit = (unsigned)m->fd;
 
-                if (earlier == NULL) {
-                    continue;
+                if ((seen[bit / 8u] & (unsigned char)(1u << (bit % 8u))) != 0) {
+                    already = 1;
                 }
-                for (size_t q = 0; q < earlier->nmembers; q++) {
-                    if (earlier->members[q].c == m) {
-                        already = 1;
-                        break;
+            } else {
+                /* A descriptor poll() cannot name (a synthetic test conn): the
+                 * bitmap has no slot for it, so the old bounded search stands
+                 * for exactly these members and no others. */
+                for (size_t j = 0; j < i && already == 0; j++) {
+                    chan_t *earlier = chans[j];
+
+                    if (earlier == NULL) {
+                        continue;
+                    }
+                    for (size_t q = 0; q < earlier->nmembers; q++) {
+                        if (earlier->members[q].c == m) {
+                            already = 1;
+                            break;
+                        }
                     }
                 }
             }
@@ -1668,6 +1681,18 @@ int fanout_deliver_union_local_gated(server_t *s, struct chan *const *chans,
                                    fanout_tag_block(m, &ident, account, tags,
                                                     sizeof tags));
             n++;
+        }
+        /* #171: publish this channel's members to `seen` AFTER its walk, so the
+         * bit-test above sees exactly the earlier channels -- the same set the
+         * old search compared against, including members this pass skipped. */
+        for (size_t k = 0; k < ch->nmembers; k++) {
+            conn_t *done = ch->members[k].c;
+
+            if (done != NULL && done->fd >= 0 && done->fd < SERVER_FD_TABLE) {
+                const unsigned bit = (unsigned)done->fd;
+
+                seen[bit / 8u] |= (unsigned char)(1u << (bit % 8u));
+            }
         }
     }
     return n;
