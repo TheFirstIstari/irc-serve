@@ -2832,7 +2832,24 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
     }
 
     /* --- G7: the dedup store --------------------------------------------- */
-    if (fed_dedup_seen(s, &tags, server_now_ms()) != 0) {
+    {
+        int dedup = fed_dedup_seen(s, &tags, server_now_ms());
+
+        if (dedup < 0) {
+            /* THE STORE FAILED, and the message is dropped WITHOUT being
+             * counted as a duplicate (#174). An allocation failure reported as
+             * a duplicate would read on every dashboard as replay traffic,
+             * and the memory pressure behind it would be invisible. */
+            s->n_fed_dup_drop++;
+            s->n_fed_dedup_error++;
+            fed_obs("[observable] fed_dedup_error: fd=%d peer=%s command=%s origin=%s "
+                   "epoch=%llu id=%llu hops=%lu command_len=%zu command_bad_bytes=%zu\n",
+                   c->fd, link->name, m->command, tags.origin,
+                   (unsigned long long)tags.epoch, (unsigned long long)tags.id,
+                   (unsigned long)tags.hops, strlen(m->command), conn_text_bad_count(m->command));
+            return;
+        }
+        if (dedup != 0) {
         /* RECORDED HERE, AT THE GUARD, AND NOT AFTER THE HANDLER.
          *
          * Dedup is a statement about the WIRE, not about whether this node
@@ -2849,7 +2866,8 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
          *
          * The two counters are incremented together because they are the same
          * event read at two levels -- the guard's drop and the store's duplicate
-         * -- and a difference between them would be a bug in the chain rather
+         * -- and a difference between them is either a store error
+         * (n_fed_dedup_error, the <0 arm above) or a bug in the chain rather
          * than a number nobody looked at. */
         s->n_fed_dup_drop++;
         s->n_fed_dedup_dup++;
@@ -2859,6 +2877,7 @@ void fed_dispatch(server_t *s, conn_t *c, const message_t *m)
                (unsigned long long)tags.epoch, (unsigned long long)tags.id,
                (unsigned long)tags.hops, strlen(m->command), conn_text_bad_count(m->command));
         return;
+        } /* dedup != 0: a real duplicate */
     }
 
     /* --- G8: the verb ----------------------------------------------------- */

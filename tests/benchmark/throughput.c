@@ -1,8 +1,7 @@
-/* throughput.c -- parser throughput, over BOTH parsers, with the production one
- * labelled as the production one.
+/* throughput.c -- parser throughput of the production parser.
  *
  * ---------------------------------------------------------------------------
- * WHY THERE ARE TWO NUMBERS, AND WHICH IS THE SERVER'S
+ * WHAT THIS MEASURES, AND WHY THERE IS ONE NUMBER
  * ---------------------------------------------------------------------------
  * The node parses every inbound line through message_parse_n() in
  * src/core/message.c (the framing layer at 3.3 calls it with the byte count it
@@ -10,35 +9,14 @@
  * and tag-block extraction, tag unescaping, the 15-parameter cap, trailing-
  * parameter absorption, the CRLF scan, and the IRC_MAX_LINE bound.
  *
- * parse_command() in src/protocol_parse.c is the Phase-0 function that only
- * COUNTS whitespace-separated tokens and returns the count. Nothing in the node
- * has called it since Phase 1.
- *
- * So the two measurements below are not two views of one thing:
- *
- *   message_parse_n()   THE PRODUCTION PATH. This is the number that says
- *                       something about server throughput.
- *   parse_command()     A LEGACY BASELINE, retained deliberately. It is ~an
- *                       order of magnitude cheaper because it does a tenth of
- *                       the work, so it is the comparison that shows how much of
- *                       the parse cost is tokenization rather than the rest --
- *                       and dropping it would lose that, along with the ability
- *                       to compare against the baseline already recorded in
- *                       docs/SPEC_TRACKING.md (which is why its workload below is
- *                       the original eight lines, unchanged, rather than a
- *                       tidier set).
- *
- * The legacy baseline is NOT server throughput and the output says so in those
- * words on every run, because the failure this fixes was precisely a number
- * that could not be misread in context.
+ * That is the number below: the production path, and the number that says
+ * something about server throughput.
  *
  * ---------------------------------------------------------------------------
  * WHY THE PRODUCTION WORKLOAD LOOKS LIKE THIS
  * ---------------------------------------------------------------------------
  * Same method as before -- CLOCK_MONOTONIC around each call, batch mean plus
- * p50 and p99 in microseconds, plus operations/second -- and both measurements
- * go through the identical harness, so the two sets of statistics are produced
- * by the same code and are comparable.
+ * p50 and p99 in microseconds, plus operations/second.
  *
  * The lines are the shapes a FEDERATED node actually receives, because that is
  * what the function being measured is asked to handle:
@@ -86,16 +64,14 @@
 #include <time.h>
 
 #include "core/message.h"
-#include "protocol_parse.h"
 
-/* Calls per measurement. The production workload contains an 8192-byte line, so
- * the batch is much more work than the legacy one; both are sized so the whole
- * benchmark stays well inside the 60s CTest timeout on a loaded CI runner. */
+/* Calls per measurement. The production workload contains an 8192-byte line; the
+ * count is sized so the whole benchmark stays well inside the 60s CTest
+ * timeout on a loaded CI runner. */
 #define CALLS 20000
 
 /* ---------------------------------------------------------------------------
- * The measurement harness. One copy, used by both, so the two numbers cannot
- * differ because they were computed differently.
+ * The measurement harness.
  * --------------------------------------------------------------------------- */
 typedef struct {
     long long *per;            /* per-call nanoseconds, one per call  */
@@ -174,9 +150,7 @@ static void stats_finish(stats *st, int n)
     st->batched_ops_sec = (st->batched_total > 0)
         ? ((double)st->batched_calls / ((double)st->batched_total / 1e9))
         : 0.0;
-    /* Reported alongside the batched figure and named for what it is, because
-     * it is the estimator the historical baseline in docs/SPEC_TRACKING.md used
-     * and dropping it would make that recorded number incomparable. It is the
+    /* Reported alongside the batched figure and named for what it is. It is the
      * same total with up to one clock tick of rounding error per call. */
     st->per_call_ops_sec = (st->total > 0) ? ((double)n / ((double)st->total / 1e9))
                                            : 0.0;
@@ -362,22 +336,6 @@ static void build_production_workload(void)
     PRODUCTION_LEN = n;
 }
 
-/* ---------------------------------------------------------------------------
- * The LEGACY workload: the original eight lines, unchanged, so the figure stays
- * comparable with the baseline already recorded in docs/SPEC_TRACKING.md.
- * --------------------------------------------------------------------------- */
-static const char *const LEGACY[] = {
-    "PRIVMSG #general :hello everyone",
-    "JOIN #general",
-    "NICK alice",
-    "USER alice host.example server.example :Alice Q. User",
-    "PING :server",
-    "PRIVMSG #dev :this is a longer message to parse",
-    "MODE #general +o alice",
-    "TOPIC #general :a topic string",
-};
-#define LEGACY_LEN ((size_t)(sizeof LEGACY / sizeof LEGACY[0]))
-
 /* Verify the production workload before timing anything: every line must PARSE,
  * and carry the prefix, tags and parameter count the table claims for it. A
  * workload that had quietly lost its prefixes, or that the parser rejects, would
@@ -451,8 +409,7 @@ static void verify_production_workload(void)
     }
 }
 
-/* Warm up, measure, report. `label` and `fn` go into the output verbatim so the
- * reader cannot mistake one row for the other. */
+/* Warm up, measure, report. `label` and `fn` go into the output verbatim. */
 static void run_production(stats *st)
 {
     int n;
@@ -578,102 +535,9 @@ static void run_production(stats *st)
                 PRODUCTION_LEN, CALLS);
 }
 
-static void run_legacy(stats *st)
-{
-    size_t i;
-    int n;
-
-    stats_init(st, CALLS);
-
-    for (i = 0; i < LEGACY_LEN; i++) {
-        int tc = 0;
-        int ec = 0;
-
-        if (parse_command(LEGACY[i], &tc, &ec) != 0) {
-            fprintf(stderr, "throughput: warmup parse_command failed-> work=%s\n",
-                    LEGACY[i]);
-            exit(1);
-        }
-    }
-
-    for (n = 0; n < CALLS; n++) {
-        const char *w = LEGACY[n % (int)LEGACY_LEN];
-        int tc = 0;
-        int ec = 0;
-        long long s = now_ns();
-        long long e;
-
-        if (s < 0) {
-            fprintf(stderr, "throughput: clock_gettime failed\n");
-            exit(1);
-        }
-        if (parse_command(w, &tc, &ec) != 0) {
-            fprintf(stderr, "throughput: parse_command rc!=0 for %s\n", w);
-            exit(1);
-        }
-        e = now_ns();
-        if (e < 0) {
-            fprintf(stderr, "throughput: clock_gettime failed\n");
-            exit(1);
-        }
-        st->per[n] = e - s;
-        if (st->per[n] < 0) {
-            st->per[n] = 0;
-        }
-        st->total += st->per[n];
-    }
-
-    if (st->total <= 0) {
-        fprintf(stderr, "throughput: no positive elapsed time measured\n");
-        exit(1);
-    }
-
-    /* The batched pass, identical in shape to the production one so the two
-     * ratios below are computed the same way. */
-    {
-        int b;
-
-        for (b = 0; b < CALLS / BATCH; b++) {
-            long long s;
-            long long e;
-            int k;
-
-            s = now_ns();
-            if (s < 0) {
-                fprintf(stderr, "throughput: clock_gettime failed\n");
-                exit(1);
-            }
-            for (k = 0; k < BATCH; k++) {
-                int tc = 0;
-                int ec = 0;
-
-                if (parse_command(LEGACY[(b * BATCH + k) % (int)LEGACY_LEN], &tc,
-                                  &ec) != 0) {
-                    fprintf(stderr, "throughput: parse_command rc!=0\n");
-                    exit(1);
-                }
-            }
-            e = now_ns();
-            if (e < 0) {
-                fprintf(stderr, "throughput: clock_gettime failed\n");
-                exit(1);
-            }
-            stats_add_batch(st, e - s, BATCH);
-        }
-    }
-    if (st->batched_total <= 0) {
-        fprintf(stderr, "throughput: no positive batched elapsed time measured\n");
-        exit(1);
-    }
-    stats_finish(st, CALLS);
-    stats_print(st, "LEGACY BASELINE", "parse_command", "client-mix", LEGACY_LEN,
-                CALLS);
-}
-
 int main(void)
 {
     stats prod;
-    stats legacy;
     long long gran = clock_granularity_ns();
 
     build_cap_lines();
@@ -681,7 +545,6 @@ int main(void)
     verify_production_workload();
 
     run_production(&prod);
-    run_legacy(&legacy);
 
     if (gran <= 0) {
         fprintf(stderr, "throughput: could not measure CLOCK_MONOTONIC "
@@ -692,20 +555,9 @@ int main(void)
            "columns are quantised to that and batched_mean is the figure to "
            "quote\n", gran);
 
-    /* The disambiguation, in plain words, on every run. The bug this fixes was a
-     * reported number that described a function nothing calls in production, and
-     * a footnote nobody reads is not a fix for that. */
     printf("throughput: the PRODUCTION PATH row is the server's parse cost "
-           "(message_parse_n, the function every inbound line goes through). "
-           "The LEGACY BASELINE row is parse_command, a Phase-0 token COUNTER "
-           "that the node has not called since Phase 1; it is a comparison, NOT "
-           "server throughput.\n");
-    printf("throughput: production_path=message_parse_n batched_mean=%.4fus "
-           "legacy_baseline=parse_command batched_mean=%.4fus ratio=%.1fx "
-           "(both are the same measurement harness over the same call count)\n",
-           prod.batched_mean_us, legacy.batched_mean_us,
-           (legacy.batched_mean_us > 0.0)
-               ? (prod.batched_mean_us / legacy.batched_mean_us)
-               : 0.0);
+           "(message_parse_n, the function every inbound line goes through).\n");
+    printf("throughput: production_path=message_parse_n batched_mean=%.4fus\n",
+           prod.batched_mean_us);
     return 0;
 }
