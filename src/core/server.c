@@ -137,12 +137,30 @@ static uint64_t strtab_hash(const char *s)
     return h;
 }
 
-static char down_ascii(char c)
+/* THE ONE ASCII FOLD (issue #181): the single definition behind
+ * message.h's irc_ascii_fold()/irc_ascii_same(). A-Z -> a-z only, no
+ * locale/tolower, for the reasons the header gives. */
+char irc_ascii_fold(char c)
 {
     if (c >= 'A' && c <= 'Z') {
         return (char)(c + ('a' - 'A'));
     }
     return c;
+}
+
+int irc_ascii_same(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+    while (*a != '\0' && *b != '\0') {
+        if (irc_ascii_fold(*a) != irc_ascii_fold(*b)) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
 }
 
 /* Fold `key` into `out`, which holds `cap` bytes including the NUL. Returns 0 on
@@ -162,7 +180,7 @@ static int strtab_fold(char *out, size_t cap, const char *key)
         if (i + 1u >= cap) {
             return -1;
         }
-        out[i] = down_ascii(key[i]);
+        out[i] = irc_ascii_fold(key[i]);
     }
     out[i] = '\0';
     return 0;
@@ -527,39 +545,8 @@ static size_t strtab_del_owner(struct strtab *t, const void *owner)
     return n;
 }
 
-/* Case-insensitive server-name comparison, ASCII-folded.
- *
- * The same fold is required in four places now: 2.1's nick@server split, 2.4
- * ("server names are case-insensitive in IRC, so a comparison against our OWN
- * name MUST be case-insensitive"), channel.c's own server-name fold, and
- * fanout.c's own-origin check on the forward path. It is written out here
- * rather than exported because it is six lines and a public helper two of the
- * three callers would never use again is a wider API than the duplication is
- * worth. The copies are asserted to agree by test_channels.c, which looks a
- * peer up by a name differing only in case. */
-static int same_server_name(const char *a, const char *b)
-{
-    if (a == NULL || b == NULL) {
-        return 0;
-    }
-    while (*a != '\0' && *b != '\0') {
-        char ca = *a;
-        char cb = *b;
-
-        if (ca >= 'a' && ca <= 'z') {
-            ca = (char)(ca - ('a' - 'A'));
-        }
-        if (cb >= 'a' && cb <= 'z') {
-            cb = (char)(cb - ('a' - 'A'));
-        }
-        if (ca != cb) {
-            return 0;
-        }
-        a++;
-        b++;
-    }
-    return *a == '\0' && *b == '\0';
-}
+/* server_find_link() compares with irc_ascii_same() (message.h, issue #181):
+ * server names are case-insensitive in IRC, so the lookup must fold. */
 
 /* Put a descriptor into nonblocking mode. Called on the listener, on every
  * accepted socket and on every dialled socket BEFORE the descriptor becomes
@@ -957,6 +944,14 @@ void server_shutdown(server_t *s)
     free(s->by_fd);
     s->by_fd = NULL;
     s->nconns = 0;
+    /* The enumeration goes with the index it enumerates. Every conn above was
+     * closed through server_close_conn(), so this is normally already empty;
+     * freed unconditionally because a node that never held a connection holds
+     * NULL here either way. */
+    free(s->active_fds);
+    s->active_fds = NULL;
+    s->nactive = 0;
+    s->active_cap = 0;
 }
 
 int server_listen(server_t *s, int port)
@@ -1295,6 +1290,19 @@ int server_add_conn(server_t *s, conn_t *c)
     if (s->by_fd[c->fd] != NULL) {
         return -1;
     }
+    /* The active list grows BEFORE anything is registered, so a failed
+     * realloc leaves the node exactly as it was: by_fd untouched, nconns
+     * untouched. Growth is geometric, like dials. */
+    if (s->nactive == s->active_cap) {
+        size_t want = (s->active_cap == 0) ? 16u : s->active_cap * 2u;
+        int *grown = (int *)realloc(s->active_fds, want * sizeof *grown);
+
+        if (grown == NULL) {
+            return -1;
+        }
+        s->active_fds = grown;
+        s->active_cap = want;
+    }
     /* Phase 12: the conn acquires its NODE here, which is the only writer. The TLS
      * backend needs the node's SSL_CTX and the call site that starts a handshake
      * -- conn_pump(), from inside the connection layer -- has no server_t. See
@@ -1302,6 +1310,7 @@ int server_add_conn(server_t *s, conn_t *c)
      * and the backend treats that as "not configured" rather than dereferencing. */
     c->owner = s;
     s->by_fd[c->fd] = c;
+    s->active_fds[s->nactive++] = c->fd;
     s->nconns++;
     s->n_accepted++;
     return 0;
@@ -1419,6 +1428,7 @@ int server_accept_one(server_t *s)
 void server_close_conn(server_t *s, int fd)
 {
     conn_t *c = server_conn(s, fd);
+    size_t i;
 
     if (c == NULL) {
         return; /* unregistered: a second close is a no-op, not a double close */
@@ -1457,9 +1467,17 @@ void server_close_conn(server_t *s, int fd)
 
     /* Detach from the registry BEFORE closing, so a descriptor the OS reuses
      * between the close() and the next poll iteration cannot resolve to this
-     * conn. */
+     * conn. The active list loses the fd in the same breath, by swap-remove:
+     * order is insignificant, so the last entry fills the hole in O(1) with
+     * no shift and no compaction pass. */
     s->by_fd[fd] = NULL;
     s->nconns--;
+    for (i = 0; i < s->nactive; i++) {
+        if (s->active_fds[i] == fd) {
+            s->active_fds[i] = s->active_fds[--s->nactive];
+            break;
+        }
+    }
 
     /* Retire the connection from the nick index, and through the ONE function
      * that does it. This is the whole of issue #102: the close used to remove
@@ -1539,16 +1557,25 @@ int server_queue(server_t *s, conn_t *c, const char *data, size_t len)
 
 int server_reap(server_t *s)
 {
-    size_t i;
+    size_t i = 0;
     int closed = 0;
 
     if (s == NULL || s->by_fd == NULL) {
         return 0;
     }
-    for (i = 0; i < SERVER_FD_TABLE; i++) {
-        if (s->by_fd[i] != NULL && s->by_fd[i]->state == CONN_CLOSING) {
-            server_close_conn(s, (int)i);
+    /* The reaper walks the active list, not the flat table: O(nconns) per
+     * tick. server_close_conn() swap-removes, so after a close the index is
+     * re-examined rather than advanced -- the entry now sitting there has not
+     * been looked at yet. */
+    while (i < s->nactive) {
+        int fd = s->active_fds[i];
+        conn_t *c = server_conn(s, fd);
+
+        if (c != NULL && c->state == CONN_CLOSING) {
+            server_close_conn(s, fd);
             closed++;
+        } else {
+            i++;
         }
     }
     return closed;
@@ -1712,9 +1739,7 @@ int server_nick_claim(server_t *s, const char *nick, conn_t *c)
  * shrank too, and that still works, because server_nick_release() below gets
  * the holder from the TABLE, and the table's probe folds. One implementation of
  * the rule instead of two, and the copy that could have drifted is the one that
- * is gone. same_server_name() below and channel.c's same_name() are the other
- * two folds in the node, both still written out for the reason server.h records
- * for the first pair. */
+ * is gone. irc_ascii_same() (message.h, issue #181) is the node's one fold. */
 
 /* Give up ONE name, leaving the connection itself in the registry. This is the
  * release for a connection that is STAYING: handle_nick()'s rename is the only
@@ -1943,7 +1968,7 @@ server_link_t *server_find_link(const server_t *s, const char *name)
         return NULL;
     }
     for (i = 0; i < s->nlinks; i++) {
-        if (same_server_name(s->links[i].name, name)) {
+        if (irc_ascii_same(s->links[i].name, name)) {
             return &s->links[i];
         }
     }

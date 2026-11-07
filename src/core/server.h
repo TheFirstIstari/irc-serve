@@ -33,12 +33,11 @@
  * kept freed nodes on a list would need a generation or liveness check for the
  * same guarantee.
  *
- * The cost of the choice is stated rather than hidden: iterating every
- * connection is O(FD_SETSIZE) per tick, because the index is a flat array and
- * the loop has no other way to enumerate. At a 50 ms tick that is about twenty
- * thousand pointer tests a second, which is not a cost worth optimising at
- * this scale -- and the FD_SETSIZE ceiling it inherits is the one 3.4 already
- * accepted in choosing poll() over epoll/kqueue.
+ * The cost of the choice is stated rather than hidden: the flat array is the
+ * O(1) lookup, and enumeration is the dense active-fd list beside it
+ * (server_t::active_fds), so iterating every connection is O(nconns) per
+ * tick rather than O(FD_SETSIZE) -- and the FD_SETSIZE ceiling it inherits
+ * is the one 3.4 already accepted in choosing poll() over epoll/kqueue.
  *
  * ---------------------------------------------------------------------------
  * PEER ADDRESSES MUST BE PRE-RESOLVED
@@ -492,6 +491,16 @@ struct server {
     conn_t  **by_fd;          /* FD_SETSIZE slots; NULL when the slot is free */
     size_t    nconns;
 
+    /* The ACTIVE list: every fd held in by_fd, dense, order insignificant
+     * (issue #176). by_fd is the O(1) lookup; this is the enumeration, so the
+     * loop walks it instead of scanning FD_SETSIZE slots per tick.
+     * server_add_conn() appends, server_close_conn() swap-removes, and
+     * nactive == nconns is the invariant both keep. Grown geometrically and
+     * lazily, like dials: a node with no connections holds no array. */
+    int      *active_fds;
+    size_t    nactive;
+    size_t    active_cap;
+
     /* Registries. Both are string -> pointer maps. The nick one is FOLDED
      * (ASCII, case-insensitive keys) and the channel one is EXACT -- for the
      * reason spelled out where the table is defined in server.c: a nickname
@@ -750,13 +759,20 @@ struct server {
     uint64_t  n_fed_malformed;     /* arity or field validation refused it    */
     /* The drop the guard chain took at the dedup guard, and the store's own
      * count of the same event. They are incremented together at G7 and are
-     * equal on any node this build produces; they are two names for one fact
-     * on purpose, because they are read at two different levels -- a loop test
-     * asserts on the guard's drop, and a dedup test asserts on the store's --
-     * and a difference between them would be a real bug in the chain rather
-     * than a number nobody looked at. */
+     * equal on any node whose n_fed_dedup_error is 0; they are two names for
+     * one fact on purpose, because they are read at two different levels --
+     * a loop test asserts on the guard's drop, and a dedup test asserts on
+     * the store's -- and a difference between them is either a store error
+     * (counted below) or a real bug in the chain rather than a number nobody
+     * looked at. */
     uint64_t  n_fed_dup_drop;
     uint64_t  n_fed_dedup_dup;
+    /* The G7 drop that was NOT a duplicate: fed_dedup_seen() answered -1, so
+     * the store could not record (allocation failure, or full past eviction).
+     * It is not counted in n_fed_dedup_dup -- a climbing dup counter under
+     * memory pressure is what #174 removes -- but it is still a guard drop, so
+     * n_fed_dup_drop counts it. Logged as fed_dedup_error, not fed_duplicate. */
+    uint64_t  n_fed_dedup_error;
 
     /* ------------------------------------------------------------------------
      * Phase 6 C5: a peer that says THIS NODE is gone. federation/verbs.c's

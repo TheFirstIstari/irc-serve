@@ -389,8 +389,11 @@ int poll_loop_step(server_t *s, int timeout_ms)
         tls_listen_pfd = nfds;
         nfds++;
     }
-    for (i = 0; i < SERVER_FD_TABLE && nfds < POLL_MAX_FDS; i++) {
-        conn_t *c = s->by_fd[i];
+    /* The poll set is the ACTIVE list (#176), not a scan of the fd table: the
+     * listeners, every live connection, in-flight dials. A CLOSING conn is
+     * already out of the set. */
+    for (i = 0; i < s->nactive && nfds < POLL_MAX_FDS; i++) {
+        conn_t *c = s->by_fd[s->active_fds[i]];
         short events = 0;
 
         if (c == NULL || c->state == CONN_CLOSING) {
@@ -446,8 +449,8 @@ int poll_loop_step(server_t *s, int timeout_ms)
     /* Buffered lines produce no POLLIN. If the per-connection line budget
      * cut one off mid-burst, do not sleep on work already in hand. */
     if (timeout_ms > 0) {
-        for (i = 0; i < SERVER_FD_TABLE; i++) {
-            conn_t *c = s->by_fd[i];
+        for (i = 0; i < s->nactive; i++) {
+            conn_t *c = s->by_fd[s->active_fds[i]];
 
             if (c != NULL && c->state != CONN_CLOSING && conn_has_line(c)) {
                 timeout_ms = 0;
@@ -552,8 +555,8 @@ int poll_loop_step(server_t *s, int timeout_ms)
 
         /* #168: refill every live bucket on the tick, so a flooder's debt is
          * measured in real time rather than in poll iterations. */
-        for (i = 0; i < SERVER_FD_TABLE; i++) {
-            conn_t *c = s->by_fd[i];
+        for (i = 0; i < s->nactive; i++) {
+            conn_t *c = s->by_fd[s->active_fds[i]];
 
             if (c != NULL && c->state != CONN_CLOSING) {
                 rate_refill(c, now_ms);

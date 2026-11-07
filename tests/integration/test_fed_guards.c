@@ -403,9 +403,9 @@ static void case_duplicate_dropped(nf_node_t *node, test_client_t *client,
                  "the client's client saw a duplicated message %lu times; 2.4's "
                  "whole point is that a second copy is dropped, not re-delivered",
                  (unsigned long)pf_times_seen(tc_buffer(client), "onlyonce"));
-    /* The two counters are the same event at two levels, and a difference
-     * between them would be a bug in the chain rather than a number nobody
-     * looked at. */
+    /* The two counters are the same event at two levels, and -- with no store
+     * errors (n_fed_dedup_error == 0 here) -- a difference between them would
+     * be a bug in the chain rather than a number nobody looked at. */
     TF_CHECK_MSG(nf_expect_u64(node, "fed_dup_drop=", 1, T_IO_MS) == 0,
                  "node A never published fed_dup_drop=1, so the guard's own count "
                  "of the drop is missing even though it reported one: %s",

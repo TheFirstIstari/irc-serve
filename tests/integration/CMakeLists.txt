@@ -215,6 +215,10 @@ irc_add_integration_test(test_framing test_framing.c)
 # connection registry, and the per-SERVER message id.
 irc_add_integration_test(test_registries test_registries.c)
 
+# 3.4: the active-fd list is the poll set -- N clients poll as N + listeners,
+# and close-all drains it to empty (#176).
+irc_add_integration_test(test_active_fd test_active_fd.c)
+
 # 3.4: the nonblocking dial state machine.
 irc_add_integration_test(test_dial_fsm test_dial_fsm.c)
 
@@ -658,6 +662,15 @@ irc_add_integration_test(test_account test_account.c)
 # test_nick_index.c makes for the nick enumeration. Phase 10.8b then adds the
 # wire-level case on top of it.
 irc_add_integration_test(test_fanout_gate test_fanout_gate.c)
+
+# #174: the dedup store's -1 error arm (RLIMIT_AS fault injection) and G7's
+# error/dup counter split. In-process: the ceiling has to apply to the very
+# calloc the store makes, which no forked node lets a test time.
+irc_add_integration_test(test_dedup_error test_dedup_error.c)
+# #175: 317 idle on the monotonic clock. In-process (a fabricated 60 s-old
+# stamp), because no wire fixture can produce a minute of idle without sleeping
+# for one.
+irc_add_integration_test(test_idle_mono test_idle_mono.c)
 
 # 7/Phase 10.9: `standard-replies`, and the KICK reason bound `KICKLEN` was
 # waiting for. One file because the two halves of the commit are the same claim
