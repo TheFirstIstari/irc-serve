@@ -275,7 +275,7 @@ static void expect_who_entry(client_t *cl, size_t from, size_t end,
 int main(void)
 {
     nf_node_t node;
-    client_t alice, bob, carol, dave_client;
+    client_t alice, bob, carol, dave_client, eve;
     size_t from, end;
     /* The away body is AWAY_MAX bytes, and it is composed into command and
      * expectation strings from there. The buffers are sized from the bound
@@ -392,21 +392,35 @@ int main(void)
                  count_in_window(&alice, from, end, ":" BIN_NAME " 352 "));
     expect_in_window(&alice, from, end, "the masked entry", ":" BIN_NAME " 352 alice * bob ");
 
-    /* Bare WHO: what irssi and weechat send on connect, and the reason the nick
-     * registry has to be enumerable at all. The <channel> field is '*' -- the
-     * RFC's placeholder for "this was not a channel query" -- and a node that
-     * put an empty string or a leftover channel name there would be reporting
-     * something false about a query that had no channel. */
+    /* Bare WHO: capped by #170. A bare mask ("*") would sweep the whole nick
+     * table -- one line in, one 352 per user -- so the node answers 315 alone
+     * with no 352 rows. The <channel> field of 315 is '*' (the mask echoed). */
     from = open_window(&alice);
     TF_CHECK_MSG(tc_send(&alice.c, "WHO") == 0, "tc_send failed");
     end = drain(&alice);
-    TF_CHECK_MSG(count_in_window(&alice, from, end, ":" BIN_NAME " 352 ") == 3,
-                 "bare WHO produced %zu 352 lines, expected 3 (every nick)",
+    TF_CHECK_MSG(count_in_window(&alice, from, end, ":" BIN_NAME " 352 ") == 0,
+                 "bare WHO produced %zu 352 lines, expected 0 (#170 cap)",
                  count_in_window(&alice, from, end, ":" BIN_NAME " 352 "));
-    expect_in_window(&alice, from, end, "the '*' channel placeholder",
-                     ":" BIN_NAME " 352 alice * alice ");
     expect_in_window(&alice, from, end, "bare WHO terminates",
                      ":" BIN_NAME " 315 alice * :End of WHO list\r\n");
+
+    /* WHO * and WHO 0: the same broad-mask refusal, 315 alone, no sweep. */
+    from = open_window(&alice);
+    TF_CHECK_MSG(tc_send(&alice.c, "WHO *") == 0, "tc_send failed");
+    end = drain(&alice);
+    TF_CHECK_MSG(count_in_window(&alice, from, end, ":" BIN_NAME " 352 ") == 0,
+                 "WHO * produced %zu 352 lines, expected 0 (#170 cap)",
+                 count_in_window(&alice, from, end, ":" BIN_NAME " 352 "));
+    expect_in_window(&alice, from, end, "WHO * terminates",
+                     ":" BIN_NAME " 315 alice * :End of WHO list\r\n");
+    from = open_window(&alice);
+    TF_CHECK_MSG(tc_send(&alice.c, "WHO 0") == 0, "tc_send failed");
+    end = drain(&alice);
+    TF_CHECK_MSG(count_in_window(&alice, from, end, ":" BIN_NAME " 352 ") == 0,
+                 "WHO 0 produced %zu 352 lines, expected 0 (#170 cap)",
+                 count_in_window(&alice, from, end, ":" BIN_NAME " 352 "));
+    expect_in_window(&alice, from, end, "WHO 0 terminates",
+                     ":" BIN_NAME " 315 alice 0 :End of WHO list\r\n");
 
     /* =======================================================================
      * 2. WHOIS <nick> -> 311, 312, 317, 318
@@ -946,6 +960,46 @@ int main(void)
     }
 
     /* =======================================================================
+     * 7. #170: WHO * with 5 nicks -> 0x352 + 315; filtered masks stay capped;
+     *    WHO #chan unchanged
+     * ==================================================================== */
+    client_open(&eve, &node, "eve");
+    /* WHO * sweeps nothing: 315 alone even with five nicks online. */
+    from = open_window(&alice);
+    TF_CHECK_MSG(tc_send(&alice.c, "WHO *") == 0, "tc_send failed");
+    end = drain(&alice);
+    TF_CHECK_MSG(count_in_window(&alice, from, end, ":" BIN_NAME " 352 ") == 0,
+                 "WHO * with 5 nicks produced %zu 352 lines, expected 0 (#170)",
+                 count_in_window(&alice, from, end, ":" BIN_NAME " 352 "));
+    expect_in_window(&alice, from, end, "WHO * terminates with 5 nicks",
+                     ":" BIN_NAME " 315 alice * :End of WHO list\r\n");
+    /* A filtered mask still answers, bounded by the 64-row cap. One match
+     * here, far below the cap, so the answer is exact plus 315. */
+    from = open_window(&alice);
+    TF_CHECK_MSG(tc_send(&alice.c, "WHO bob*") == 0, "tc_send failed");
+    end = drain(&alice);
+    {
+        size_t n352 = count_in_window(&alice, from, end, ":" BIN_NAME " 352 ");
+
+        TF_CHECK_MSG(n352 <= 64u && n352 == 1u,
+                     "WHO bob* produced %zu 352 lines, expected 1 and at most "
+                     "64 (#170 cap)",
+                     n352);
+    }
+    expect_in_window(&alice, from, end, "WHO bob* terminates",
+                     ":" BIN_NAME " 315 alice bob* :End of WHO list\r\n");
+    /* WHO #chan is bounded by membership, not by the mask cap: unchanged. */
+    from = open_window(&alice);
+    TF_CHECK_MSG(tc_send(&alice.c, "WHO #Q") == 0, "tc_send failed");
+    end = drain(&alice);
+    TF_CHECK_MSG(count_in_window(&alice, from, end, ":" BIN_NAME " 352 ") == 3,
+                 "WHO #Q produced %zu 352 lines, expected exactly 3 (channel "
+                 "branch unchanged by #170)",
+                 count_in_window(&alice, from, end, ":" BIN_NAME " 352 "));
+    expect_in_window(&alice, from, end, "WHO #Q terminates",
+                     ":" BIN_NAME " 315 alice #Q :End of WHO list\r\n");
+
+    /* =======================================================================
      * The node's own accounting
      * ==================================================================== */
     /* Read AFTER nf_stop(): the node publishes its counters at shutdown and not
@@ -963,6 +1017,7 @@ int main(void)
     tc_close(&bob.c);
     tc_close(&carol.c);
     tc_close(&dave_client.c);
+    tc_close(&eve.c);
     nf_free(&node);
     tf_done("queries");
     return 0;
