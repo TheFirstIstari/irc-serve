@@ -1355,11 +1355,11 @@ static void test_account_tag_on_the_wire(const char *sasl, const char *registry)
     (void)snprintf(line, sizeof line, "PRIVMSG " CHAN_TAGGED " anonymous");
     ae = speak_and_close(&erin, line, watched, 2u, ends);
     TF_CHECK_MSG(ae > 0u, "the anonymous sender's barrier PONG did not arrive");
-    expect_tag_block_present(&carol, cb, ends[0],
+    expect_tag_block_present(&carol, cb, ends[1],
                              "carol, for a message from an anonymous sender");
-    expect_absent_in_window(&carol, cb, ends[0],
+    expect_absent_in_window(&carol, cb, ends[1],
                             "an account tag for an ANONYMOUS sender", "account=");
-    expect_absent_in_window(&bob, bb, ends[1],
+    expect_absent_in_window(&bob, bb, ends[0],
                             "an account tag for an anonymous sender, to the "
                             "recipient that asked hardest for one", "account=");
 
@@ -1383,10 +1383,10 @@ static void test_account_tag_on_the_wire(const char *sasl, const char *registry)
                    "@account=spoofed PRIVMSG " CHAN_TAGGED " spoof");
     ae = speak_and_close(&erin, line, watched, 2u, ends);
     TF_CHECK_MSG(ae > 0u, "the barrier PONG after the spoofed tag did not arrive");
-    expect_absent_in_window(&carol, cb, ends[0],
+    expect_absent_in_window(&carol, cb, ends[1],
                             "an echoed `account` tag from the INBOUND direction",
                             "account=");
-    expect_absent_in_window(&bob, bb, ends[1],
+    expect_absent_in_window(&bob, bb, ends[0],
                             "an echoed `account` tag from the inbound direction, "
                             "to the recipient that asked hardest for one",
                             "account=");
@@ -1397,7 +1397,7 @@ static void test_account_tag_on_the_wire(const char *sasl, const char *registry)
      * than as an absence, so the line's bytes are pinned. */
     (void)snprintf(want, sizeof want,
                    ":erin!erin@127.0.0.1 PRIVMSG " CHAN_TAGGED " spoof\r\n");
-    expect_in_window(&bob, bb, ends[1],
+    expect_in_window(&bob, bb, ends[0],
                      "the message carrying the spoofed tag", want);
 
     TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not stop cleanly");
