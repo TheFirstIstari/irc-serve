@@ -18,6 +18,7 @@
 #include <sys/types.h>
 #include <time.h>
 
+#include "core/server.h"
 #include "core/transport.h"
 
 /* Grow `*buf` to at least `need` bytes, doubling from the current capacity and
@@ -79,23 +80,20 @@ conn_t *conn_new(int fd, int kind)
      * transport from the instant it exists" true rather than something each
      * construction site has to remember -- see transport.h. */
     transport_init_plaintext(c);
-    /* The two 317 RPL_WHOISIDLE timestamps, stamped where the connection comes
+    /* The two 317 RPL_WHOISIDLE stamps, taken where the connection comes
      * into existence rather than where they are asked for. signon_at is the
      * answer to "when did this user connect", which is a fact about accept and
-     * is therefore true from this instant; last_active starts equal to it so an
-     * idle time measured before the client has said anything is zero rather
-     * than whatever the epoch happened to be.
+     * is therefore true from this instant; last_active_ms starts at the
+     * same instant so an idle time measured before the client has said
+     * anything is zero rather than whatever the clock happened to read.
      *
-     * This is a wall-clock read, which 3.4 otherwise forbids in handlers ("the
-     * poll tick drives time"). The rule is about TIME-OUT logic -- handshake
-     * deadlines, link liveness, LRU eviction -- which must be immune to a clock
-     * jump. 317 is the opposite case: its <signon time> is a calendar time the
-     * client is meant to compare against its own clock, so no monotonic
-     * substitute would be the right value. It is read once per connection,
-     * never per tick, and commands.c's 003 already established the precedent
-     * and the reasoning for exactly one such read on the reply path. */
+     * signon_at is wall-clock (time()): 317's <signon> is a calendar time
+     * the client compares against its own clock. last_active_ms is
+     * server_now_ms() on the MONOTONIC clock (#175): idle is a duration
+     * and a wall-clock duration warps under an NTP step (mass-kick or
+     * never-kick). See connection.h. */
     c->signon_at = time(NULL);
-    c->last_active = c->signon_at;
+    c->last_active_ms = server_now_ms();
     return c;
 }
 
@@ -164,8 +162,9 @@ int conn_fill(conn_t *c)
              * which is what makes it the right place to stamp 317's <idle>
              * from: stamping it in a command handler would report a client as
              * idle while it was mid-burst, and stamping it nowhere would make
-             * the number a constant. */
-            c->last_active = time(NULL);
+             * the number a constant. Monotonic (#175), matching conn_new()'s
+             * last_active_ms; signon_at is untouched here. */
+            c->last_active_ms = server_now_ms();
             continue;
         }
         if (n == 0) {

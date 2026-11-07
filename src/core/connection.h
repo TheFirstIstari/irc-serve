@@ -24,7 +24,7 @@
  *
  * The struct's shape has since been FINAL in the sense 7/Phase 4 meant: the
  * fields Phase 4 and Phase 5 added (member flags and the remote caches on
- * chan_t; away, signon_at and last_active here) are additions, not
+ * chan_t; away, signon_at and last_active_ms here) are additions, not
  * rearrangements, and every one of them is a field a later phase or a numeric
  * needs. A phase that finds itself wanting a DIFFERENT struct is the signal
  * that the design above is wrong, not that the field should be shoved in
@@ -894,7 +894,14 @@ size_t conn_text_logsafe(char *out, size_t cap, const char *s);
  *               is"). Borrowing the node's boot time would be the same lie one
  *               level up: it is when the SERVER started, not when the user
  *               connected.
- *   last_active 317's other half. It is updated in conn_fill(), which is the
+ *               signon_at stays wall-clock (time_t from time()): 317's
+ *               <signon> is a calendar time the client compares against its
+ *               own clock, so no monotonic substitute is the right value.
+ *               last_active_ms is the separate monotonic stamp
+ *               (server_now_ms() ms, #175) that 317's <idle> is computed
+ *               from: idle is a duration, and a wall-clock duration warps
+ *               under an NTP step.
+ *   last_active_ms 317's other half. It is updated in conn_fill(), which is the
  *               only place that observes the connection doing anything, so the
  *               idle time it yields is measured from real socket activity rather
  *               than from the last command that happened to be dispatched.
@@ -937,7 +944,7 @@ typedef struct conn {
     int         user_seen;         /* a USER command arrived; ident may be empty */
     char        away[CONN_MAX_AWAY + 1];
     time_t      signon_at;         /* accept time; 317's <signon time> */
-    time_t      last_active;       /* last byte read; 317's <idle> */
+    uint64_t    last_active_ms;  /* last byte read, monotonic ms; 317's <idle> */
     unsigned    caps;              /* negotiated capabilities; core/cap.h bits */
     int         cap_negotiating;   /* CAP LS/REQ in flight; CAP END clears it */
     int         sasl;              /* sasl_state_t; FAILED is terminal */
