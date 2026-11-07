@@ -192,7 +192,6 @@ int main(void)
         "src/core/reply.c",
         "src/core/commands.c",
         "src/node_main.c",
-        "src/protocol_parse.c",
         "src/ircv3_tags.c",
         "src/federation_handshake.c",
         "src/sasl_framework.c"
@@ -211,7 +210,7 @@ int main(void)
     static const char *const no_destroy[] = {
         "src/core/poll_loop.c", "src/core/message.c", "src/core/reply.c",
         "src/core/commands.c", "src/node_main.c",
-        "src/protocol_parse.c", "src/ircv3_tags.c",
+        "src/ircv3_tags.c",
         "src/federation_handshake.c", "src/sasl_framework.c",
         /* The link module. It is in the second list and NOT the first, which is
          * the whole of the exception documented in the header: it closes a

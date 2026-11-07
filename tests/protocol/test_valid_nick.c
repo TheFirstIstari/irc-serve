@@ -1,15 +1,12 @@
 /* valid_nick tests -- the nick charset rule that SERVER_DESIGN.md 5 says is
  * MISSING, and that 2.1's `nick@server` identity scheme is unsound without.
  *
- * parse_nick() performs no character validation at all: it returns 1 for
- * "NICK a@evil" and yields the nickname "a@evil". These tests pin the
- * predicate that closes that, and the last block demonstrates the gap
- * concretely against the real parse_nick(). */
+ * These tests pin the predicate that enforces it: the illegal sigils below
+ * must all be refused, and ordinary nicknames accepted. */
 #include <assert.h>
 #include <string.h>
 
 #include "core/message.h"
-#include "protocol_parse.h"
 
 static void assert_valid(const char *nick)
 {
@@ -28,8 +25,6 @@ static void assert_invalid(const char *nick)
 
 int main(void)
 {
-    char nick[128];
-
     /* --- ordinary nicknames are accepted --- */
     /* Note what is NOT here: "123" and "0" (leading digit), and "a:b", "a;b"
      * and "a:b.c" (embedded ':' or ';'). Those were legal under the first
@@ -283,47 +278,10 @@ int main(void)
         assert_invalid(over);
     }
 
-    /* --- the gap this predicate closes, against the real parse_nick() --- */
-    {
-        static const char *const lines[] = {
-            "NICK a@evil",  /* the case 5 calls out by name */
-            "NICK a#b",
-            "NICK a&b",
-            "NICK a+b",
-            "NICK a!b",
-            "NICK @",
-            "NICK a:b",     /* a colon in a nick muddies the prefix grammar */
-            "NICK a;b",     /* a tag separator in a nick */
-            "NICK 1abc",    /* a leading digit is neither letter nor "special" */
-            "NICK 9",
-            "NICK a b",     /* parse_nick rejects this one itself */
-        };
-        size_t accepted = 0;
-        int tokens = 0;
-        for (size_t i = 0; i < sizeof lines / sizeof lines[0]; i++) {
-            if (parse_nick(lines[i], nick, (int)sizeof nick, &tokens) != 1) {
-                continue;
-            }
-            accepted++;
-            /* parse_nick says yes; the charset rule must be able to say no. */
-            assert(valid_nick(nick) == 0);
-        }
-        /* parse_nick really did accept the illegal ones, so the block is
-         * testing something real rather than passing vacuously. Ten of the
-         * eleven: everything except the nickname containing a space, which
-         * parse_nick rejects on its own. */
-        assert(accepted == 10);
-
-        /* And a legitimate nickname passes both. */
-        assert(parse_nick("NICK alice", nick, (int)sizeof nick, &tokens) == 1);
-        assert(strcmp(nick, "alice") == 0);
-        assert(valid_nick(nick) == 1);
-        /* A qualified name is two nicks, and both halves are valid, so the
-         * whole thing is a nick@server pair that splits at the last '@'. */
-        assert(parse_nick("NICK alice@", nick, (int)sizeof nick, &tokens) == 1);
-        assert(valid_nick("alice") == 1);
-        assert(valid_nick("irc.a") == 1);
-    }
+    /* A qualified name is two nicks, and both halves are valid, so the
+     * whole thing is a nick@server pair that splits at the last '@'. */
+    assert_valid("alice");
+    assert_valid("irc.a");
 
     return 0;
 }
