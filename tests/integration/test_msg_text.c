@@ -927,7 +927,7 @@ static void fed_child_setup(server_t *s)
     /* RAISED, not the shipped values: this case sends a handful of lines and the
      * shipped 5 s keepalive against a 30 s dead threshold is a real schedule, but
      * nothing here waits on it and raising it only removes a source of flake. */
-    fed_set_timeouts(2000, 60000, 30000, 600000);
+    fed_set_timeouts(s, 2000, 60000, 30000, 600000);
 
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;

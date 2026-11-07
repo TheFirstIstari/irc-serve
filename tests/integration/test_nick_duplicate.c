@@ -127,7 +127,7 @@ static void child_setup(server_t *s)
      * at all -- it runs on a registry entry, not on a clock -- so there is
      * nothing here to scale down, and using the shipped values is a statement
      * that the test is not measuring time. */
-    fed_set_timeouts(2000, 2000, 900, 2700);
+    fed_set_timeouts(s, 2000, 2000, 900, 2700);
 
     if (g_cfg.peer_name != NULL && g_cfg.peer_port > 0) {
         memset(&addr, 0, sizeof addr);

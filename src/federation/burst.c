@@ -46,13 +46,13 @@ int fed_burst_verb(const char *verb)
 /* ---------------------------------------------------------------------------
  * THE SHADOW -- the transaction being assembled
  * ---------------------------------------------------------------------------
- * There is ONE, and it is a module global for the reason the shared secret and
- * the dispatch hook in federation/link.c are: this node is one process
- * (fed_open() refuses a second node) and the loop is single-threaded (3.4). A
- * per-link shadow would be a second thing to index for no property -- a node has
- * one transaction in flight per link, and a link's transaction is over the
- * instant a second SBURST arrives on it, because a BEGIN discards whatever was
- * open.
+ * There is ONE PER NODE, held on server_t and allocated by server_init() for
+ * the reason the shared secret and the dispatch hook in federation/link.c are
+ * (issue #173): two server_t in one process stage into separate shadows, and
+ * the loop is single-threaded (3.4). A per-link shadow would be a second thing
+ * to index for no property -- a node has one transaction in flight per link,
+ * and a link's transaction is over the instant a second SBURST arrives on it,
+ * because a BEGIN discards whatever was open.
  *
  * WHAT A NICK RECORD KEEPS, and what it does not, is the interesting part of
  * this struct. SBURSTN carries nick, user, host, modes, signon and away, and
@@ -167,7 +167,7 @@ enum {
 #define BURST_CHAN_PRESENTATION_MASK                                     \
     ((unsigned)(BURST_CHAN_REFUSED_TOPIC | BURST_CHAN_REFUSED_MODES))
 
-typedef struct {
+typedef struct burst_shadow {
     int             open;  /* a BEGIN has arrived and no COMMIT has           */
     char            origin[IRC_MAX_SERVER_NAME + 1];
     uint64_t        epoch; /* what the BEGIN claimed                          */
@@ -184,16 +184,25 @@ typedef struct {
     burst_chan_t   *cur; /* the SBURSTC the SBURSTM lines attach to           */
 } burst_shadow_t;
 
-static burst_shadow_t g_shadow;
-static size_t          g_max_bytes = IRC_BURST_MAX_BYTES;
-
-void fed_burst_set_max_bytes(size_t max_bytes)
+/* This node's shadow, or NULL on a node server_init() never built. Every
+ * reader below goes through here so the NULL is checked once per entry
+ * rather than once per field. */
+static burst_shadow_t *sh_of(server_t *s)
 {
-    /* 0 KEEPS THE BUILT-IN rather than meaning "no bytes": a zero budget is not
-     * a configuration anybody wants, and the alternative is a second sentinel for
-     * the same question. fed_set_timeouts() answers it the same way. */
+    return (s != NULL) ? s->burst : NULL;
+}
+
+void fed_burst_set_max_bytes(server_t *s, size_t max_bytes)
+{
+    /* 0 KEEPS THE CURRENT VALUE rather than meaning "no bytes": a zero budget
+     * is not a configuration anybody wants, and the alternative is a second
+     * sentinel for the same question. server_init() seeded the built-in, so
+     * "current" is the built-in until a caller says otherwise. */
+    if (s == NULL) {
+        return;
+    }
     if (max_bytes > 0u) {
-        g_max_bytes = max_bytes;
+        s->burst_max_bytes = max_bytes;
     }
 }
 
@@ -384,7 +393,7 @@ static int stage_line(burst_stage_t *st, server_t *s, const char *origin,
      * intends to send, and a burst that stops half way is the truncated
      * transaction the format exists to prevent. */
     need = st->len + len + 2u;
-    if (need > g_max_bytes) {
+    if (need > s->burst_max_bytes) {
         return -1;
     }
     if (stage_grow(st, need) != 0) {
@@ -758,7 +767,7 @@ int fed_burst_send(server_t *s, server_link_t *link)
     printf("[observable] fed_burst_sent: peer=%s epoch=%llu nicks=%zu chans=%zu "
            "members=%zu bytes=%zu budget=%zu\n",
            link->name, (unsigned long long)s->epoch, nnicks, nchans, nmembers,
-           st.len, g_max_bytes);
+           st.len, s->burst_max_bytes);
     stage_free(&st);
     return 0;
 
@@ -774,7 +783,7 @@ refused:
         s->n_burst_refused++;
         printf("[observable] fed_burst_refused: peer=%s bytes=%zu budget=%zu "
                "reason=TOO_LARGE\n",
-               link->name, was, g_max_bytes);
+               link->name, was, s->burst_max_bytes);
     }
     return -1;
 }
@@ -818,30 +827,35 @@ int federation_resync(server_t *s, server_link_t *link)
  * largest burst it has ever applied for the life of the process, and a node
  * whose peak burst is set by one client's away message has no business doing
  * that. */
-static void shadow_release(void)
+static void shadow_release(burst_shadow_t *sh)
 {
-    free(g_shadow.nicks);
-    g_shadow.nicks = NULL;
-    g_shadow.nnick_cap = 0u;
-    g_shadow.nnicks = 0u;
-    for (size_t i = 0; i < g_shadow.nchan_used; i++) {
-        free(g_shadow.chans[i].members);
-        g_shadow.chans[i].members = NULL;
-        g_shadow.chans[i].nmembers = 0u;
-        g_shadow.chans[i].mcap = 0u;
+    size_t i;
+
+    if (sh == NULL) {
+        return;
     }
-    free(g_shadow.chans);
-    g_shadow.chans = NULL;
-    g_shadow.nchan_cap = 0u;
-    g_shadow.nchan_used = 0u;
-    g_shadow.nchans = 0u;
-    g_shadow.cur = NULL;
-    g_shadow.open = 0;
-    g_shadow.origin[0] = '\0';
-    g_shadow.epoch = 0u;
-    g_shadow.expect_nnicks = 0u;
-    g_shadow.nmembers = 0u;
-    g_shadow.bytes = 0u;
+    free(sh->nicks);
+    sh->nicks = NULL;
+    sh->nnick_cap = 0u;
+    sh->nnicks = 0u;
+    for (i = 0; i < sh->nchan_used; i++) {
+        free(sh->chans[i].members);
+        sh->chans[i].members = NULL;
+        sh->chans[i].nmembers = 0u;
+        sh->chans[i].mcap = 0u;
+    }
+    free(sh->chans);
+    sh->chans = NULL;
+    sh->nchan_cap = 0u;
+    sh->nchan_used = 0u;
+    sh->nchans = 0u;
+    sh->cur = NULL;
+    sh->open = 0;
+    sh->origin[0] = '\0';
+    sh->epoch = 0u;
+    sh->expect_nnicks = 0u;
+    sh->nmembers = 0u;
+    sh->bytes = 0u;
 }
 
 /* Every discard in this file goes through here, so the counter and the
@@ -852,38 +866,47 @@ static void shadow_release(void)
 static void shadow_discard(server_t *s, const char *why, const char *origin,
                            size_t nnicks, size_t nchans, size_t nmembers)
 {
+    burst_shadow_t *sh = sh_of(s);
+
+    if (s == NULL) {
+        return;
+    }
     printf("[observable] fed_burst_abandon: origin=%s reason=%s nicks=%zu "
            "chans=%zu members=%zu bytes=%zu budget=%zu\n",
            (origin != NULL) ? origin : "?", (why != NULL) ? why : "?", nnicks,
-           nchans, nmembers, g_shadow.bytes, g_max_bytes);
+           nchans, nmembers, (sh != NULL) ? sh->bytes : 0u,
+           s->burst_max_bytes);
     s->n_burst_abandoned++;
-    shadow_release();
+    shadow_release(sh);
 }
 
-void fed_burst_abandon(server_link_t *link)
+void fed_burst_abandon(server_t *s, server_link_t *link)
 {
-    if (link == NULL || g_shadow.open == 0) {
+    burst_shadow_t *sh = sh_of(s);
+
+    if (sh == NULL || link == NULL || sh->open == 0) {
         return;
     }
     /* Only the owner abandons: a link going down must not throw away another
      * peer's in-flight burst. */
-    if (!chan_same_name(g_shadow.origin, link->name)) {
+    if (!chan_same_name(sh->origin, link->name)) {
         return;
     }
     printf("[observable] fed_burst_abandon: origin=%s reason=LINK_DOWN nicks=%zu "
            "chans=%zu members=%zu bytes=%zu\n",
-           g_shadow.origin, g_shadow.nnicks, g_shadow.nchans, g_shadow.nmembers,
-           g_shadow.bytes);
-    shadow_release();
+           sh->origin, sh->nnicks, sh->nchans, sh->nmembers,
+           sh->bytes);
+    shadow_release(sh);
 }
 
 /* ---------------------------------------------------------------------------
  * THE TEARDOWN ARM
  * ---------------------------------------------------------------------------
- * The shadow is a MODULE GLOBAL, so it is the one allocation on a node whose
- * owner cannot be reached from server_shutdown() by freeing a field. This is the
- * arm, and its contract is the one in burst.h: release, count nothing, say
- * whether there was anything to release.
+ * The shadow is a per-node heap allocation on server_t (issue #173), so this
+ * arm releases it the way the dedup free releases its table: from the one
+ * function that ends every allocation on the struct. Its contract is the one
+ * in burst.h: release, count nothing, say whether there was anything to
+ * release.
  *
  * WHY IT IS HERE NOW RATHER THAN NEVER, which is what C4 concluded and got
  * backwards. C4's reasoning was that the arm is unverifiable on this platform --
@@ -902,22 +925,25 @@ void fed_burst_abandon(server_link_t *link)
  * prints the counts rather than just a boolean because a reader looking at the
  * last line a node printed wants to know what it was holding.
  *
- * Safe on a node that never called fed_open(): g_shadow is a file-scope static,
- * so it is already zero and shadow_release() on it frees two NULL pointers. */
+ * The shadow struct itself is freed and the field cleared, so a second close
+ * is a NONE rather than a double free. Safe on a node that never called
+ * fed_open(), on a node server_init() never built, and on NULL. */
 void fed_burst_close(server_t *s)
 {
-    int open = g_shadow.open;
+    burst_shadow_t *sh = sh_of(s);
+    int open = (sh != NULL) ? sh->open : 0;
 
-    /* The node is not touched today and the parameter is not dropped. The shadow
-     * is a module global, but a teardown that may one day need to walk the node
-     * should not have its signature changed underneath the caller, and every
-     * other teardown in this tree takes the node it is tearing down. */
-    (void)s;
     printf("[observable] fed_burst_close: shadow=%s origin=%s nicks=%zu chans=%zu "
            "members=%zu bytes=%zu\n",
-           (open != 0) ? "OPEN" : "NONE", g_shadow.origin, g_shadow.nnicks,
-           g_shadow.nchans, g_shadow.nmembers, g_shadow.bytes);
-    shadow_release();
+           (open != 0) ? "OPEN" : "NONE", (sh != NULL) ? sh->origin : "",
+           (sh != NULL) ? sh->nnicks : 0u,
+           (sh != NULL) ? sh->nchans : 0u, (sh != NULL) ? sh->nmembers : 0u,
+           (sh != NULL) ? sh->bytes : 0u);
+    shadow_release(sh);
+    if (s != NULL) {
+        free(sh);
+        s->burst = NULL;
+    }
 }
 
 /* Charge a record's WIRE size against the same budget the sender charges, and
@@ -937,12 +963,17 @@ void fed_burst_close(server_t *s)
  * against a line in a log rather than against a struct. */
 static int shadow_charge(server_t *s, const char *why, size_t wire_bytes)
 {
-    if (g_shadow.bytes + wire_bytes > g_max_bytes) {
-        shadow_discard(s, why, g_shadow.origin, g_shadow.nnicks, g_shadow.nchans,
-                       g_shadow.nmembers);
+    burst_shadow_t *sh = sh_of(s);
+
+    if (sh == NULL) {
         return -1;
     }
-    g_shadow.bytes += wire_bytes;
+    if (sh->bytes + wire_bytes > s->burst_max_bytes) {
+        shadow_discard(s, why, sh->origin, sh->nnicks, sh->nchans,
+                       sh->nmembers);
+        return -1;
+    }
+    sh->bytes += wire_bytes;
     return 0;
 }
 
@@ -966,6 +997,7 @@ static size_t wire_size(const char *origin, const char *verb, char *const *p,
 static int apply_begin(server_t *s, server_link_t *link, const message_t *m)
 {
     irc_serve_tags_t tags;
+    burst_shadow_t *sh = sh_of(s);
     uint64_t epoch = 0u;
     uint64_t nnicks = 0u;
 
@@ -977,21 +1009,32 @@ static int apply_begin(server_t *s, server_link_t *link, const message_t *m)
                link->fd, m->nparams);
         return -1;
     }
+    if (sh == NULL) {
+        /* First transaction on this node: the shadow is allocated here rather
+         * than in server_init() so a node with no peers pays nothing for it,
+         * and per node rather than per process so two server_t stage into
+         * separate shadows (issue #173). */
+        s->burst = (burst_shadow_t *)calloc(1, sizeof *s->burst);
+        if (s->burst == NULL) {
+            return -1;
+        }
+        sh = s->burst;
+    }
     /* A transaction that is already open is REPLACED, not resumed -- but
      * only by the peer that opened it. That is 4.3's own rule arriving from
      * the other direction: a BEGIN is a statement that everything after it
      * is the whole truth. A second BEGIN from the SAME link restarts its
      * transaction; a BEGIN from another link while one is open is refused
      * with BUSY, so two peers bursting at once do not destroy each other. */
-    if (g_shadow.open != 0) {
-        if (!chan_same_name(g_shadow.origin, link->name)) {
+    if (sh->open != 0) {
+        if (!chan_same_name(sh->origin, link->name)) {
             printf("[observable] fed_burst_refused: peer=%s reason=BUSY "
                    "owner=%s\n",
-                   link->name, g_shadow.origin);
+                   link->name, sh->origin);
             return -1;
         }
-        shadow_discard(s, "SUPERSEDED", g_shadow.origin, g_shadow.nnicks,
-                       g_shadow.nchans, g_shadow.nmembers);
+        shadow_discard(s, "SUPERSEDED", sh->origin, sh->nnicks,
+                       sh->nchans, sh->nmembers);
     }
     /* The transaction is about the PEER, and the peer is the link. A burst whose
      * tag block names a third server is a RELAYED burst, and this protocol has
@@ -1011,12 +1054,12 @@ static int apply_begin(server_t *s, server_link_t *link, const message_t *m)
                link->name, tags.origin);
         return -1;
     }
-    if (!burst_copy(g_shadow.origin, sizeof g_shadow.origin, link->name)) {
+    if (!burst_copy(sh->origin, sizeof sh->origin, link->name)) {
         return -1;
     }
-    g_shadow.epoch = epoch;
-    g_shadow.expect_nnicks = nnicks;
-    g_shadow.open = 1;
+    sh->epoch = epoch;
+    sh->expect_nnicks = nnicks;
+    sh->open = 1;
     /* A peer that restarts and says so is the one case the epoch is FOR: the
      * ids this node will accept from that peer after the commit belong to the
      * boot the burst described, and leaving link->epoch at the old value would
@@ -1031,8 +1074,13 @@ static int apply_begin(server_t *s, server_link_t *link, const message_t *m)
 /* SBURSTN <nick> <user> <host> <modes> <signon> :<away>. */
 static int apply_nick(server_t *s, server_link_t *link, const message_t *m)
 {
+    burst_shadow_t *sh = sh_of(s);
     burst_nick_t *slot;
     uint64_t signon = 0u;
+
+    if (sh == NULL) {
+        return -1;
+    }
 
     /* THE ARITY IS THE FORMAT'S, not the S-verb table's, and the nickname is
      * validated with 2.1's rule here for the reason channel.h's
@@ -1071,29 +1119,29 @@ static int apply_nick(server_t *s, server_link_t *link, const message_t *m)
                     "nick_len=%zu nick_bad_bytes=%zu\n",
                     link->fd, raw, strlen(raw), conn_text_bad_count(raw));
         }
-        shadow_discard(s, "BAD_NICK_RECORD", g_shadow.origin, g_shadow.nnicks,
-                       g_shadow.nchans, g_shadow.nmembers);
+        shadow_discard(s, "BAD_NICK_RECORD", sh->origin, sh->nnicks,
+                       sh->nchans, sh->nmembers);
         return -1;
     }
     if (shadow_charge(s, "TOO_LARGE", wire_size(link->name, "SBURSTN", m->params,
                                                 6)) != 0) {
         return -1;
     }
-    if (g_shadow.nnicks == g_shadow.nnick_cap) {
-        size_t want = (g_shadow.nnick_cap == 0u) ? 8u : g_shadow.nnick_cap * 2u;
+    if (sh->nnicks == sh->nnick_cap) {
+        size_t want = (sh->nnick_cap == 0u) ? 8u : sh->nnick_cap * 2u;
         burst_nick_t *grown =
-            (burst_nick_t *)realloc(g_shadow.nicks, want * sizeof *grown);
+            (burst_nick_t *)realloc(sh->nicks, want * sizeof *grown);
 
         if (grown == NULL) {
             s->n_fed_malformed++;
-            shadow_discard(s, "NO_MEMORY", g_shadow.origin, g_shadow.nnicks,
-                           g_shadow.nchans, g_shadow.nmembers);
+            shadow_discard(s, "NO_MEMORY", sh->origin, sh->nnicks,
+                           sh->nchans, sh->nmembers);
             return -1;
         }
-        g_shadow.nicks = grown;
-        g_shadow.nnick_cap = want;
+        sh->nicks = grown;
+        sh->nnick_cap = want;
     }
-    slot = &g_shadow.nicks[g_shadow.nnicks];
+    slot = &sh->nicks[sh->nnicks];
     memset(slot, 0, sizeof *slot);
     (void)burst_copy(slot->nick, sizeof slot->nick, m->params[0]);
     /* A host longer than conn_t::host is TRUNCATED rather than refused, and that
@@ -1121,16 +1169,21 @@ static int apply_nick(server_t *s, server_link_t *link, const message_t *m)
      * parse of the same field would be a second opinion about it, and this file
      * is explicit that the parse belongs with the shape check. */
     slot->signon = signon;
-    g_shadow.nnicks++;
+    sh->nnicks++;
     return 0;
 }
 
 /* SBURSTC <chan> <origin> <topic_who> <topic_when> <modes> :<topic>. */
 static int apply_chan(server_t *s, server_link_t *link, const message_t *m)
 {
+    burst_shadow_t *sh = sh_of(s);
     burst_chan_t *sc;
     uint64_t when = 0u;
     char canonical[CHAN_MAX_NAME + 1];
+
+    if (sh == NULL) {
+        return -1;
+    }
 
     if (m->nparams != 6 || !chan_name_valid(m->params[0]) ||
         !irc_serve_server_name_valid(m->params[1]) ||
@@ -1149,8 +1202,8 @@ static int apply_chan(server_t *s, server_link_t *link, const message_t *m)
                     "channel_len=%zu channel_bad_bytes=%zu\n",
                     link->fd, raw, strlen(raw), conn_text_bad_count(raw));
         }
-        shadow_discard(s, "BAD_CHAN_RECORD", g_shadow.origin, g_shadow.nnicks,
-                       g_shadow.nchans, g_shadow.nmembers);
+        shadow_discard(s, "BAD_CHAN_RECORD", sh->origin, sh->nnicks,
+                       sh->nchans, sh->nmembers);
         return -1;
     }
     if (shadow_charge(s, "TOO_LARGE",
@@ -1163,29 +1216,29 @@ static int apply_chan(server_t *s, server_link_t *link, const message_t *m)
      * caps the count at 642 at the shipped budget, and this arm exists so that
      * the day that arithmetic moves, the count this node will allocate for is a
      * number somebody wrote down rather than a quotient. */
-    if (g_shadow.nchan_used >= IRC_BURST_MAX_CHANS) {
+    if (sh->nchan_used >= IRC_BURST_MAX_CHANS) {
         s->n_fed_malformed++;
-        shadow_discard(s, "TOO_MANY_CHANS", g_shadow.origin, g_shadow.nnicks,
-                       g_shadow.nchans, g_shadow.nmembers);
+        shadow_discard(s, "TOO_MANY_CHANS", sh->origin, sh->nnicks,
+                       sh->nchans, sh->nmembers);
         return -1;
     }
-    if (g_shadow.nchan_used == g_shadow.nchan_cap) {
-        size_t want = (g_shadow.nchan_cap == 0u) ? 8u : g_shadow.nchan_cap * 2u;
+    if (sh->nchan_used == sh->nchan_cap) {
+        size_t want = (sh->nchan_cap == 0u) ? 8u : sh->nchan_cap * 2u;
         burst_chan_t *grown =
-            (burst_chan_t *)realloc(g_shadow.chans, want * sizeof *grown);
+            (burst_chan_t *)realloc(sh->chans, want * sizeof *grown);
 
         if (grown == NULL) {
             s->n_fed_malformed++;
-            shadow_discard(s, "NO_MEMORY", g_shadow.origin, g_shadow.nnicks,
-                           g_shadow.nchans, g_shadow.nmembers);
+            shadow_discard(s, "NO_MEMORY", sh->origin, sh->nnicks,
+                           sh->nchans, sh->nmembers);
             return -1;
         }
-        memset(grown + g_shadow.nchan_cap, 0,
-               (want - g_shadow.nchan_cap) * sizeof *grown);
-        g_shadow.chans = grown;
-        g_shadow.nchan_cap = want;
+        memset(grown + sh->nchan_cap, 0,
+               (want - sh->nchan_cap) * sizeof *grown);
+        sh->chans = grown;
+        sh->nchan_cap = want;
     }
-    sc = &g_shadow.chans[g_shadow.nchan_used++];
+    sc = &sh->chans[sh->nchan_used++];
     (void)chan_name_upper(canonical, sizeof canonical, m->params[0]);
     /* THE TWO FIELDS THAT CANNOT FAIL ARE NOT `(void)`-ED (#122). Both are
      * validated above -- chan_name_valid() against the width chan_name_upper()
@@ -1199,8 +1252,8 @@ static int apply_chan(server_t *s, server_link_t *link, const message_t *m)
      * say so. */
     if (!burst_copy(sc->name, sizeof sc->name, canonical) ||
         !burst_copy(sc->origin, sizeof sc->origin, m->params[1])) {
-        shadow_discard(s, "BAD_CHAN_RECORD", g_shadow.origin, g_shadow.nnicks,
-                       g_shadow.nchans, g_shadow.nmembers);
+        shadow_discard(s, "BAD_CHAN_RECORD", sh->origin, sh->nnicks,
+                       sh->nchans, sh->nmembers);
         return -1;
     }
     /* ------------------------------------------------------------------------
@@ -1329,8 +1382,8 @@ static int apply_chan(server_t *s, server_link_t *link, const message_t *m)
                conn_text_bad_count(m->params[2]), strlen(m->params[4]));
     }
     sc->topic_when = when;
-    g_shadow.cur = sc;
-    g_shadow.nchans++;
+    sh->cur = sc;
+    sh->nchans++;
     return 0;
 }
 
@@ -1360,9 +1413,15 @@ static int apply_chan(server_t *s, server_link_t *link, const message_t *m)
  * verbs.c's G6 makes for a hop ceiling the dedup store would also have caught. */
 static int apply_member(server_t *s, server_link_t *link, const message_t *m)
 {
+    burst_shadow_t *sh = sh_of(s);
     burst_member_t *slot;
-    burst_chan_t *sc = g_shadow.cur;
+    burst_chan_t *sc;
     unsigned flags = 0u;
+
+    if (sh == NULL) {
+        return -1;
+    }
+    sc = sh->cur;
 
     /* FIVE PARAMETERS NOW: <chan> <server> <nick> <flags> <account>. The arity is
      * the FORMAT's and is enforced here rather than defaulted, for the reason the
@@ -1392,8 +1451,8 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
                     "member_len=%zu member_bad_bytes=%zu\n",
                     link->fd, raw, strlen(raw), conn_text_bad_count(raw));
         }
-        shadow_discard(s, "BAD_MEMBER_RECORD", g_shadow.origin, g_shadow.nnicks,
-                       g_shadow.nchans, g_shadow.nmembers);
+        shadow_discard(s, "BAD_MEMBER_RECORD", sh->origin, sh->nnicks,
+                       sh->nchans, sh->nmembers);
         return -1;
     }
     {
@@ -1419,8 +1478,8 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
                     "member_len=%zu member_bad_bytes=%zu reason=CHANNEL_MISMATCH\n",
                     link->fd, m->params[2], strlen(m->params[2]),
                     conn_text_bad_count(m->params[2]));
-            shadow_discard(s, "CHANNEL_MISMATCH", g_shadow.origin, g_shadow.nnicks,
-                           g_shadow.nchans, g_shadow.nmembers);
+            shadow_discard(s, "CHANNEL_MISMATCH", sh->origin, sh->nnicks,
+                           sh->nchans, sh->nmembers);
             return -1;
         }
     }
@@ -1432,8 +1491,8 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
     if (strcmp(m->params[3], "-") != 0) {
         if (m->params[3][0] == '\0') {
             s->n_fed_malformed++;
-            shadow_discard(s, "BAD_FLAGS", g_shadow.origin, g_shadow.nnicks,
-                           g_shadow.nchans, g_shadow.nmembers);
+            shadow_discard(s, "BAD_FLAGS", sh->origin, sh->nnicks,
+                           sh->nchans, sh->nmembers);
             return -1;
         }
         for (size_t i = 0; m->params[3][i] != '\0'; i++) {
@@ -1444,8 +1503,8 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
                 flags |= CHAN_MEMBER_VOICE;
             } else {
                 s->n_fed_malformed++;
-                shadow_discard(s, "BAD_FLAGS", g_shadow.origin, g_shadow.nnicks,
-                               g_shadow.nchans, g_shadow.nmembers);
+                shadow_discard(s, "BAD_FLAGS", sh->origin, sh->nnicks,
+                               sh->nchans, sh->nmembers);
                 return -1;
             }
         }
@@ -1461,8 +1520,8 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
 
         if (grown == NULL) {
             s->n_fed_malformed++;
-            shadow_discard(s, "NO_MEMORY", g_shadow.origin, g_shadow.nnicks,
-                           g_shadow.nchans, g_shadow.nmembers);
+            shadow_discard(s, "NO_MEMORY", sh->origin, sh->nnicks,
+                           sh->nchans, sh->nmembers);
             return -1;
         }
         sc->members = grown;
@@ -1492,7 +1551,7 @@ static int apply_member(server_t *s, server_link_t *link, const message_t *m)
     (void)burst_copy(slot->account, sizeof slot->account,
                      (m->params[4][0] == '*') ? "" : m->params[4]);
     slot->flags = flags;
-    g_shadow.nmembers++;
+    sh->nmembers++;
     return 0;
 }
 
@@ -1553,13 +1612,15 @@ static int burst_fold_cmp(const char *a, const char *b)
     }
 }
 
-/* qsort order for the index: folded nick first, staging position second so
- * that the first-staged record among equals sorts first. */
-static int burst_nick_order_cmp(const void *pa, const void *pb)
+/* Index order for the commit: folded nick first, staging position second so
+ * that the first-staged record among equals sorts first. Takes the shadow
+ * explicitly: qsort's comparator takes no context, and a file-static holding
+ * this node's shadow across the call would be the module global this file
+ * just stopped having (issue #173). The single caller sorts the index itself
+ * below instead, which keeps the ordering in one place with its context. */
+static int nick_idx_cmp(const burst_shadow_t *sh, size_t ia, size_t ib)
 {
-    size_t ia = *(const size_t *)pa;
-    size_t ib = *(const size_t *)pb;
-    int c = burst_fold_cmp(g_shadow.nicks[ia].nick, g_shadow.nicks[ib].nick);
+    int c = burst_fold_cmp(sh->nicks[ia].nick, sh->nicks[ib].nick);
 
     if (c != 0) {
         return c;
@@ -1573,22 +1634,45 @@ static int burst_nick_order_cmp(const void *pa, const void *pb)
     return 0;
 }
 
+/* Sort the commit's nick index in place: a stable insertion sort over the
+ * order above. The array is bounded by the byte budget (a few hundred entries
+ * at the shipped sizes) and built once per commit, so quadratic here costs
+ * less than the commit's own walks; what it buys is a sort with a context,
+ * which qsort cannot express portably. */
+static void nick_order_sort(const burst_shadow_t *sh, size_t *order, size_t n)
+{
+    size_t i;
+
+    for (i = 1u; i < n; i++) {
+        size_t key = order[i];
+        size_t j = i;
+
+        while (j > 0u && nick_idx_cmp(sh, key, order[j - 1u]) < 0) {
+            order[j] = order[j - 1u];
+            j--;
+        }
+        order[j] = key;
+    }
+}
+
 /* The staged record for `nick`, or NULL on the "never announced" rule above.
  * `order` is the commit index, or NULL when nothing was staged or the commit
  * could not fund one -- in which case this is the old linear walk, first
  * staged record wins, so a commit without an index still converges. */
-static const burst_nick_t *shadow_find(const size_t *order, const char *nick)
+static const burst_nick_t *shadow_find(const burst_shadow_t *sh,
+                                         const size_t *order, const char *nick)
 {
     size_t lo = 0u;
-    size_t hi = g_shadow.nnicks;
+    size_t hi;
 
-    if (nick == NULL) {
+    if (sh == NULL || nick == NULL) {
         return NULL;
     }
+    hi = sh->nnicks;
     if (order == NULL) {
-        for (size_t i = 0; i < g_shadow.nnicks; i++) {
-            if (chan_same_name(g_shadow.nicks[i].nick, nick)) {
-                return &g_shadow.nicks[i];
+        for (size_t i = 0; i < sh->nnicks; i++) {
+            if (chan_same_name(sh->nicks[i].nick, nick)) {
+                return &sh->nicks[i];
             }
         }
         return NULL;
@@ -1596,15 +1680,15 @@ static const burst_nick_t *shadow_find(const size_t *order, const char *nick)
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2u;
 
-        if (burst_fold_cmp(g_shadow.nicks[order[mid]].nick, nick) < 0) {
+        if (burst_fold_cmp(sh->nicks[order[mid]].nick, nick) < 0) {
             lo = mid + 1u;
         } else {
             hi = mid;
         }
     }
-    if (lo < g_shadow.nnicks &&
-        chan_same_name(g_shadow.nicks[order[lo]].nick, nick)) {
-        return &g_shadow.nicks[order[lo]];
+    if (lo < sh->nnicks &&
+        chan_same_name(sh->nicks[order[lo]].nick, nick)) {
+        return &sh->nicks[order[lo]];
     }
     return NULL;
 }
@@ -1756,7 +1840,8 @@ static void apply_topic(chan_t *ch, const burst_chan_t *sc)
 /* SBURSTE <epoch> <nnicks> <nchans> <nmembers>. */
 static int apply_end(server_t *s, server_link_t *link, const message_t *m)
 {
-    const char *origin = g_shadow.origin;
+    burst_shadow_t *sh = sh_of(s);
+    const char *origin;
     uint64_t epoch = 0u;
     uint64_t nn = 0u;
     uint64_t nch = 0u;
@@ -1780,7 +1865,11 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
      * defeat the TTL's job of measuring how long this node has believed them. */
     const uint64_t applied_ms = server_now_ms();
 
-    if (g_shadow.open == 0) {
+    if (sh == NULL) {
+        return -1;
+    }
+    origin = sh->origin;
+    if (sh->open == 0) {
         /* A COMMIT with nothing open. Counted, not applied: a terminator on its
          * own is a peer that has lost track, and honouring it would mean this
          * node purging a peer's state on the strength of a line that claims to
@@ -1796,8 +1885,8 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
         burst_parse_u64(m->params[2], &nch) != 0 ||
         burst_parse_u64(m->params[3], &nmb) != 0) {
         s->n_fed_malformed++;
-        shadow_discard(s, "BAD_COMMIT", origin, g_shadow.nnicks, g_shadow.nchans,
-                       g_shadow.nmembers);
+        shadow_discard(s, "BAD_COMMIT", origin, sh->nnicks, sh->nchans,
+                       sh->nmembers);
         return -1;
     }
     /* THE COUNT ASSERTION, and it is the whole of "there is no partial burst".
@@ -1807,8 +1896,8 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
      * count that does not match, and every one of them leaves this node holding
      * exactly what it held before. A roster missing a member is worse than a
      * roster that is stale, because nothing downstream can tell them apart. */
-    if (epoch != g_shadow.epoch || nn != g_shadow.expect_nnicks ||
-        nch != (uint64_t)g_shadow.nchans || nmb != (uint64_t)g_shadow.nmembers) {
+    if (epoch != sh->epoch || nn != sh->expect_nnicks ||
+        nch != (uint64_t)sh->nchans || nmb != (uint64_t)sh->nmembers) {
         /* NOT COUNTED AS n_fed_malformed, and the distinction is the point of
          * having more than one counter. That counter is documented as "arity or
          * field validation refused it", and every line of a transaction that
@@ -1831,12 +1920,12 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
         printf("[observable] fed_burst_truncated: peer=%s epoch=%llu/%llu "
                "nicks=%llu/%llu chans=%llu/%zu members=%llu/%zu\n",
                link->name, (unsigned long long)epoch,
-               (unsigned long long)g_shadow.epoch, (unsigned long long)nn,
-               (unsigned long long)g_shadow.expect_nnicks,
-               (unsigned long long)nch, g_shadow.nchans,
-               (unsigned long long)nmb, g_shadow.nmembers);
-        shadow_discard(s, "COUNT_MISMATCH", origin, g_shadow.nnicks,
-                       g_shadow.nchans, g_shadow.nmembers);
+               (unsigned long long)sh->epoch, (unsigned long long)nn,
+               (unsigned long long)sh->expect_nnicks,
+               (unsigned long long)nch, sh->nchans,
+               (unsigned long long)nmb, sh->nmembers);
+        shadow_discard(s, "COUNT_MISMATCH", origin, sh->nnicks,
+                       sh->nchans, sh->nmembers);
         return -1;
     }
 
@@ -1873,8 +1962,8 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
      * server, which is why fed_nickreg_learn_member() exists separately and why
      * it can correct a record this pass already wrote. */
     fed_nickreg_purge_server(s, origin);
-    for (size_t i = 0; i < g_shadow.nnicks; i++) {
-        const burst_nick_t *n = &g_shadow.nicks[i];
+    for (size_t i = 0; i < sh->nnicks; i++) {
+        const burst_nick_t *n = &sh->nicks[i];
 
         if (n->nick[0] == '\0') {
             continue;
@@ -1893,21 +1982,20 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
     }
 
     /* --- the staged-nick index, built once for the install below --------- */
-    if (g_shadow.nnicks > 0u) {
-        nick_order = (size_t *)malloc(g_shadow.nnicks * sizeof *nick_order);
+    if (sh->nnicks > 0u) {
+        nick_order = (size_t *)malloc(sh->nnicks * sizeof *nick_order);
         if (nick_order != NULL) {
-            for (size_t i = 0; i < g_shadow.nnicks; i++) {
+            for (size_t i = 0; i < sh->nnicks; i++) {
                 nick_order[i] = i;
             }
-            qsort(nick_order, g_shadow.nnicks, sizeof *nick_order,
-                  burst_nick_order_cmp);
+            nick_order_sort(sh, nick_order, sh->nnicks);
         }
     }
 
     /* --- the install, channel by channel --------------------------------- */
-    for (size_t i = 0; i < g_shadow.nchan_used; i++) {
-        const burst_chan_t *sc = &g_shadow.chans[i];
-        chan_t *ch = resolve_shadow_chan(s, sc, g_shadow.epoch);
+    for (size_t i = 0; i < sh->nchan_used; i++) {
+        const burst_chan_t *sc = &sh->chans[i];
+        chan_t *ch = resolve_shadow_chan(s, sc, sh->epoch);
 
         if (ch == NULL) {
             dropped++;
@@ -2029,7 +2117,7 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
              * arrived in a different order or not at all -- so one of them being
              * absent must not cost the other. The setters take the absence
              * independently for the same reason. */
-            rec = shadow_find(nick_order, sc->members[k].nick);
+            rec = shadow_find(sh, nick_order, sc->members[k].nick);
             if (rec != NULL) {
                 (void)chan_remote_set_host(ch, origin, sc->members[k].nick,
                                            rec->host);
@@ -2057,8 +2145,8 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
         if (ch == NULL || !chan_same_name(ch->origin, origin)) {
             continue;
         }
-        for (size_t k = 0; k < g_shadow.nchan_used; k++) {
-            if (strcmp(g_shadow.chans[k].name, ch->name) == 0) {
+        for (size_t k = 0; k < sh->nchan_used; k++) {
+            if (strcmp(sh->chans[k].name, ch->name) == 0) {
                 named = 1;
                 break;
             }
@@ -2074,15 +2162,17 @@ static int apply_end(server_t *s, server_link_t *link, const message_t *m)
     link->burst_done = 1;
     printf("[observable] fed_burst_applied: peer=%s epoch=%llu nicks=%zu chans=%zu "
            "members=%zu installed=%zu purged=%zu dropped=%zu bytes=%zu\n",
-           origin, (unsigned long long)g_shadow.epoch, g_shadow.nnicks,
-           g_shadow.nchans, g_shadow.nmembers, installed, purged, dropped,
-           g_shadow.bytes);
-    shadow_release();
+           origin, (unsigned long long)sh->epoch, sh->nnicks,
+           sh->nchans, sh->nmembers, installed, purged, dropped,
+           sh->bytes);
+    shadow_release(sh);
     return 0;
 }
 
 int fed_burst_apply(server_t *s, server_link_t *link, const message_t *m)
 {
+    burst_shadow_t *sh = sh_of(s);
+
     if (s == NULL || link == NULL || m == NULL || m->command == NULL) {
         return -1;
     }
@@ -2096,7 +2186,7 @@ int fed_burst_apply(server_t *s, server_link_t *link, const message_t *m)
         return apply_begin(s, link, m);
     }
     if (strcmp(m->command, "SBURSTN") == 0) {
-        if (g_shadow.open == 0) {
+        if (sh == NULL || sh->open == 0) {
             s->n_fed_malformed++;
             printf("[observable] fed_malformed: fd=%d command=SBURSTN "
                    "reason=NO_TRANSACTION\n",
@@ -2106,7 +2196,7 @@ int fed_burst_apply(server_t *s, server_link_t *link, const message_t *m)
         return apply_nick(s, link, m);
     }
     if (strcmp(m->command, "SBURSTC") == 0) {
-        if (g_shadow.open == 0) {
+        if (sh == NULL || sh->open == 0) {
             s->n_fed_malformed++;
             printf("[observable] fed_malformed: fd=%d command=SBURSTC "
                    "reason=NO_TRANSACTION\n",
@@ -2116,7 +2206,7 @@ int fed_burst_apply(server_t *s, server_link_t *link, const message_t *m)
         return apply_chan(s, link, m);
     }
     if (strcmp(m->command, "SBURSTM") == 0) {
-        if (g_shadow.open == 0) {
+        if (sh == NULL || sh->open == 0) {
             s->n_fed_malformed++;
             printf("[observable] fed_malformed: fd=%d command=SBURSTM "
                    "reason=NO_TRANSACTION\n",

@@ -40,58 +40,23 @@
  * array -- and the dump prints "?" for it, which is how it gets noticed. */
 #define FED_RESULT_COUNT 11
 
+#if FED_RESULT_COUNT != IRC_FED_REJECT_REASONS
+#error "link.c's FED_RESULT_COUNT and server.h's IRC_FED_REJECT_REASONS disagree"
+#endif
+
 /* ---------------------------------------------------------------------------
- * Module state, and what it is allowed to hold
+ * Module state, and what it is allowed to hold (issue #173)
  * ---------------------------------------------------------------------------
- * Three things, all of them node-identity rather than node-state, and all
- * single-threaded behind the one event loop (3.4). The link table itself, the
- * dedup store and the counters are all on server_t; what is here is what
- * server_t has no room for because it is not a per-node fact:
+ * NOTHING PER NODE. The secret, the wrapped dispatch, the four link timers,
+ * the three reconnect intervals and the per-reason rejection breakdown all
+ * used to be file-static here; they are fields on server_t now, seeded by
+ * server_init() and stored by fed_open(), so two nodes in one process keep
+ * separate secrets, timers and counters. What remains in this file is
+ * stateless: the reason spellings (constant tables) and the pure checks.
  *
- *   g_secret / g_secret_len  the shared token. It is the one piece of the
- *       node's configuration that no struct on server_t carries, and adding a
- *       field there for it would put a credential in the struct that half the
- *       tree can see. Keeping it here is the smaller of two exposures, and it
- *       is a module global for the same reason the handshake FSM has no
- *       module state of its own: single-threaded, one node per process, and
- *       fed_open() refuses a second node.
- *   g_inner / g_owner        the dispatch this module wrapped, and the node it
- *       was taken from. See the ONE NODE PER PROCESS note in the header.
- *   g_dial_ms / g_hs_ms /    the per-process timer overrides. Parameters
- *   g_keepalive_ms / g_dead_ms rather than function arguments because the tick
- *       hook's signature is fixed by core/server.h and a timer is not
- *       something the loop should have to be told about on every call.
- */
-
-/* The node whose FEDERATE lines this process handles, and the dispatch that was
- * installed before fed_open() replaced it. */
-static server_t *g_owner = NULL;
-static server_dispatch_fn g_inner = NULL;
-
-static char     g_secret[IRC_FED_MAX_SECRET];
-static size_t   g_secret_len = 0;
-
-static uint64_t g_dial_ms = (uint64_t)IRC_FED_DIAL_TIMEOUT_MS;
-static uint64_t g_hs_ms = (uint64_t)IRC_FED_HS_TIMEOUT_MS;
-static uint64_t g_advertise_ms = (uint64_t)IRC_FED_ADVERTISE_MS;
-static uint64_t g_keepalive_ms = (uint64_t)IRC_FED_KEEPALIVE_MS;
-static uint64_t g_dead_ms = (uint64_t)IRC_FED_DEAD_MS;
-
-/* The three reconnect intervals, and why they are module state rather than
- * arguments. Same argument as the four above: the tick hook's signature is
- * fixed by core/server.h, and a schedule is not something the loop should have
- * to be handed on every call. The seeded values are the #ifndef defaults, so a
- * build that supplied its own at compile time and a test that supplies its own
- * at run time reach this code by the same path. */
-static uint64_t   g_retry_base_ms = (uint64_t)IRC_FED_RETRY_BASE_MS;
-static uint64_t   g_retry_max_ms = (uint64_t)IRC_FED_RETRY_MAX_MS;
-static unsigned   g_retry_budget = (unsigned)IRC_FED_RETRY_BUDGET;
-
-/* The per-reason rejection breakdown. Indexed by fed_federate_result_t, so the
- * index of a verdict IS its counter, and a dump cannot print a reason beside
- * another reason's count. FED_OK's slot is never written: a line that is
- * accepted is not a rejection. */
-static uint64_t g_rejected[FED_RESULT_COUNT];
+ * fed_open() therefore refuses only a SECOND open of the SAME node (which
+ * would wrap the wrapper and recurse), and a second node in the same process
+ * is an ordinary second caller rather than a diagnosed refusal. */
 
 /* The stable spellings, and the dump keys. One table for both so that the
  * `reason=` on the rejection line and the `rej_*=` on the dump line cannot
@@ -170,12 +135,15 @@ const char *fed_federate_reason(fed_federate_result_t result)
     return FED_REASON_NAME[which];
 }
 
-static void count_reject(fed_federate_result_t result)
+static void count_reject(server_t *s, fed_federate_result_t result)
 {
     int which = (int)result;
 
+    if (s == NULL) {
+        return;
+    }
     if (which > 0 && which < FED_RESULT_COUNT) {
-        g_rejected[which]++;
+        s->fed_rejected[which]++;
     }
 }
 
@@ -282,7 +250,7 @@ void fed_dump(const server_t *s, const char *why)
         }
     }
     for (i = 1; i < (size_t)FED_RESULT_COUNT; i++) {
-        total_rejected += g_rejected[i];
+        total_rejected += s->fed_rejected[i];
     }
     /* Why the dump is not gated on s->trace, unlike the per-line trace: a dump
      * is asked for because something is wrong, and the flag that produces the
@@ -302,7 +270,7 @@ void fed_dump(const server_t *s, const char *why)
     printf("[observable] link_reject_reasons: ");
     for (i = 1; i < (size_t)FED_RESULT_COUNT; i++) {
         printf("%s%s%llu", (i > 1u) ? " " : "", FED_REASON_KEY[i],
-               (unsigned long long)g_rejected[i]);
+               (unsigned long long)s->fed_rejected[i]);
     }
     printf("\n");
 
@@ -745,7 +713,7 @@ static void fed_link_down(server_t *s, server_link_t *link, int announce)
      * burst would discard it anyway; discarding it here means the discard is
      * reported against the link that went down rather than against the next
      * burst, which is where an operator looking for a flapping link will look. */
-    fed_burst_abandon(link);
+    fed_burst_abandon(s, link);
     link->last_sent_ms = 0;
     link->last_recv_ms = 0;
     /* AND THE PEER'S LAST ADVERTISED FIGURE GOES WITH IT. A link that has gone down
@@ -1156,9 +1124,12 @@ void fed_set_load(server_t *s, unsigned pct)
  * T4's dead threshold and conclude the node has stopped. A test needs the figure
  * inside its own deadline, so this exists -- and it was declared without a
  * definition, which would have made every caller a link failure. */
-void fed_set_advertise_interval(uint64_t ms)
+void fed_set_advertise_interval(server_t *s, uint64_t ms)
 {
-    g_advertise_ms = ms;
+    if (s == NULL) {
+        return;
+    }
+    s->fed_advertise_ms = ms;
 }
 
 
@@ -1346,13 +1317,13 @@ static int fed_queue_federate(server_t *s, server_link_t *link, conn_t *c)
      * in a module that is behaving exactly as specified. The two are opposites
      * (a message that cannot be built versus a policy that forbids building it)
      * and they belong to different files. */
-    if (g_secret_len == 0u) {
+    if (s->fed_secret_len == 0u) {
         printf("[observable] link_send_failed: peer=%s reason=NO_SECRET "
                "configured=0\n",
                link->name);
         return -1;
     }
-    memcpy(secret, g_secret, g_secret_len + 1u);
+    memcpy(secret, s->fed_secret, s->fed_secret_len + 1u);
 
     params[0] = s->name;                        /* our own claim        */
     params[1] = epoch;                          /* our per-boot epoch   */
@@ -1430,7 +1401,7 @@ static void fed_reject(server_t *s, server_link_t *link, conn_t *c,
     if (c != NULL) {
         conn_mark_closing(c);
     }
-    count_reject(result);
+    count_reject(s, result);
     fed_dump(s, "rejected");
 }
 
@@ -1525,7 +1496,7 @@ static void fed_link_established(server_t *s, server_link_t *link, conn_t *c,
      * like -- and because a test with a short interval and a long dial would
      * otherwise have to wait out the interval to see the first one. Everything
      * after this is a refresh, driven from fed_tick() at
-     * g_advertise_ms. */
+     * s->fed_advertise_ms. */
     (void)fed_send_advertise(s);
     s->advert_sent_ms = server_now_ms();
 }
@@ -1897,7 +1868,7 @@ void fed_on_federate(server_t *s, conn_t *c, const message_t *m)
     if (s == NULL || c == NULL || m == NULL) {
         return;
     }
-    result = fed_check_federate(s, self, m, g_secret, &peer_epoch);
+    result = fed_check_federate(s, self, m, s->fed_secret, &peer_epoch);
     if (result != FED_OK) {
         fed_reject(s, self, c, result, m->params[0]);
         return;
@@ -1927,8 +1898,8 @@ static void fed_dispatch_hook(server_t *s, conn_t *c, const message_t *m)
 
     link = fed_link_of_conn(s, c);
     if (link == NULL) {
-        if (g_inner != NULL) {
-            g_inner(s, c, m);
+        if (s->fed_inner != NULL) {
+            s->fed_inner(s, c, m);
         }
         return;
     }
@@ -1946,8 +1917,8 @@ static void fed_dispatch_hook(server_t *s, conn_t *c, const message_t *m)
      * and is not a peer line falls through to the client verb table, where
      * every S-verb is an unknown command -- which is the correct answer and is
      * counted, not the reason this routing exists. */
-    if (g_inner != NULL) {
-        g_inner(s, c, m);
+    if (s->fed_inner != NULL) {
+        s->fed_inner(s, c, m);
     }
 }
 
@@ -1962,15 +1933,11 @@ int fed_open(server_t *s, const char *secret)
     if (s == NULL) {
         return -1;
     }
-    if (g_owner != NULL) {
-        /* One node per process, and the reason is in the header: the saved
-         * dispatch has nowhere to live but here, and two nodes in one process
-         * would mean the second chaining a wrapper round the first. The
-         * same-node case is refused for a different reason -- it would wrap
-         * the wrapper and recurse -- and both are the same mistake, so both
-         * are reported by the same line. */
-        printf("[observable] link_open_refused: reason=ALREADY_OPEN node=%s\n",
-               (g_owner == s) ? "same" : "other");
+    if (s->fed_opened != 0) {
+        /* A second open of the SAME node would wrap the wrapper and recurse.
+         * A second node in the same process is no longer refused: its secret,
+         * timers and counters are its own fields (issue #173). */
+        printf("[observable] link_open_refused: reason=ALREADY_OPEN node=same\n");
         return -1;
     }
     if (secret != NULL) {
@@ -1993,34 +1960,61 @@ int fed_open(server_t *s, const char *secret)
             printf("[observable] link_open_warning: reason=SECRET_SHORT len=%zu "
                    "recommended_min=16\n", len);
         }
-        memcpy(g_secret, secret, len + 1u);
-        g_secret_len = len;
+        memcpy(s->fed_secret, secret, len + 1u);
+        s->fed_secret_len = len;
     } else {
-        g_secret[0] = '\0';
-        g_secret_len = 0;
+        s->fed_secret[0] = '\0';
+        s->fed_secret_len = 0;
     }
-    g_owner = s;
-    g_inner = s->dispatch;
+    s->fed_opened = 1;
+    s->fed_inner = s->dispatch;
     s->dispatch = fed_dispatch_hook;
     /* NOT s->on_tick. The tick assignment is deliberately left to the caller
      * so that node_main.c shows the loop's time seam; see the header. */
     return 0;
 }
 
-void fed_set_timeouts(uint64_t dial_ms, uint64_t hs_ms, uint64_t keepalive_ms,
-                      uint64_t dead_ms)
+/* Unwrap the dispatch fed_open() installed and forget this node's secret, so
+ * a server_t that is shut down can be re-opened and so no credential outlives
+ * the node that used it. Safe on a node that never called fed_open(), and on
+ * NULL. Called from server_shutdown(); the goodbye (fed_send_shutdown) runs
+ * before it, because the goodbye is queued through the node's own state and
+ * the unwrap only touches the dispatch seam. */
+void fed_close(server_t *s)
 {
+    size_t i;
+
+    if (s == NULL || s->fed_opened == 0) {
+        return;
+    }
+    if (s->fed_inner != NULL) {
+        s->dispatch = s->fed_inner;
+    }
+    s->fed_inner = NULL;
+    s->fed_opened = 0;
+    for (i = 0; i < sizeof s->fed_secret; i++) {
+        s->fed_secret[i] = 0;
+    }
+    s->fed_secret_len = 0;
+}
+
+void fed_set_timeouts(server_t *s, uint64_t dial_ms, uint64_t hs_ms,
+                       uint64_t keepalive_ms, uint64_t dead_ms)
+{
+    if (s == NULL) {
+        return;
+    }
     if (dial_ms != 0u) {
-        g_dial_ms = dial_ms;
+        s->fed_dial_ms = dial_ms;
     }
     if (hs_ms != 0u) {
-        g_hs_ms = hs_ms;
+        s->fed_hs_ms = hs_ms;
     }
     if (keepalive_ms != 0u) {
-        g_keepalive_ms = keepalive_ms;
+        s->fed_keepalive_ms = keepalive_ms;
     }
     if (dead_ms != 0u) {
-        g_dead_ms = dead_ms;
+        s->fed_dead_ms = dead_ms;
     }
 }
 
@@ -2029,21 +2023,27 @@ void fed_set_timeouts(uint64_t dial_ms, uint64_t hs_ms, uint64_t keepalive_ms,
  * is not due, and it is reachable here without the clock going backwards because
  * this tick's now_ms was sampled before fed_link_promote() stamped created_ms from
  * a later reading on the same monotonic clock. */
-int fed_hs_due(uint64_t created_ms, uint64_t now_ms)
+int fed_hs_due(const server_t *s, uint64_t created_ms, uint64_t now_ms)
 {
+    if (s == NULL) {
+        return 0;
+    }
     if (created_ms == 0u) {
         return 0; /* no attempt stamped: a reset link, nothing to be late for */
     }
     if (now_ms < created_ms) {
         return 0; /* THE RULE. Unsigned, this would be 2^64-1 and always due. */
     }
-    return (uint64_t)(now_ms - created_ms) >= g_hs_ms;
+    return (uint64_t)(now_ms - created_ms) >= s->fed_hs_ms;
 }
 
-void fed_set_retry(uint64_t base_ms, uint64_t max_ms, unsigned budget)
+void fed_set_retry(server_t *s, uint64_t base_ms, uint64_t max_ms, unsigned budget)
 {
+    if (s == NULL) {
+        return;
+    }
     if (base_ms != 0u) {
-        g_retry_base_ms = base_ms;
+        s->fed_retry_base_ms = base_ms;
     }
     /* The ceiling is only ever LOWERED onto a base the caller also chose, and
      * never raised above a base that is smaller than it: a caller passing
@@ -2052,10 +2052,10 @@ void fed_set_retry(uint64_t base_ms, uint64_t max_ms, unsigned budget)
      * the difference between "the caller asked for a short scale" and "the
      * caller asked for something incoherent". */
     if (max_ms != 0u) {
-        g_retry_max_ms = (max_ms > g_retry_base_ms) ? max_ms : g_retry_base_ms;
+        s->fed_retry_max_ms = (max_ms > s->fed_retry_base_ms) ? max_ms : s->fed_retry_base_ms;
     }
     if (budget != 0u) {
-        g_retry_budget = budget;
+        s->fed_retry_budget = budget;
     }
 }
 
@@ -2138,12 +2138,12 @@ static void fed_retry_arm(server_t *s, server_link_t *link, uint64_t now_ms,
     if (link->retry_at_ms > now_ms) {
         return;
     }
-    if (link->retries >= g_retry_budget) {
+    if (link->retries >= s->fed_retry_budget) {
         link->gave_up = 1;
         s->n_fed_retry_exhausted++;
         printf("[observable] link_retry_exhausted: peer=%s attempts=%u budget=%u "
                "reason=AFTER_%s\n",
-               link->name, link->retries, g_retry_budget, (why != NULL) ? why : "?");
+               link->name, link->retries, s->fed_retry_budget, (why != NULL) ? why : "?");
         return;
     }
 
@@ -2157,14 +2157,14 @@ static void fed_retry_arm(server_t *s, server_link_t *link, uint64_t now_ms,
     if (step >= (unsigned)IRC_FED_RETRY_MAX_STEPS) {
         step = (unsigned)IRC_FED_RETRY_MAX_STEPS;
     }
-    delay = g_retry_base_ms * ((uint64_t)1u << step);
-    if (delay > g_retry_max_ms) {
-        delay = g_retry_max_ms;
+    delay = s->fed_retry_base_ms * ((uint64_t)1u << step);
+    if (delay > s->fed_retry_max_ms) {
+        delay = s->fed_retry_max_ms;
     }
     link->retries++;
     link->retry_at_ms = now_ms + delay;
     printf("[observable] link_retry: peer=%s attempt=%u/%u delay_ms=%llu after=%s\n",
-           link->name, link->retries, g_retry_budget,
+           link->name, link->retries, s->fed_retry_budget,
            (unsigned long long)delay, (why != NULL) ? why : "?");
 }
 
@@ -2433,7 +2433,7 @@ void fed_tick(server_t *s, uint64_t now_ms)
     /* --- T1: dials that will never complete ---------------------------- */
     for (i = 0; i < s->ndials; i++) {
         if (s->dials[i].state == DIAL_CONNECTING &&
-            (uint64_t)(now_ms - s->dials[i].started_ms) >= g_dial_ms) {
+            (uint64_t)(now_ms - s->dials[i].started_ms) >= s->fed_dial_ms) {
             fed_dial_expired(s, i, now_ms);
         }
     }
@@ -2562,7 +2562,7 @@ void fed_tick(server_t *s, uint64_t now_ms)
              * T4a above finds on an established link and which cost this test
              * eleven seconds.
              *
-             * T2's own question is "has the peer had g_hs_ms to answer?". The
+             * T2's own question is "has the peer had fed_hs_ms to answer?". The
              * answer is also NO -- for ever -- when the socket this attempt was
              * made on is gone: fed_link_promote() queued the FEDERATE and the peer
              * will never see it, because there is no socket left to carry it. And
@@ -2610,7 +2610,7 @@ void fed_tick(server_t *s, uint64_t now_ms)
              * are in the right order in real time.
              *
              * `now_ms - link->created_ms` is an UNSIGNED subtraction, so a stamp one
-             * millisecond in the future underflows to 2^64-1, that is >= g_hs_ms on
+             * millisecond in the future underflows to 2^64-1, that is >= fed_hs_ms on
              * any clock, and T2 fires ON THE VERY TICK THAT PROMOTED THE LINK: the
              * handshake is declared timed out, the connection is marked CLOSING with
              * the FEDERATE still sitting in its write queue, the peer sees a clean
@@ -2633,7 +2633,7 @@ void fed_tick(server_t *s, uint64_t now_ms)
              * arm is correctly not taken. It is a race on the tick's own
              * duration, so it needs a loaded machine to lose -- which is why it
              * survived a timeout increase (Phase 8 raised the budget 5000 -> 6000
-             * -> 12000 and changed nothing) and why raising g_hs_ms is not the fix:
+             * -> 12000 and changed nothing) and why raising fed_hs_ms is not the fix:
              * the age is 2^64-1, and no budget is larger than that.
              *
              * THE CLOCK HALF IS fed_hs_due(), and the rule it applies is the
@@ -2650,7 +2650,7 @@ void fed_tick(server_t *s, uint64_t now_ms)
              * elapsed time and is true whenever it is true. PR #119's fix therefore
              * still fires exactly when it should.
              * ------------------------------------------------------------------------ */
-            if (fed_hs_due(link->created_ms, now_ms) ||
+            if (fed_hs_due(s, link->created_ms, now_ms) ||
                 (link->fd >= 0 &&
                  (c == NULL || fed_link_of_conn(s, c) != link))) {
                 (void)handshake_timeout(&link->hs);
@@ -2764,7 +2764,7 @@ void fed_tick(server_t *s, uint64_t now_ms)
             /* Both tests are on this link's own stamps, and both are
              * subtractions: 3.4's clock is monotonic, and a subtraction is the
              * shape that stays correct if it ever is not. */
-            if ((uint64_t)(now_ms - link->last_sent_ms) >= g_keepalive_ms) {
+            if ((uint64_t)(now_ms - link->last_sent_ms) >= s->fed_keepalive_ms) {
                 if (c != NULL) {
                     /* On failure last_sent_ms is NOT advanced, which is the
                      * point of returning the status: server_queue() has already
@@ -2790,13 +2790,13 @@ void fed_tick(server_t *s, uint64_t now_ms)
              * gone quiet gets no advertisement at all, because the arm is inside
              * the ESTABLISHED case and T4 has not yet moved the link out of it --
              * so a dead peer is never told this node's load. */
-            if (g_advertise_ms > 0u && (s->advert_sent_ms == 0u ||
+            if (s->fed_advertise_ms > 0u && (s->advert_sent_ms == 0u ||
                                         now_ms >= s->advert_sent_ms) &&
-                (uint64_t)(now_ms - s->advert_sent_ms) >= g_advertise_ms) {
+                (uint64_t)(now_ms - s->advert_sent_ms) >= s->fed_advertise_ms) {
                 (void)fed_send_advertise(s);
                 s->advert_sent_ms = now_ms;
             }
-            if ((uint64_t)(now_ms - link->last_recv_ms) > g_dead_ms) {
+            if ((uint64_t)(now_ms - link->last_recv_ms) > s->fed_dead_ms) {
                 /* THE FAILOVER ARM, once. T4 is the only place a link that was
                  * ESTABLISHED can be declared dead, so the heartbeat is the only
                  * thing that drives a redial of a link that WAS up: there is no
