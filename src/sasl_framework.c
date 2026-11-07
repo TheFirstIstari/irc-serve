@@ -500,15 +500,16 @@ sasl_store_t *sasl_store_load(const char *path)
             return NULL;
         }
     }
-    /* The line buffer held plaintext passwords; the heap holds only hashes. */
-    sasl_wipe(line, sizeof line);
     if (ferror(f) != 0) {
         printf("[observable] sasl_store: state=REFUSED path=%s reason=read_error\n",
                path);
+        sasl_wipe(line, sizeof line);
         sasl_store_free(store);
         (void)fclose(f);
         return NULL;
     }
+    /* The line buffer held plaintext passwords; the heap holds only hashes. */
+    sasl_wipe(line, sizeof line);
     (void)fclose(f);
 
     if (store->n == 0u) {
@@ -905,19 +906,23 @@ sasl_state_t sasl_step(sasl_ctx_t *ctx, const char *server_data, size_t len,
     if (n < 0) {
         ctx->last_error = SASL_ERR_PAYLOAD;
         ctx->state = SASL_FAILED;
+        sasl_wipe(payload, sizeof payload);
+        sasl_wipe(passwd, sizeof passwd);
         return ctx->state;
     }
     if (sasl_plain_parse((const char *)payload, (size_t)n, authzid, sizeof authzid,
                          authcid, sizeof authcid, passwd, sizeof passwd) != 0) {
         ctx->last_error = SASL_ERR_PAYLOAD;
         ctx->state = SASL_FAILED;
+        sasl_wipe(payload, sizeof payload);
+        sasl_wipe(passwd, sizeof passwd);
         return ctx->state;
     }
     /* The decoded identity is recorded on the context -- it is the fact that
      * happened, and a handler needs it to answer 903. The PASSWORD IS NOT, and
-     * there is no field for it: `passwd` is a local that goes out of scope here
-     * and is never copied anywhere. A struct that held the password would be a
-     * struct a later teardown had to remember to clear. */
+     * there is no field for it: `passwd` is a local that is wiped before every
+     * return below and is never copied anywhere. A struct that held the
+     * password would be a struct a later teardown had to remember to clear. */
     /* The identity is BOUNDED before it is copied rather than truncated after.
      * sasl_plain_parse() has already refused an authcid over
      * SASL_MAX_AUTHCID, and ctx->authcid is 64 wide, so the copy fits; saying so
@@ -930,6 +935,8 @@ sasl_state_t sasl_step(sasl_ctx_t *ctx, const char *server_data, size_t len,
         if (az >= sizeof ctx->authzid || ac >= sizeof ctx->authcid) {
             ctx->last_error = SASL_ERR_PAYLOAD;
             ctx->state = SASL_FAILED;
+            sasl_wipe(payload, sizeof payload);
+            sasl_wipe(passwd, sizeof passwd);
             return ctx->state;
         }
         memcpy(ctx->authzid, authzid, az + 1u);
@@ -942,10 +949,14 @@ sasl_state_t sasl_step(sasl_ctx_t *ctx, const char *server_data, size_t len,
                 ? SASL_ERR_NO_STORE
                 : SASL_ERR_CREDENTIAL;
         ctx->state = SASL_FAILED;
+        sasl_wipe(payload, sizeof payload);
+        sasl_wipe(passwd, sizeof passwd);
         return ctx->state;
     }
     ctx->last_error = SASL_OK;
     ctx->state = SASL_COMPLETED;
+    sasl_wipe(payload, sizeof payload);
+    sasl_wipe(passwd, sizeof passwd);
     return ctx->state;
 }
 
