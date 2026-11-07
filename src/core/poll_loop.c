@@ -30,6 +30,7 @@
 
 #include "core/connection.h"
 #include "core/message.h"
+#include "core/reply.h"
 
 /* Upper bound on descriptors in one poll() set. By construction this is
  * enough: the listener plus every registered connection plus in-flight dials
@@ -37,6 +38,13 @@
  * larger. The +2 is headroom for the listener and the dial entries, which are
  * not connections. */
 #define POLL_MAX_FDS (FD_SETSIZE + 2)
+
+/* #168: per-connection flood token bucket. Burst 256 covers the existing
+ * per-iteration line budget (128) plus pipelined registration churn, so an
+ * honest client burst is unaffected; the 50 lines/sec trickle is what a
+ * flooder cannot outrun. CONN_SERVER links are exempt. */
+#define RATE_BURST 256.0
+#define RATE_REFILL_PER_SEC 50.0
 
 /* The stop latch. sig_atomic_t because it is written from a signal handler
  * while the loop reads it; volatile so the read is not cached across poll(). */
@@ -57,6 +65,26 @@ void poll_loop_clear_stop(void)
     g_stop = 0;
 }
 
+/* #168: refill one connection's bucket toward the burst. A stamp of 0 means
+ * "never refilled" (conn_new() zeroes the struct), so the first call grants
+ * the full burst and the constant lives here alone. */
+static void rate_refill(conn_t *c, uint64_t now_ms)
+{
+    if (c->rate_last_ms == 0u) {
+        c->rate_tokens = RATE_BURST;
+        c->rate_last_ms = now_ms;
+        return;
+    }
+    if (now_ms > c->rate_last_ms) {
+        c->rate_tokens += (double)(now_ms - c->rate_last_ms) *
+                          (RATE_REFILL_PER_SEC / 1000.0);
+        if (c->rate_tokens > RATE_BURST) {
+            c->rate_tokens = RATE_BURST;
+        }
+        c->rate_last_ms = now_ms;
+    }
+}
+
 /* The readable half of the message path (3.3):
  *
  *   socket read --> framing --> message_parse --> dispatch(cmd_t)
@@ -74,6 +102,8 @@ static void conn_readable(server_t *s, conn_t *c)
     /* One sender must not starve the loop: a pipelined burst is framed
      * across ticks instead of all at once. */
     unsigned budget = 128u;
+
+    rate_refill(c, server_now_ms());
 
     for (;;) {
         message_t m;
@@ -102,6 +132,27 @@ static void conn_readable(server_t *s, conn_t *c)
         }
 
         s->n_lines++;
+        /* #168: each dispatched client line spends one token. Empty means the
+         * sender is flooding: one 417, then CLOSING, and the reaper collects
+         * the fd at step 7. The reply precedes the mark because the reply
+         * path refuses a CLOSING target. "Once" needs no flag: a CLOSING
+         * conn is never read again. */
+        if (c->kind != CONN_SERVER) {
+            if (c->rate_tokens < 1.0) {
+                printf("[observable] rate_limited: fd=%d\n", c->fd);
+                (void)reply_refused(s, c, m.command, NULL, "417", NULL, 0,
+                                    "Input rate limit exceeded");
+                message_free(&m);
+                /* Flush NOW: the loop's write step runs before its read step
+                 * per iteration, and a CLOSING conn leaves the poll set, so a
+                 * 417 left queued would die in the reaper's close() unsent.
+                 * conn_pump() never closes; the mark below still does. */
+                (void)conn_pump(c);
+                conn_mark_closing(c);
+                return;
+            }
+            c->rate_tokens -= 1.0;
+        }
         if (s->trace) {
             /* THE COMMAND WORD IS AN IDENTIFIER, SO IT IS MEASURED, NOT FILTERED.
              * Every word on this line came off a socket, including the one that
@@ -496,7 +547,20 @@ int poll_loop_step(server_t *s, int timeout_ms)
     (void)server_reap(s);
 
     /* --- 8. tick: the only place time advances --- */
-    server_tick(s, server_now_ms());
+    {
+        uint64_t now_ms = server_now_ms();
+
+        /* #168: refill every live bucket on the tick, so a flooder's debt is
+         * measured in real time rather than in poll iterations. */
+        for (i = 0; i < SERVER_FD_TABLE; i++) {
+            conn_t *c = s->by_fd[i];
+
+            if (c != NULL && c->state != CONN_CLOSING) {
+                rate_refill(c, now_ms);
+            }
+        }
+        server_tick(s, now_ms);
+    }
     return 0;
 }
 

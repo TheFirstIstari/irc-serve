@@ -196,6 +196,10 @@ irc_add_integration_test(test_fdsize_reject test_fdsize_reject.c)
 # 3.4: the loop is EINTR-safe.
 irc_add_integration_test(test_eintr test_eintr.c)
 
+# #168: per-connection flood rate limit (burst 256, 50 lines/sec); a flooder
+# gets one 417 and a close, an honest client is unaffected.
+irc_add_integration_test(test_flood_rate test_flood_rate.c)
+
 # 3.4: the reaper is the only close site, and a closed slot leaves nothing
 # behind. The structural half is the test below.
 irc_add_integration_test(test_reaper_close test_reaper_close.c)
