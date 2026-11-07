@@ -60,11 +60,14 @@
  *   AGAINST THE HOST'S getpwnam(). Real, but it makes a federated node's user
  *   namespace the host's, so a container image's `root` becomes an IRC identity
  *   nobody chose, and the node's `--name` gives no hint of it.
- *   A HASH. Right in the abstract and wrong here: this tree contains no
- *   cryptographic code and hand-rolling a primitive into an authentication path
- *   is a worse outcome than being explicit about what the file is. The file is a
- *   secret store, so it is required to be a SECRET FILE -- see
- *   sasl_store_load() -- and that requirement, not a hash, is the control.
+ *   A HASH. Right in the abstract and -- for the FILE -- wrong here: this
+ *   tree contains no cryptographic code and hand-rolling a primitive into an
+ *   authentication path is a worse outcome than being explicit about what the
+ *   file is. The file is a secret store, so it is required to be a SECRET
+ *   FILE -- see sasl_store_load() -- and that requirement, not a hash, is the
+ *   control on what is on disk. What is hashed is the HEAP copy: each record
+ *   holds SHA-256(salt || password) under a per-boot salt, so a core dump or
+ *   an allocator reuse reads back digests rather than passwords.
  */
 #ifndef IRC_SASL_FRAMEWORK_H
 #define IRC_SASL_FRAMEWORK_H
@@ -152,12 +155,18 @@ sasl_store_t *sasl_store_new(void);
 
 /* Add or replace the record for `authcid`. Returns 0, or -1 on a NULL/empty or
  * over-long authcid, an over-long password, or a full store. `password` is
- * COPIED. */
+ * HASHED (salted SHA-256 under the store's per-boot salt) and never stored. */
 int sasl_store_add(sasl_store_t *store, const char *authcid, const char *password);
 
 /* Number of records loaded. 0 on a NULL store, which is the honest answer for
  * "this node can authenticate nobody". */
 size_t sasl_store_count(const sasl_store_t *store);
+
+/* Test support: 1 when no byte run in the store's records still equals
+ * `password` -- i.e. the heap holds the salted hash and not the literal.
+ * 0 on a NULL store or an empty password. */
+int sasl_store_holds_no_plaintext(const sasl_store_t *store,
+                                  const char *password);
 
 /* Release. Safe on NULL. A node calls this from server_shutdown(); LeakSanitizer
  * runs on the Linux CI job, so anything allocated here has to be freed there. */
@@ -201,8 +210,9 @@ int sasl_plain_parse(const char *payload, size_t len,
  * constant-time comparisons per AUTHENTICATE, and N is capped at
  * SASL_MAX_CREDENTIALS, so the worst case is 64 short comparisons on a
  * connection that has not registered. That is noise next to the base64 decode
- * that precedes it, and the alternative -- a hash of the password, so a lookup
- * could be O(1) -- is the hand-rolled-crypto outcome the header argues against. */
+ * that precedes it. The password itself is never stored -- each record holds
+ * SHA-256(salt || password) under a per-boot salt -- so the comparison is
+ * hash-against-hash and a heap dump reads back digests. */
 int sasl_plain_verify(const sasl_store_t *store,
                       const char *authzid, const char *authcid, const char *passwd);
 

@@ -460,6 +460,10 @@ typedef struct {
  * rule the tag format accepts. 1 valid, 0 invalid. */
 int irc_serve_server_name_valid(const char *name);
 
+/* Overflow-safe unsigned decimal, canonical form only (no leading zero unless
+ * the value is exactly "0"). 0 on success, -1 otherwise. */
+int parse_decimal(const char *s, size_t len, uint64_t limit, uint64_t *out);
+
 /* Read the four internal tags out of a parsed message into `*out`. Returns 0
  * when all four are present and legal, -1 otherwise (and *out is zeroed).
  * Extra unrelated tags are ignored, so a line may carry client tags too. */

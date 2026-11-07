@@ -55,6 +55,8 @@
 
 #include "core/connection.h"
 #include "core/msg_verbs.h"
+#include "core/server.h"
+#include "core/chan_verbs.h"
 
 #include "harness/irc_client.h"
 #include "harness/node_fixture.h"
@@ -285,10 +287,179 @@ static void case_away_walk_is_bounded(void)
     nf_free(&node);
 }
 
+/* ---------------------------------------------------------------------------
+ * CASE 4 -- THE NODE-WIDE CAP REFUSES CREATION, AND A PART FREES A SLOT
+ * ---------------------------------------------------------------------------
+ * Issue #169: membership is capped per connection (128) but nothing capped the
+ * node, so distinct JOINs from many connections grew the registry without
+ * bound. Filling to SERVER_MAX_CHANNELS takes 8 connections at 128 channels
+ * each (one client cannot hold the whole cap, which is the point of the
+ * per-connection bound); the JOINs go out 16 to a command (CHAN_MAX_LIST_ARGS)
+ * so the fill is tens of round trips rather than a thousand, and each channel
+ * is still confirmed by its own echo. A fresh client past the cap gets 437 --
+ * the attach-failure numeric, not 405's per-connection one -- plus an
+ * `[observable] chan_create_refused ... reason=TOO_MANY_CHANNELS` line and no
+ * `chan_create` line for the refused name; joining a channel the node already
+ * holds still works (only CREATION is refused); and after one PART the same
+ * JOIN creates again. */
+static void case_node_cap_refuses_creation(void)
+{
+    /* One client holds CONN_MAX_CHANNELS, so the fill needs this many of them.
+     * Derived from the two constants so moving either number keeps the fill at
+     * exactly the edge rather than silently short of it. */
+    enum { NFILL = SERVER_MAX_CHANNELS / CONN_MAX_CHANNELS };
+    enum { NBATCH = CONN_MAX_CHANNELS / CHAN_MAX_LIST_ARGS };
+    nf_node_t node;
+    test_client_t f[NFILL];
+    test_client_t c;
+    char line[512];
+    char echo[96];
+    char chan[32];
+    unsigned fi;
+    unsigned b;
+    unsigned k;
+
+    TF_CHECK_MSG(SERVER_MAX_CHANNELS % CONN_MAX_CHANNELS == 0,
+                 "SERVER_MAX_CHANNELS (%d) is not a multiple of "
+                 "CONN_MAX_CHANNELS (%d), so an exact fill needs a ragged "
+                 "last client this case does not have.",
+                 SERVER_MAX_CHANNELS, CONN_MAX_CHANNELS);
+    TF_CHECK_MSG(CONN_MAX_CHANNELS % CHAN_MAX_LIST_ARGS == 0,
+                 "CONN_MAX_CHANNELS (%d) is not a multiple of "
+                 "CHAN_MAX_LIST_ARGS (%d), so batched JOINs cannot land "
+                 "exactly on the per-connection edge.",
+                 CONN_MAX_CHANNELS, CHAN_MAX_LIST_ARGS);
+    TF_CHECK_MSG(nf_spawn_binary(&node) == 0, "could not spawn the node");
+    for (fi = 0; fi < NFILL; fi++) {
+        char nick[32];
+
+        tc_init(&f[fi]);
+        TF_CHECK_MSG(tc_connect(&f[fi], node.port) == 0,
+                     "filler %u could not connect", fi);
+        (void)snprintf(nick, sizeof nick, "fill%u", fi);
+        (void)snprintf(line, sizeof line, "NICK %s", nick);
+        TF_CHECK_MSG(tc_send(&f[fi], line) == 0, "filler %u NICK failed", fi);
+        (void)snprintf(line, sizeof line, "USER %s 0 * :Fill", nick);
+        TF_CHECK_MSG(tc_send(&f[fi], line) == 0, "filler %u USER failed", fi);
+        TF_CHECK_MSG(tc_expect(&f[fi], " 001 ", T_IO_MS) == 0,
+                     "filler %u never registered", fi);
+    }
+    for (fi = 0; fi < NFILL; fi++) {
+        for (b = 0; b < NBATCH; b++) {
+            size_t used = 5; /* "JOIN " */
+
+            memcpy(line, "JOIN ", 5);
+            for (k = 0; k < CHAN_MAX_LIST_ARGS; k++) {
+                unsigned idx = fi * (unsigned)CONN_MAX_CHANNELS +
+                               b * (unsigned)CHAN_MAX_LIST_ARGS + k;
+
+                (void)snprintf(chan, sizeof chan, "#CN%04u", idx);
+                if (k != 0) {
+                    line[used++] = ',';
+                }
+                memcpy(line + used, chan, strlen(chan) + 1u);
+                used += strlen(chan);
+            }
+            TF_CHECK_MSG(tc_send(&f[fi], line) == 0,
+                         "filler %u batch %u could not be sent", fi, b);
+            for (k = 0; k < CHAN_MAX_LIST_ARGS; k++) {
+                unsigned idx = fi * (unsigned)CONN_MAX_CHANNELS +
+                               b * (unsigned)CHAN_MAX_LIST_ARGS + k;
+
+                (void)snprintf(chan, sizeof chan, "#CN%04u", idx);
+                (void)snprintf(echo, sizeof echo, " JOIN %s\r\n", chan);
+                TF_CHECK_MSG(tc_expect(&f[fi], echo, T_IO_MS) == 0,
+                             "filler %u channel %s never echoed -- the fill "
+                             "stopped short of the cap, so the refusal below "
+                             "would be for the wrong reason.\n  saw: %s",
+                             fi, chan, tc_buffer(&f[fi]));
+            }
+        }
+    }
+
+    /* AND THE ONE PAST THE EDGE, from a client that holds nothing: 437, not
+     * 405, because the per-connection cap is not what fired. */
+    tc_init(&c);
+    TF_CHECK_MSG(tc_connect(&c, node.port) == 0, "could not connect");
+    TF_CHECK_MSG(tc_send(&c, "NICK capnode") == 0, "NICK send failed");
+    TF_CHECK_MSG(tc_send(&c, "USER capnode 0 * :CapNode") == 0,
+                 "USER send failed");
+    TF_CHECK_MSG(tc_expect(&c, " 001 ", T_IO_MS) == 0,
+                 "the overflow client never registered");
+    TF_CHECK_MSG(tc_send(&c, "JOIN #CNOVERFLOW") == 0,
+                 "the JOIN past the node cap could not be sent");
+    TF_CHECK_MSG(tc_expect(&c, " 437 ", T_IO_MS) == 0,
+                 "the JOIN that would take this node past SERVER_MAX_CHANNELS "
+                 "(%d) was not refused with 437.\n  saw: %s",
+                 SERVER_MAX_CHANNELS, tc_buffer(&c));
+    TF_CHECK_MSG(nf_expect(&node, "chan_create_refused: channel=", T_IO_MS) == 0,
+                 "the creation refusal was not counted.\n  node said: %s",
+                 node.out);
+    TF_CHECK_MSG(nf_expect(&node, "reason=TOO_MANY_CHANNELS", T_IO_MS) == 0,
+                 "the creation refusal does not name the reason.\n"
+                 "  node said: %s", node.out);
+    /* AND NOTHING WAS CREATED: no chan_create line for the refused name, so
+     * the count the refusal reported is the count the node still holds. */
+    TF_CHECK_MSG(strstr(node.out, "chan_create: channel=#CNOVERFLOW") == NULL,
+                 "a refused JOIN left a chan_create line for #CNOVERFLOW: the "
+                 "refusal created the channel it refused.\n  node said: %s",
+                 node.out);
+    /* AND ONLY CREATION IS REFUSED: an existing channel still admits members,
+     * and a second new name is refused again, so the count did not move. */
+    TF_CHECK_MSG(tc_send(&c, "JOIN #CN0000") == 0,
+                 "the JOIN of an existing channel could not be sent");
+    TF_CHECK_MSG(tc_expect(&c, " JOIN #CN0000\r\n", T_IO_MS) == 0,
+                 "a JOIN of a channel the node already holds was refused at "
+                 "the node cap. Only creation is capped; membership of what "
+                 "exists must keep working.\n  saw: %s", tc_buffer(&c));
+    TF_CHECK_MSG(tc_send(&c, "JOIN #CNOVERFLOW2") == 0,
+                 "the second overflow JOIN could not be sent");
+    TF_CHECK_MSG(tc_expect(&c, " 437 ", T_IO_MS) == 0,
+                 "a second new channel past the cap was not refused: the "
+                 "first refusal must have created something.\n  saw: %s",
+                 tc_buffer(&c));
+
+    /* PART FREES A SLOT: the filler held #CN0000 alone, so parting destroys it
+     * and the refused JOIN creates again -- the cap is on what the node holds,
+     * not on what it has ever held. */
+    TF_CHECK_MSG(tc_send(&f[0], "PART #CN0000") == 0,
+                 "the freeing PART could not be sent");
+    TF_CHECK_MSG(tc_expect(&f[0], " PART #CN0000\r\n", T_IO_MS) == 0,
+                 "the freeing PART never echoed.\n  saw: %s",
+                 tc_buffer(&f[0]));
+    TF_CHECK_MSG(tc_send(&c, "PART #CN0000") == 0,
+                 "the overflow client's PART could not be sent");
+    TF_CHECK_MSG(tc_expect(&c, " PART #CN0000\r\n", T_IO_MS) == 0,
+                 "the overflow client's PART never echoed.\n  saw: %s",
+                 tc_buffer(&c));
+    /* The fill already printed one `chan_create: channel=#CN0000`, so the
+     * SECOND occurrence is the proof the PART freed the slot and the re-JOIN
+     * created again -- a plain nf_expect would match the fill's own line and
+     * prove nothing. */
+    TF_CHECK_MSG(tc_send(&c, "JOIN #CN0000") == 0,
+                 "the re-JOIN could not be sent");
+    TF_CHECK_MSG(tc_expect(&c, " JOIN #CN0000\r\n", T_IO_MS) == 0,
+                 "a JOIN refused at the node cap was refused AGAIN after a "
+                 "PART freed a slot.\n  saw: %s", tc_buffer(&c));
+    TF_CHECK_MSG(nf_expect_nth(&node, "chan_create: channel=#CN0000", 2,
+                               T_IO_MS) == 0,
+                 "the re-JOIN after a PART created nothing: there is no "
+                 "second chan_create line for #CN0000.\n  node said: %s",
+                 node.out);
+
+    tc_close(&c);
+    for (fi = 0; fi < NFILL; fi++) {
+        tc_close(&f[fi]);
+    }
+    TF_CHECK_MSG(nf_stop(&node) == 0, "the node did not exit cleanly");
+    nf_free(&node);
+}
+
 int main(void)
 {
     case_cap_refuses_the_next_join();
     case_away_walk_is_bounded();
+    case_node_cap_refuses_creation();
     tf_done("test_channel_cap");
     return 0;
 }

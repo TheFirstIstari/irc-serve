@@ -227,9 +227,10 @@ account_store_t *account_store_new(void);
 
 /* Add or replace the record for `name`. Returns 0, or -1 on a NULL/empty
  * `name`, an over-long name or password, a name or password containing a TAB,
- * or a full store. Both strings are COPIED. The timestamp is a C long rather
- * than a string because it is a NUMBER, and a number kept as a string is a
- * number two comparisons from being compared wrongly.
+ * or a full store. The name is COPIED; `password` is HASHED (salted SHA-256
+ * under the registry's per-boot salt) and never stored. The timestamp is a
+ * C long rather than a string because it is a NUMBER, and a number kept as
+ * a string is a number two comparisons from being compared wrongly.
  *
  * `created` is the registration metadata this module holds and is REQUIRED --
  * see the format block above for why a two-field record is a refusal rather
@@ -260,13 +261,21 @@ int account_store_add(account_store_t *store, const char *name,
  * cost the same and neither costs a function of WHERE the difference is. The
  * cost, stated rather than hidden: one bounded linear scan of at most
  * ACCOUNT_MAX_RECORDS constant-time comparisons per login, which is noise
- * next to the base64 decode that precedes it. */
+ * next to the base64 decode that precedes it. The password itself is never
+ * stored -- each record holds SHA-256(salt || password) under a per-boot
+ * salt -- so the comparison is hash-against-hash. */
 int account_store_verify(const account_store_t *store, const char *name,
                          const char *password);
 
 /* Number of records loaded. 0 on a NULL registry, which is the honest answer for
  * "this node holds no account registry". */
 size_t account_store_count(const account_store_t *store);
+
+/* Test support: 1 when no byte run in the registry's records still equals
+ * `password` -- i.e. the heap holds the salted hash and not the literal.
+ * 0 on a NULL registry or an empty password. */
+int account_store_holds_no_plaintext(const account_store_t *store,
+                                     const char *password);
 
 /* Release. Safe on NULL. A node calls this from server_shutdown();
  * LeakSanitizer runs on the Linux CI job, so anything allocated here has to be
