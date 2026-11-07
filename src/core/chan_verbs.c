@@ -852,6 +852,28 @@ void handle_join(server_t *s, conn_t *c, const message_t *m)
                 refuse_join_too_many(s, c, canonical);
                 continue;
             }
+            /* THE NODE-WIDE CAP (issue #169), and it is checked HERE, before
+             * chan_new(), for the same reason the per-connection one is: a
+             * check that lived in chan_admit() would be too late, because the
+             * creation and the registry attach happen above admission and every
+             * refused JOIN would leave a zero-member ghost behind. s->nchan_objs
+             * is the count -- no new state, it is the enumeration server.h
+             * already keeps -- and only CREATION is refused: a JOIN of a channel
+             * the node already holds does not take this branch. 437, the same
+             * numeric the attach-failure arm below uses, with an observable that
+             * names the reason so a refused creation is findable. */
+            if (s->nchan_objs >= SERVER_MAX_CHANNELS) {
+                char shown[CONN_LOG_FIELD_MAX + 1u];
+
+                (void)reply(s, c, "437",
+                            (const char *const[]){ canonical }, 1,
+                            "Cannot create channel: too many channels");
+                (void)conn_text_logsafe(shown, sizeof shown, canonical);
+                printf("[observable] chan_create_refused: channel=%s nick=%s "
+                       "nchan=%zu cap=%d reason=TOO_MANY_CHANNELS\n",
+                       shown, c->nick, s->nchan_objs, SERVER_MAX_CHANNELS);
+                continue;
+            }
             /* CREATE. The first server to see a channel owns it (2.2), and on a
              * single node that is always this one -- so origin is s->name and
              * creation_epoch is s->epoch, which is the per-boot value server_t
