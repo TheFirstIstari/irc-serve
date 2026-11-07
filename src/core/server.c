@@ -13,6 +13,9 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/random.h>
+#endif
 
 #include "core/channel.h"
 #include "core/message.h"
@@ -134,12 +137,30 @@ static uint64_t strtab_hash(const char *s)
     return h;
 }
 
-static char down_ascii(char c)
+/* THE ONE ASCII FOLD (issue #181): the single definition behind
+ * message.h's irc_ascii_fold()/irc_ascii_same(). A-Z -> a-z only, no
+ * locale/tolower, for the reasons the header gives. */
+char irc_ascii_fold(char c)
 {
     if (c >= 'A' && c <= 'Z') {
         return (char)(c + ('a' - 'A'));
     }
     return c;
+}
+
+int irc_ascii_same(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+    while (*a != '\0' && *b != '\0') {
+        if (irc_ascii_fold(*a) != irc_ascii_fold(*b)) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
 }
 
 /* Fold `key` into `out`, which holds `cap` bytes including the NUL. Returns 0 on
@@ -159,7 +180,7 @@ static int strtab_fold(char *out, size_t cap, const char *key)
         if (i + 1u >= cap) {
             return -1;
         }
-        out[i] = down_ascii(key[i]);
+        out[i] = irc_ascii_fold(key[i]);
     }
     out[i] = '\0';
     return 0;
@@ -524,39 +545,8 @@ static size_t strtab_del_owner(struct strtab *t, const void *owner)
     return n;
 }
 
-/* Case-insensitive server-name comparison, ASCII-folded.
- *
- * The same fold is required in four places now: 2.1's nick@server split, 2.4
- * ("server names are case-insensitive in IRC, so a comparison against our OWN
- * name MUST be case-insensitive"), channel.c's own server-name fold, and
- * fanout.c's own-origin check on the forward path. It is written out here
- * rather than exported because it is six lines and a public helper two of the
- * three callers would never use again is a wider API than the duplication is
- * worth. The copies are asserted to agree by test_channels.c, which looks a
- * peer up by a name differing only in case. */
-static int same_server_name(const char *a, const char *b)
-{
-    if (a == NULL || b == NULL) {
-        return 0;
-    }
-    while (*a != '\0' && *b != '\0') {
-        char ca = *a;
-        char cb = *b;
-
-        if (ca >= 'a' && ca <= 'z') {
-            ca = (char)(ca - ('a' - 'A'));
-        }
-        if (cb >= 'a' && cb <= 'z') {
-            cb = (char)(cb - ('a' - 'A'));
-        }
-        if (ca != cb) {
-            return 0;
-        }
-        a++;
-        b++;
-    }
-    return *a == '\0' && *b == '\0';
-}
+/* server_find_link() compares with irc_ascii_same() (message.h, issue #181):
+ * server names are case-insensitive in IRC, so the lookup must fold. */
 
 /* Put a descriptor into nonblocking mode. Called on the listener, on every
  * accepted socket and on every dialled socket BEFORE the descriptor becomes
@@ -604,6 +594,56 @@ static void describe_peer(conn_t *c, const struct sockaddr *sa)
  * ---------------------------------------------------------------------------
  */
 
+/* ---------------------------------------------------------------------------
+ * The first msg_id of a boot is RANDOM, not 1 (issue #180).
+ * ---------------------------------------------------------------------------
+ * (origin, epoch, id) is the dedup key, and epoch is only boot-time
+ * milliseconds: two boots in the same millisecond share an epoch, so a counter
+ * that restarts at 1 reissues (origin, epoch, 1..N) and a peer drops the replay
+ * as a duplicate. A random 64-bit start makes a collision need the same epoch
+ * AND the same draw, which is not a thing that happens twice.
+ *
+ * One draw per boot, here rather than per message: getrandom()/arc4random_buf()
+ * once is free, per message it would be a syscall per relay. 0 is never drawn:
+ * it means "unset", and server_next_msg_id() already skips it on wrap, so the
+ * counter keeps its shape (monotonic, wrap-skip-0) whatever the start. Epoch is
+ * untouched: still the boot time in milliseconds.
+ *
+ * No new dependency: arc4random_buf() on Apple/BSD, getrandom() on Linux, and a
+ * server_now_ms/pid mix when neither is available or the call fails. The
+ * fallback only has to be better than a constant, and differing boots differ
+ * in time or pid; adjacent milliseconds are spread by a Knuth constant so
+ * adjacent boots do not get adjacent starts. */
+static uint64_t server_msgid_fallback(void)
+{
+    uint64_t v;
+
+    v = server_now_ms() * 6364136223846793005ULL +
+        (uint64_t)getpid() * 1442695040888963407ULL;
+    return (v != 0) ? v : 1;
+}
+
+static uint64_t server_msgid_seed(void)
+{
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
+    defined(__NetBSD__) || defined(__DragonFly__)
+    uint64_t v = 0;
+
+    arc4random_buf(&v, sizeof v);
+    return (v != 0) ? v : server_msgid_fallback();
+#elif defined(__linux__)
+    uint64_t v = 0;
+    ssize_t n = getrandom(&v, sizeof v, 0);
+
+    if (n == (ssize_t)sizeof v && v != 0) {
+        return v;
+    }
+    return server_msgid_fallback();
+#else
+    return server_msgid_fallback();
+#endif
+}
+
 int server_init(server_t *s, const char *name)
 {
     if (s == NULL || name == NULL) {
@@ -648,7 +688,9 @@ int server_init(server_t *s, const char *name)
     if (s->epoch == 0) {
         s->epoch = 1;
     }
-    s->msg_id = 1;
+    /* Issue #180: the start is random per boot (server_msgid_seed), never 0.
+     * Same-epoch reboots would otherwise reissue the same low ids. */
+    s->msg_id = server_msgid_seed();
     return 0;
 }
 
@@ -902,6 +944,14 @@ void server_shutdown(server_t *s)
     free(s->by_fd);
     s->by_fd = NULL;
     s->nconns = 0;
+    /* The enumeration goes with the index it enumerates. Every conn above was
+     * closed through server_close_conn(), so this is normally already empty;
+     * freed unconditionally because a node that never held a connection holds
+     * NULL here either way. */
+    free(s->active_fds);
+    s->active_fds = NULL;
+    s->nactive = 0;
+    s->active_cap = 0;
 }
 
 int server_listen(server_t *s, int port)
@@ -1240,6 +1290,19 @@ int server_add_conn(server_t *s, conn_t *c)
     if (s->by_fd[c->fd] != NULL) {
         return -1;
     }
+    /* The active list grows BEFORE anything is registered, so a failed
+     * realloc leaves the node exactly as it was: by_fd untouched, nconns
+     * untouched. Growth is geometric, like dials. */
+    if (s->nactive == s->active_cap) {
+        size_t want = (s->active_cap == 0) ? 16u : s->active_cap * 2u;
+        int *grown = (int *)realloc(s->active_fds, want * sizeof *grown);
+
+        if (grown == NULL) {
+            return -1;
+        }
+        s->active_fds = grown;
+        s->active_cap = want;
+    }
     /* Phase 12: the conn acquires its NODE here, which is the only writer. The TLS
      * backend needs the node's SSL_CTX and the call site that starts a handshake
      * -- conn_pump(), from inside the connection layer -- has no server_t. See
@@ -1247,6 +1310,7 @@ int server_add_conn(server_t *s, conn_t *c)
      * and the backend treats that as "not configured" rather than dereferencing. */
     c->owner = s;
     s->by_fd[c->fd] = c;
+    s->active_fds[s->nactive++] = c->fd;
     s->nconns++;
     s->n_accepted++;
     return 0;
@@ -1364,6 +1428,7 @@ int server_accept_one(server_t *s)
 void server_close_conn(server_t *s, int fd)
 {
     conn_t *c = server_conn(s, fd);
+    size_t i;
 
     if (c == NULL) {
         return; /* unregistered: a second close is a no-op, not a double close */
@@ -1402,9 +1467,17 @@ void server_close_conn(server_t *s, int fd)
 
     /* Detach from the registry BEFORE closing, so a descriptor the OS reuses
      * between the close() and the next poll iteration cannot resolve to this
-     * conn. */
+     * conn. The active list loses the fd in the same breath, by swap-remove:
+     * order is insignificant, so the last entry fills the hole in O(1) with
+     * no shift and no compaction pass. */
     s->by_fd[fd] = NULL;
     s->nconns--;
+    for (i = 0; i < s->nactive; i++) {
+        if (s->active_fds[i] == fd) {
+            s->active_fds[i] = s->active_fds[--s->nactive];
+            break;
+        }
+    }
 
     /* Retire the connection from the nick index, and through the ONE function
      * that does it. This is the whole of issue #102: the close used to remove
@@ -1484,16 +1557,25 @@ int server_queue(server_t *s, conn_t *c, const char *data, size_t len)
 
 int server_reap(server_t *s)
 {
-    size_t i;
+    size_t i = 0;
     int closed = 0;
 
     if (s == NULL || s->by_fd == NULL) {
         return 0;
     }
-    for (i = 0; i < SERVER_FD_TABLE; i++) {
-        if (s->by_fd[i] != NULL && s->by_fd[i]->state == CONN_CLOSING) {
-            server_close_conn(s, (int)i);
+    /* The reaper walks the active list, not the flat table: O(nconns) per
+     * tick. server_close_conn() swap-removes, so after a close the index is
+     * re-examined rather than advanced -- the entry now sitting there has not
+     * been looked at yet. */
+    while (i < s->nactive) {
+        int fd = s->active_fds[i];
+        conn_t *c = server_conn(s, fd);
+
+        if (c != NULL && c->state == CONN_CLOSING) {
+            server_close_conn(s, fd);
             closed++;
+        } else {
+            i++;
         }
     }
     return closed;
@@ -1657,9 +1739,7 @@ int server_nick_claim(server_t *s, const char *nick, conn_t *c)
  * shrank too, and that still works, because server_nick_release() below gets
  * the holder from the TABLE, and the table's probe folds. One implementation of
  * the rule instead of two, and the copy that could have drifted is the one that
- * is gone. same_server_name() below and channel.c's same_name() are the other
- * two folds in the node, both still written out for the reason server.h records
- * for the first pair. */
+ * is gone. irc_ascii_same() (message.h, issue #181) is the node's one fold. */
 
 /* Give up ONE name, leaving the connection itself in the registry. This is the
  * release for a connection that is STAYING: handle_nick()'s rename is the only
@@ -1888,7 +1968,7 @@ server_link_t *server_find_link(const server_t *s, const char *name)
         return NULL;
     }
     for (i = 0; i < s->nlinks; i++) {
-        if (same_server_name(s->links[i].name, name)) {
+        if (irc_ascii_same(s->links[i].name, name)) {
             return &s->links[i];
         }
     }

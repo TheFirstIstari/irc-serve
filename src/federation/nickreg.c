@@ -100,57 +100,12 @@ struct fed_rnick {
     uint64_t seen_ms;
 };
 
-/* The ASCII fold, and the FOURTH copy of it in this tree. See the header for why
- * it is a copy rather than a share. Deliberately the narrowest form: one
- * comparison, no table, no branch for a signed char -- and the reason it is that
- * narrow is dedup.c's, which states that 005 has already told every client that
- * []\~ and {}|^ are not equivalent, so folding them here would break that
- * promise in the one place nothing on the wire would show it. */
-static char nickreg_fold(char c)
-{
-    if (c >= 'A' && c <= 'Z') {
-        return (char)(c - ('A' - 'a'));
-    }
-    return c;
-}
-
-/* Two server names, compared as 2.4's grammar says two server names are. The
- * grammar makes them case-insensitive, so this cannot be a strcmp: `IRC.A` and
- * `irc.a` are one server and a registry that stored them as two entries would
- * let a node claim two servers hold a nick when one does. */
-static int same_server(const char *a, const char *b)
-{
-    size_t i;
-
-    if (a == NULL || b == NULL) {
-        return 0;
-    }
-    for (i = 0; a[i] != '\0' && b[i] != '\0'; i++) {
-        if (nickreg_fold(a[i]) != nickreg_fold(b[i])) {
-            return 0;
-        }
-    }
-    return a[i] == '\0' && b[i] == '\0';
-}
-
-/* Two nicknames, compared as 2.1 says two nicknames are: case-insensitively,
- * because a nickname is folded everywhere in this node (server.c's nicks strtab
- * folds) while the case the user chose is what gets DISPLAYED. A registry that
- * compared them exactly would hold `Bob` and `bob` as two remote users. */
-static int same_nick(const char *a, const char *b)
-{
-    size_t i;
-
-    if (a == NULL || b == NULL) {
-        return 0;
-    }
-    for (i = 0; a[i] != '\0' && b[i] != '\0'; i++) {
-        if (nickreg_fold(a[i]) != nickreg_fold(b[i])) {
-            return 0;
-        }
-    }
-    return a[i] == '\0' && b[i] == '\0';
-}
+/* Nickname and server-name comparison is message.h's irc_ascii_same()
+ * (issue #181): 2.1 makes nicknames case-insensitive while the case the user
+ * chose is what gets DISPLAYED, and 2.4's grammar makes server names
+ * case-insensitive, so `IRC.A` and `irc.a` are one server and a registry that
+ * stored them as two entries would let a node claim two servers hold a nick
+ * when one does. */
 
 /* A bounded copy: the same rule as channel.c's copy_bounded() -- refuse, never
  * truncate -- for the reason 3.2 gives: a truncated host is a hostmask that is not
@@ -207,10 +162,10 @@ static struct fed_rnick *nickreg_find(server_t *s, const char *nick,
         if (e->nick[0] == '\0') {
             continue; /* free slot */
         }
-        if (!same_nick(e->nick, nick)) {
+        if (!irc_ascii_same(e->nick, nick)) {
             continue;
         }
-        if (server != NULL && server[0] != '\0' && !same_server(e->server, server)) {
+        if (server != NULL && server[0] != '\0' && !irc_ascii_same(e->server, server)) {
             continue;
         }
         return e;
@@ -631,11 +586,11 @@ void fed_nickreg_forget(server_t *s, const char *nick, const char *server)
     }
     /* nrnick_used, not nrnicks -- see nickreg_find(). */
     for (i = 0; i < s->nrnick_used; i++) {
-        if (s->rnicks[i].nick[0] == '\0' || !same_nick(s->rnicks[i].nick, nick)) {
+        if (s->rnicks[i].nick[0] == '\0' || !irc_ascii_same(s->rnicks[i].nick, nick)) {
             continue;
         }
         if (server != NULL && server[0] != '\0' &&
-            !same_server(s->rnicks[i].server, server)) {
+            !irc_ascii_same(s->rnicks[i].server, server)) {
             continue;
         }
         /* COMPACT rather than clear-and-leave-a-hole, and the reason is the
@@ -683,7 +638,7 @@ int fed_nickreg_rename(server_t *s, const char *server, const char *old_nick,
     if (!valid_nick(new_nick)) {
         return -1;
     }
-    if (same_nick(old_nick, new_nick)) {
+    if (irc_ascii_same(old_nick, new_nick)) {
         /* A rename TO THE SAME NAME is a no-op, and returning 0 for it rather
          * than 1 is what stops a caller from reporting a roster change it did not
          * make. Both names folding equal is the case worth handling, not the byte
@@ -692,10 +647,10 @@ int fed_nickreg_rename(server_t *s, const char *server, const char *old_nick,
         return 0;
     }
     for (i = 0; i < s->nrnick_used; i++) {
-        if (s->rnicks[i].nick[0] == '\0' || !same_nick(s->rnicks[i].nick, new_nick)) {
+        if (s->rnicks[i].nick[0] == '\0' || !irc_ascii_same(s->rnicks[i].nick, new_nick)) {
             continue;
         }
-        if (!same_server(s->rnicks[i].server, server)) {
+        if (!irc_ascii_same(s->rnicks[i].server, server)) {
             /* HELD BY A DIFFERENT SERVER, and that is NOT a collision: 2.1's
              * duplicate is legal and is resolved by the rename policy, not by
              * refusing the rename. Refusing here would leave the two users
@@ -710,10 +665,10 @@ int fed_nickreg_rename(server_t *s, const char *server, const char *old_nick,
         return -1;
     }
     for (i = 0; i < s->nrnick_used; i++) {
-        if (s->rnicks[i].nick[0] == '\0' || !same_nick(s->rnicks[i].nick, old_nick)) {
+        if (s->rnicks[i].nick[0] == '\0' || !irc_ascii_same(s->rnicks[i].nick, old_nick)) {
             continue;
         }
-        if (!same_server(s->rnicks[i].server, server)) {
+        if (!irc_ascii_same(s->rnicks[i].server, server)) {
             continue;
         }
         at = i;
@@ -787,7 +742,7 @@ int fed_nickreg_resolve_local(server_t *s, const char *nick, uint64_t now_ms)
         for (size_t i = 0; i < s->nrnick_used; i++) {
             const struct fed_rnick *e = &s->rnicks[i];
 
-            if (e->nick[0] == '\0' || !same_nick(e->nick, nick)) {
+            if (e->nick[0] == '\0' || !irc_ascii_same(e->nick, nick)) {
                 continue;
             }
             if (e->server[0] == '\0' || chan_same_name(e->server, s->name)) {
@@ -958,7 +913,7 @@ void fed_nickreg_purge_server(server_t *s, const char *server)
         return;
     }
     for (i = 0; i < s->nrnick_used; i++) {
-        if (s->rnicks[i].nick[0] == '\0' || !same_server(s->rnicks[i].server, server)) {
+        if (s->rnicks[i].nick[0] == '\0' || !irc_ascii_same(s->rnicks[i].server, server)) {
             continue;
         }
         for (j = i + 1u; j < s->nrnick_used; j++) {
@@ -1068,7 +1023,7 @@ const char *fed_nickreg_holder(const server_t *s, const char *nick, char *out,
     for (i = 0; i < s->nrnick_used; i++) {
         const struct fed_rnick *e = &s->rnicks[i];
 
-        if (e->nick[0] == '\0' || !same_nick(e->nick, nick)) {
+        if (e->nick[0] == '\0' || !irc_ascii_same(e->nick, nick)) {
             continue;
         }
         if (found == 0) {
@@ -1082,7 +1037,7 @@ const char *fed_nickreg_holder(const server_t *s, const char *nick, char *out,
                 return NULL;
             }
             found = 1;
-        } else if (!same_server(out, e->server)) {
+        } else if (!irc_ascii_same(out, e->server)) {
             if (ambiguous_out != NULL) {
                 *ambiguous_out = 1;
             }
@@ -1147,7 +1102,7 @@ int fed_nickreg_local_loses(const char *local, const char *remote)
         return 0;
     }
     for (i = 0;; i++) {
-        char a = nickreg_fold((local[i] != '\0') ? local[i] : ' ');
+        char a = irc_ascii_fold((local[i] != '\0') ? local[i] : ' ');
 
         if (local[i] == '\0') {
             /* LOCAL IS A STRICT PREFIX OF REMOTE, so local is the SMALLER name and
@@ -1172,8 +1127,8 @@ int fed_nickreg_local_loses(const char *local, const char *remote)
              * this function's whole existence is meant to prevent. */
             return 1;
         }
-        if (a != nickreg_fold(remote[i])) {
-            return (a > nickreg_fold(remote[i])) ? 1 : 0;
+        if (a != irc_ascii_fold(remote[i])) {
+            return (a > irc_ascii_fold(remote[i])) ? 1 : 0;
         }
     }
 }
@@ -1208,7 +1163,7 @@ int fed_nickreg_next_name(const server_t *s, const char *nick, char *out,
          * check against a REMOTE holder -- this one is against a local one and
          * the two are different tables. */
         for (i = 0; i < s->nrnick_used; i++) {
-            if (s->rnicks[i].nick[0] != '\0' && same_nick(s->rnicks[i].nick, candidate)) {
+            if (s->rnicks[i].nick[0] != '\0' && irc_ascii_same(s->rnicks[i].nick, candidate)) {
                 break;
             }
         }

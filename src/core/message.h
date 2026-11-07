@@ -565,14 +565,37 @@ size_t irc_serve_msgid_tag(const irc_serve_tags_t *t, char *out, size_t cap);
 size_t irc_serve_msgid_value(const irc_serve_tags_t *t, char *out, size_t cap);
 
 /* ---------------------------------------------------------------------------
+ * THE ONE ASCII FOLD (issue #181)
+ * ---------------------------------------------------------------------------
+ * Every case-insensitive comparison on this node -- nicknames (2.1), server
+ * names (2.1, 2.4), tag keys (IRCv3), WHO/mask matching (3.1) -- goes through
+ * these two functions, defined once in core/server.c. The copies that used to
+ * live in server.c (down_ascii, same_server_name), channel.c (up_ascii loop,
+ * same_name), fanout.c (ascii_lower, same_origin), dedup.c (fold_byte,
+ * same_origin), nickreg.c (nickreg_fold, same_server, same_nick), link.c
+ * (fold_char, same_name) and ircv3_tags.c (ascii_lower) are gone; each now
+ * calls this.
+ *
+ * A-Z -> a-z ONLY: no tolower()/toupper() (locale-sensitive -- in a Turkish
+ * locale 'I' folds to U+0131 rather than 'i', and two nodes on
+ * differently-configured hosts would then disagree about whether a nickname
+ * is taken), and no []\~ -> {}|^ (005 advertises CASEMAPPING=ascii, so this
+ * node has already promised those are NOT equivalent). Bytes outside 'A'..'Z'
+ * pass through unchanged, whatever the sign of char is. */
+char irc_ascii_fold(char c);
+
+/* 1 when `a` and `b` name the same string under the fold above, 0 otherwise.
+ * NULL is never the same as anything, including NULL. */
+int irc_ascii_same(const char *a, const char *b);
+
+/* ---------------------------------------------------------------------------
  * The nick rule 2.1 depends on and 5 says is missing
  * ---------------------------------------------------------------------------
  * The whole identity scheme is `nick@server`. 2.1 splits a qualified name at
  * the LAST '@', which is only unambiguous if '@' cannot appear inside a nick.
- * parse_nick() performs no character validation at all -- it returns 1 for
- * "NICK a@evil" and hands back the nickname "a@evil" -- so the predicate
+ * There is no separate NICK parser doing character validation -- the predicate
  * below is what makes the scheme sound. It is a local rule, enforced at
- * registration, and it deliberately does not change parse_nick().
+ * registration.
  *
  * The rule, in full. `nick` is valid iff ALL of the following hold:
  *

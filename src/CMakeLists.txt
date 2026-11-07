@@ -95,7 +95,6 @@ if(WITH_TLS)
 endif()
 
 add_library(irc_core STATIC
-  protocol_parse.c
   ircv3_tags.c
   federation_handshake.c
   sasl_framework.c
