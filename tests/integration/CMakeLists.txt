@@ -215,6 +215,10 @@ irc_add_integration_test(test_framing test_framing.c)
 # connection registry, and the per-SERVER message id.
 irc_add_integration_test(test_registries test_registries.c)
 
+# 3.4: the active-fd list is the poll set -- N clients poll as N + listeners,
+# and close-all drains it to empty (#176).
+irc_add_integration_test(test_active_fd test_active_fd.c)
+
 # 3.4: the nonblocking dial state machine.
 irc_add_integration_test(test_dial_fsm test_dial_fsm.c)
 
