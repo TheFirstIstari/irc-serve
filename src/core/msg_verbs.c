@@ -555,6 +555,13 @@ static void who_entry(server_t *s, conn_t *dst, const conn_t *who,
                 (who->realname[0] != '\0') ? who->realname : who->nick);
 }
 
+/* WHO's mask-form row cap (#170). One input line walks the nick table and
+ * emits one 352 per match, so an unfiltered mask is ~1000x amplification
+ * into per-connection queues. Broad masks answer 315 alone; anything else
+ * is truncated at the cap with 315 closing the list. The channel branch is
+ * bounded by membership and is unchanged. */
+#define WHO_MASK_MAX 64
+
 void handle_who(server_t *s, conn_t *c, const message_t *m)
 {
     const char *mask = "*";
@@ -627,6 +634,24 @@ void handle_who(server_t *s, conn_t *c, const message_t *m)
                c->nick, shown, strlen(mask), conn_text_bad_count(mask),
                server_nick_count(s));
     }
+    /* Broad masks sweep the whole table for no information: "WHO *", "WHO 0"
+     * and bare WHO (mask "*") or an empty mask match every nick, so one line
+     * in becomes one 352 per user. Answer 315 alone with no 352 sweep. */
+    if (mask[0] == '\0' || strcmp(mask, "*") == 0 || strcmp(mask, "0") == 0) {
+        /* An empty mask cannot be echoed as a MIDDLE parameter -- 3.2 refuses
+         * those -- so 315 names '*' for it, the mask a bare WHO implies. */
+        const char *eomask = (mask[0] != '\0') ? mask : "*";
+
+        printf("[observable] who_truncated: nick=%s mask_len=%zu reason=broad_mask "
+               "replies=0\n",
+               c->nick, strlen(mask));
+        (void)reply(s, c, "315", (const char *const[]){ eomask }, 1,
+                    "End of WHO list");
+        return;
+    }
+    {
+        size_t sent = 0u;
+        size_t truncated = 0u;
     for (size_t i = 0; i < server_nick_count(s); i++) {
         conn_t *who = server_nick_at(s, i);
 
@@ -636,7 +661,17 @@ void handle_who(server_t *s, conn_t *c, const message_t *m)
         if (fanout_mask_match(mask, who->nick) == 0) {
             continue;
         }
+        if (sent >= WHO_MASK_MAX) {
+            truncated++;
+            continue;
+        }
         who_entry(s, c, who, NULL, 0u, multiprefix);
+        sent++;
+    }
+    if (truncated != 0u) {
+        printf("[observable] who_truncated: nick=%s sent=%zu truncated=%zu cap=%d\n",
+               c->nick, sent, truncated, WHO_MASK_MAX);
+    }
     }
     (void)reply(s, c, "315", (const char *const[]){ mask }, 1,
                 "End of WHO list");
