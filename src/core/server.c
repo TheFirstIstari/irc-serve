@@ -134,12 +134,30 @@ static uint64_t strtab_hash(const char *s)
     return h;
 }
 
-static char down_ascii(char c)
+/* THE ONE ASCII FOLD (issue #181): the single definition behind
+ * message.h's irc_ascii_fold()/irc_ascii_same(). A-Z -> a-z only, no
+ * locale/tolower, for the reasons the header gives. */
+char irc_ascii_fold(char c)
 {
     if (c >= 'A' && c <= 'Z') {
         return (char)(c + ('a' - 'A'));
     }
     return c;
+}
+
+int irc_ascii_same(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+    while (*a != '\0' && *b != '\0') {
+        if (irc_ascii_fold(*a) != irc_ascii_fold(*b)) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
 }
 
 /* Fold `key` into `out`, which holds `cap` bytes including the NUL. Returns 0 on
@@ -159,7 +177,7 @@ static int strtab_fold(char *out, size_t cap, const char *key)
         if (i + 1u >= cap) {
             return -1;
         }
-        out[i] = down_ascii(key[i]);
+        out[i] = irc_ascii_fold(key[i]);
     }
     out[i] = '\0';
     return 0;
@@ -524,39 +542,8 @@ static size_t strtab_del_owner(struct strtab *t, const void *owner)
     return n;
 }
 
-/* Case-insensitive server-name comparison, ASCII-folded.
- *
- * The same fold is required in four places now: 2.1's nick@server split, 2.4
- * ("server names are case-insensitive in IRC, so a comparison against our OWN
- * name MUST be case-insensitive"), channel.c's own server-name fold, and
- * fanout.c's own-origin check on the forward path. It is written out here
- * rather than exported because it is six lines and a public helper two of the
- * three callers would never use again is a wider API than the duplication is
- * worth. The copies are asserted to agree by test_channels.c, which looks a
- * peer up by a name differing only in case. */
-static int same_server_name(const char *a, const char *b)
-{
-    if (a == NULL || b == NULL) {
-        return 0;
-    }
-    while (*a != '\0' && *b != '\0') {
-        char ca = *a;
-        char cb = *b;
-
-        if (ca >= 'a' && ca <= 'z') {
-            ca = (char)(ca - ('a' - 'A'));
-        }
-        if (cb >= 'a' && cb <= 'z') {
-            cb = (char)(cb - ('a' - 'A'));
-        }
-        if (ca != cb) {
-            return 0;
-        }
-        a++;
-        b++;
-    }
-    return *a == '\0' && *b == '\0';
-}
+/* server_find_link() compares with irc_ascii_same() (message.h, issue #181):
+ * server names are case-insensitive in IRC, so the lookup must fold. */
 
 /* Put a descriptor into nonblocking mode. Called on the listener, on every
  * accepted socket and on every dialled socket BEFORE the descriptor becomes
@@ -1657,9 +1644,7 @@ int server_nick_claim(server_t *s, const char *nick, conn_t *c)
  * shrank too, and that still works, because server_nick_release() below gets
  * the holder from the TABLE, and the table's probe folds. One implementation of
  * the rule instead of two, and the copy that could have drifted is the one that
- * is gone. same_server_name() below and channel.c's same_name() are the other
- * two folds in the node, both still written out for the reason server.h records
- * for the first pair. */
+ * is gone. irc_ascii_same() (message.h, issue #181) is the node's one fold. */
 
 /* Give up ONE name, leaving the connection itself in the registry. This is the
  * release for a connection that is STAYING: handle_nick()'s rename is the only
@@ -1888,7 +1873,7 @@ server_link_t *server_find_link(const server_t *s, const char *name)
         return NULL;
     }
     for (i = 0; i < s->nlinks; i++) {
-        if (same_server_name(s->links[i].name, name)) {
+        if (irc_ascii_same(s->links[i].name, name)) {
             return &s->links[i];
         }
     }

@@ -4,6 +4,8 @@
 
 #include "ircv3_tags.h"
 
+#include "core/message.h" /* irc_ascii_fold(): the node's one fold (issue #181) */
+
 /* IRCv3 message-tags: the escape table (see the header for the specification
  * table and for why a colon is NOT escaped), and the parse -> list -> serialize
  * pair built on it.
@@ -16,18 +18,10 @@
  * header for why the bound is where it is.
  */
 
-/* ASCII lowercase of one byte, and nothing else. IRCv3 folds tag KEYS case
- * insensitively and nothing else: 005 already advertises CASEMAPPING=ascii, and
+/* Tag KEYS fold case-insensitively with irc_ascii_fold() (message.h, issue
+ * #181) and nothing else: 005 already advertises CASEMAPPING=ascii, and
  * folding a tag VALUE would merge `label=Yes` and `label=yes`, which the
- * specification treats as two different values. Deliberately not tolower(): that
- * is locale-sensitive, and 005's promise is that this node does not do it. */
-static char ascii_lower(char c)
-{
-    if (c >= 'A' && c <= 'Z') {
-        return (char)(c - 'A' + 'a');
-    }
-    return c;
-}
+ * specification treats as two different values. */
 
 /* Do the NUL-terminated key `a` and the `alen`-byte span `b` name the same tag?
  * The span form exists because a key inside a block being parsed is not
@@ -38,7 +32,7 @@ static int key_eq_span(const char *a, size_t alen, const char *b, size_t blen)
         return 0;
     }
     for (size_t i = 0; i < alen; i++) {
-        if (ascii_lower(a[i]) != ascii_lower(b[i])) {
+        if (irc_ascii_fold(a[i]) != irc_ascii_fold(b[i])) {
             return 0;
         }
     }
