@@ -253,7 +253,9 @@ static void usage(FILE *out, const char *argv0)
                  "         ignores --user and runs as itself. There is no\n"
                  "         daemonize and no chroot: the node stays in the\n"
                  "         foreground, in the same filesystem, with fewer\n"
-                 "         privileges.\n",
+                 "         privileges. Files read after the drop (--sasl-store,\n"
+                 "         --account-store, --secret-file) must be readable by\n"
+                 "         NAME: chown them to it.\n",
              NODE_DEFAULT_USER);
     fprintf(out, "\n");
     fprintf(out, "  --secret S\n"
@@ -972,14 +974,25 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
  *
  * The first result is used and the rest freed; see the header for why. */
 /* ---------------------------------------------------------------------------
- * THE PRIVILEGE DROP, and it runs exactly once: after both listeners are bound
+ * THE PRIVILEGE DROP, and it runs exactly once: after all listeners are bound
  * and before any store, secret or peer state is read (issue #182).
  * ---------------------------------------------------------------------------
  * Binding is the one step that can need privilege (a low port), and everything
  * after it -- file reads, the handshake, the loop -- does not. So the order is
- * parse -> bind -> drop -> load stores -> fed_open -> loop, and the drop is
- * setgid() then setuid() to --user, with NO daemonize and NO chroot: the node
- * stays in the foreground, in the same filesystem, with fewer privileges.
+ * parse -> bind plain -> TLS init -> bind TLS -> drop -> load stores ->
+ * fed_open -> loop, and the drop is setgid() then setuid() to --user, with NO
+ * daemonize and NO chroot: the node stays in the foreground, in the same
+ * filesystem, with fewer privileges.
+ *
+ * TLS INIT SITS BEFORE THE DROP, between the two binds, and that exception is
+ * load-bearing rather than incidental: server_listen_tls() REFUSES a port it
+ * cannot encrypt (srv.tls == NULL), so the certificate has to be loaded before
+ * the TLS listener is bound -- and both binds need privilege, so both precede
+ * the drop. Reading the key as root is also what lets a root-owned 0600 key
+ * work: after the drop the node is `nobody` and could not open it. Stores,
+ * the secret file and peers stay AFTER the drop, so those files must be
+ * readable by --user (chown them to it); a store that cannot be read is
+ * refused without failing startup, but an unreadable --secret-file is fatal.
  *
  * Root without an explicit --user is a REFUSAL, not a default: the default is
  * `nobody`, but a default the operator did not type is not consent to have run
@@ -1123,10 +1136,13 @@ int main(int argc, char **argv)
      * visible at the point where it decides it. */
     srv.dispatch = commands_dispatch;
 
-    /* BOTH LISTENERS ARE BOUND HERE, before anything else is read (issue #182:
-     * parse -> bind -> drop -> load stores -> fed_open -> loop). Binding is the
-     * one step that can need privilege -- a low port -- and everything after it
-     * does not, so the drop below sheds privilege before any file is opened. */
+    /* BOTH LISTENERS ARE BOUND HERE, before the drop (issue #182:
+     * parse -> bind plain -> TLS init -> bind TLS -> drop -> load stores ->
+     * fed_open -> loop). Binding is the one step that can need privilege -- a
+     * low port -- and the TLS listener cannot be bound until the certificate
+     * is loaded (server_listen_tls() refuses a port it cannot encrypt), so the
+     * TLS configuration is validated and loaded between the two binds, still
+     * as root. Stores, the secret file and peers are read after the drop. */
     if (server_listen(&srv, opts.port) != 0) {
         printf("[observable] server startup failed: port=%d reason=%s\n",
                opts.port, strerror(errno));
@@ -1134,12 +1150,106 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* ------------------------------------------------------------------------
+     * PHASE 12: TLS, and WHERE it is configured matters more than it looks
+     * ------------------------------------------------------------------------
+     * Here, between the two binds and before the drop, for two reasons at once:
+     * 3.4 forbids a blocking call inside the event loop, and reading a
+     * certificate is as blocking as reading a file; AND server_listen_tls()
+     * below REFUSES a port it cannot encrypt, so srv.tls has to exist before
+     * the TLS listener is bound. Both binds need privilege, so both precede
+     * the drop -- which is also what lets a root-owned 0600 key load: after
+     * the drop the node is `nobody` and could not open it. (Stores, the secret
+     * file and peers stay after the drop; see the drop's comment.)
+     *
+     * THE ORDER inside this block is load-bearing and each step refuses rather
+     * than degrades:
+     *
+     *   1. The cert/key PAIR is checked before either is opened. Half a
+     *      configuration is not a state this binary can be in.
+     *   2. tls_backend_node_init() checks the KEY'S PERMISSIONS before loading
+     *      anything, so a world-readable key refuses the whole configuration
+     *      rather than producing a node that offers a certificate whose private
+     *      half is on a shared filesystem.
+     *   3. --peer-tls is applied only after the peers exist and only if TLS
+     *      exists, and a name that matches no peer is a STARTUP ERROR: a flag that
+     *      quietly does nothing on a security option is worse than no flag.
+     */
+    if ((opts.tls_cert == NULL) != (opts.tls_key == NULL)) {
+        fprintf(stderr, "irc-serve: --tls-cert and --tls-key are a pair; "
+                        "supplying one is not a configuration this node has\n");
+        server_shutdown(&srv);
+        return 1;
+    }
+    if (opts.tls_cert != NULL) {
+        /* THE KEY'S MODE IS CHECKED BEFORE ANYTHING IS LOADED, and it is a refusal
+         * of the whole CONFIGURATION rather than of the file: a node that cannot
+         * prove its key is private must not come up offering a certificate, because
+         * half-configured TLS that looks configured is the worst of the three
+         * states -- an operator reading `tls=configured` would believe in it. */
+        if (key_file_is_private(opts.tls_key) != 0) {
+            fprintf(stderr, "irc-serve: the TLS private key is readable by group "
+                            "or other; refusing to start\n");
+            server_shutdown(&srv);
+            return 1;
+        }
+        if (tls_backend_node_init(&srv.tls, opts.tls_cert, opts.tls_key,
+                                  opts.tls_ca, opts.tls_insecure,
+                                  opts.tls_ocsp_staple,
+                                  (opts.tls_staple_permissive != 0) ? 0 : 1)
+            != 0) {
+            /* A CERTIFICATE THAT DID NOT LOAD IS A STARTUP FAILURE, and this is
+             * the one configuration error in the phase that is. The reasoning is
+             * cap.h's rule applied to the node rather than to a capability: a node
+             * that was told to serve TLS and cannot must NOT come up as a node
+             * that does not, because "my node has no `sts` in CAP LS" is a thing
+             * an operator has to go looking for and "TLS is on and broken" is
+             * worse than either. Compare --sasl-store, whose failure is NOT
+             * fatal: there, a node without a store refuses every AUTHENTICATE and
+             * says so, which is a correct node. Here, a node without a
+             * certificate would serve plaintext on the port the operator believes
+             * is encrypted. */
+            fprintf(stderr, "irc-serve: TLS was configured and could not be "
+                            "loaded; refusing to start rather than serving "
+                            "plaintext\n");
+            server_shutdown(&srv);
+            return 1;
+        }
+        srv.tls_require = opts.tls_require;
+        srv.sts_duration = opts.tls_sts_duration;
+    } else {
+        /* Every TLS option without a certificate pair is an ERROR rather than a
+         * silent no-op, for the same reason: `--tls-port 6697 --tls-require` on a
+         * node with no certificate is a command line that says "this node is
+         * encrypted" and is not. --tls-insecure is included in the test because
+         * it says the same thing: "accept unverifiable peers" on a node that can
+         * have no peers is a configuration an operator believes in and does not
+         * have. */
+        if (opts.have_tls_port || opts.tls_require != 0 ||
+            opts.tls_ca != NULL || opts.tls_sts_duration != 0u ||
+            opts.tls_insecure != 0 || opts.tls_ocsp_staple != NULL ||
+            opts.tls_staple_permissive != 0) {
+            fprintf(stderr, "irc-serve: TLS options were given without "
+                            "--tls-cert and --tls-key\n");
+            server_shutdown(&srv);
+            return 1;
+        }
+        if (opts.ntls_peers > 0) {
+            fprintf(stderr, "irc-serve: --peer-tls was given but this node has "
+                            "no TLS\n");
+            server_shutdown(&srv);
+            return 1;
+        }
+    }
+
     /* THE IMPLICIT-TLS LISTENER, second and after the plain one. Its failure is
      * FATAL rather than a warning, and that is a different decision from the
      * certificate's: an operator who asked for --tls-port has said clients will be
      * encrypted from the first byte, and a node that could not bind that port and
      * said nothing would leave those clients on a plaintext port they were told
-     * not to use. A REFUSAL here is the honest answer. */
+     * not to use. A REFUSAL here is the honest answer. The certificate is already
+     * loaded above, so the no_tls_configured arm below is unreachable through
+     * this binary -- defence in depth, for a future caller that is not main(). */
     if (opts.have_tls_port) {
         if (server_listen_tls(&srv, opts.tls_port) != 0) {
             printf("[observable] server startup failed: tls_port=%d reason=%s\n",
@@ -1282,93 +1392,6 @@ int main(int argc, char **argv)
         }
     }
     srv.on_tick = fed_tick;
-
-    /* ------------------------------------------------------------------------
-     * PHASE 12: TLS, and WHERE it is configured matters more than it looks
-     * ------------------------------------------------------------------------
-     * Here, before the loop is armed, for the reason the credential store and the
-     * account registry are loaded here: 3.4 forbids a blocking call inside the
-     * event loop, and reading a certificate is as blocking as reading a file.
-     *
-     * THE ORDER inside this block is load-bearing and each step refuses rather
-     * than degrades:
-     *
-     *   1. The cert/key PAIR is checked before either is opened. Half a
-     *      configuration is not a state this binary can be in.
-     *   2. tls_backend_node_init() checks the KEY'S PERMISSIONS before loading
-     *      anything, so a world-readable key refuses the whole configuration
-     *      rather than producing a node that offers a certificate whose private
-     *      half is on a shared filesystem.
-     *   3. --peer-tls is applied only after the peers exist and only if TLS
-     *      exists, and a name that matches no peer is a STARTUP ERROR: a flag that
-     *      quietly does nothing on a security option is worse than no flag.
-     */
-    if ((opts.tls_cert == NULL) != (opts.tls_key == NULL)) {
-        fprintf(stderr, "irc-serve: --tls-cert and --tls-key are a pair; "
-                        "supplying one is not a configuration this node has\n");
-        server_shutdown(&srv);
-        return 1;
-    }
-    if (opts.tls_cert != NULL) {
-        /* THE KEY'S MODE IS CHECKED BEFORE ANYTHING IS LOADED, and it is a refusal
-         * of the whole CONFIGURATION rather than of the file: a node that cannot
-         * prove its key is private must not come up offering a certificate, because
-         * half-configured TLS that looks configured is the worst of the three
-         * states -- an operator reading `tls=configured` would believe in it. */
-        if (key_file_is_private(opts.tls_key) != 0) {
-            fprintf(stderr, "irc-serve: the TLS private key is readable by group "
-                            "or other; refusing to start\n");
-            server_shutdown(&srv);
-            return 1;
-        }
-        if (tls_backend_node_init(&srv.tls, opts.tls_cert, opts.tls_key,
-                                  opts.tls_ca, opts.tls_insecure,
-                                  opts.tls_ocsp_staple,
-                                  (opts.tls_staple_permissive != 0) ? 0 : 1)
-            != 0) {
-            /* A CERTIFICATE THAT DID NOT LOAD IS A STARTUP FAILURE, and this is
-             * the one configuration error in the phase that is. The reasoning is
-             * cap.h's rule applied to the node rather than to a capability: a node
-             * that was told to serve TLS and cannot must NOT come up as a node
-             * that does not, because "my node has no `sts` in CAP LS" is a thing
-             * an operator has to go looking for and "TLS is on and broken" is
-             * worse than either. Compare --sasl-store, whose failure is NOT
-             * fatal: there, a node without a store refuses every AUTHENTICATE and
-             * says so, which is a correct node. Here, a node without a
-             * certificate would serve plaintext on the port the operator believes
-             * is encrypted. */
-            fprintf(stderr, "irc-serve: TLS was configured and could not be "
-                            "loaded; refusing to start rather than serving "
-                            "plaintext\n");
-            server_shutdown(&srv);
-            return 1;
-        }
-        srv.tls_require = opts.tls_require;
-        srv.sts_duration = opts.tls_sts_duration;
-    } else {
-        /* Every TLS option without a certificate pair is an ERROR rather than a
-         * silent no-op, for the same reason: `--tls-port 6697 --tls-require` on a
-         * node with no certificate is a command line that says "this node is
-         * encrypted" and is not. --tls-insecure is included in the test because
-         * it says the same thing: "accept unverifiable peers" on a node that can
-         * have no peers is a configuration an operator believes in and does not
-         * have. */
-        if (opts.have_tls_port || opts.tls_require != 0 ||
-            opts.tls_ca != NULL || opts.tls_sts_duration != 0u ||
-            opts.tls_insecure != 0 || opts.tls_ocsp_staple != NULL ||
-            opts.tls_staple_permissive != 0) {
-            fprintf(stderr, "irc-serve: TLS options were given without "
-                            "--tls-cert and --tls-key\n");
-            server_shutdown(&srv);
-            return 1;
-        }
-        if (opts.ntls_peers > 0) {
-            fprintf(stderr, "irc-serve: --peer-tls was given but this node has "
-                            "no TLS\n");
-            server_shutdown(&srv);
-            return 1;
-        }
-    }
 
     /* Resolve and configure the peers, still before the loop. */
     for (i = 0; i < opts.npeers; i++) {
