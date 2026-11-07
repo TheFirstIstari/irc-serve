@@ -93,38 +93,10 @@
     do { if ((from) != NULL) (void)reply((s), (from), __VA_ARGS__); } while (0)
 
 
-/* ASCII-only case folding, deliberately: 005 advertises CASEMAPPING=ascii, so
- * this node has already told every client that []\~ and {}|^ are NOT
- * equivalent, and folding them here would break that promise in a way no test
- * elsewhere would catch. The (unsigned char) cast is what makes that true for
- * every byte rather than only for the ones that are already ASCII. */
-static int ascii_lower(int ch)
-{
-    return (ch >= 'A' && ch <= 'Z') ? (ch - 'A' + 'a') : ch;
-}
-
-/* The 2.4 never-forward-own-origin test, case-insensitively. This is the third
- * copy of an ASCII server-name fold (server.c and channel.c have the other two)
- * and the reasons it cannot be one function are spelled out where server.c's
- * copy is: a fold nobody uses twice is a helper exported for the sake of it, and
- * 2.1's nick@server split, 2.4's own-origin rule and 2.2's servers[] set are
- * three genuinely separate questions that happen to need the same six lines.
- * The copies are asserted to agree by test_channels.c, which looks a peer up by
- * a name differing only in case. */
-static int same_origin(const char *a, const char *b)
-{
-    if (a == NULL || b == NULL) {
-        return 0;
-    }
-    while (*a != '\0' && *b != '\0') {
-        if (ascii_lower((unsigned char)*a) != ascii_lower((unsigned char)*b)) {
-            return 0;
-        }
-        a++;
-        b++;
-    }
-    return *a == '\0' && *b == '\0';
-}
+/* The 2.4 never-forward-own-origin test is irc_ascii_same() (message.h, issue
+ * #181), and mask matching folds with irc_ascii_fold(): 005 advertises
+ * CASEMAPPING=ascii, so this node has already told every client that []\~ and
+ * {}|^ are NOT equivalent. */
 
 int fanout_mask_match(const char *mask, const char *value)
 {
@@ -148,8 +120,8 @@ int fanout_mask_match(const char *mask, const char *value)
         if (*m == '*') {
             star = m++;
             retry = v;
-        } else if (*m == '?' || ascii_lower((unsigned char)*m) ==
-                                    ascii_lower((unsigned char)*v)) {
+        } else if (*m == '?' || irc_ascii_fold(*m) ==
+                                    irc_ascii_fold(*v)) {
             m++;
             v++;
         } else if (star != NULL) {
@@ -2090,7 +2062,7 @@ static int forward_one_peer(server_t *s, const char *peer_name, const char *sver
                    IRC_MAX_HOPS);
             return 0;
         }
-        if (same_origin(stamp->origin, s->name)) {
+        if (irc_ascii_same(stamp->origin, s->name)) {
             /* 2.4: "A node never forwards a message whose irc-serve-origin is
              * itself." This is the second of the three loop rules, and it is the
              * one that stops the SHORT cycle -- two nodes bouncing one message
@@ -2179,7 +2151,7 @@ static int forward_channel_targets(server_t *s, const chan_t *ch,
             continue;
         }
         for (size_t i = 0; i < ch->nservers; i++) {
-            if (same_origin(ch->servers[i].name, lk->name)) {
+            if (irc_ascii_same(ch->servers[i].name, lk->name)) {
                 already = 1;
                 break;
             }

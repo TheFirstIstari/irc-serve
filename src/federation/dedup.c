@@ -64,10 +64,10 @@
  * the per-probe modulo into an AND, and the probe runs on the message path. */
 #define DEDUP_MASK ((size_t)(IRC_DEDUP_MAX - 1u))
 
-/* ASCII-only case fold, and the reason is the one fanout.c and channel.c and
- * server.c each already give: 005 advertises CASEMAPPING=ascii, so this node has
- * told every client that []\~ and {}|^ are not equivalent, and folding them here
- * would break that promise where nothing else on the wire would show it.
+/* The origin fold is message.h's irc_ascii_fold() (issue #181): 005 advertises
+ * CASEMAPPING=ascii, so this node has told every client that []\~ and {}|^
+ * are not equivalent, and folding them here would break that promise where
+ * nothing else on the wire would show it.
  *
  * Folding the KEY is not optional. message.h is explicit that an
  * irc-serve-origin value is preserved verbatim and that comparing it against
@@ -76,13 +76,6 @@
  * hashed the origin verbatim would treat a peer's re-spelling of the same
  * origin as a new message and forward a duplicate, and the peer that re-spelled
  * it would be entirely within its rights. */
-static uint64_t fold_byte(char c)
-{
-    if (c >= 'A' && c <= 'Z') {
-        return (uint64_t)(unsigned char)(c - ('A' - 'a'));
-    }
-    return (uint64_t)(unsigned char)c;
-}
 
 /* FNV-1a over the folded origin, then the two numbers, then a final avalanche.
  *
@@ -103,7 +96,7 @@ static uint64_t entry_hash(const char *origin, uint64_t epoch, uint64_t id)
     const char *p;
 
     for (p = origin; *p != '\0'; p++) {
-        h ^= fold_byte(*p);
+        h ^= (uint64_t)(unsigned char)irc_ascii_fold(*p);
         h *= 1099511628211ULL;           /* FNV-1a 64 prime */
     }
     h ^= epoch;
@@ -114,18 +107,6 @@ static uint64_t entry_hash(const char *origin, uint64_t epoch, uint64_t id)
     h *= 0xff51afd7ed558ccdULL;
     h ^= h >> 33;
     return h;
-}
-
-static int same_origin(const char *a, const char *b)
-{
-    size_t i;
-
-    for (i = 0; a[i] != '\0' && b[i] != '\0'; i++) {
-        if (fold_byte(a[i]) != fold_byte(b[i])) {
-            return 0;
-        }
-    }
-    return a[i] == '\0' && b[i] == '\0';
 }
 
 /* ---------------------------------------------------------------------------
@@ -326,7 +307,7 @@ int fed_dedup_seen(struct server *s, const irc_serve_tags_t *t,
             return 0;
         }
         if (tab[at].epoch == key.epoch && tab[at].id == key.id &&
-            same_origin(tab[at].origin, key.origin)) {
+            irc_ascii_same(tab[at].origin, key.origin)) {
             lru_touch(&s->dedup_head, &s->dedup_tail, &tab[at]);
             tab[at].seen_ms = now_ms;
             printf("[observable] fed_dedup_drop: origin=%s epoch=%llu id=%llu "
