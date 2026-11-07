@@ -55,34 +55,15 @@ static int copy_bounded(char *dst, size_t cap, const char *src)
     return 1;
 }
 
-/* ASCII upper-case. Deliberately not tolower()/toupper() in a locale: 005
- * advertises CASEMAPPING=ascii, message.c's up() is ASCII-only, and a
- * locale-dependent fold here would make the registry key depend on the
- * environment the node happens to run in. */
+/* ASCII upper-case, for chan_name_upper() ONLY (2.2's storage canonicalizer:
+ * a channel name is stored uppercase-normalised and displayed uppercase).
+ * Comparison folding is message.h's irc_ascii_fold() (issue #181), not this. */
 static char up_ascii(char c)
 {
     if (c >= 'a' && c <= 'z') {
         return (char)(c - ('a' - 'A'));
     }
     return c;
-}
-
-/* Case-insensitive equality, ASCII-folded, for server names. 2.1 and 2.4 both
- * say a server-name comparison must be case-insensitive, and this is the one
- * place the rule is implemented for channel state. */
-static int same_name(const char *a, const char *b)
-{
-    if (a == NULL || b == NULL) {
-        return 0;
-    }
-    while (*a != '\0' && *b != '\0') {
-        if (up_ascii(*a) != up_ascii(*b)) {
-            return 0;
-        }
-        a++;
-        b++;
-    }
-    return *a == '\0' && *b == '\0';
 }
 
 /* ---------------------------------------------------------------------------
@@ -342,7 +323,9 @@ int chan_has_flag(const chan_t *ch, const conn_t *c, unsigned flag)
 
 int chan_same_name(const char *a, const char *b)
 {
-    return same_name(a, b);
+    /* THE ONE FOLD (issue #181): 2.1 and 2.4 both say a server-name comparison
+     * must be case-insensitive, and this is the exported spelling of it. */
+    return irc_ascii_same(a, b);
 }
 
 struct member *chan_find_nick(const chan_t *ch, const char *nick)
@@ -351,7 +334,7 @@ struct member *chan_find_nick(const chan_t *ch, const char *nick)
         return NULL;
     }
     for (size_t i = 0; i < ch->nmembers; i++) {
-        if (ch->members[i].c != NULL && same_name(ch->members[i].c->nick, nick)) {
+        if (ch->members[i].c != NULL && chan_same_name(ch->members[i].c->nick, nick)) {
             return &ch->members[i];
         }
     }
@@ -550,7 +533,7 @@ int chan_server_remove(chan_t *ch, const char *name)
         return 0;
     }
     for (size_t i = 0; i < ch->nservers; i++) {
-        if (same_name(ch->servers[i].name, name)) {
+        if (chan_same_name(ch->servers[i].name, name)) {
             (void)memmove(&ch->servers[i], &ch->servers[i + 1u],
                           (ch->nservers - i - 1u) * sizeof ch->servers[0]);
             ch->nservers--;
@@ -566,7 +549,7 @@ int chan_server_has(const chan_t *ch, const char *name)
         return 0;
     }
     for (size_t i = 0; i < ch->nservers; i++) {
-        if (same_name(ch->servers[i].name, name)) {
+        if (chan_same_name(ch->servers[i].name, name)) {
             return 1;
         }
     }
@@ -584,8 +567,8 @@ chan_remote_t *chan_remote_find(const chan_t *ch, const char *server,
         return NULL;
     }
     for (size_t i = 0; i < ch->nremotes; i++) {
-        if (same_name(ch->remotes[i].server, server) &&
-            same_name(ch->remotes[i].nick, nick)) {
+        if (chan_same_name(ch->remotes[i].server, server) &&
+            chan_same_name(ch->remotes[i].nick, nick)) {
             return &ch->remotes[i];
         }
     }
@@ -751,7 +734,7 @@ size_t chan_remote_purge(chan_t *ch, const char *server)
      * 4 fixes 353's rendering order across this array, so a forward walk is
      * also the one that does not reorder what is kept. */
     while (i < ch->nremotes) {
-        if (same_name(ch->remotes[i].server, server)) {
+        if (chan_same_name(ch->remotes[i].server, server)) {
             (void)memmove(&ch->remotes[i], &ch->remotes[i + 1u],
                           (ch->nremotes - i - 1u) * sizeof ch->remotes[0]);
             ch->nremotes--;
@@ -812,8 +795,8 @@ int chan_remote_remove(chan_t *ch, const char *server, const char *nick)
         return 0;
     }
     for (size_t i = 0; i < ch->nremotes; i++) {
-        if (same_name(ch->remotes[i].server, server) &&
-            same_name(ch->remotes[i].nick, nick)) {
+        if (chan_same_name(ch->remotes[i].server, server) &&
+            chan_same_name(ch->remotes[i].nick, nick)) {
             (void)memmove(&ch->remotes[i], &ch->remotes[i + 1u],
                           (ch->nremotes - i - 1u) * sizeof ch->remotes[0]);
             ch->nremotes--;
@@ -845,14 +828,14 @@ int chan_remote_rename(chan_t *ch, const char *server, const char *old_nick,
      * invariant the rest of this module maintains, so this check is what keeps
      * "one row per (server, nick)" true. */
     for (size_t i = 0; i < ch->nremotes; i++) {
-        if (same_name(ch->remotes[i].server, server) &&
-            same_name(ch->remotes[i].nick, new_nick)) {
+        if (chan_same_name(ch->remotes[i].server, server) &&
+            chan_same_name(ch->remotes[i].nick, new_nick)) {
             return -1;
         }
     }
     for (size_t i = 0; i < ch->nremotes; i++) {
-        if (!same_name(ch->remotes[i].server, server) ||
-            !same_name(ch->remotes[i].nick, old_nick)) {
+        if (!chan_same_name(ch->remotes[i].server, server) ||
+            !chan_same_name(ch->remotes[i].nick, old_nick)) {
             continue;
         }
         /* IN PLACE, and the reason is the row's other fields. A remove-then-add
@@ -1070,7 +1053,7 @@ int chan_ban_remove(chan_t *ch, const char *mask)
         return 0;
     }
     for (size_t i = 0; i < ch->nbans; i++) {
-        if (same_name(ch->bans[i].mask, mask)) {
+        if (chan_same_name(ch->bans[i].mask, mask)) {
             (void)memmove(&ch->bans[i], &ch->bans[i + 1u],
                           (ch->nbans - i - 1u) * sizeof ch->bans[0]);
             ch->nbans--;
@@ -1102,7 +1085,8 @@ int chan_mask_match(const char *mask, const char *value)
             star = m++;
             retry = v;
         } else if (*m == '?' ||
-                   (up_ascii(*m) != '\0' && up_ascii(*m) == up_ascii(*v))) {
+                   (irc_ascii_fold(*m) != '\0' &&
+                    irc_ascii_fold(*m) == irc_ascii_fold(*v))) {
             m++;
             v++;
         } else if (star != NULL) {
@@ -1169,7 +1153,7 @@ chan_origin_state_t chan_origin_state(const server_t *s, const chan_t *ch)
     /* origin == self FIRST, and unconditionally. On a single node every channel
      * this node created takes this branch, so the single-writer refusal costs
      * no lookup at all in the case that is the only case a single node has. */
-    if (same_name(ch->origin, s->name)) {
+    if (chan_same_name(ch->origin, s->name)) {
         return CHAN_ORIGIN_SELF;
     }
     /* A peer connection bearing that name exists, so 3.1's FORWARD path is
