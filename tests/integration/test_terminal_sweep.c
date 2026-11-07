@@ -1387,6 +1387,21 @@ static void probe_verb(nf_node_t *node, const sw_verb *v, size_t idx)
         emit_all_markers(&b, &c, node, v->verb, chan, shape);
         alive = drain_or_closed(&c, nick);
         assert_probe_socket_clean(&c, nick);
+        /* RATE-LIMIT PACING, the same idiom as test_peer_terminal_sweep.c's
+         * refresh every 8 markers, calibrated to this loop's unit. One shape is
+         * ~62 probe lines plus its JOIN and drain PING, and the flood bucket
+         * holds 256 lines with a 50/sec trickle -- so two shapes (~130 lines)
+         * is the most one connection sends before a fresh one takes over with
+         * a fresh budget. Without this the node answers 417 and closes
+         * mid-verb, and a later batch is then written into a dead socket:
+         * locally the send wins the race and the sweep passes, on a loaded
+         * runner it loses it and sw_flush's tc_send_raw check fails. The scan
+         * above means no swept byte is lost on the close, and every wait in
+         * the reopen is a deadline wait. */
+        if (alive != 0 && (shape % 2) == 1 && shape + 1 < SH_ALL) {
+            tc_close(&c);
+            open_probe(node, &c, nick, chan);
+        }
     }
     sw_buf_free(&b);
     tc_close(&c);
@@ -1409,12 +1424,26 @@ static void probe_unknown_verb(nf_node_t *node)
 
     open_probe(node, &c, nick, chan);
     sw_buf_init(&b);
-    for (int shape = 0; shape < SH_ALL; shape++) {
-        emit_all_markers(&b, &c, node, "NOSUCHVERB", chan, shape);
+    {
+        int alive = 1;
+
+        for (int shape = 0; shape < SH_ALL; shape++) {
+            if (alive == 0) {
+                tc_close(&c);
+                open_probe(node, &c, nick, chan);
+            }
+            emit_all_markers(&b, &c, node, "NOSUCHVERB", chan, shape);
+            alive = drain_or_closed(&c, nick);
+            assert_probe_socket_clean(&c, nick);
+            /* RATE-LIMIT PACING: see probe_verb. Two shapes per connection,
+             * then a fresh budget, so the node never answers 417 mid-sweep. */
+            if (alive != 0 && (shape % 2) == 1 && shape + 1 < SH_ALL) {
+                tc_close(&c);
+                open_probe(node, &c, nick, chan);
+            }
+        }
     }
     sw_buf_free(&b);
-    (void)drain_or_closed(&c, nick);
-    assert_probe_socket_clean(&c, nick);
     tc_close(&c);
 }
 
@@ -1430,6 +1459,16 @@ static void probe_pre_registration(nf_node_t *node)
 {
     test_client_t c;
     sw_buf b;
+    /* The last pre_reg verb, so the pacing refresh below can skip reopening
+     * after the final shape: there is nothing left to send on it. */
+    size_t last_pre = 0;
+    size_t k;
+
+    for (k = 0; k < g_nverbs; k++) {
+        if (g_verbs[k].pre_reg != 0) {
+            last_pre = k;
+        }
+    }
 
     tc_init(&c);
     TF_CHECK_MSG(tc_connect(&c, node->port) == 0, "tc_connect failed");
@@ -1459,6 +1498,14 @@ static void probe_pre_registration(nf_node_t *node)
                 tc_init(&c);
                 TF_CHECK_MSG(tc_connect(&c, node->port) == 0,
                              "could not reopen the pre-registration probe");
+            } else if ((shape % 2) == 1 &&
+                       (i != last_pre || shape + 1 < SH_SUBJECT_FIRST)) {
+                /* RATE-LIMIT PACING: see probe_verb. Two shapes per
+                 * connection, then a fresh budget. */
+                tc_close(&c);
+                tc_init(&c);
+                TF_CHECK_MSG(tc_connect(&c, node->port) == 0,
+                             "could not refresh the pre-registration probe");
             }
         }
     }

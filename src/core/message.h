@@ -593,10 +593,9 @@ int irc_ascii_same(const char *a, const char *b);
  * ---------------------------------------------------------------------------
  * The whole identity scheme is `nick@server`. 2.1 splits a qualified name at
  * the LAST '@', which is only unambiguous if '@' cannot appear inside a nick.
- * parse_nick() performs no character validation at all -- it returns 1 for
- * "NICK a@evil" and hands back the nickname "a@evil" -- so the predicate
+ * There is no separate NICK parser doing character validation -- the predicate
  * below is what makes the scheme sound. It is a local rule, enforced at
- * registration, and it deliberately does not change parse_nick().
+ * registration.
  *
  * The rule, in full. `nick` is valid iff ALL of the following hold:
  *
