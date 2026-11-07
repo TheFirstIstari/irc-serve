@@ -528,7 +528,8 @@ const char *fed_prefix_server(const char *prefix, char *out, size_t cap);
  *   G5  hops >= IRC_MAX_HOPS. 2.4's ceiling.
  *   G6  The origin is THIS node. 2.4's never-forward-own-origin, inbound half.
  *   G7  fed_dedup_seen() says this (origin, epoch, id) is already known. The
- *       record happens HERE, at the guard, not after the handler.
+ *       record happens HERE, at the guard, not after the handler. A -1 answer
+ *       is a store failure, dropped as fed_dedup_error and NOT as a duplicate.
  *   G8  The verb is not in 4.3's list. The SBURST family is asked HERE rather
  *       than in the table, because its five verbs have five different shapes and
  *       no common channel position; everything above still applies to it, which

@@ -291,10 +291,11 @@ int fed_dedup_seen(struct server *s, const irc_serve_tags_t *t,
     key.id = t->id;
 
     if (table_alloc(s) != 0) {
-        /* Fail closed. The alternative -- carry on as though nothing had been
-         * recorded -- is a store that does not store, which is the loop 2.4
-         * exists to prevent. */
-        return 1;
+        /* Fail closed, AS AN ERROR (#174): the caller must not mistake this
+         * for a duplicate. A dropped message is one lost message, whereas a
+         * store that silently did not record is a loop that runs until the hop
+         * ceiling stops it. */
+        return -1;
     }
     tab = s->dedup_tab;
 
@@ -374,9 +375,10 @@ int fed_dedup_seen(struct server *s, const irc_serve_tags_t *t,
     }
     /* Unreachable: the table has IRC_DEDUP_MAX slots, the loop is about to look
      * at all of them, and a full sweep with no free slot means every slot is
-     * occupied. Refusing is the only honest answer left, and it is the same
-     * fail-closed one as an allocation failure. */
-    return 1;
+     * occupied. Refusing is the only honest answer left, and it is the error
+     * answer (-1), not a duplicate: a full store is memory pressure, and the
+     * caller reports it as such. */
+    return -1;
 }
 
 size_t fed_dedup_sweep(struct server *s, uint64_t now_ms)
