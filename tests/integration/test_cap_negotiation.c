@@ -718,6 +718,48 @@ static void test_bad_store(char *path, const char *mode, const char *label)
 }
 
 /* --------------------------------------------------------------------------
+ * Issue #178: the four shapes of secret-file refusal, asserted on the node's
+ * OWN OUTPUT so the REASON is checked rather than only the behaviour.
+ * ------------------------------------------------------------------------ */
+static void test_secret_refused(char *path, const char *reason,
+                                const char *label)
+{
+    nf_node_t node;
+    test_client_t c;
+    char portbuf[16];
+    char *argv[6];
+
+    tc_init(&c);
+    (void)snprintf(portbuf, sizeof portbuf, "0");
+    argv[0] = (char *)"irc-serve";
+    argv[1] = portbuf;
+    argv[2] = (char *)"--sasl-store";
+    argv[3] = path;
+    argv[4] = NULL;
+    argv[5] = NULL;
+    TF_CHECK(nf_spawn_binary_argv(&node, argv) == 0);
+    /* The refusal names its reason, which is the half test_bad_store() does
+     * not assert: the same behaviour with two different reasons is two
+     * different refusals, and #178 is about the two loaders refusing alike --
+     * so test_account.c carries the mirror of these four cases. */
+    TF_CHECK_MSG(nf_expect(&node, "sasl_store: state=REFUSED", T_IO_MS) == 0,
+                 "%s: the node printed no sasl_store refusal", label);
+    TF_CHECK_MSG(nf_expect(&node, reason, T_IO_MS) == 0,
+                 "%s: the refusal did not name \"%s\"", label, reason);
+    /* And the behaviour is the refusal behaviour: no `sasl` capability. */
+    TF_CHECK_MSG(tc_connect(&c, node.port) == 0, "tc_connect failed");
+    TF_CHECK_MSG(tc_send(&c, "CAP LS") == 0, "tc_send failed");
+    TF_CHECK_MSG(tc_expect(&c, " CAP * LS :", T_IO_MS) == 0, "no CAP LS");
+    TF_CHECK_MSG(strstr(tc_buffer(&c), "sasl") == NULL,
+                 "%s: a node whose credential store was refused still "
+                 "advertised sasl", label);
+
+    nf_kill(&node);
+    nf_free(&node);
+    tc_close(&c);
+}
+
+/* --------------------------------------------------------------------------
  * Part 6: a credential is never logged. Read the CHILD'S OWN OUTPUT and assert
  * the secret does not appear in it.
  * ------------------------------------------------------------------------ */
@@ -1281,6 +1323,77 @@ int main(void)
         }
     }
     test_bad_store(broken_store, "0600", "a malformed record");
+
+    /* Issue #178: symlink, 0640, FIFO and over-long stores are each REFUSED,
+     * with the reason named so the two loaders can be compared against the
+     * mirror of these four cases in test_account.c. */
+    {
+        char sym_target[] = "/tmp/irc_serve_cap_symt.XXXXXX";
+        char sym_link[] = "/tmp/irc_serve_cap_link.XXXXXX";
+        char store640[] = "/tmp/irc_serve_cap_640.XXXXXX";
+        char store_fifo[] = "/tmp/irc_serve_cap_fifo.XXXXXX";
+        char store_long[] = "/tmp/irc_serve_cap_long.XXXXXX";
+        char chunk[128];
+        int fd;
+
+        memset(chunk, 'A', sizeof chunk);
+
+        fd = mkstemp(sym_target);
+        TF_CHECK(fd >= 0);
+        if (fd >= 0) {
+            TF_CHECK(write(fd, "alice\tcorrect horse\n", (size_t)21) == 21);
+            (void)close(fd);
+            TF_CHECK(chmod(sym_target, S_IRUSR | S_IWUSR) == 0);
+        }
+        fd = mkstemp(sym_link);
+        TF_CHECK(fd >= 0);
+        if (fd >= 0) {
+            (void)close(fd);
+            (void)unlink(sym_link);
+            TF_CHECK(symlink(sym_target, sym_link) == 0);
+            test_secret_refused(sym_link, "reason=open", "a symlinked store");
+            (void)unlink(sym_link);
+        }
+        (void)unlink(sym_target);
+
+        fd = mkstemp(store640);
+        TF_CHECK(fd >= 0);
+        if (fd >= 0) {
+            TF_CHECK(write(fd, "alice\tcorrect horse\n", (size_t)21) == 21);
+            (void)close(fd);
+            TF_CHECK(chmod(store640, S_IRUSR | S_IWUSR | S_IRGRP) == 0);
+            test_secret_refused(store640, "reason=mode_640",
+                                "a group-readable store");
+            (void)unlink(store640);
+        }
+
+        fd = mkstemp(store_fifo);
+        TF_CHECK(fd >= 0);
+        if (fd >= 0) {
+            (void)close(fd);
+            (void)unlink(store_fifo);
+            TF_CHECK(mkfifo(store_fifo, S_IRUSR | S_IWUSR) == 0);
+            test_secret_refused(store_fifo, "reason=not_regular",
+                                "a FIFO store");
+            (void)unlink(store_fifo);
+        }
+
+        fd = mkstemp(store_long);
+        TF_CHECK(fd >= 0);
+        if (fd >= 0) {
+            /* Five chunks of 128: the first fgets fills without a newline,
+             * which is the over-long refusal rather than a record. */
+            for (int k = 0; k < 5; k++) {
+                TF_CHECK(write(fd, chunk, sizeof chunk) == (ssize_t)sizeof chunk);
+            }
+            TF_CHECK(write(fd, "\n", (size_t)1) == 1);
+            (void)close(fd);
+            TF_CHECK(chmod(store_long, S_IRUSR | S_IWUSR) == 0);
+            test_secret_refused(store_long, "reason=line_too_long",
+                                "an over-long store line");
+            (void)unlink(store_long);
+        }
+    }
 
     test_sasl_plain(good_store, 1);
     test_bad_credentials(good_store, "a wrong password", "alice", "nope");
