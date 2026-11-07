@@ -33,12 +33,11 @@
  * kept freed nodes on a list would need a generation or liveness check for the
  * same guarantee.
  *
- * The cost of the choice is stated rather than hidden: iterating every
- * connection is O(FD_SETSIZE) per tick, because the index is a flat array and
- * the loop has no other way to enumerate. At a 50 ms tick that is about twenty
- * thousand pointer tests a second, which is not a cost worth optimising at
- * this scale -- and the FD_SETSIZE ceiling it inherits is the one 3.4 already
- * accepted in choosing poll() over epoll/kqueue.
+ * The cost of the choice is stated rather than hidden: the flat array is the
+ * O(1) lookup, and enumeration is the dense active-fd list beside it
+ * (server_t::active_fds), so iterating every connection is O(nconns) per
+ * tick rather than O(FD_SETSIZE) -- and the FD_SETSIZE ceiling it inherits
+ * is the one 3.4 already accepted in choosing poll() over epoll/kqueue.
  *
  * ---------------------------------------------------------------------------
  * PEER ADDRESSES MUST BE PRE-RESOLVED
@@ -491,6 +490,16 @@ struct server {
 
     conn_t  **by_fd;          /* FD_SETSIZE slots; NULL when the slot is free */
     size_t    nconns;
+
+    /* The ACTIVE list: every fd held in by_fd, dense, order insignificant
+     * (issue #176). by_fd is the O(1) lookup; this is the enumeration, so the
+     * loop walks it instead of scanning FD_SETSIZE slots per tick.
+     * server_add_conn() appends, server_close_conn() swap-removes, and
+     * nactive == nconns is the invariant both keep. Grown geometrically and
+     * lazily, like dials: a node with no connections holds no array. */
+    int      *active_fds;
+    size_t    nactive;
+    size_t    active_cap;
 
     /* Registries. Both are string -> pointer maps. The nick one is FOLDED
      * (ASCII, case-insensitive keys) and the channel one is EXACT -- for the
