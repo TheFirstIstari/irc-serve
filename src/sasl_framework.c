@@ -23,6 +23,7 @@
 #endif
 
 #include "sasl_framework.h"
+#include "core/secret_util.h"
 
 /* --------------------------------------------------------------------------
  * The store
@@ -437,61 +438,32 @@ static int store_parse_line(sasl_store_t *store, char *line)
 sasl_store_t *sasl_store_load(const char *path)
 {
     FILE *f;
-    struct stat sb;
+    secret_open_status_t open_status = SECRET_OPEN_FAIL_OPEN;
+    unsigned open_mode = 0u;
     sasl_store_t *store;
     char line[SASL_MAX_LINE];
 
     if (path == NULL || path[0] == '\0') {
         return NULL;
     }
-    /* THE SECRET-FILE CHECK, before a byte is read.
-     *
-     * `stat` failing is a refusal rather than a fallback to a permission-blind
-     * read: a credential file whose mode cannot be established is a credential
-     * file whose exposure cannot be established either, and the whole control
-     * this check exists to apply is unknowable in that case.
-     *
-     * A SYMLINK is not followed and not special-cased. stat() has followed it
-     * already, so what is judged is the target -- which is the file whose
-     * contents would be read. */
-      /* OPEN FIRST, THEN fstat THE DESCRIPTOR.
-       *
-       * This used to stat() the path, judge the mode, and only then fopen() it.
-       * Between the stat and the open the file can be replaced -- by a symlink, by
-       * a FIFO, or by a 0644 copy -- so the thing that was checked is not
-       * necessarily the thing that gets read. CodeQL flagged it, and it is a real
-       * race on a file of passwords: the checks below are the only thing standing
-       * between a world-readable file and an authentication oracle.
-       *
-       * fstat() on the descriptor cannot race, because the descriptor names an
-       * inode the kernel has already opened, and O_NOFOLLOW makes a symlink at the
-       * final component a hard error rather than something to reason about.
-       *
-       * Nothing changes for an honest operator: same observable lines, same refusal
-       * reasons, same mode rule. Only the order changes, and the order was the bug. */
-      f = fopen(path, "re");
-      if (f == NULL) {
-          printf("[observable] sasl_store: state=REFUSED path=%s reason=open\n", path);
-          return NULL;
-      }
-      if (fstat(fileno(f), &sb) != 0) {
-          printf("[observable] sasl_store: state=REFUSED path=%s reason=fstat\n", path);
-          (void)fclose(f);
-          return NULL;
-      }
-      if (!S_ISREG(sb.st_mode)) {
-          printf("[observable] sasl_store: state=REFUSED path=%s reason=not_regular\n",
-                 path);
-          (void)fclose(f);
-          return NULL;
-      }
-      if ((sb.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
-          printf("[observable] sasl_store: state=REFUSED path=%s reason=mode_%03o "
-                 "(group or other may access a file of passwords)\n",
-                 path, (unsigned)(sb.st_mode & 0777));
-          (void)fclose(f);
-          return NULL;
-      }
+    /* THE SECRET-FILE CHECK, before a byte is read: one shared open
+     * (see secret_file_open) whose refusal reasons are the ones below. */
+    f = secret_file_open(path, &open_status, &open_mode);
+    if (f == NULL) {
+        if (open_status == SECRET_OPEN_FAIL_FSTAT) {
+            printf("[observable] sasl_store: state=REFUSED path=%s reason=fstat\n", path);
+        } else if (open_status == SECRET_OPEN_NOT_REGULAR) {
+            printf("[observable] sasl_store: state=REFUSED path=%s reason=not_regular\n",
+                   path);
+        } else if (open_status == SECRET_OPEN_BAD_MODE) {
+            printf("[observable] sasl_store: state=REFUSED path=%s reason=mode_%03o "
+                   "(group or other may access a file of passwords)\n",
+                   path, open_mode);
+        } else {
+            printf("[observable] sasl_store: state=REFUSED path=%s reason=open\n", path);
+        }
+        return NULL;
+    }
     store = sasl_store_new();
     if (store == NULL) {
         (void)fclose(f);
@@ -738,31 +710,8 @@ int sasl_plain_parse(const char *payload, size_t len,
 }
 
 /* --------------------------------------------------------------------------
- * Constant-time comparison
+ * Password verification, against the shared constant-time compare
  * ------------------------------------------------------------------------ */
-
-/* Returns 1 when the two fixed-length buffers hold the same bytes, in time
- * that depends only on their LENGTH and not on their contents.
- *
- * `diff` accumulates the XOR of every byte, so a mismatch anywhere makes it
- * non-zero, and the loop cannot exit early -- it always walks the whole
- * length. The accumulator is unsigned so the compiler cannot reason about its
- * value being always zero, and the result is folded to 0/1 at the end so no
- * caller can be tempted to branch on an intermediate. Both sides here are
- * digests (see sasl_plain_verify): the comparison is hash-against-hash. */
-static int const_time_eq(const unsigned char *a, const unsigned char *b,
-                         size_t n)
-{
-    unsigned diff = 0u;
-
-    if (a == NULL || b == NULL) {
-        return 0;
-    }
-    for (size_t i = 0; i < n; i++) {
-        diff |= (unsigned)(a[i] ^ b[i]);
-    }
-    return (diff == 0u) ? 1 : 0;
-}
 
 /* A fixed dummy compared against when no record matched, so that "no such
  * authcid" and "wrong password" cost the same. It is a constant, not a derived
@@ -809,14 +758,14 @@ int sasl_plain_verify(const sasl_store_t *store,
     for (size_t i = 0; i < store->n; i++) {
         if (authcid_eq(store->rec[i].authcid, authcid) != 0) {
             saw_match |=
-                (unsigned)const_time_eq(store->rec[i].phash, want, SASL_HASH_LEN);
+                (unsigned)secret_const_time_eq(store->rec[i].phash, want, SASL_HASH_LEN);
         }
     }
     /* And a miss still pays one comparison, so an authcid that is not in the
      * store is not distinguishable from one whose password is wrong. */
     if (saw_match == 0u) {
         dummy_used =
-            (unsigned)const_time_eq(dummy, want, SASL_HASH_LEN);
+            (unsigned)secret_const_time_eq(dummy, want, SASL_HASH_LEN);
     }
     (void)dummy_used;
     sasl_wipe(want, sizeof want);
