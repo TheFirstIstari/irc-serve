@@ -8,7 +8,6 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 
 #include "core/account.h"
 #include "core/cap.h"
@@ -823,8 +822,8 @@ void handle_whois(server_t *s, conn_t *c, const message_t *m)
     conn_t *who;
     char idle[24];
     char signon[24];
-    long secs;
-    time_t now;
+    uint64_t now_ms;
+    unsigned long long secs;
 
     if (m->nparams != 1) {
         (void)reply_refused(s, c, "WHOIS", "INVALID_PARAMS", "461", NULL, 0,
@@ -932,12 +931,16 @@ void handle_whois(server_t *s, conn_t *c, const message_t *m)
      * RFC 2812 3.3.4's field list is, and it is satisfied. A reader who wants
      * both numbers already has both.
      */
-    now = time(NULL);
-    secs = (long)(now - who->last_active);
-    if (secs < 0) {
-        secs = 0; /* a clock that went backwards reports 0, never a negative */
-    }
-    (void)snprintf(idle, sizeof idle, "%ld", secs);
+    /* Monotonic idle (#175): last_active_ms is server_now_ms() ms, so
+     * the difference is a duration no wall-clock step can warp.
+     * Saturating, so a stamp from the future reports 0 rather than
+     * wrapping. signon_at stays wall-clock: 317's <signon> is a Unix
+     * time the client compares against its own clock. */
+    now_ms = server_now_ms();
+    secs = (now_ms >= who->last_active_ms)
+               ? (unsigned long long)((now_ms - who->last_active_ms) / 1000u)
+               : 0ull;
+    (void)snprintf(idle, sizeof idle, "%llu", secs);
     (void)snprintf(signon, sizeof signon, "%lld", (long long)who->signon_at);
     (void)reply(s, c, "317", (const char *const[]){ who->nick, idle, signon }, 3,
                 "seconds idle");
