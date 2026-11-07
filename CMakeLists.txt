@@ -264,8 +264,8 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     #
     # -Wno-unsafe-buffer-usage: an experimental Clang diagnostic that fires on
     # essentially ALL pointer arithmetic and indexing in C (`p++`, `line[i]`,
-    # `end - rn`, strncpy bounds). The sites it flags in protocol_parse.c and
-    # ircv3_tags.c are ordinary, already bounds-checked parsing code.
+    # `end - rn`, strncpy bounds). The sites it flags in ircv3_tags.c are
+    # ordinary, already bounds-checked parsing code.
     # Satisfying it would mean rewriting correct parsers into unnatural forms
     # with no safety gain, so it is disabled rather than obeyed. Do NOT
     # re-enable it and then "fix" the parsers to satisfy it.
