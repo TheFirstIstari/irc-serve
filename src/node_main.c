@@ -307,7 +307,10 @@ static void usage(FILE *out, const char *argv0)
                  "         TO CLOSE THE OTHER DIRECTION, use --tls-require, which\n"
                  "         refuses every plaintext connection at accept; or point\n"
                  "         peers at --tls-port, where every byte is TLS before\n"
-                 "         anything is interpreted. The startup line reports which\n"
+                 "         anything is interpreted. A link with require_tls set is\n"
+                 "         never dialled without TLS: if this node has none, the\n"
+                 "         dial is refused as reason=TLS_REQUIRED and no FEDERATE\n"
+                 "         is sent. The startup line reports which\n"
                  "         half each --peer-tls enforces as\n"
                  "         enforced=outbound_dial or use_tls_port_or_tls_require.\n",
             NODE_MAX_PEERS);

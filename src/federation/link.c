@@ -2562,6 +2562,18 @@ void fed_tick(server_t *s, uint64_t now_ms)
                 link->clean_leave == 0 &&
                 (link->retry_at_ms == 0u || now_ms >= link->retry_at_ms) &&
                 fed_dial_for(s, link->name) == NULL) {
+                /* Gate, don't encrypt (#167): a link with require_tls is never
+                 * dialled without TLS, so its FEDERATE -- which carries the
+                 * shared secret -- can never go out in the clear. Unreachable
+                 * through the shipped binary (main() refuses --peer-tls with no
+                 * certificate), so this is the backstop for any caller that set
+                 * the flag another way: no socket, no FEDERATE, and the backoff
+                 * armed so the refusal does not spin. */
+                if (link->require_tls != 0 && s->tls == NULL) {
+                    fed_refuse(s, link, NULL, link->name, "TLS_REQUIRED");
+                    fed_retry_arm(s, link, now_ms, "TLS_REQUIRED");
+                    break;
+                }
                 link->created_ms = now_ms;
                 if (server_dial(s, (const struct sockaddr *)&link->addr,
                                 link->addrlen, link->name) == 0) {
