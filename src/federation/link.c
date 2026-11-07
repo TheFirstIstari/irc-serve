@@ -1,19 +1,9 @@
 /* link.c -- see link.h. The link lifecycle and the FEDERATE exchange.
  *
- * ---------------------------------------------------------------------------
- * THE ASCII FOLD, AND WHY IT IS A FOURTH COPY
- * ---------------------------------------------------------------------------
- * A server name is case-insensitive (2.1, RFC 1459 2.3.2), so `IRC.A` and
- * `irc.a` are one server, and every comparison of two server names in this
- * node has to fold. The fold already exists three times -- in server.c
- * (same_server_name), channel.c (same_name) and dedup.c (fold_byte) -- and it
- * is copied rather than exported for the reason those three are: each is
- * private to a module whose key rule is its own, and exporting a fold would
- * make a fifth place able to get it subtly wrong (a Unicode fold, say, in a
- * node that advertises CASEMAPPING=ascii in 005). ASCII-only is the fold, for
- * the reason dedup.c gives: 005 has already told every client that []\~ and
- * {}|^ are not equivalent, and folding them here would break that promise in
- * the one place nothing on the wire would show it.
+ * Server-name comparison is message.h's irc_ascii_same() (issue #181): a server
+ * name is case-insensitive (2.1, RFC 1459 2.3.2), so `IRC.A` and `irc.a` are
+ * one server. ASCII-only, for the reason dedup.c gives: 005 has already told
+ * every client that []\~ and {}|^ are not equivalent.
  */
 #include "federation/link.h"
 
@@ -187,30 +177,6 @@ static void count_reject(fed_federate_result_t result)
     if (which > 0 && which < FED_RESULT_COUNT) {
         g_rejected[which]++;
     }
-}
-
-/* ---------------------------------------------------------------------------
- * Folding and comparison
- * ---------------------------------------------------------------------------
- */
-static char fold_char(char c)
-{
-    if (c >= 'A' && c <= 'Z') {
-        return (char)(c - ('A' - 'a'));
-    }
-    return c;
-}
-
-static int same_name(const char *a, const char *b)
-{
-    size_t i;
-
-    for (i = 0; a[i] != '\0' && b[i] != '\0'; i++) {
-        if (fold_char(a[i]) != fold_char(b[i])) {
-            return 0;
-        }
-    }
-    return a[i] == '\0' && b[i] == '\0';
 }
 
 /* Constant-time secret comparison.
@@ -426,7 +392,7 @@ static server_link_t *fed_link_of_conn(const server_t *s, const conn_t *c)
         return NULL;
     }
     for (i = 0; i < s->nlinks; i++) {
-        if (s->links[i].fd == c->fd && same_name(s->links[i].name, c->peer_name)) {
+        if (s->links[i].fd == c->fd && irc_ascii_same(s->links[i].name, c->peer_name)) {
             return &s->links[i];
         }
     }
@@ -1689,7 +1655,7 @@ fed_federate_result_t fed_check_federate(const server_t *s,
     }
 
     /* --- 3. not our own name -------------------------------------------- */
-    if (same_name(claim, s->name)) {
+    if (irc_ascii_same(claim, s->name)) {
         return FED_SELF_NAME;
     }
 
@@ -1727,7 +1693,7 @@ fed_federate_result_t fed_check_federate(const server_t *s,
     for (i = 0; i < server_link_count(s); i++) {
         const server_link_t *other = server_link_at(s, i);
 
-        if (other == NULL || other == self || !same_name(other->name, claim)) {
+        if (other == NULL || other == self || !irc_ascii_same(other->name, claim)) {
             continue;
         }
         if (other->state == (int)ESTABLISHED) {
@@ -1762,7 +1728,7 @@ fed_federate_result_t fed_check_federate(const server_t *s,
      * it would leave this node with a route whose name is not the one the
      * handshake was checked against. The line is closed, counted and dumped
      * like any other, under a name that says what happened. */
-    if (self != NULL && !same_name(self->name, claim)) {
+    if (self != NULL && !irc_ascii_same(self->name, claim)) {
         return FED_NAME_MISMATCH;
     }
     /* Only on the accepted path, and the out-parameter is why: the epoch is
@@ -2113,7 +2079,7 @@ static dial_t *fed_dial_for(server_t *s, const char *peer_name)
     for (i = 0; i < s->ndials; i++) {
         if (s->dials[i].state == DIAL_CONNECTING ||
             s->dials[i].state == DIAL_CONNECTED) {
-            if (same_name(s->dials[i].peer_name, peer_name)) {
+            if (irc_ascii_same(s->dials[i].peer_name, peer_name)) {
                 return &s->dials[i];
             }
         }
@@ -2241,7 +2207,7 @@ static void fed_dial_expired(server_t *s, size_t i, uint64_t now_ms)
     for (size_t k = 0; k < server_link_count(s); k++) {
         server_link_t *link = server_link_at(s, k);
 
-        if (link != NULL && same_name(link->name, peer) &&
+        if (link != NULL && irc_ascii_same(link->name, peer) &&
             link->state == (int)INIT) {
             fed_retry_arm(s, link, now_ms, "DIAL_TIMEOUT");
             break;
