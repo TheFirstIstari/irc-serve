@@ -86,6 +86,7 @@
  */
 #include <errno.h>
 #include <netdb.h>
+#include <pwd.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -160,6 +161,12 @@
 #define NODE_DEFAULT_SECRET ""
 
 #define NODE_DEFAULT_PORT 6667
+
+/* The account the node runs as after the listeners are bound (issue #182), when
+ * --user is not given. `nobody` is the conventional least-privilege account: it
+ * owns no files and is the user with the least reason to exist for any other
+ * purpose, so a compromised node gains nothing that is already somebody's. */
+#define NODE_DEFAULT_USER "nobody"
 
 /* How many --peer options are accepted, and why the limit is here rather than
  * only in the table.
@@ -236,6 +243,18 @@ static void usage(FILE *out, const char *argv0)
                  "         this node's server name (2.4 tag grammar: letters,\n"
                  "         digits, '-' and '.'; must start with a letter or\n"
                  "         digit). Default: %s\n", NODE_NAME);
+    fprintf(out, "\n");
+    fprintf(out, "  --user NAME\n"
+                 "         the account to run as once the listeners are bound.\n"
+                 "         Default: %s. A node started by root REFUSES to run\n"
+                 "         without an explicit --user, because a network-facing\n"
+                 "         process keeping root after bind is a misconfiguration\n"
+                 "         rather than a default. A node started by anyone else\n"
+                 "         ignores --user and runs as itself. There is no\n"
+                 "         daemonize and no chroot: the node stays in the\n"
+                 "         foreground, in the same filesystem, with fewer\n"
+                 "         privileges.\n",
+             NODE_DEFAULT_USER);
     fprintf(out, "\n");
     fprintf(out, "  --secret S\n"
                  "         the shared federation secret a peer must present in\n"
@@ -612,6 +631,12 @@ typedef struct {
  * node used before this phase had a command line. */
 typedef struct {
     const char *name;
+    /* The account to drop to after bind (issue #182), or NODE_DEFAULT_USER.
+     * have_user records whether the operator TYPED --user: a node started by
+     * root refuses to run without it, so the default being present is not
+     * enough -- the flag has to have been given. */
+    const char *user;
+    int         have_user;
     const char *secret;
     const char *secret_file;
     int have_secret;
@@ -688,6 +713,7 @@ static void opts_defaults(node_opts_t *o)
 {
     memset(o, 0, sizeof *o);
     o->name = NODE_NAME;
+    o->user = NODE_DEFAULT_USER;
     o->secret = NODE_DEFAULT_SECRET;
     o->port = NODE_DEFAULT_PORT;
 }
@@ -779,6 +805,7 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
             strcmp(arg, "--secret-file") == 0 ||
             strcmp(arg, "--peer") == 0 || strcmp(arg, "--sasl-store") == 0 ||
             strcmp(arg, "--account-store") == 0 ||
+            strcmp(arg, "--user") == 0 ||
             strcmp(arg, "--peer-tls") == 0 || strcmp(arg, "--tls-cert") == 0 ||
             strcmp(arg, "--tls-key") == 0 || strcmp(arg, "--tls-ca") == 0 ||
             strcmp(arg, "--tls-ocsp-staple") == 0 ||
@@ -836,6 +863,13 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
 
         if (strcmp(arg, "--name") == 0) {
             o->name = value;
+        } else if (strcmp(arg, "--user") == 0) {
+            if (value[0] == '\0') {
+                fprintf(stderr, "irc-serve: --user needs a name\n");
+                return -1;
+            }
+            o->user = value;
+            o->have_user = 1;
         } else if (strcmp(arg, "--secret") == 0) {
             o->secret = value;
             o->have_secret = 1;
@@ -937,6 +971,70 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
  * future caller might copy for a hostname.
  *
  * The first result is used and the rest freed; see the header for why. */
+/* ---------------------------------------------------------------------------
+ * THE PRIVILEGE DROP, and it runs exactly once: after both listeners are bound
+ * and before any store, secret or peer state is read (issue #182).
+ * ---------------------------------------------------------------------------
+ * Binding is the one step that can need privilege (a low port), and everything
+ * after it -- file reads, the handshake, the loop -- does not. So the order is
+ * parse -> bind -> drop -> load stores -> fed_open -> loop, and the drop is
+ * setgid() then setuid() to --user, with NO daemonize and NO chroot: the node
+ * stays in the foreground, in the same filesystem, with fewer privileges.
+ *
+ * Root without an explicit --user is a REFUSAL, not a default: the default is
+ * `nobody`, but a default the operator did not type is not consent to have run
+ * the privileged half of startup as root, and silently dropping would bless a
+ * command line the operator never meant. Not root is a SKIP: there is nothing
+ * to shed, --user is ignored, and the start is exactly what it was before the
+ * option existed.
+ *
+ * Every outcome prints one [observable] line, because a test cannot watch a uid
+ * change from outside -- the refusal and the drop have to be readable off the
+ * node's own output. No secret bytes appear in any of them. */
+static int drop_privileges(const node_opts_t *o)
+{
+    const char *name;
+    struct passwd *pw;
+
+    if (o == NULL) {
+        return -1;
+    }
+    name = (o->user != NULL) ? o->user : NODE_DEFAULT_USER;
+    if (geteuid() != 0) {
+        printf("[observable] priv_drop: state=SKIPPED_NOT_ROOT user=%s\n",
+               name);
+        return 0;
+    }
+    if (!o->have_user) {
+        printf("[observable] priv_drop: state=REFUSED "
+               "reason=root_without_user\n");
+        fprintf(stderr, "irc-serve: running as root requires --user NAME; "
+                        "refusing to start rather than keep root after bind\n");
+        return -1;
+    }
+    pw = getpwnam(name);
+    if (pw == NULL) {
+        printf("[observable] priv_drop: state=REFUSED reason=unknown_user "
+               "user=%s\n", name);
+        fprintf(stderr, "irc-serve: --user %s names no local account\n", name);
+        return -1;
+    }
+    /* Group first: after setuid() the process could no longer change its own
+     * group. A setgid() that succeeded and a setuid() that failed must still
+     * refuse -- half-dropped privilege is the state this function exists to
+     * prevent, so either failure is fatal. */
+    if (setgid(pw->pw_gid) != 0 || setuid(pw->pw_uid) != 0) {
+        printf("[observable] priv_drop: state=REFUSED reason=setid_failed "
+               "user=%s\n", name);
+        fprintf(stderr, "irc-serve: could not drop to %s: %s\n", name,
+                strerror(errno));
+        return -1;
+    }
+    printf("[observable] priv_drop: state=DROPPED user=%s uid=%lu gid=%lu\n",
+           name, (unsigned long)pw->pw_uid, (unsigned long)pw->pw_gid);
+    return 0;
+}
+
 static int resolve_peer(server_t *s, const node_peer_t *peer)
 {
     struct addrinfo hints;
@@ -1025,8 +1123,103 @@ int main(int argc, char **argv)
      * visible at the point where it decides it. */
     srv.dispatch = commands_dispatch;
 
-    /* The peer link, and the ORDER of these three assignments is the order the
-     * federation module has to be built up in:
+    /* BOTH LISTENERS ARE BOUND HERE, before anything else is read (issue #182:
+     * parse -> bind -> drop -> load stores -> fed_open -> loop). Binding is the
+     * one step that can need privilege -- a low port -- and everything after it
+     * does not, so the drop below sheds privilege before any file is opened. */
+    if (server_listen(&srv, opts.port) != 0) {
+        printf("[observable] server startup failed: port=%d reason=%s\n",
+               opts.port, strerror(errno));
+        server_shutdown(&srv);
+        return 1;
+    }
+
+    /* THE IMPLICIT-TLS LISTENER, second and after the plain one. Its failure is
+     * FATAL rather than a warning, and that is a different decision from the
+     * certificate's: an operator who asked for --tls-port has said clients will be
+     * encrypted from the first byte, and a node that could not bind that port and
+     * said nothing would leave those clients on a plaintext port they were told
+     * not to use. A REFUSAL here is the honest answer. */
+    if (opts.have_tls_port) {
+        if (server_listen_tls(&srv, opts.tls_port) != 0) {
+            printf("[observable] server startup failed: tls_port=%d reason=%s\n",
+                   opts.tls_port,
+                   (srv.tls == NULL) ? "no_tls_configured" : strerror(errno));
+            server_shutdown(&srv);
+            return 1;
+        }
+        printf("[observable] tls_bind: port=%d fd=%d state=LISTENING\n",
+               server_tls_port(&srv), srv.tls_listen_fd);
+    }
+
+    /* THE DROP, after both binds and before any store, secret or peer state is
+     * read. Root without an explicit --user refuses here; anything else sheds
+     * to --user or skips, with one [observable] line either way. */
+    if (drop_privileges(&opts) != 0) {
+        server_shutdown(&srv);
+        return 1;
+    }
+
+    /* ------------------------------------------------------------------------
+     * THE CREDENTIAL STORE, loaded here and nowhere else.
+     * ------------------------------------------------------------------------
+     * It is loaded BEFORE the loop is armed and that is the whole of the design:
+     * 3.4 forbids a blocking call inside the event loop, and reading a file is
+     * the most blocking call there is. Once loaded, the store is an in-memory
+     * array on server_t and every AUTHENTICATE is a bounded linear scan of at
+     * most SASL_MAX_CREDENTIALS records.
+     *
+     * A STORE THAT FAILED TO LOAD IS NOT A STARTUP FAILURE. The node comes up,
+     * says so on stderr and in the startup line, and advertises no `sasl`. The
+     * alternative -- refusing to start -- would turn a typo in a path into a
+     * node that will not serve anybody, over a feature most deployments of this
+     * design do not use. And a node that WILL NOT ADVERTISE what it cannot do is
+     * the rule cap.c exists to enforce, so "no store" has to be a state this
+     * binary can be in, and it is.
+     */
+    if (opts.sasl_store != NULL) {
+        srv.sasl_store = sasl_store_load(opts.sasl_store);
+        if (srv.sasl_store == NULL) {
+            fprintf(stderr, "irc-serve: --sasl-store %s was refused; this node "
+                            "will advertise no sasl capability\n", opts.sasl_store);
+        }
+    }
+
+    /* ------------------------------------------------------------------------
+     * THE ACCOUNT REGISTRY, loaded here for the same two reasons the credential
+     * store above is: 3.4 forbids a blocking call inside the event loop, and a
+     * node's configuration is read once, before the loop is armed.
+     *
+     * IT IS A SEPARATE FILE AND IT IS LOADED SEPARATELY, deliberately. The two
+     * files answer different questions -- "may this client authenticate" and
+     * "does this account exist" -- and a node started with neither, or with
+     * either, has to be a state this binary can be in. Loading one file and
+     * splitting it on a per-record flag would make the meaning of the FILE a
+     * property of a byte inside a line, and a credential file whose rows mean
+     * different things is a file whose blast radius is one bad edit wide.
+     *
+     * A REGISTRY THAT FAILED TO LOAD IS NOT A STARTUP FAILURE, for the same
+     * reason the credential store's is not: the node comes up, says so on stderr
+     * and in the startup line, and identifies nobody. Crucially this is NOT the
+     * same as refusing the client -- a client that authenticates against
+     * --sasl-store is still authenticated, and is simply not identified to an
+     * account, which is the state it is already in when it declines to
+     * authenticate at all. That equivalence is what makes the account subsystem
+     * ADDITIVE: nothing a deployment did before this option changes.
+     */
+    if (opts.account_store != NULL) {
+        srv.account_store = account_store_load(opts.account_store);
+        if (srv.account_store == NULL) {
+            fprintf(stderr, "irc-serve: --account-store %s was refused; this node "
+                            "will identify no client to an account\n",
+                    opts.account_store);
+        }
+    }
+
+    /* The peer link, AFTER the stores and the drop (issue #182: the order is
+     * parse -> bind -> drop -> load stores -> fed_open -> loop), and the ORDER
+     * of these three assignments is the order the federation module has to be
+     * built up in:
      *
      *   srv.dispatch = commands_dispatch  first, because fed_open() WRAPS
      *       whatever dispatch is there. The reverse order would wrap NULL and
@@ -1089,62 +1282,6 @@ int main(int argc, char **argv)
         }
     }
     srv.on_tick = fed_tick;
-
-    /* ------------------------------------------------------------------------
-     * THE CREDENTIAL STORE, loaded here and nowhere else.
-     * ------------------------------------------------------------------------
-     * It is loaded BEFORE the loop is armed and that is the whole of the design:
-     * 3.4 forbids a blocking call inside the event loop, and reading a file is
-     * the most blocking call there is. Once loaded, the store is an in-memory
-     * array on server_t and every AUTHENTICATE is a bounded linear scan of at
-     * most SASL_MAX_CREDENTIALS records.
-     *
-     * A STORE THAT FAILED TO LOAD IS NOT A STARTUP FAILURE. The node comes up,
-     * says so on stderr and in the startup line, and advertises no `sasl`. The
-     * alternative -- refusing to start -- would turn a typo in a path into a
-     * node that will not serve anybody, over a feature most deployments of this
-     * design do not use. And a node that WILL NOT ADVERTISE what it cannot do is
-     * the rule cap.c exists to enforce, so "no store" has to be a state this
-     * binary can be in, and it is.
-     */
-    if (opts.sasl_store != NULL) {
-        srv.sasl_store = sasl_store_load(opts.sasl_store);
-        if (srv.sasl_store == NULL) {
-            fprintf(stderr, "irc-serve: --sasl-store %s was refused; this node "
-                            "will advertise no sasl capability\n", opts.sasl_store);
-        }
-    }
-
-    /* ------------------------------------------------------------------------
-     * THE ACCOUNT REGISTRY, loaded here for the same two reasons the credential
-     * store above is: 3.4 forbids a blocking call inside the event loop, and a
-     * node's configuration is read once, before the loop is armed.
-     *
-     * IT IS A SEPARATE FILE AND IT IS LOADED SEPARATELY, deliberately. The two
-     * files answer different questions -- "may this client authenticate" and
-     * "does this account exist" -- and a node started with neither, or with
-     * either, has to be a state this binary can be in. Loading one file and
-     * splitting it on a per-record flag would make the meaning of the FILE a
-     * property of a byte inside a line, and a credential file whose rows mean
-     * different things is a file whose blast radius is one bad edit wide.
-     *
-     * A REGISTRY THAT FAILED TO LOAD IS NOT A STARTUP FAILURE, for the same
-     * reason the credential store's is not: the node comes up, says so on stderr
-     * and in the startup line, and identifies nobody. Crucially this is NOT the
-     * same as refusing the client -- a client that authenticates against
-     * --sasl-store is still authenticated, and is simply not identified to an
-     * account, which is the state it is already in when it declines to
-     * authenticate at all. That equivalence is what makes the account subsystem
-     * ADDITIVE: nothing a deployment did before this option changes.
-     */
-    if (opts.account_store != NULL) {
-        srv.account_store = account_store_load(opts.account_store);
-        if (srv.account_store == NULL) {
-            fprintf(stderr, "irc-serve: --account-store %s was refused; this node "
-                            "will identify no client to an account\n",
-                    opts.account_store);
-        }
-    }
 
     /* ------------------------------------------------------------------------
      * PHASE 12: TLS, and WHERE it is configured matters more than it looks
@@ -1256,31 +1393,6 @@ int main(int argc, char **argv)
         }
     }
 
-    if (server_listen(&srv, opts.port) != 0) {
-        printf("[observable] server startup failed: port=%d reason=%s\n",
-               opts.port, strerror(errno));
-        server_shutdown(&srv);
-        return 1;
-    }
-
-    /* THE IMPLICIT-TLS LISTENER, second and after the plain one. Its failure is
-     * FATAL rather than a warning, and that is a different decision from the
-     * certificate's: an operator who asked for --tls-port has said clients will be
-     * encrypted from the first byte, and a node that could not bind that port and
-     * said nothing would leave those clients on a plaintext port they were told
-     * not to use. A REFUSAL here is the honest answer. */
-    if (opts.have_tls_port) {
-        if (server_listen_tls(&srv, opts.tls_port) != 0) {
-            printf("[observable] server startup failed: tls_port=%d reason=%s\n",
-                   opts.tls_port,
-                   (srv.tls == NULL) ? "no_tls_configured" : strerror(errno));
-            server_shutdown(&srv);
-            return 1;
-        }
-        printf("[observable] tls_bind: port=%d fd=%d state=LISTENING\n",
-               server_tls_port(&srv), srv.tls_listen_fd);
-    }
-
     /* Read the port back rather than echoing the argument: with port 0 the
      * argument is not the port, and a caller that cannot learn the real one
      * cannot connect. */
@@ -1292,6 +1404,13 @@ int main(int argc, char **argv)
     }
     printf("[observable] tcp_bind: port=%d fd=%d state=LISTENING\n",
            bound, srv.listen_fd);
+    /* THE STARTUP BANNER (issue #182): version, name, port and whether a secret
+     * is set -- and never the secret itself, which must not appear in `ps`-visible
+     * output or in any log this line is copied to. One line, after bind and the
+     * drop, so a reader can tell what is running, where, and whether it
+     * federates, without reading the command line. */
+    printf("[observable] startup: version=%s name=%s port=%d secret=%s\n",
+           IRC_SERVE_VERSION, opts.name, bound, secret_state);
     /* `sasl=` is the startup line's half of "advertise only what you have": a
      * reader comparing two nodes' startup output can tell which one offers
      * authentication without opening either one's credential file. */
