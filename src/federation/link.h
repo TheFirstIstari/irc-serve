@@ -78,7 +78,7 @@
  * core/poll_loop.c -- which stays byte-for-byte unchanged by this phase. A
  * received line from a peer is stamped on the link; a line from a client is
  * not stamped at all, because no client's traffic says anything about whether
- * a peer is alive. (conn_t::last_active exists for the 317 half of the same
+ * a peer is alive. (conn_t::last_active_ms exists for the 317 half of the same
  * idea and is deliberately a different field for a different question.)
  *
  * The clock is read with server_now_ms() here rather than taken from the tick.

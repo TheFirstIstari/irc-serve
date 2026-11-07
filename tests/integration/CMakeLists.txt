@@ -667,6 +667,10 @@ irc_add_integration_test(test_fanout_gate test_fanout_gate.c)
 # error/dup counter split. In-process: the ceiling has to apply to the very
 # calloc the store makes, which no forked node lets a test time.
 irc_add_integration_test(test_dedup_error test_dedup_error.c)
+# #175: 317 idle on the monotonic clock. In-process (a fabricated 60 s-old
+# stamp), because no wire fixture can produce a minute of idle without sleeping
+# for one.
+irc_add_integration_test(test_idle_mono test_idle_mono.c)
 
 # 7/Phase 10.9: `standard-replies`, and the KICK reason bound `KICKLEN` was
 # waiting for. One file because the two halves of the commit are the same claim
