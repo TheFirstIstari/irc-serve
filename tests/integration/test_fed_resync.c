@@ -388,8 +388,8 @@ static void child_setup(server_t *s)
                  "federation module cannot reach any assertion in this test");
     s->trace = g_trace;
     s->on_tick = child_tick;
-    fed_set_timeouts(TEST_DIAL_MS, TEST_HS_MS, TEST_KEEPALIVE_MS, TEST_DEAD_MS);
-    fed_set_retry(TEST_RETRY_BASE_MS, TEST_RETRY_MAX_MS, TEST_RETRY_BUDGET);
+    fed_set_timeouts(s, TEST_DIAL_MS, TEST_HS_MS, TEST_KEEPALIVE_MS, TEST_DEAD_MS);
+    fed_set_retry(s, TEST_RETRY_BASE_MS, TEST_RETRY_MAX_MS, TEST_RETRY_BUDGET);
 
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_retry_signal;

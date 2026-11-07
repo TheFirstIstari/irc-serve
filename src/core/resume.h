@@ -341,23 +341,22 @@ const struct resume_chan *resume_window_for(const server_t *s, const conn_t *c,
  * ---------------------------------------------------------------------------
  */
 
-/* Set the window length for this process. The house pattern (fed_set_timeouts(),
- * fed_set_retry()) is a per-process override rather than a flag, because a test
+/* Set the window length for this node. The house pattern (fed_set_timeouts(),
+ * fed_set_retry()) is a per-node override rather than a flag, because a test
  * that has to wait out a two-minute window is a test that either takes two
- * minutes or lies. Called before the window table is used; a value of 0 is
- * refused rather than clamped, because "no window" and "a window that expires
- * immediately" are different configurations and only one of them is expressible
- * by turning the feature off.
+ * minutes or lies. A value of 0 is refused rather than clamped, because "no
+ * window" and "a window that expires immediately" are different configurations
+ * and only one of them is expressible by turning the feature off.
  *
  * THIS IS A TEST AND OPERATIONS KNOB, and it is deliberately not on the command
  * line: a flag that changes how long a removed operator stays restorable is a
  * flag that belongs to whoever embeds this library, not to whoever can reach the
  * process. */
-void resume_set_window(uint64_t window_ms);
+void resume_set_window(server_t *s, uint64_t window_ms);
 
-/* The current window length, in milliseconds. Exposed because the sweep's
- * behaviour is a function of it and a reader should be able to ask. */
-uint64_t resume_window_ms(void);
+/* The current window length of this node, in milliseconds. Exposed because the
+ * sweep's behaviour is a function of it and a reader should be able to ask. */
+uint64_t resume_window_ms(const server_t *s);
 
 /* Is any LIVE window still holding a claim on `chan`? 1 if so, 0 if not.
  *
@@ -385,11 +384,12 @@ uint64_t resume_window_ms(void);
  * the other (a channel destroyed before the client returns). */
 int resume_holds(const server_t *s, const char *chan);
 
-/* How long a window holds its channels, in milliseconds. Derived from the window
- * and clamped, so a caller that sets the window has set this too and there is no
- * second knob to get out of step. The derivation is stated at the top of this
- * file; the short version is that it is window/2 clamped into [1000, 5000]. */
-uint64_t resume_hold_ms(void);
+/* How long a window on this node holds its channels, in milliseconds. Derived
+ * from the node's window and clamped, so a caller that sets the window has set
+ * this too and there is no second knob to get out of step. The derivation is
+ * stated at the top of this file; the short version is that it is window/2
+ * clamped into [1000, 5000]. */
+uint64_t resume_hold_ms(const server_t *s);
 
 /* Drop every window older than the bound. Returns how many went.
  *

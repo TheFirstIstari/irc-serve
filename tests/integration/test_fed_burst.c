@@ -461,7 +461,7 @@ static void offer_resync(server_t *s)
             (void)federation_resync(s, server_find_link(s, NAME_B));
             printf("[fixture] resync_refused_tiny: stage=1\n");
             fflush(stdout);
-            fed_burst_set_max_bytes(IRC_BURST_MAX_BYTES);
+            fed_burst_set_max_bytes(s, IRC_BURST_MAX_BYTES);
         }
     } else if (g_stage == 1) {
         if (chan_has_flag(ch, ch->members[0].c, CHAN_MEMBER_OP) != 0) {
@@ -981,7 +981,7 @@ static void child_setup(server_t *s)
      * 5000 is 100 poll ticks of POLL_TICK_MS, which is the shipped handshake
      * default. The happy path still completes in two ticks, so nothing waits
      * longer -- these budgets only bound the failure case. */
-    fed_set_timeouts(5000, 5000, 30000, 90000);
+    fed_set_timeouts(s, 5000, 5000, 30000, 90000);
     if (g_tiny_send != 0 && g_is_b == 0) {
         /* NODE A ONLY, and the distinction is the case's whole point. The bound is
          * symmetric in the code -- the receiver charges every record against the
@@ -1004,7 +1004,7 @@ static void child_setup(server_t *s)
          * This is the same per-process override the four link timers have, for the
          * same reason -- a build default serves a deployment, a per-process
          * override serves a case that must not make every later case slow. */
-        fed_burst_set_max_bytes(BURST_TEST_SEND_BUDGET);
+        fed_burst_set_max_bytes(s, BURST_TEST_SEND_BUDGET);
     }
     if (g_tiny_recv != 0 && g_is_b != 0) {
         /* THE RECEIVER'S HALF, and it is the same bound reached from the other
@@ -1014,14 +1014,14 @@ static void child_setup(server_t *s)
          * because the accounting is different -- a charge is the FROZEN 179-byte
          * tag block plus the prefix, the verb and the parameters, not the bytes
          * actually rendered -- and the case below states both numbers. */
-        fed_burst_set_max_bytes(BURST_TEST_RECV_BUDGET);
+        fed_burst_set_max_bytes(s, BURST_TEST_RECV_BUDGET);
     }
     if (g_raised_recv != 0 && g_is_b != 0) {
         /* THE RECEIVER WITH ITS BYTE BOUND RAISED (#122), and the comment at the
          * constant says why this is the only case in the suite that raises one: the
          * claim is about the SECOND bound existing, and a ceiling nobody has ever
          * seen refuse anything is a comment. */
-        fed_burst_set_max_bytes(BURST_TEST_CEIL_BUDGET);
+        fed_burst_set_max_bytes(s, BURST_TEST_CEIL_BUDGET);
     }
 
     if (g_peer_port <= 0) {

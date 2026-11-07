@@ -82,16 +82,19 @@ struct resume_window {
     size_t   dropped_chans; /* beyond IRC_RESUME_MAX_CHANS; counted, not silent */
 };
 
-/* The per-process window length. Static because it is a property of the
- * PROCESS and not of a server_t: a test that forks a child sets it in the child
- * before the child has a server, and two server_t in one process (which is what
- * the inline fixture makes) would otherwise disagree about the same constant.
+/* The per-node window length (issue #173): a field on server_t
+ * (server.h), seeded with IRC_RESUME_WINDOW_MS by server_init(), rather than
+ * a property of the process. A test that forks a child sets it on the child's
+ * node, and two server_t in one process hold different windows without
+ * disagreeing about a constant.
  *
- * THE INITIALISER AND NOT A ZERO CHECK, and that is the point: a zero here would
- * mean "every window is already expired", which is a configuration a caller
- * cannot ask for and does not mean. A caller who wants no feature at all sets
- * the length to 0 through resume_set_window(), which refuses it. */
-static uint64_t g_window_ms = IRC_RESUME_WINDOW_MS;
+ * There is deliberately no zero here: 0 would mean "every window is already
+ * expired", which is a configuration a caller cannot ask for and does not
+ * mean. A caller who wants no feature at all gets a resume_find() that never
+ * matches, because the recorded window is older than any subsequent lookup --
+ * which is what resume_set_window(s, 1) buys, and it is why that function
+ * returns without setting anything on a 0 rather than setting 0 and making
+ * every window match and immediately expire. */
 
 /* The sweep throttle, as a divisor of the window. Same shape as
  * fed_dedup_sweep()'s and for the same reason: expiry is O(windows) and there is
@@ -315,7 +318,7 @@ static const struct resume_window *resume_find_const(const server_t *s,
             !same_folded(w->account, c->account)) {
             continue;
         }
-        if (now_ms < w->dropped_ms || (now_ms - w->dropped_ms) >= g_window_ms) {
+        if (now_ms < w->dropped_ms || (now_ms - w->dropped_ms) >= s->resume_window_ms) {
             return NULL;
         }
         if (w->retired_ms != 0u) {
@@ -665,7 +668,7 @@ int resume_apply(server_t *s, conn_t *c, uint64_t now_ms)
      *   LIVE           the restore below. */
     if (s->resume_windows[idx].retired_ms != 0u ||
         (now_ms >= s->resume_windows[idx].dropped_ms &&
-         (now_ms - s->resume_windows[idx].dropped_ms) >= g_window_ms)) {
+         (now_ms - s->resume_windows[idx].dropped_ms) >= s->resume_window_ms)) {
         if (s->resume_windows[idx].retired_ms == 0u) {
             s->resume_windows[idx].retired_ms = now_ms;
         }
@@ -686,7 +689,7 @@ int resume_apply(server_t *s, conn_t *c, uint64_t now_ms)
                         2);
         return 0;
     }
-    if ((now_ms - s->resume_windows[idx].dropped_ms) >= g_window_ms) {
+    if ((now_ms - s->resume_windows[idx].dropped_ms) >= s->resume_window_ms) {
         /* Unreachable given the arm above, and kept as the belt to it: the first
          * arm reads the age and this one reads the bound, and a change to one
          * that missed the other would be a window that is neither restored nor
@@ -802,24 +805,24 @@ int resume_apply(server_t *s, conn_t *c, uint64_t now_ms)
  * ---------------------------------------------------------------------------
  */
 
-void resume_set_window(uint64_t window_ms)
+void resume_set_window(server_t *s, uint64_t window_ms)
 {
     /* ZERO IS REFUSED rather than clamped, and the reason is that "no window"
      * and "a window that expires immediately" are different configurations.
      * A caller who wants the feature off gets a resume_find() that never
      * matches, because the recorded window is older than any subsequent
-     * lookup -- which is what resume_set_window(1) buys, and it is why this
+     * lookup -- which is what resume_set_window(s, 1) buys, and it is why this
      * function returns without setting anything rather than setting 0 and
      * making every window match and immediately expire. */
-    if (window_ms == 0u) {
+    if (s == NULL || window_ms == 0u) {
         return;
     }
-    g_window_ms = window_ms;
+    s->resume_window_ms = window_ms;
 }
 
-uint64_t resume_window_ms(void)
+uint64_t resume_window_ms(const server_t *s)
 {
-    return g_window_ms;
+    return (s != NULL) ? s->resume_window_ms : 0u;
 }
 
 /* The grace, and it is CLAMPED AT ONE TICK'S WORTH so a window shorter than the
@@ -828,7 +831,7 @@ uint64_t resume_window_ms(void)
  * window the client is told about would be gone before it could be told -- which
  * is the failure the two-stage expiry exists to prevent, reintroduced through
  * the other end. */
-uint64_t resume_hold_ms(void)
+uint64_t resume_hold_ms(const server_t *s)
 {
     /* WINDOW/2, CLAMPED into [1000, 5000]. resume.h argues both clamps: the floor
      * is above the sweep interval at every window length this build can be given
@@ -836,7 +839,8 @@ uint64_t resume_hold_ms(void)
      * the floor, so the floor is what guarantees the hold is re-checked at least
      * once while in force, and the ceiling is what keeps a two-minute window from
      * delaying a channel's disposal for two minutes). */
-    uint64_t hold = g_window_ms / 2u;
+    uint64_t window = (s != NULL) ? s->resume_window_ms : 0u;
+    uint64_t hold = window / 2u;
 
     if (hold < 1000u) {
         hold = 1000u;
@@ -847,9 +851,9 @@ uint64_t resume_hold_ms(void)
     return hold;
 }
 
-static uint64_t resume_grace_ms(void)
+static uint64_t resume_grace_ms(uint64_t window_ms)
 {
-    uint64_t grace = g_window_ms / IRC_RESUME_GRACE_DIVISOR;
+    uint64_t grace = window_ms / IRC_RESUME_GRACE_DIVISOR;
 
     return (grace == 0u) ? 1u : grace;
 }
@@ -960,7 +964,7 @@ size_t resume_sweep(server_t *s, uint64_t now_ms)
          * not be resumed -- when in fact the session could have been and it was the
          * channel that had gone. */
         if (w->hold_released == 0 && now_ms >= w->dropped_ms &&
-            (now_ms - w->dropped_ms) >= resume_hold_ms()) {
+            (now_ms - w->dropped_ms) >= resume_hold_ms(s)) {
             w->hold_released = 1;
             printf("[observable] session_resume_hold: nick=%s ident=%s released=1\n",
                    w->nick, w->ident);
@@ -976,7 +980,7 @@ size_t resume_sweep(server_t *s, uint64_t now_ms)
                        * in the same pass */
         }
         if (w->retired_ms == 0u) {
-            if (now_ms >= w->dropped_ms && (now_ms - w->dropped_ms) >= g_window_ms) {
+            if (now_ms >= w->dropped_ms && (now_ms - w->dropped_ms) >= s->resume_window_ms) {
                 /* RETIRE, DO NOT FREE. This is the stage that makes expiry
                  * visible on the wire: a freed window is a client that comes back
                  * too late and is told NOTHING, and the sweep runs on a tick, so
@@ -1003,7 +1007,7 @@ size_t resume_sweep(server_t *s, uint64_t now_ms)
             continue;
         }
         if (now_ms < w->retired_ms ||
-            (now_ms - w->retired_ms) < resume_grace_ms()) {
+            (now_ms - w->retired_ms) < resume_grace_ms(s->resume_window_ms)) {
             /* STILL INSIDE THE GRACE, and the guard is the same `now <` test the
              * live arm uses: a stamp in the future is not due, and dropping a
              * tombstone over a clock glitch would be the wrong way to lose it. */

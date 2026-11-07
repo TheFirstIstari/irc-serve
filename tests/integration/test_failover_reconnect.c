@@ -160,8 +160,8 @@ static void child_setup(server_t *s)
     s->on_tick = fed_tick;
     /* Applied BEFORE the loop is armed, and therefore before the first tick, so
      * the first dial is already timed against this process's numbers. */
-    fed_set_timeouts(2000, HS_MS, KEEPALIVE_MS, DEAD_MS);
-    fed_set_retry(RETRY_BASE_MS, RETRY_MAX_MS, RETRY_BUDGET);
+    fed_set_timeouts(s, 2000, HS_MS, KEEPALIVE_MS, DEAD_MS);
+    fed_set_retry(s, RETRY_BASE_MS, RETRY_MAX_MS, RETRY_BUDGET);
 
     if (g_cfg.peer_name != NULL && g_cfg.peer_port > 0) {
         /* 127.0.0.1 built by hand rather than resolved, for the reason

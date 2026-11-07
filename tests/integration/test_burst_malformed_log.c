@@ -110,7 +110,7 @@ static void child_setup(server_t *s)
                  "fed_open() failed in the child; a node with an unopenable "
                  "federation module cannot reach any assertion in this test");
     s->on_tick = child_tick;
-    fed_set_timeouts(1000, 5000, 30000, 90000);
+    fed_set_timeouts(s, 1000, 5000, 30000, 90000);
 
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;

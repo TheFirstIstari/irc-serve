@@ -649,6 +649,26 @@ int server_init(server_t *s, const char *name)
         s->epoch = 1;
     }
     s->msg_id = 1;
+
+    /* Issue #173: seed the per-node federation and resume configuration with
+     * the shipped defaults, so a node that never calls a setter and a node
+     * whose setter passes 0 ("keep the built-in") both run the documented
+     * values. The setters only ever OVERWRITE these fields, which is what
+     * keeps two server_t in one process from sharing them. */
+    s->fed_dial_ms = (uint64_t)IRC_FED_DIAL_TIMEOUT_MS;
+    s->fed_hs_ms = (uint64_t)IRC_FED_HS_TIMEOUT_MS;
+    s->fed_advertise_ms = (uint64_t)IRC_FED_ADVERTISE_MS;
+    s->fed_keepalive_ms = (uint64_t)IRC_FED_KEEPALIVE_MS;
+    s->fed_dead_ms = (uint64_t)IRC_FED_DEAD_MS;
+    s->fed_retry_base_ms = (uint64_t)IRC_FED_RETRY_BASE_MS;
+    s->fed_retry_max_ms = (uint64_t)IRC_FED_RETRY_MAX_MS;
+    s->fed_retry_budget = (unsigned)IRC_FED_RETRY_BUDGET;
+    s->burst_max_bytes = (size_t)IRC_BURST_MAX_BYTES;
+    s->resume_window_ms = (uint64_t)IRC_RESUME_WINDOW_MS;
+    /* The resync shadow itself is NOT allocated here: burst.c allocates it on
+     * the first SBURST BEGIN and fed_burst_close() releases it, so a node
+     * with no peers pays nothing for a second node in the process not
+     * sharing its transactions. */
     return 0;
 }
 
@@ -672,6 +692,12 @@ void server_shutdown(server_t *s)
      * implementation would have to guess at is a compatibility break bought for
      * nothing, and the receiver's log already names who left. */
     (void)fed_send_shutdown(s, NULL);
+    /* Issue #173: unwrap the federation dispatch and forget the secret, so a
+     * server_t that is shut down can be re-opened and no credential outlives
+     * the node. Safe on a node that never called fed_open(). After the
+     * goodbye above, which is queued through the node's own state rather than
+     * the dispatch seam. */
+    fed_close(s);
     for (i = 0; i < SERVER_FD_TABLE; i++) {
         if (s->by_fd != NULL && s->by_fd[i] != NULL) {
             server_close_conn(s, (int)i);
@@ -771,8 +797,8 @@ void server_shutdown(server_t *s)
      * this node copied out of what a peer said. It holds no conn_t*, no chan_t*
      * and no server_link_t*, so nothing it can be holding has been freed yet.
      * And it is safe on a node that never called fed_open(), which is every
-     * test that links this library without the federation fixture -- the shadow
-     * is a file-scope static and therefore already zero.
+     * test that links this library without the federation fixture -- the field
+     * is NULL until server_init() allocates it.
      *
      * ASSERTED, NOT VERIFIED, ON THIS PLATFORM -- and the arm prints an
      * `[observable] fed_burst_close: shadow=OPEN|NONE` line precisely so it is
@@ -1186,7 +1212,7 @@ void server_tick(server_t *s, uint64_t now_ms)
          * the sweep itself uses: a window shorter than the divisor has to be
          * swept every tick, and a stamp in the future (which a clock that went
          * backwards would produce) must not be read as "due long ago". */
-        uint64_t due = resume_window_ms() / RESUME_TICK_DIVISOR;
+        uint64_t due = resume_window_ms(s) / RESUME_TICK_DIVISOR;
 
         if (due == 0u) {
             due = 1u;

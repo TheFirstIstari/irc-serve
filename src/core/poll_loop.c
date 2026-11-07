@@ -47,7 +47,15 @@
 #define RATE_REFILL_PER_SEC 50.0
 
 /* The stop latch. sig_atomic_t because it is written from a signal handler
- * while the loop reads it; volatile so the read is not cached across poll(). */
+ * while the loop reads it; volatile so the read is not cached across poll().
+ *
+ * Issue #173 deliberately leaves this global while every other module global
+ * moved onto server_t: a signal handler receives only a signal number, so it
+ * cannot name which node should stop, and signals are delivered to the PROCESS
+ * rather than to a node in it. A per-server flag here would be a flag no
+ * handler could set -- the one writer this variable has is the thing that
+ * cannot take a server_t. The loop polls it and stops whichever node it is
+ * driving, which is the correct scope for "the process was asked to exit". */
 static volatile sig_atomic_t g_stop = 0;
 
 void poll_loop_request_stop(void)

@@ -216,7 +216,7 @@ static void child_setup(server_t *s)
     /* Applied BEFORE the loop is armed, and therefore before the first tick:
      * a dial started in the first tick must already be timed against this
      * process's dial timeout rather than the shipped one. */
-    fed_set_timeouts(g_cfg.dial_ms, g_cfg.hs_ms, g_cfg.keepalive_ms,
+    fed_set_timeouts(s, g_cfg.dial_ms, g_cfg.hs_ms, g_cfg.keepalive_ms,
                      g_cfg.dead_ms);
 
     if (g_cfg.peer_name != NULL && g_cfg.peer_port > 0) {

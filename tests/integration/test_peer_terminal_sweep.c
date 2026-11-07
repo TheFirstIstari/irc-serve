@@ -376,7 +376,7 @@ static void child_setup(server_t *s)
      * timeout and the sweep would stop proving anything while still looking busy.
      * 30 s keepalive and 10 minutes dead keeps the module's own PINGs arriving (and
      * swept: they are on the peer surface) without the link dying underneath. */
-    fed_set_timeouts(2000, 60000, 30000, 600000);
+    fed_set_timeouts(s, 2000, 60000, 30000, 600000);
 
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
