@@ -100,9 +100,10 @@
  * restated here because the discipline has to be visible AT BOTH readers rather
  * than in one of them:
  *
- *   - `fopen(path, "re")` with the 'e' flag (O_CLOEXEC), then `fstat()` on the
- *     DESCRIPTOR. stat()-then-open was a real TOCTOU race on a file of
- *     passwords and is not repeated here.
+ *   - secret_file_open() (see core/secret_util.h): open() with O_NOFOLLOW and
+ *     O_CLOEXEC, then `fstat()` on the DESCRIPTOR. stat()-then-open was a real
+ *     TOCTOU race on a file of passwords and is not repeated here. A symlink
+ *     is refused at open rather than followed.
  *   - `S_ISREG`. A FIFO or a device is not a registry.
  *   - The group and world permission bits must be CLEAR. A registry any other
  *     account on the host can read is a list of passwords, and this is a

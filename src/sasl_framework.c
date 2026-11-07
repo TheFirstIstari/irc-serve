@@ -23,6 +23,7 @@
 #endif
 
 #include "sasl_framework.h"
+#include "core/secret_util.h"
 
 /* --------------------------------------------------------------------------
  * The store
@@ -437,61 +438,32 @@ static int store_parse_line(sasl_store_t *store, char *line)
 sasl_store_t *sasl_store_load(const char *path)
 {
     FILE *f;
-    struct stat sb;
+    secret_open_status_t open_status = SECRET_OPEN_FAIL_OPEN;
+    unsigned open_mode = 0u;
     sasl_store_t *store;
     char line[SASL_MAX_LINE];
 
     if (path == NULL || path[0] == '\0') {
         return NULL;
     }
-    /* THE SECRET-FILE CHECK, before a byte is read.
-     *
-     * `stat` failing is a refusal rather than a fallback to a permission-blind
-     * read: a credential file whose mode cannot be established is a credential
-     * file whose exposure cannot be established either, and the whole control
-     * this check exists to apply is unknowable in that case.
-     *
-     * A SYMLINK is not followed and not special-cased. stat() has followed it
-     * already, so what is judged is the target -- which is the file whose
-     * contents would be read. */
-      /* OPEN FIRST, THEN fstat THE DESCRIPTOR.
-       *
-       * This used to stat() the path, judge the mode, and only then fopen() it.
-       * Between the stat and the open the file can be replaced -- by a symlink, by
-       * a FIFO, or by a 0644 copy -- so the thing that was checked is not
-       * necessarily the thing that gets read. CodeQL flagged it, and it is a real
-       * race on a file of passwords: the checks below are the only thing standing
-       * between a world-readable file and an authentication oracle.
-       *
-       * fstat() on the descriptor cannot race, because the descriptor names an
-       * inode the kernel has already opened, and O_NOFOLLOW makes a symlink at the
-       * final component a hard error rather than something to reason about.
-       *
-       * Nothing changes for an honest operator: same observable lines, same refusal
-       * reasons, same mode rule. Only the order changes, and the order was the bug. */
-      f = fopen(path, "re");
-      if (f == NULL) {
-          printf("[observable] sasl_store: state=REFUSED path=%s reason=open\n", path);
-          return NULL;
-      }
-      if (fstat(fileno(f), &sb) != 0) {
-          printf("[observable] sasl_store: state=REFUSED path=%s reason=fstat\n", path);
-          (void)fclose(f);
-          return NULL;
-      }
-      if (!S_ISREG(sb.st_mode)) {
-          printf("[observable] sasl_store: state=REFUSED path=%s reason=not_regular\n",
-                 path);
-          (void)fclose(f);
-          return NULL;
-      }
-      if ((sb.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
-          printf("[observable] sasl_store: state=REFUSED path=%s reason=mode_%03o "
-                 "(group or other may access a file of passwords)\n",
-                 path, (unsigned)(sb.st_mode & 0777));
-          (void)fclose(f);
-          return NULL;
-      }
+    /* THE SECRET-FILE CHECK, before a byte is read: one shared open
+     * (see secret_file_open) whose refusal reasons are the ones below. */
+    f = secret_file_open(path, &open_status, &open_mode);
+    if (f == NULL) {
+        if (open_status == SECRET_OPEN_FAIL_FSTAT) {
+            printf("[observable] sasl_store: state=REFUSED path=%s reason=fstat\n", path);
+        } else if (open_status == SECRET_OPEN_NOT_REGULAR) {
+            printf("[observable] sasl_store: state=REFUSED path=%s reason=not_regular\n",
+                   path);
+        } else if (open_status == SECRET_OPEN_BAD_MODE) {
+            printf("[observable] sasl_store: state=REFUSED path=%s reason=mode_%03o "
+                   "(group or other may access a file of passwords)\n",
+                   path, open_mode);
+        } else {
+            printf("[observable] sasl_store: state=REFUSED path=%s reason=open\n", path);
+        }
+        return NULL;
+    }
     store = sasl_store_new();
     if (store == NULL) {
         (void)fclose(f);
@@ -528,15 +500,16 @@ sasl_store_t *sasl_store_load(const char *path)
             return NULL;
         }
     }
-    /* The line buffer held plaintext passwords; the heap holds only hashes. */
-    sasl_wipe(line, sizeof line);
     if (ferror(f) != 0) {
         printf("[observable] sasl_store: state=REFUSED path=%s reason=read_error\n",
                path);
+        sasl_wipe(line, sizeof line);
         sasl_store_free(store);
         (void)fclose(f);
         return NULL;
     }
+    /* The line buffer held plaintext passwords; the heap holds only hashes. */
+    sasl_wipe(line, sizeof line);
     (void)fclose(f);
 
     if (store->n == 0u) {
@@ -738,31 +711,8 @@ int sasl_plain_parse(const char *payload, size_t len,
 }
 
 /* --------------------------------------------------------------------------
- * Constant-time comparison
+ * Password verification, against the shared constant-time compare
  * ------------------------------------------------------------------------ */
-
-/* Returns 1 when the two fixed-length buffers hold the same bytes, in time
- * that depends only on their LENGTH and not on their contents.
- *
- * `diff` accumulates the XOR of every byte, so a mismatch anywhere makes it
- * non-zero, and the loop cannot exit early -- it always walks the whole
- * length. The accumulator is unsigned so the compiler cannot reason about its
- * value being always zero, and the result is folded to 0/1 at the end so no
- * caller can be tempted to branch on an intermediate. Both sides here are
- * digests (see sasl_plain_verify): the comparison is hash-against-hash. */
-static int const_time_eq(const unsigned char *a, const unsigned char *b,
-                         size_t n)
-{
-    unsigned diff = 0u;
-
-    if (a == NULL || b == NULL) {
-        return 0;
-    }
-    for (size_t i = 0; i < n; i++) {
-        diff |= (unsigned)(a[i] ^ b[i]);
-    }
-    return (diff == 0u) ? 1 : 0;
-}
 
 /* A fixed dummy compared against when no record matched, so that "no such
  * authcid" and "wrong password" cost the same. It is a constant, not a derived
@@ -809,14 +759,14 @@ int sasl_plain_verify(const sasl_store_t *store,
     for (size_t i = 0; i < store->n; i++) {
         if (authcid_eq(store->rec[i].authcid, authcid) != 0) {
             saw_match |=
-                (unsigned)const_time_eq(store->rec[i].phash, want, SASL_HASH_LEN);
+                (unsigned)secret_const_time_eq(store->rec[i].phash, want, SASL_HASH_LEN);
         }
     }
     /* And a miss still pays one comparison, so an authcid that is not in the
      * store is not distinguishable from one whose password is wrong. */
     if (saw_match == 0u) {
         dummy_used =
-            (unsigned)const_time_eq(dummy, want, SASL_HASH_LEN);
+            (unsigned)secret_const_time_eq(dummy, want, SASL_HASH_LEN);
     }
     (void)dummy_used;
     sasl_wipe(want, sizeof want);
@@ -956,19 +906,23 @@ sasl_state_t sasl_step(sasl_ctx_t *ctx, const char *server_data, size_t len,
     if (n < 0) {
         ctx->last_error = SASL_ERR_PAYLOAD;
         ctx->state = SASL_FAILED;
+        sasl_wipe(payload, sizeof payload);
+        sasl_wipe(passwd, sizeof passwd);
         return ctx->state;
     }
     if (sasl_plain_parse((const char *)payload, (size_t)n, authzid, sizeof authzid,
                          authcid, sizeof authcid, passwd, sizeof passwd) != 0) {
         ctx->last_error = SASL_ERR_PAYLOAD;
         ctx->state = SASL_FAILED;
+        sasl_wipe(payload, sizeof payload);
+        sasl_wipe(passwd, sizeof passwd);
         return ctx->state;
     }
     /* The decoded identity is recorded on the context -- it is the fact that
      * happened, and a handler needs it to answer 903. The PASSWORD IS NOT, and
-     * there is no field for it: `passwd` is a local that goes out of scope here
-     * and is never copied anywhere. A struct that held the password would be a
-     * struct a later teardown had to remember to clear. */
+     * there is no field for it: `passwd` is a local that is wiped before every
+     * return below and is never copied anywhere. A struct that held the
+     * password would be a struct a later teardown had to remember to clear. */
     /* The identity is BOUNDED before it is copied rather than truncated after.
      * sasl_plain_parse() has already refused an authcid over
      * SASL_MAX_AUTHCID, and ctx->authcid is 64 wide, so the copy fits; saying so
@@ -981,6 +935,8 @@ sasl_state_t sasl_step(sasl_ctx_t *ctx, const char *server_data, size_t len,
         if (az >= sizeof ctx->authzid || ac >= sizeof ctx->authcid) {
             ctx->last_error = SASL_ERR_PAYLOAD;
             ctx->state = SASL_FAILED;
+            sasl_wipe(payload, sizeof payload);
+            sasl_wipe(passwd, sizeof passwd);
             return ctx->state;
         }
         memcpy(ctx->authzid, authzid, az + 1u);
@@ -993,10 +949,14 @@ sasl_state_t sasl_step(sasl_ctx_t *ctx, const char *server_data, size_t len,
                 ? SASL_ERR_NO_STORE
                 : SASL_ERR_CREDENTIAL;
         ctx->state = SASL_FAILED;
+        sasl_wipe(payload, sizeof payload);
+        sasl_wipe(passwd, sizeof passwd);
         return ctx->state;
     }
     ctx->last_error = SASL_OK;
     ctx->state = SASL_COMPLETED;
+    sasl_wipe(payload, sizeof payload);
+    sasl_wipe(passwd, sizeof passwd);
     return ctx->state;
 }
 

@@ -133,12 +133,13 @@ typedef struct {
  * believes are configured, and the half that fails is discovered by a user
  * being refused.
  *
- * THE FILE IS A SECRET STORE and is checked as one. stat() must succeed and the
- * group and world permission bits must be CLEAR, because a credential file any
- * other account on the host can read is not a credential store -- it is a list
- * of passwords. This is a refusal, not a warning: the cost of getting it wrong
- * is every password on the node, and the cost of getting it right is an operator
- * who has to run `chmod 600`.
+ * THE FILE IS A SECRET STORE and is checked as one. secret_file_open() must
+ * succeed -- open() with O_NOFOLLOW, then fstat() on the DESCRIPTOR, which
+ * must be a regular file -- and the group and world permission bits must be
+ * CLEAR, because a credential file any other account on the host can read is
+ * not a credential store -- it is a list of passwords. This is a refusal, not
+ * a warning: the cost of getting it wrong is every password on the node, and
+ * the cost of getting it right is an operator who has to run `chmod 600`.
  *
  * FORMAT. One record per line, `authcid<TAB>password`. Blank lines and lines
  * whose first non-blank byte is '#' are ignored. The TAB is mandatory and is
