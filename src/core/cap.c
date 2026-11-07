@@ -114,6 +114,11 @@ static const cap_def_t k_caps[] = {
 
 static const size_t k_ncaps = sizeof k_caps / sizeof k_caps[0];
 
+/* Forward declarations: defined beside tls_conn_possible() below, and needed
+ * here because the SASL gate reuses the same TLS-possible question. */
+static int tls_node_possible(const server_t *s);
+static int conn_plaintext(const conn_t *c);
+
 /* Is this node able to authenticate anybody?
  *
  * `sasl` is the only capability whose availability is not a property of the
@@ -123,13 +128,27 @@ static const size_t k_ncaps = sizeof k_caps / sizeof k_caps[0];
  * then being told it failed, so the store is consulted and the capability is
  * withheld when there is nothing behind it.
  *
+ * AND IT IS WITHHELD ON A PLAINTEXT CONNECTION TO A NODE WITH TLS (#167).
+ * A PLAIN payload is the credential itself, so advertising `sasl` in the clear
+ * on a node that has TLS is an invitation to send a password where anyone
+ * listening can read it. Gate, don't encrypt: the capability is omitted there,
+ * and a client that ignores the omission and sends AUTHENTICATE anyway is
+ * refused by handle_authenticate(). A node with no TLS keeps the old
+ * behaviour -- there is no safer connection to point the client at.
+ *
  * The cost is that a node whose store failed to LOAD advertises no SASL rather
  * than a broken one, and an operator has to read the startup log to find out why
  * -- which is the trade this whole rule is about: a missing capability is a
  * client that carries on, a wrong one is a client that acts on a lie. */
-static int sasl_possible(const server_t *s)
+static int sasl_possible(const server_t *s, const conn_t *c)
 {
-    return (s != NULL && sasl_store_count(s->sasl_store) > 0u) ? 1 : 0;
+    if (s == NULL || sasl_store_count(s->sasl_store) == 0u) {
+        return 0;
+    }
+    if (tls_node_possible(s) != 0 && conn_plaintext(c) != 0) {
+        return 0;
+    }
+    return 1;
 }
 
 /* Is this node able to say WHO somebody is? `account-tag`, and the question is
@@ -346,7 +365,7 @@ int cap_available(const server_t *s, const conn_t *c, const char *name)
         return 0;
     }
     if (strcasecmp(name, CAP_SASL) == 0) {
-        return sasl_possible(s);
+        return sasl_possible(s, c);
     }
     if (strcasecmp(name, CAP_ACCOUNT_TAG) == 0) {
         return account_possible(s);

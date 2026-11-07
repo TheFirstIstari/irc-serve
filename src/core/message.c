@@ -832,7 +832,7 @@ int irc_serve_server_name_valid(const char *name)
 
 /* Unsigned decimal, canonical form only: no leading zero unless the value is
  * exactly "0". Returns 0 on success, -1 otherwise. */
-static int parse_decimal(const char *s, size_t len, uint64_t limit,
+int parse_decimal(const char *s, size_t len, uint64_t limit,
                          uint64_t *out)
 {
     if (len == 0 || len > NUM_DIGITS_U64) {

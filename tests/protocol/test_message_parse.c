@@ -408,6 +408,12 @@ int main(void)
             /* uint64_max itself is fine */
             { "@irc-serve-origin=irc.a;irc-serve-epoch=18446744073709551615;"
               "irc-serve-id=1;irc-serve-hops=0 :a PING", 0 },
+            /* uint64_max + 1 overflows and must be rejected (#172) */
+            { "@irc-serve-origin=irc.a;irc-serve-epoch=18446744073709551616;"
+              "irc-serve-id=1;irc-serve-hops=0 :a PING", -1 },
+            /* largest 20-digit decimal overflows uint64 and must be rejected */
+            { "@irc-serve-origin=irc.a;irc-serve-epoch=99999999999999999999;"
+              "irc-serve-id=1;irc-serve-hops=0 :a PING", -1 },
             /* hops above uint32_max is rejected */
             { "@irc-serve-origin=irc.a;irc-serve-epoch=1;irc-serve-id=1;"
               "irc-serve-hops=4294967296 :a PING", -1 },

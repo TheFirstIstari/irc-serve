@@ -257,46 +257,6 @@ static int secret_matches(const char *configured, const char *offered)
     return (diff == 0u) ? 1 : 0;
 }
 
-/* The peer's epoch, which is not this node's and is not derivable from it.
- *
- * The grammar is 2.4's epoch grammar from message.h verbatim -- unsigned
- * decimal, 1..20 digits, no leading zero unless the value is exactly "0" --
- * and the 20-digit ceiling is what makes the multiply below safe: the largest
- * 20-digit decimal is UINT64_MAX, so `v` cannot wrap.
- *
- * The parser is a copy of the one inside irc_serve_tags_parse() and it is a
- * copy rather than a share because that one is file-static inside message.c and
- * exporting it would mean message.c's tag grammar becoming a dependency of the
- * link path for the sake of twelve lines. A consequence worth writing down: a
- * peer that sends an epoch this rejects is a peer whose tags would also be
- * rejected by irc_serve_tags_valid(), so the two cannot disagree about what a
- * legal epoch is -- they can only be reached from different directions. */
-static int parse_epoch(const char *text, uint64_t *out)
-{
-    uint64_t v = 0;
-    size_t n;
-    size_t i;
-
-    if (text == NULL || out == NULL) {
-        return -1;
-    }
-    n = strlen(text);
-    if (n == 0u || n > 20u) {
-        return -1;
-    }
-    if (n > 1u && text[0] == '0') {
-        return -1; /* a leading zero, so it is not a number the peer will repeat */
-    }
-    for (i = 0; i < n; i++) {
-        if (text[i] < '0' || text[i] > '9') {
-            return -1;
-        }
-        v = (v * 10u) + (uint64_t)(text[i] - '0');
-    }
-    *out = v;
-    return 0;
-}
-
 /* The observable dump
  * ---------------------------------------------------------------------------
  * Three shapes, deliberately, because they answer three different questions.
@@ -1636,7 +1596,11 @@ fed_federate_result_t fed_check_federate(const server_t *s,
         !irc_serve_server_name_valid(claim)) {
         return FED_BAD_NAME;
     }
-    if (parse_epoch(m->params[1], &peer_epoch) != 0) {
+    /* 2.4's epoch grammar, enforced by the shared overflow-safe
+     * parse_decimal: 1..20 digits, no leading zero, <= UINT64_MAX. */
+    if (m->params[1] == NULL ||
+        parse_decimal(m->params[1], strlen(m->params[1]), UINT64_MAX,
+                      &peer_epoch) != 0) {
         return FED_BAD_EPOCH;
     }
     if (strcmp(m->params[3], IRC_SERVE_VERSION) != 0) {
@@ -2598,6 +2562,18 @@ void fed_tick(server_t *s, uint64_t now_ms)
                 link->clean_leave == 0 &&
                 (link->retry_at_ms == 0u || now_ms >= link->retry_at_ms) &&
                 fed_dial_for(s, link->name) == NULL) {
+                /* Gate, don't encrypt (#167): a link with require_tls is never
+                 * dialled without TLS, so its FEDERATE -- which carries the
+                 * shared secret -- can never go out in the clear. Unreachable
+                 * through the shipped binary (main() refuses --peer-tls with no
+                 * certificate), so this is the backstop for any caller that set
+                 * the flag another way: no socket, no FEDERATE, and the backoff
+                 * armed so the refusal does not spin. */
+                if (link->require_tls != 0 && s->tls == NULL) {
+                    fed_refuse(s, link, NULL, link->name, "TLS_REQUIRED");
+                    fed_retry_arm(s, link, now_ms, "TLS_REQUIRED");
+                    break;
+                }
                 link->created_ms = now_ms;
                 if (server_dial(s, (const struct sockaddr *)&link->addr,
                                 link->addrlen, link->name) == 0) {

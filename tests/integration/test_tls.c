@@ -49,7 +49,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/select.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -837,6 +840,335 @@ static void case_caps_vary_by_connection(const char *cert, const char *key,
     nf_free(&n);
 }
 
+/* ===========================================================================
+ * CASE GROUP 4: cleartext credentials are GATED, not encrypted (#167)
+ * ===========================================================================
+ *
+ * A PLAIN payload IS the credential, and a FEDERATE line carries the shared
+ * federation secret, so neither may cross the wire in the clear merely because
+ * the node was configured for better. The fix gates rather than encrypts:
+ *
+ *   1. CAP LS on a PLAINTEXT connection to a node WITH TLS omits `sasl`, even
+ *      though the store is loaded -- and the same node's TLS port lists it.
+ *      The pair matters: suppressing both would pass the first half and be
+ *      wrong, and the `sasl=loaded` anchor below proves the omission is the
+ *      gate rather than a missing store.
+ *   2. AUTHENTICATE PLAIN on that plaintext connection is refused 464 with
+ *      reason=TLS_REQUIRED, and registration never follows -- a client that
+ *      ignored the advertisement is still not let in.
+ *   3. A --peer-tls dial whose peer speaks plaintext sends no FEDERATE bytes:
+ *      the handshake is started, it never completes, and the queued claim is
+ *      held until the close rather than leaked. Asserted on the BYTES a
+ *      test-held socket receives, not on a log line.
+ *
+ * A node with NO TLS keeps the old behaviour -- sasl advertised and honoured
+ * in the clear -- because there is no safer connection to point the client at.
+ * That half is pinned by test_cap_negotiation.c, which runs against plain
+ * nodes in both builds.
+ */
+static void case_sasl_gated_by_tls(const char *dir, const char *cert,
+                                   const char *key)
+{
+    /* `alice<TAB>correct horse`: the store the gate is about, and the
+     * credential the refusal below must not accept. */
+    static const char rec[] = "alice\tcorrect horse\n";
+    /* base64 of "\0alice\0correct horse" (RFC 4616, empty authzid). */
+    static const char good[] = "AGFsaWNlAGNvcnJlY3QgaG9yc2U=";
+    char store[TF_PATH];
+    nf_node_t n;
+    test_client_t plain;
+    char a0[] = "irc-serve";
+    char a1[] = "0";
+    char a2[] = "--name";
+    char a3[] = "irc.tls";
+    char port0[] = "0";
+    char line[512];
+    char *argv[13];
+    int tls_port;
+
+    snprintf(store, sizeof store, "%s/sasl-gated.store", dir);
+    if (tf_tls_write_file(store, rec, sizeof rec - 1u, 0600) != 0) {
+        check(0, "write a 0600 credential store for the SASL-gating case",
+              NULL);
+        return;
+    }
+    argv[0] = a0; argv[1] = a1; argv[2] = a2; argv[3] = a3;
+    argv[4] = "--tls-cert"; argv[5] = (char *)(uintptr_t)(const void *)cert;
+    argv[6] = "--tls-key"; argv[7] = (char *)(uintptr_t)(const void *)key;
+    argv[8] = "--tls-port"; argv[9] = port0;
+    argv[10] = "--sasl-store"; argv[11] = store;
+    argv[12] = NULL;
+    if (spawn_argv(&n, argv) != 0) {
+        check(0, "spawn a TLS node with a loaded credential store", NULL);
+        return;
+    }
+    check(nf_expect(&n, "tls=configured", 5000) == 0,
+          "the certificate loaded, so the gate below is about a node that HAS "
+          "TLS and not about a missing one",
+          n.out);
+    check(nf_expect(&n, "sasl=loaded", 5000) == 0,
+          "the credential store loaded, so omitting `sasl` is the gate and "
+          "not an empty store",
+          n.out);
+    {
+        const char *p = strstr(n.out, "tls_port=");
+
+        tls_port = (p != NULL) ? atoi(p + 9) : -1;
+    }
+    check(tls_port > 0, "the node bound its own implicit-TLS port", n.out);
+
+    /* ---- 1. plaintext CAP LS omits `sasl` ---- */
+    if (tc_connect(&plain, n.port) != 0) {
+        check(0, "connect to the plaintext port", NULL);
+    } else {
+        check(tc_send(&plain, "CAP LS") == 0, "send CAP LS in the clear",
+              NULL);
+        check(tc_expect(&plain, " LS :", 10000) == 0,
+              "the plaintext listener answers CAP LS", tc_buffer(&plain));
+        check(strstr(tc_buffer(&plain), "sasl") == NULL,
+              "CAP LS on PLAINTEXT omits `sasl` when the node has TLS: a PLAIN "
+              "payload is the credential itself, and advertising it here "
+              "invites a password anyone listening can read",
+              tc_buffer(&plain));
+        check(strstr(tc_buffer(&plain), " tls") != NULL,
+              "and `tls` IS advertised there, so the client is told where the "
+              "safer connection is",
+              tc_buffer(&plain));
+
+        /* ---- a REQ for the withheld name is NAKed, not ACKed ---- */
+        check(tc_send(&plain, "CAP REQ :sasl") == 0,
+              "a client requests sasl anyway", NULL);
+        check(tc_expect(&plain, "NAK :sasl", 10000) == 0,
+              "CAP REQ :sasl on plaintext with TLS is NAKed",
+              tc_buffer(&plain));
+
+        /* ---- 2. AUTHENTICATE PLAIN there is refused ---- */
+        snprintf(line, sizeof line, "AUTHENTICATE PLAIN %s", good);
+        check(tc_send(&plain, line) == 0,
+              "send a correct one-shot PLAIN credential in the clear", NULL);
+        check(tc_expect(&plain, " 464 ", 10000) == 0,
+              "the cleartext credential is refused 464 rather than verified",
+              tc_buffer(&plain));
+        check(nf_expect(&n, "reason=TLS_REQUIRED", 5000) == 0,
+              "the refusal names TLS_REQUIRED, so an operator can see the "
+              "credential was gated and not merely wrong",
+              NULL);
+        check(tc_send(&plain, "CAP END") == 0, "send CAP END", NULL);
+        check(tc_send(&plain, "NICK alice") == 0, "send NICK", NULL);
+        check(tc_send(&plain, "USER a 0 * :Alice") == 0, "send USER", NULL);
+        check(tc_expect(&plain, " 001 ", 700) != 0,
+              "no 001 follows a gated SASL: a refused credential registers "
+              "nobody",
+              tc_buffer(&plain));
+        check(tc_send(&plain, "PING :still-here") == 0,
+              "the connection is fenced -- PING must still be answered, so "
+              "the absence above is a gate and not a wedged socket",
+              NULL);
+        check(tc_expect(&plain, "PONG", 10000) == 0,
+              "PING is answered after the refusal", tc_buffer(&plain));
+        tc_close(&plain);
+    }
+
+    /* ---- the same node, over TLS, DOES offer sasl ---- */
+    if (tls_port > 0) {
+        tf_tls_t t;
+        const char *why = NULL;
+
+        if (tf_tls_connect(&t, tls_port, cert, "irc.tls", &why) != 0) {
+            check(0, "an implicit-TLS handshake succeeds, so the secure CAP LS "
+                      "this case asserts about exists",
+                  (why != NULL) ? why : "handshake failed");
+        } else {
+            check(tf_tls_send(&t, "CAP LS") == 0,
+                  "a client sends CAP LS over TLS", NULL);
+            check(tf_tls_expect(&t, " LS :", 10000) == 0,
+                  "the node answers CAP LS on the secure connection",
+                  tf_tls_buffer(&t));
+            check(strstr(tf_tls_buffer(&t), "sasl") != NULL,
+                  "CAP LS over TLS LISTS `sasl`: the store is loaded and the "
+                  "connection is one a credential may cross",
+                  tf_tls_buffer(&t));
+            tf_tls_close(&t);
+        }
+    }
+
+    (void)nf_stop(&n);
+    nf_free(&n);
+}
+
+/* Whether `buf[0..n)` contains "FEDERATE". A manual walk rather than
+ * strstr(): the bytes are a TLS ClientHello and contain NULs, and a NUL is
+ * where strstr() stops looking. */
+static int has_federate(const char *buf, size_t n)
+{
+    static const char want[] = "FEDERATE";
+
+    if (n < sizeof want - 1u) {
+        return 0;
+    }
+    for (size_t i = 0; i + sizeof want - 1u <= n; i++) {
+        if (memcmp(buf + i, want, sizeof want - 1u) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void case_peer_tls_sends_no_federate_in_clear(const char *cert,
+                                                     const char *key)
+{
+    int ls = -1;
+    int cfd = -1;
+    struct sockaddr_in sa;
+    socklen_t slen = (socklen_t)sizeof sa;
+    int raw_port = -1;
+    nf_node_t na;
+    test_client_t fence;
+    char a0[] = "irc-serve";
+    char a1[] = "0";
+    char peer[64];
+    char *argv[17];
+    char got[8192];
+    size_t ngot = 0u;
+    char detail[128];
+    int one = 1;
+
+    /* A test-held socket playing a PLAINTEXT peer: it accepts and records
+     * bytes, and never speaks TLS, so whatever arrives is what a plaintext
+     * observer of this dial would see. */
+    ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls < 0) {
+        check(0, "open a listening socket for the fake plaintext peer",
+              strerror(errno));
+        return;
+    }
+    (void)setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, (socklen_t)sizeof one);
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    if (bind(ls, (const struct sockaddr *)&sa, (socklen_t)sizeof sa) != 0 ||
+        listen(ls, 1) != 0 ||
+        getsockname(ls, (struct sockaddr *)&sa, &slen) != 0) {
+        check(0, "bind the fake peer to an ephemeral loopback port",
+              strerror(errno));
+        (void)close(ls);
+        return;
+    }
+    raw_port = (int)ntohs(sa.sin_port);
+    check(raw_port > 0, "the fake peer holds a real port", NULL);
+
+    snprintf(peer, sizeof peer, "irc.b,127.0.0.1,%d", raw_port);
+    argv[0] = a0; argv[1] = a1;
+    argv[2] = "--name"; argv[3] = "irc.a";
+    argv[4] = "--secret"; argv[5] = "shared";
+    argv[6] = "--peer"; argv[7] = peer;
+    argv[8] = "--peer-tls"; argv[9] = "irc.b";
+    argv[10] = "--tls-cert"; argv[11] = (char *)(uintptr_t)(const void *)cert;
+    argv[12] = "--tls-key"; argv[13] = (char *)(uintptr_t)(const void *)key;
+    argv[14] = "--tls-ca"; argv[15] = (char *)(uintptr_t)(const void *)cert;
+    argv[16] = NULL;
+    if (raw_port <= 0 || spawn_argv(&na, argv) != 0) {
+        check(0, "spawn a TLS node dialling the fake peer with --peer-tls",
+              NULL);
+        (void)close(ls);
+        return;
+    }
+    check(nf_expect(&na, "link_tls: peer=irc.b require_tls=1", 5000) == 0,
+          "the link carries require_tls", na.out);
+    check(nf_expect(&na, "link_tls_start: peer=irc.b role=client", 15000) == 0,
+          "the dial connected and the require_tls handshake started -- so "
+          "bytes may flow and the assertion below is about a real dial",
+          na.out);
+
+    /* Accept the dial, then read for five seconds. The peer never answers the
+     * handshake, so it can never complete -- and the FEDERATE queued behind
+     * it must never be sent. NO FIXED SLEEP: the five seconds ARE the
+     * assertion window, bounded by select(). */
+    {
+        fd_set rd;
+        struct timeval tv;
+
+        FD_ZERO(&rd);
+        FD_SET(ls, &rd);
+        tv.tv_sec = 15;
+        tv.tv_usec = 0;
+        if (select(ls + 1, &rd, NULL, NULL, &tv) <= 0 || !FD_ISSET(ls, &rd)) {
+            check(0, "the node dialled the fake peer", NULL);
+        } else {
+            cfd = accept(ls, NULL, NULL);
+            check(cfd >= 0, "the dial is accepted", NULL);
+        }
+    }
+    if (cfd >= 0) {
+        uint64_t deadline_ms = 0u;
+        struct timespec ts;
+
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+            deadline_ms = (uint64_t)ts.tv_sec * 1000u +
+                          (uint64_t)(ts.tv_nsec / 1000000L) + 5000u;
+        }
+        for (;;) {
+            fd_set rd;
+            struct timeval tv;
+            ssize_t r;
+
+            FD_ZERO(&rd);
+            FD_SET(cfd, &rd);
+            tv.tv_sec = 0;
+            tv.tv_usec = 200000;
+            if (select(cfd + 1, &rd, NULL, NULL, &tv) <= 0) {
+                struct timespec now;
+
+                if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+                    (uint64_t)now.tv_sec * 1000u +
+                        (uint64_t)(now.tv_nsec / 1000000L) >= deadline_ms) {
+                    break;
+                }
+                continue;
+            }
+            r = recv(cfd, got + ngot, sizeof got - ngot, 0);
+            if (r <= 0 || ngot + (size_t)r >= sizeof got) {
+                if (r > 0) {
+                    ngot += (size_t)r;
+                }
+                break;
+            }
+            ngot += (size_t)r;
+        }
+        (void)snprintf(detail, sizeof detail,
+                       "received %zu bytes in the assertion window", ngot);
+        check(ngot > 0u,
+              "the dial put bytes on the wire -- the handshake started, so "
+              "the absence below is about a live dial and not a dial that "
+              "never happened",
+              detail);
+        check(has_federate(got, ngot) == 0,
+              "no FEDERATE bytes reach a plaintext peer from a --peer-tls "
+              "dial: the claim queued behind the handshake is held until the "
+              "close, so the shared secret never crosses in the clear",
+              detail);
+        /* The link never establishes against a peer that cannot speak TLS. */
+        check(nf_expect(&na, "link_established: peer=irc.b", 3000) != 0,
+              "the link to the plaintext peer never establishes", na.out);
+        /* FENCED: the node answers a client, so the absence above is a gate
+         * and not a dead node. */
+        if (tc_connect(&fence, na.port) != 0) {
+            check(0, "the dialling node still serves clients", NULL);
+        } else {
+            check(tc_send(&fence, "PING :fence") == 0, "send PING", NULL);
+            check(tc_expect(&fence, "PONG", 10000) == 0,
+                  "the dialling node answers while refusing the peer",
+                  tc_buffer(&fence));
+            tc_close(&fence);
+        }
+        (void)close(cfd);
+    }
+    (void)close(ls);
+    (void)nf_stop(&na);
+    nf_free(&na);
+}
+
 int main(void)
 {
     char dir[TF_DIR_MAX];
@@ -1555,6 +1887,10 @@ int main(void)
                 check(0, "spawn a --tls-require node", NULL);
             }
         }
+
+        /* --- #167: cleartext credentials are gated, not encrypted --- */
+        case_sasl_gated_by_tls(dir, g_cert, g_key);
+        case_peer_tls_sends_no_federate_in_clear(g_cert, g_key);
     }
 
     case_one_named_gap();

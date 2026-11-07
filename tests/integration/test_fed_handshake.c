@@ -14,7 +14,7 @@
  * Every assertion here is on OBSERVABLE OUTPUT -- the child's own [observable]
  * lines and, in four cases, the bytes this test sends and receives. No case
  * reads a struct field, and none of them would notice a reorder of server_t.
- * The nine cases, in the order they run:
+ * The eleven cases, in the order they run:
  *
  *   1. same name, both directions    SELF_NAME, and NOBODY reaches ESTABLISHED
  *   2. wrong secret                  BAD_SECRET, and the exchange still failed
@@ -25,6 +25,8 @@
  *   6. liveness, the positive case   keepalives flow and lines= climbs
  *   7. peer goes silent              link_dead, after the keepalives stop
  *   8. happy path, the SHIPPED BINARY  link_established on both nodes
+ *   9. --secret-file, SHIPPED BINARY  file side links with an argv side
+ *   10. --secret AND --secret-file    usage error, exit 2, no node starts
  *
  * Case 8 is the one that runs the real executable, so the command line and
  * node_main.c's getaddrinfo are covered by something that can fail: a broken
@@ -96,6 +98,7 @@
  * handshake (6.2) rather than by a delay.
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
@@ -103,7 +106,11 @@
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
+/* waitpid()/WEXITSTATUS, for the case that asserts an exit status rather than
+ * output: see test_version_truth.c for why the include is spelled out. */
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "core/server.h"
@@ -1316,6 +1323,145 @@ static void case_happy_path_binary(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * Case 9: --secret-file, on the SHIPPED BINARY
+ * ---------------------------------------------------------------------------
+ * Issue #165: a command line is visible to every local user in `ps`, so the
+ * federation secret needs a way in that is not argv. Node A reads SECRET_OK
+ * from a file -- written with one trailing newline, which is what
+ * `echo SECRET > file` produces and therefore what the node must strip rather
+ * than adopt -- while node B takes the same value as --secret argv.
+ *
+ * The MIX is the strip proof: had A adopted the newline as part of the
+ * secret, its offer would carry a byte B's does not, and neither side would
+ * reach ESTABLISHED. Two file sides would prove nothing, because both would
+ * adopt the same byte.
+ *
+ * The file is a mkstemp() template under /tmp, because CTest runs at -j8 and
+ * a literal path would be shared between parallel runs (test_account.c's
+ * fixture note). mkstemp() creates 0600, which is what the loader requires.
+ *
+ * The startup lines must say `secret=set` with the source each side used:
+ * `secret=` keeps the shape case 8 asserts, and the source is what tells `ps`
+ * exposure from a file. */
+static void write_secret_file(char *tmpl, const char *secret)
+{
+    int fd = mkstemp(tmpl);
+
+    TF_CHECK_MSG(fd >= 0, "could not create a temp secret file");
+    TF_CHECK_MSG(write(fd, secret, strlen(secret)) == (ssize_t)strlen(secret),
+                 "could not write the secret to the temp file");
+    TF_CHECK_MSG(write(fd, "\n", 1) == 1,
+                 "could not write the trailing newline an echo would add");
+    TF_CHECK_MSG(close(fd) == 0, "could not close the temp secret file");
+}
+
+static void case_secret_file_binary(void)
+{
+    nf_node_t a;
+    nf_node_t b;
+    char peer_arg[64];
+    char file_a[] = "/tmp/irc_serve_fed_secret_a.XXXXXX";
+
+    write_secret_file(file_a, SECRET_OK);
+
+    {
+        char *const argv[] = { (char *)"irc-serve", (char *)"--name",
+                               (char *)"irc.a",   (char *)"--secret-file",
+                               file_a,            (char *)"0",
+                               NULL };
+
+        TF_CHECK_MSG(nf_spawn_binary_argv(&a, argv) == 0,
+                      "could not start node A with --secret-file %s", file_a);
+    }
+    TF_CHECK_MSG(nf_expect(&a, "peers=0 secret=set secret_source=file", T_IO_MS)
+                     == 0,
+                 "node A did not report a file-sourced secret: %s", a.out);
+
+    (void)snprintf(peer_arg, sizeof peer_arg, "irc.a,127.0.0.1,%d", a.port);
+    {
+        char *const argv[] = { (char *)"irc-serve", (char *)"--name",
+                               (char *)"irc.b",   (char *)"--secret",
+                               SECRET_OK,         (char *)"--peer",
+                               peer_arg,          (char *)"0",
+                               NULL };
+
+        TF_CHECK_MSG(nf_spawn_binary_argv(&b, argv) == 0,
+                      "could not start node B from the shipped binary with a "
+                      "--peer of %s", peer_arg);
+    }
+    TF_CHECK_MSG(nf_expect(&b, "peers=1 secret=set secret_source=argv_warn",
+                           T_IO_MS) == 0,
+                 "node B did not report an argv-sourced secret: %s", b.out);
+
+    /* The exchange, which is also the newline-strip proof: had node A adopted
+     * the trailing newline as part of the secret, its offer would differ from
+     * node B's argv value and neither side would reach ESTABLISHED. */
+    TF_CHECK_MSG(nf_expect(&a, "link_established: peer=irc.b", T_IO_MS) == 0,
+                 "the accepting node never reported an established link: %s",
+                 a.out);
+    TF_CHECK_MSG(nf_expect(&b, "link_established: peer=irc.a", T_IO_MS) == 0,
+                 "the dialling node never reported an established link: %s",
+                 b.out);
+
+    TF_CHECK_MSG(nf_stop(&a) == 0, "node A did not exit cleanly");
+    TF_CHECK_MSG(nf_stop(&b) == 0, "node B did not exit cleanly");
+    TF_CHECK_MSG(strstr(a.out, "link_rejected:") == NULL,
+                 "the accepting node reported a rejection: %s", a.out);
+    TF_CHECK_MSG(strstr(b.out, "link_rejected:") == NULL,
+                 "the dialling node reported a rejection: %s", b.out);
+    nf_free(&a);
+    nf_free(&b);
+    (void)unlink(file_a);
+}
+
+/* ---------------------------------------------------------------------------
+ * Case 10: --secret and --secret-file together are a usage error
+ * ---------------------------------------------------------------------------
+ * ONE SOURCE, because two cannot be honoured: preferring either silently
+ * would bless the `ps` leak or surprise the file's author. The binary must
+ * exit 2 without starting a node, which is asserted on the exit status
+ * itself -- the usage text also goes to stderr, but grepping it would assert
+ * wording rather than behaviour. fork()+execv()+waitpid() directly, because
+ * the fixture's spawn helpers wait for a readiness line a refused node never
+ * prints (test_version_truth.c's `--help` case for the pattern). */
+static void case_secret_and_file_refused(void)
+{
+    char file[] = "/tmp/irc_serve_fed_secret_both.XXXXXX";
+    char *argv[7];
+    pid_t pid;
+    int status = 0;
+
+    write_secret_file(file, SECRET_OK);
+
+    argv[0] = (char *)"irc-serve";
+    argv[1] = (char *)"--secret";
+    argv[2] = (char *)SECRET_OK;
+    argv[3] = (char *)"--secret-file";
+    argv[4] = file;
+    argv[5] = (char *)"0";
+    argv[6] = NULL;
+    pid = fork();
+    TF_CHECK_MSG(pid >= 0, "could not fork to run the refused command line");
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+
+        if (devnull >= 0) {
+            (void)dup2(devnull, STDOUT_FILENO);
+            (void)dup2(devnull, STDERR_FILENO);
+            (void)close(devnull);
+        }
+        execv(NF_SERVER_BIN, argv);
+        _exit(127);
+    }
+    TF_CHECK_MSG(waitpid(pid, &status, 0) == pid,
+                 "could not reap the refused node");
+    TF_CHECK_MSG(WIFEXITED(status) && WEXITSTATUS(status) == 2,
+                 "a node given both --secret and --secret-file must exit 2 "
+                 "rather than start with either source");
+    (void)unlink(file);
+}
+
+/* ---------------------------------------------------------------------------
  * main
  * ---------------------------------------------------------------------------
  * The cases run in the order they are listed in the header, and the ordering is
@@ -1335,6 +1481,8 @@ int main(void)
     case_keepalive_flows();
     case_dead_link();
     case_happy_path_binary();
+    case_secret_file_binary();
+    case_secret_and_file_refused();
     tf_done("fed_handshake");
     return 0;
 }
