@@ -159,6 +159,18 @@ struct fed_rnick;
  * surface -- it is the single constant the Phase 3 numerics need. */
 #define IRC_SERVE_VERSION "irc-serve-0.1.0"
 
+/* The node-wide channel cap (issue #169): the most chan_t objects one node
+ * will hold at once. The per-connection cap (CONN_MAX_CHANNELS, 128) bounds
+ * what one client may occupy; this bounds what every client together may
+ * create, because channels are created from wire JOINs and an unbounded
+ * registry is unauthenticated remote memory exhaustion (~800 conns x 128
+ * distinct JOINs ~= 100k entries). 1024 is the registry's own width
+ * (STRTAB_BUCKETS) and the burst shadow's (IRC_BURST_MAX_CHANS), so the
+ * enforcement, the table and the resync agree on one number rather than
+ * three. A JOIN that would create past it is refused with 437 before
+ * chan_new(), and joining a channel the node already holds is unaffected. */
+#define SERVER_MAX_CHANNELS 1024
+
 typedef struct server server_t;
 typedef struct chan chan_t; /* opaque until Phase 4 (2.2) */
 /* message_t comes from core/message.h, which connection.h includes. It is an
