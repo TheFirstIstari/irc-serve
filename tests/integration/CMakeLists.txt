@@ -784,6 +784,12 @@ irc_add_integration_test(test_tls_revocation test_tls_revocation.c)
 # binary's --help and startup line, and none of them needs a crypto library.
 irc_add_integration_test(test_version_truth test_version_truth.c)
 
+# Issue #182: --user and the post-bind privilege drop. Its own file because every
+# case drives the shipped binary's command line and startup output -- an inline
+# child has neither. The root cases run only as root; off root they note and
+# pass, and the unprivileged start is asserted everywhere.
+irc_add_integration_test(test_priv_drop test_priv_drop.c)
+
 # Phase 12 item 5: TLS on a PEER LINK, and the mixed-mesh decision. Its own file
 # because the decision is the deliverable as much as the code is: a mesh may MIX TLS
 # and plaintext links, and what makes that safe is that a link's mode is STICKY --
