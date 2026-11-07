@@ -13,6 +13,9 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/random.h>
+#endif
 
 #include "core/channel.h"
 #include "core/message.h"
@@ -604,6 +607,56 @@ static void describe_peer(conn_t *c, const struct sockaddr *sa)
  * ---------------------------------------------------------------------------
  */
 
+/* ---------------------------------------------------------------------------
+ * The first msg_id of a boot is RANDOM, not 1 (issue #180).
+ * ---------------------------------------------------------------------------
+ * (origin, epoch, id) is the dedup key, and epoch is only boot-time
+ * milliseconds: two boots in the same millisecond share an epoch, so a counter
+ * that restarts at 1 reissues (origin, epoch, 1..N) and a peer drops the replay
+ * as a duplicate. A random 64-bit start makes a collision need the same epoch
+ * AND the same draw, which is not a thing that happens twice.
+ *
+ * One draw per boot, here rather than per message: getrandom()/arc4random_buf()
+ * once is free, per message it would be a syscall per relay. 0 is never drawn:
+ * it means "unset", and server_next_msg_id() already skips it on wrap, so the
+ * counter keeps its shape (monotonic, wrap-skip-0) whatever the start. Epoch is
+ * untouched: still the boot time in milliseconds.
+ *
+ * No new dependency: arc4random_buf() on Apple/BSD, getrandom() on Linux, and a
+ * server_now_ms/pid mix when neither is available or the call fails. The
+ * fallback only has to be better than a constant, and differing boots differ
+ * in time or pid; adjacent milliseconds are spread by a Knuth constant so
+ * adjacent boots do not get adjacent starts. */
+static uint64_t server_msgid_fallback(void)
+{
+    uint64_t v;
+
+    v = server_now_ms() * 6364136223846793005ULL +
+        (uint64_t)getpid() * 1442695040888963407ULL;
+    return (v != 0) ? v : 1;
+}
+
+static uint64_t server_msgid_seed(void)
+{
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
+    defined(__NetBSD__) || defined(__DragonFly__)
+    uint64_t v = 0;
+
+    arc4random_buf(&v, sizeof v);
+    return (v != 0) ? v : server_msgid_fallback();
+#elif defined(__linux__)
+    uint64_t v = 0;
+    ssize_t n = getrandom(&v, sizeof v, 0);
+
+    if (n == (ssize_t)sizeof v && v != 0) {
+        return v;
+    }
+    return server_msgid_fallback();
+#else
+    return server_msgid_fallback();
+#endif
+}
+
 int server_init(server_t *s, const char *name)
 {
     if (s == NULL || name == NULL) {
@@ -648,7 +701,9 @@ int server_init(server_t *s, const char *name)
     if (s->epoch == 0) {
         s->epoch = 1;
     }
-    s->msg_id = 1;
+    /* Issue #180: the start is random per boot (server_msgid_seed), never 0.
+     * Same-epoch reboots would otherwise reissue the same low ids. */
+    s->msg_id = server_msgid_seed();
     return 0;
 }
 
