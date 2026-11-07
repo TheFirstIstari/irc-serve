@@ -19,6 +19,7 @@
  * server get DIFFERENT ids, that the sequence is monotonic, and that 0 is never
  * handed out because 0 means "tag absent" rather than "first message".
  */
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -172,20 +173,26 @@ int main(void)
     server_chan_remove(&s, "#Chan"); /* removing twice is harmless */
 
     /* --- 2.4: ids come from the server, not the connection --- */
-    TF_CHECK_MSG(s.msg_id == 1, "the id counter does not start at 1");
+    TF_CHECK_MSG(s.msg_id != 0, "the id counter starts at 0, which is the "
+                 "value that means 'unset'");
     TF_CHECK_MSG(s.epoch != 0, "the per-boot epoch is zero, which is the "
                  "value that means 'unset'");
     id1 = server_next_msg_id(&s);
     id2 = server_next_msg_id(&s);
     id3 = server_next_msg_id(&s);
-    TF_CHECK_MSG(id1 == 1 && id2 == 2 && id3 == 3,
-                 "ids are %llu %llu %llu, expected 1 2 3 from a monotonic "
-                 "counter",
-                 (unsigned long long)id1, (unsigned long long)id2,
-                 (unsigned long long)id3);
+    /* Issue #180: the start is random per boot, so no fixed values are
+     * asserted -- only that the draws are nonzero and consecutive (modulo the
+     * wrap, which can only trigger here if the random start drew near the
+     * top). */
     TF_CHECK_MSG(id1 != 0 && id2 != 0 && id3 != 0,
                  "0 was handed out as a message id: 0 means the tag was "
                  "absent, so a peer must never read it as a real id");
+    TF_CHECK_MSG(id2 == ((id1 == UINT64_MAX) ? 1 : id1 + 1u) &&
+                 id3 == ((id2 == UINT64_MAX) ? 1 : id2 + 1u),
+                 "ids are %llu %llu %llu, expected three consecutive draws "
+                 "from a monotonic counter",
+                 (unsigned long long)id1, (unsigned long long)id2,
+                 (unsigned long long)id3);
 
     /* Two connections on one server drawing ids must not collide. This is the
      * 2.4 bug the per-SERVER counter exists to prevent, so it is asserted in
@@ -210,6 +217,49 @@ int main(void)
                          (unsigned long long)from_a[i],
                          (unsigned long long)from_b[i]);
         }
+    }
+
+    /* --- issue #180: the first id of a boot is random, and 0 is skipped
+     * on wrap --- */
+    {
+        server_t t1;
+        server_t t2;
+        server_t w;
+        uint64_t f1;
+        uint64_t f2;
+        uint64_t top;
+        uint64_t wrapped;
+
+        TF_CHECK_MSG(server_init(&t1, "irc.test") == 0, "server_init failed");
+        TF_CHECK_MSG(server_init(&t2, "irc.test") == 0, "server_init failed");
+        f1 = server_next_msg_id(&t1);
+        f2 = server_next_msg_id(&t2);
+        TF_CHECK_MSG(f1 != 0 && f2 != 0,
+                     "a boot drew 0 as its first id: 0 means 'unset'");
+        TF_CHECK_MSG(f1 != f2, "two boots drew the same first id %llu: a "
+                     "same-millisecond reboot would reissue live ids and a "
+                     "peer would drop the replay as a duplicate",
+                     (unsigned long long)f1);
+        server_shutdown(&t1);
+        server_shutdown(&t2);
+
+        /* The counter skips 0 when it wraps: forcing the top draws the top
+         * and then 1, never 0. */
+        TF_CHECK_MSG(server_init(&w, "irc.test") == 0, "server_init failed");
+        w.msg_id = UINT64_MAX;
+        top = server_next_msg_id(&w);
+        wrapped = server_next_msg_id(&w);
+        TF_CHECK_MSG(top == UINT64_MAX,
+                     "forcing msg_id to the top drew %llu, expected %llu",
+                     (unsigned long long)top,
+                     (unsigned long long)UINT64_MAX);
+        TF_CHECK_MSG(wrapped != 0,
+                     "0 was handed out over the wrap: 0 means the tag was "
+                     "absent, so a peer must never read it as a real id");
+        TF_CHECK_MSG(wrapped == 1,
+                     "the draw after the wrap is %llu, expected 1 (0 skipped)",
+                     (unsigned long long)wrapped);
+        server_shutdown(&w);
     }
 
     /* --- the fd-indexed connection registry: O(1) by descriptor --- */

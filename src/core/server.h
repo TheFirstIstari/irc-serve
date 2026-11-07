@@ -561,8 +561,11 @@ struct server {
 
     /* 2.4: ids come from a per-SERVER monotonic counter, not a per-connection
      * one, and epoch is per-boot so a restart cannot collide with ids issued
-     * before it. Both start at 1: id 0 is reserved as "unset" so an absent tag
-     * is never mistaken for a real id. */
+     * before it. Id 0 is reserved as "unset" so an absent tag is never mistaken
+     * for a real id; epoch starts at 1 for the same reason. The counter's START
+     * is random per boot (issue #180: same-millisecond reboots share an epoch,
+     * so restarting at 1 would reissue live ids), drawn once in server_init;
+     * the sequence stays monotonic and skips 0 on wrap. */
     uint64_t  msg_id;
     uint64_t  epoch;
 
