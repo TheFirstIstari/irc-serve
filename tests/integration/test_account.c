@@ -2310,6 +2310,10 @@ int main(void)
     char acct_two_fields[] = "/tmp/irc_serve_acct_2f.XXXXXX";
     char acct_loose[] = "/tmp/irc_serve_acct_loose.XXXXXX";
     char acct_empty[] = "/tmp/irc_serve_acct_empty.XXXXXX";
+    char acct_link[] = "/tmp/irc_serve_acct_link.XXXXXX";
+    char acct_0640[] = "/tmp/irc_serve_acct_0640.XXXXXX";
+    char acct_fifo[] = "/tmp/irc_serve_acct_fifo.XXXXXX";
+    char acct_long[] = "/tmp/irc_serve_acct_long.XXXXXX";
     char acct_missing[] = "/nonexistent/irc-serve-accounts";
     int fd_sasl;
     int fd_sasl2;
@@ -2319,6 +2323,10 @@ int main(void)
     int fd_2f;
     int fd_loose;
     int fd_empty;
+    int fd_link;
+    int fd_0640;
+    int fd_fifo;
+    int fd_long;
 
     /* mkstemp() creates each path AND its descriptor, and the paths have to
      * exist before a child execs onto them. */
@@ -2330,11 +2338,17 @@ int main(void)
     fd_2f = mkstemp(acct_two_fields);
     fd_loose = mkstemp(acct_loose);
     fd_empty = mkstemp(acct_empty);
+    fd_link = mkstemp(acct_link);
+    fd_0640 = mkstemp(acct_0640);
+    fd_fifo = mkstemp(acct_fifo);
+    fd_long = mkstemp(acct_long);
     TF_CHECK_MSG(fd_sasl >= 0 && fd_sasl2 >= 0 && fd_acct >= 0 && fd_mis >= 0 &&
-                     fd_bad >= 0 && fd_2f >= 0 && fd_loose >= 0 && fd_empty >= 0,
+                     fd_bad >= 0 && fd_2f >= 0 && fd_loose >= 0 && fd_empty >= 0 &&
+                     fd_link >= 0 && fd_0640 >= 0 && fd_fifo >= 0 && fd_long >= 0,
                  "could not create the store files this test needs");
     if (fd_sasl < 0 || fd_sasl2 < 0 || fd_acct < 0 || fd_mis < 0 || fd_bad < 0 ||
-        fd_2f < 0 || fd_loose < 0 || fd_empty < 0) {
+        fd_2f < 0 || fd_loose < 0 || fd_empty < 0 || fd_link < 0 || fd_0640 < 0 ||
+        fd_fifo < 0 || fd_long < 0) {
         return 1;
     }
 
@@ -2381,6 +2395,36 @@ int main(void)
     TF_CHECK_MSG(write(fd_empty, "# no accounts yet\n", (size_t)17) == 17,
                  "could not write the empty registry");
     (void)close(fd_empty);
+    /* Issue #178: the four shapes of secret-file refusal, mirroring the
+     * credential-store cases in test_cap_negotiation.c so the two loaders can
+     * be compared reason for reason. */
+    (void)close(fd_link);
+    (void)unlink(acct_link);
+    TF_CHECK_MSG(symlink(acct_good, acct_link) == 0,
+                 "could not create the symlinked registry");
+    TF_CHECK_MSG(write(fd_0640, "alice\tcorrect horse\t1750000000\n",
+                       (size_t)30) == 30,
+                 "could not write the group-readable registry");
+    (void)close(fd_0640);
+    TF_CHECK_MSG(chmod(acct_0640, S_IRUSR | S_IWUSR | S_IRGRP) == 0,
+                 "could not set the group-readable registry's mode");
+    (void)close(fd_fifo);
+    (void)unlink(acct_fifo);
+    TF_CHECK_MSG(mkfifo(acct_fifo, S_IRUSR | S_IWUSR) == 0,
+                 "could not create the FIFO registry");
+    /* Five chunks of 128: the first fgets fills without a newline, which is
+     * the over-long refusal rather than a record. */
+    for (int k = 0; k < 5; k++) {
+        char chunk[128];
+
+        memset(chunk, 'A', sizeof chunk);
+        TF_CHECK_MSG(write(fd_long, chunk, sizeof chunk) ==
+                         (ssize_t)sizeof chunk,
+                     "could not write the over-long registry");
+    }
+    TF_CHECK_MSG(write(fd_long, "\n", (size_t)1) == 1,
+                 "could not terminate the over-long registry");
+    (void)close(fd_long);
 
     /* 0600 for the two that must load, and for the rest it is set per case
      * because the MODE is what two of the refusals are about. */
@@ -2436,6 +2480,19 @@ int main(void)
     test_registry_refused(sasl_good, acct_loose, "reason=mode_644",
                           "a world-readable registry");
 
+    /* Issue #178: the four shapes of secret-file refusal. Same reasons as the
+     * credential store's mirror cases, which is the whole of the assertion:
+     * one shared open means the two loaders cannot refuse the same shape
+     * differently. */
+    test_registry_refused(sasl_good, acct_link, "reason=open",
+                          "a symlinked registry");
+    test_registry_refused(sasl_good, acct_0640, "reason=mode_640",
+                          "a group-readable registry");
+    test_registry_refused(sasl_good, acct_fifo, "reason=not_regular",
+                          "a FIFO registry");
+    test_registry_refused(sasl_good, acct_long, "reason=line_too_long",
+                          "an over-long registry line");
+
     /* ---- accounts without logins ---- */
     test_registry_without_credentials(acct_good);
 
@@ -2447,6 +2504,10 @@ int main(void)
     (void)unlink(acct_two_fields);
     (void)unlink(acct_loose);
     (void)unlink(acct_empty);
+    (void)unlink(acct_link);
+    (void)unlink(acct_0640);
+    (void)unlink(acct_fifo);
+    (void)unlink(acct_long);
     tf_done("Account");
     return 0;
 }

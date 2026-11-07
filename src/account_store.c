@@ -10,6 +10,8 @@
  */
 #include "account_store.h"
 
+#include "core/secret_util.h"
+
 
 #include <stdint.h>
 #include <stdio.h>
@@ -28,10 +30,10 @@
  * ------------------------------------------------------------------------ */
 /* The heap holds salted hashes and never the passwords (see the record below),
  * and that needs a hash in a build that links nothing beyond libc. Copied
- * from sasl_framework.c rather than shared, for the reason the scrub pass and
- * const_time_eq() below are copies too: the two stores are separate files that
- * do not link to each other. Test vector: "abc" -> ba7816bf 8f01cfea 414140de
- * 5dae2223 b00361a3 96177a9c b410ff61 f20015ad. */
+ * from sasl_framework.c rather than shared, for the reason the scrub pass
+ * below is a copy too: the two stores keep no shared state beyond the secret
+ * open and the digest comparison (see core/secret_util.h). Test vector: "abc"
+ * -> ba7816bf 8f01cfea 414140de 5dae2223 b00361a3 96177a9c b410ff61 f20015ad. */
 #define ACCOUNT_HASH_LEN 32u
 #define ACCOUNT_SALT_LEN 16u
 
@@ -509,28 +511,6 @@ int account_store_add(account_store_t *store, const char *name,
     return 0;
 }
 
-/* Returns 1 when the two fixed-length buffers hold the same bytes, in time
- * that depends only on their LENGTH and not on their contents.
- *
- * Identical in construction to sasl_framework.c's const_time_eq(), and copied
- * rather than shared for the reason account_store_free()'s scrub pass is: the
- * two stores are separate files that do not link to each other. Both sides
- * here are digests (see account_store_verify): the comparison is
- * hash-against-hash. */
-static int const_time_eq(const unsigned char *a, const unsigned char *b,
-                         size_t n)
-{
-    unsigned diff = 0u;
-
-    if (a == NULL || b == NULL) {
-        return 0;
-    }
-    for (size_t i = 0; i < n; i++) {
-        diff |= (unsigned)(a[i] ^ b[i]);
-    }
-    return (diff == 0u) ? 1 : 0;
-}
-
 /* A fixed dummy compared against when no record matched, so that "no such
  * account" and "wrong password" cost the same. A CONSTANT rather than a derived
  * value, so it cannot leak anything by being computable. */
@@ -560,7 +540,7 @@ int account_store_verify(const account_store_t *store, const char *name,
     account_hash_password(store->salt, k_dummy_pass, dummy);
     for (size_t i = 0; i < store->n; i++) {
         if (name_eq(store->rec[i].name, name) != 0) {
-            saw_match |= (unsigned)const_time_eq(store->rec[i].phash, want,
+            saw_match |= (unsigned)secret_const_time_eq(store->rec[i].phash, want,
                                                  ACCOUNT_HASH_LEN);
         }
     }
@@ -568,7 +548,7 @@ int account_store_verify(const account_store_t *store, const char *name,
      * is not distinguishable by timing from one whose password is wrong. */
     if (saw_match == 0u) {
         dummy_used =
-            (unsigned)const_time_eq(dummy, want, ACCOUNT_HASH_LEN);
+            (unsigned)secret_const_time_eq(dummy, want, ACCOUNT_HASH_LEN);
     }
     (void)dummy_used;
     account_wipe(want, sizeof want);
@@ -657,49 +637,34 @@ static int store_parse_line(account_store_t *store, char *line)
 account_store_t *account_store_load(const char *path)
 {
     FILE *f;
-    struct stat sb;
+    secret_open_status_t open_status = SECRET_OPEN_FAIL_OPEN;
+    unsigned open_mode = 0u;
     account_store_t *store;
     char line[ACCOUNT_MAX_LINE];
 
     if (path == NULL || path[0] == '\0') {
         return NULL;
     }
-    /* OPEN FIRST, THEN fstat THE DESCRIPTOR.
-     *
-     * This is sasl_store_load()'s order and sasl_store_load()'s reason, and the
-     * comment is repeated rather than referenced because the sequence is the
-     * control: stat()-then-open leaves a window in which the thing that was
-     * checked is not the thing that gets read, on a file whose whole content is
-     * passwords. fstat() on the descriptor cannot race, and 'e' (O_CLOEXEC)
-     * stops the descriptor being inherited across an exec that happens to be
-     * running while this node starts.
-     *
-     * A SYMLINK IS NOT FOLLOWED AND NOT SPECIAL-CASED: fstat() judges the target,
-     * which is the file whose bytes would be read. */
-    f = fopen(path, "re");
+    /* OPEN FIRST, THEN fstat THE DESCRIPTOR: one shared open
+     * (see secret_file_open in core/secret_util.h) whose refusal reasons are
+     * the ones below. */
+    f = secret_file_open(path, &open_status, &open_mode);
     if (f == NULL) {
-        printf("[observable] account_store: state=REFUSED path=%s reason=open\n",
-               path);
-        return NULL;
-    }
-    if (fstat(fileno(f), &sb) != 0) {
-        printf("[observable] account_store: state=REFUSED path=%s reason=fstat\n",
-               path);
-        (void)fclose(f);
-        return NULL;
-    }
-    if (!S_ISREG(sb.st_mode)) {
-        printf("[observable] account_store: state=REFUSED path=%s "
-               "reason=not_regular\n",
-               path);
-        (void)fclose(f);
-        return NULL;
-    }
-    if ((sb.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
-        printf("[observable] account_store: state=REFUSED path=%s reason=mode_%03o "
-               "(group or other may access a file of passwords)\n",
-               path, (unsigned)(sb.st_mode & 0777));
-        (void)fclose(f);
+        if (open_status == SECRET_OPEN_FAIL_FSTAT) {
+            printf("[observable] account_store: state=REFUSED path=%s reason=fstat\n",
+                   path);
+        } else if (open_status == SECRET_OPEN_NOT_REGULAR) {
+            printf("[observable] account_store: state=REFUSED path=%s "
+                   "reason=not_regular\n",
+                   path);
+        } else if (open_status == SECRET_OPEN_BAD_MODE) {
+            printf("[observable] account_store: state=REFUSED path=%s reason=mode_%03o "
+                   "(group or other may access a file of passwords)\n",
+                   path, open_mode);
+        } else {
+            printf("[observable] account_store: state=REFUSED path=%s reason=open\n",
+                   path);
+        }
         return NULL;
     }
 

@@ -124,6 +124,7 @@ add_library(irc_core STATIC
   # are loaded from main() before the loop is armed. See account_store.h for the
   # argument that they are two files rather than one.
   account_store.c
+  core/secret_util.c
   core/message.c
   core/connection.c
   core/server.c
