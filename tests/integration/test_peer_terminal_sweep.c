@@ -1026,6 +1026,7 @@ int main(void)
     char token[64];
     int listen_fd;
     unsigned probes = 0;
+    unsigned swept = 0;
     int found_surfaces = 0;
     size_t from = 0u;
     const char *const claim[] = {
@@ -1302,6 +1303,25 @@ int main(void)
         /* THE CLIENT SOCKET, SWEPT NOW THAT THE PONG PROVES THE WRITES LANDED. */
         ps_sweep_client(&client_surface, &client, &client_scanned,
                         &client_privmsgs);
+        /* RATE-LIMIT REFRESH: the flood limiter is per-connection, so a sweep
+         * that reuses one client for ~500 JOIN+PART pairs exhausts its burst
+         * and later JOINs are refused with 405. A fresh connection has a fresh
+         * budget, and the scan above means no swept byte is lost on the close.
+         * Counted in swept markers rather than loop turns so non-markers cost
+         * nothing, and reconnected with deadline waits rather than sleeps. */
+        swept++;
+        if (swept == 8u) {
+            tc_close(&client);
+            TF_CHECK_MSG(tc_connect(&client, node.port) == 0,
+                         "the client could not reconnect after 8 markers");
+            TF_CHECK_MSG(tc_send(&client, "NICK " NICK_C) == 0,
+                         "NICK send failed on reconnect");
+            TF_CHECK_MSG(tc_send(&client, "USER " NICK_C " 0 *spoofed :Real "
+                                 NICK_C) == 0, "USER send failed on reconnect");
+            TF_CHECK_MSG(tc_expect(&client, " 001 ", T_IO_MS) == 0,
+                         "the reconnected client never registered");
+            swept = 0;
+        }
     }
 
     /* The byte count, asserted rather than assumed: a marker set that quietly lost

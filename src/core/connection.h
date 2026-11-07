@@ -97,6 +97,7 @@
 #define IRC_CORE_CONNECTION_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <time.h>
 
 #include "core/message.h"
@@ -1142,6 +1143,14 @@ typedef struct conn {
      * IT GRANTS NOTHING and revokes nothing; it is a fact about the connection's
      * history and nothing reads it except STARTTLS's refusal. */
     int         credential_seen;
+    /* Flood token bucket (#168), owned by poll_loop.c. rate_tokens starts at
+     * the burst (256) and refills at 50/sec on the tick path; each
+     * dispatched client line spends one. rate_last_ms == 0 means "never
+     * refilled", which the tick initialises rather than conn_new(), so the
+     * burst constant lives in exactly one place. CONN_SERVER links are
+     * exempt and never spend. */
+    double      rate_tokens;
+    uint64_t    rate_last_ms;
     char       *rbuf;              /* read buffer */
     size_t      rlen;
     size_t      rcap;
