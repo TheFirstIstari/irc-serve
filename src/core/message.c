@@ -7,11 +7,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 
-/* The ONE escape table in this tree. message_tag_escape()/message_tag_unescape()
- * below delegate here rather than carrying their own switch; see the comments on
- * those two wrappers for why, and ircv3_tags.h for the table itself. */
+/* The ONE tag grammar in this tree lives in ircv3_tags.c: its escape table,
+ * its block validation, and its first-wins lookup. Everything tag-shaped below
+ * -- validation on the parse path, lookup, escape, unescape -- calls through
+ * to it rather than carrying a second copy, because two grammars are a tree
+ * that disagrees with itself about what `\;` means (Closes #183). */
 /* For conn_text_display_check() -- valid_nick() asks it the half of the nickname
  * grammar that no single byte can answer, rather than keeping a second copy of the
  * walk. See the two comments at valid_nick() and nick_char_illegal(). */
@@ -47,207 +48,90 @@ static int digit_value(char c)
 }
 
 /* --------------------------------------------------------------------------
- * Tag block grammar and escaping
+ * Tag block grammar and escaping: owned by ircv3_tags.c, called through here
  * ------------------------------------------------------------------------ */
 
-/* Advance to the end of a tag value: the pair's ';' or `end`, skipping over a
- * backslash-escaped character, so an escaped ';' is part of the value rather
- * than a separator. This is the only place the escape grammar affects the
- * STRUCTURE of a block; everything else about escaping is undone on lookup.
- *
- * `end` is a bound and deliberately not a NUL. A parsed tag block is a copy
- * that happens to be NUL-terminated, but the block handed to tag_block_valid()
- * points into the pristine received line, where the next byte is a space and
- * then the rest of the command. Scanning to a NUL there reads past the field
- * and rejects perfectly good lines. */
-static const char *value_end_n(const char *v, const char *end)
+/* Validate a tag block WITHOUT its leading '@' against the single grammar
+ * (Closes #183). The block is already split at the first SP/HTAB by the
+ * caller, so what arrives here is exactly what ircv3_tags_parse() accepts
+ * without a marker. A raw ';' always separates pairs -- even one written
+ * `\;`, which is an invalid escape whose backslash is dropped on decode, not
+ * a way to smuggle a separator inside a value (that spelling is `\:`).
+ * Duplicates keep the first occurrence, so a block can never rewrite a tag
+ * another node set. */
+static int tag_block_valid(const char *block)
 {
-    while (v < end && *v != ';') {
-        if (*v == '\\' && v + 1 < end) {
-            v++;
-        }
-        v++;
-    }
-    return v;
-}
+    ircv3_tags_t tmp;
 
-static const char *value_end(const char *v)
-{
-    return value_end_n(v, v + strlen(v));
-}
-
-/* A tag block is "pair *(';' pair)"; a pair is "key" or "key=value". The key
- * admits no ';' or '@'; the value admits no raw SP, may be empty, may contain
- * '=', and is walked verbatim, because unescaping happens on lookup rather
- * than at parse time. The block has already been split at the first SP by the
- * caller, so no SP can occur inside it. Rejects an empty key, a ';' or '@'
- * inside a key, and a leading or trailing ';' (an empty pair). */
-static int tag_block_valid(const char *block, size_t len)
-{
-    const char *const end = block + len;
-    const char *p = block;
-    if (p == end || *p == ';') {
+    if (block == NULL || *block == '\0') {
         return 0;
     }
-    while (p < end) {
-        const char *const key = p;
-        while (p < end && *p != '=' && *p != ';') {
-            if (*p == '@' || is_sep(*p)) {
-                return 0;
-            }
-            p++;
-        }
-        if (p == key) {
-            return 0; /* empty key */
-        }
-        if (p < end && *p == '=') {
-            p = value_end_n(p + 1, end);
-        }
-        if (p == end) {
-            break;
-        }
-        if (*p != ';') {
-            return 0;
-        }
-        p++;
-        if (p == end) {
-            return 0; /* trailing ';' */
-        }
-    }
-    return 1;
+    return ircv3_tags_parse(block, &tmp) == 0 ? 1 : 0;
 }
 
-/* Does `pair` (a whole "key" or "key=value") name `key`? IRCv3 keys are
- * case-insensitive. */
-static int tag_pair_matches(const char *pair, size_t plen, const char *key)
-{
-    const size_t klen = strlen(key);
-    if (plen != klen) {
-        return 0;
-    }
-    return strncasecmp(pair, key, klen) == 0 ? 1 : 0;
-}
-
-/* Locate a pair in a block. Returns 1 and sets the value span through the
- * `value` and `len` out-parameters to the pair's raw (still escaped) value, or
- * returns 0 if the key is absent. A tag written without '=' has a zero-length
- * value. */
-static int tag_block_find(const char *block, const char *key,
-                          const char **value, size_t *len)
-{
-    if (block == NULL || key == NULL) {
-        return 0;
-    }
-    const char *p = block;
-    while (*p != '\0') {
-        const char *const pair = p;
-        /* The key runs to this pair's own '=' or terminator. Searching for the
-         * '=' with strchr() would run on into the NEXT pair, so a valueless tag
-         * followed by a valued one would report the later key's name. */
-        const char *keyend = p;
-        while (*keyend != '\0' && *keyend != '=' && *keyend != ';') {
-            keyend++;
-        }
-        const int has_value = (*keyend == '=') ? 1 : 0;
-        const char *const vend = (has_value != 0) ? value_end(keyend + 1) : keyend;
-        if (tag_pair_matches(pair, (size_t)(keyend - pair), key) != 0) {
-            if (has_value != 0) {
-                *value = keyend + 1;
-                *len = (size_t)(vend - (keyend + 1));
-            } else {
-                *value = p; /* valueless tag: the value is empty */
-                *len = 0;
-            }
-            return 1;
-        }
-        p = (*vend == ';') ? vend + 1 : vend; /* vend is the block's NUL here */
-    }
-    return 0;
-}
-
-/* Escape `value` per IRCv3 into `out` and write the byte count to *written.
- * Returns 0 on success, -1 if it does not fit. Never truncates.
- *
- * A THIN WRAPPER, and deliberately so. ircv3_tags.c owns the escape table --
- * there is exactly one in this tree, because two copies are a tree that
- * disagrees with itself about what a value means. This function used to carry
- * its own switch, and it carried the WRONG one: it escaped ':' as '\:' and ';'
- * as '\;', which is a plausible reading of the table and is not the
- * specification's. IRCv3 maps ';' to '\:' and leaves a colon raw. The mistake is
- * retracted here rather than preserved for a test that asserted it.
- *
- * The cost of the delegation is one call per value on the serialize path, which
- * is one per relayed message, and it is not measurable next to the render that
- * follows it. */
-static int tag_escape_into(const char *value, char *out, size_t cap,
-                           size_t *written)
-{
-    const size_t n = ircv3_escape_value(value, out, cap);
-
-    if (n == 0u && value != NULL && value[0] != '\0') {
-        out[0] = '\0';
-        return -1;
-    }
-    *written = n;
-    return 0;
-}
-
+/* Thin wrapper over the single escape table in ircv3_tags.c (Closes #183):
+ * 0 is both "empty value" and "refused" -- out[0] is NUL in both, and a
+ * refusal never truncates. */
 size_t message_tag_escape(const char *value, char *out, size_t cap)
 {
+    size_t n;
+
     if (value == NULL || out == NULL || cap == 0) {
         return 0;
     }
     out[0] = '\0';
-    size_t n = 0;
-    if (tag_escape_into(value, out, cap, &n) != 0) {
+    n = ircv3_escape_value(value, out, cap);
+    if (n == 0u && value[0] != '\0') {
         out[0] = '\0';
         return 0;
     }
     return n;
 }
 
-/* Unescape exactly `len` bytes of `value` into `out`. Split out so that
- * message_tag_get, which knows a value's span inside a block and not just its
- * length, does not have to copy the value out of the block first. Returns 0 on
- * success, -1 if it does not fit. Never grows the value.
- *
- * Also a thin wrapper, for the reason tag_escape_into() gives. The rule it now
- * inherits is the specification's: a '\' before a character outside the escape
- * set has its BACKSLASH DROPPED and yields the character, and a lone trailing
- * '\' produces nothing. It used to keep the backslash as a literal character,
- * which meant a peer sending `\x` produced a value no peer would agree with --
- * the same value, spelled two ways, on two nodes. */
-static int tag_unescape_span(const char *value, size_t len, char *out, size_t cap)
-{
-    if (out == NULL || cap == 0) {
-        return -1;
-    }
-    return ircv3_unescape_value(value, len, out, cap);
-}
-
+/* Thin wrapper over the single unescape in ircv3_tags.c (Closes #183):
+ * a '\' before a character outside the escape set has its BACKSLASH DROPPED,
+ * and a lone trailing '\' produces nothing. */
 int message_tag_unescape(const char *value, char *out, size_t cap)
 {
     if (value == NULL || out == NULL || cap == 0) {
         return -1;
     }
     out[0] = '\0';
-    return tag_unescape_span(value, strlen(value), out, cap);
+    return ircv3_unescape_value(value, strlen(value), out, cap);
 }
 
+/* Lookup through the single grammar (Closes #183): the stored block is
+ * parsed once and the DECODED value is copied out. First-wins on duplicates,
+ * keys case-insensitive, per ircv3_tags.c. Returns 0 on success, -1 when the
+ * key is absent, the block does not parse, or the value does not fit. */
 int message_tag_get(const message_t *m, const char *key, char *out, size_t cap)
 {
+    ircv3_tags_t list;
+    const char *value;
+    size_t n;
+
     if (m == NULL || key == NULL || out == NULL || cap == 0) {
         return -1;
     }
     out[0] = '\0';
-    const char *value = NULL;
-    size_t len = 0;
-    if (tag_block_find(m->tags, key, &value, &len) == 0) {
+    if (m->tags == NULL) {
         return -1;
     }
-    /* Unescaping never grows a value, so `len` bytes always fit in `out`, and
-     * it can be done straight into the caller's buffer. */
-    return tag_unescape_span(value, len, out, cap);
+    if (ircv3_tags_parse(m->tags, &list) != 0) {
+        return -1;
+    }
+    value = ircv3_tags_get(&list, key);
+    if (value == NULL) {
+        return -1;
+    }
+    /* Decoding never grows a value, so refusing here is a small caller
+     * buffer, never a grammar surprise. Never truncates. */
+    n = strlen(value);
+    if (n + 1u > cap) {
+        return -1;
+    }
+    memcpy(out, value, n + 1u);
+    return 0;
 }
 
 size_t message_tags_format(const message_tag_t *tags, size_t ntags,
@@ -283,9 +167,9 @@ size_t message_tags_format(const message_tag_t *tags, size_t ntags,
         n += klen;
         out[n] = '=';
         n++;
-        size_t vlen = 0;
-        if (tag_escape_into(tags[i].value != NULL ? tags[i].value : "",
-                            out + n, cap - n, &vlen) != 0) {
+        const char *raw = (tags[i].value != NULL) ? tags[i].value : "";
+        const size_t vlen = ircv3_escape_value(raw, out + n, cap - n);
+        if (vlen == 0u && raw[0] != '\0') {
             out[0] = '\0';
             return 0;
         }
@@ -438,14 +322,32 @@ int message_parse_n(const char *line, size_t len, message_t *out)
     /* Optional '@' tag block. */
     if (p < end && *p == '@') {
         p++;
-        const char *const block = p;
+        char *const block = buf + (p - buf);
         while (p < end && !is_sep(*p)) {
             p++;
         }
         const size_t blocklen = (size_t)(p - block);
-        if (p == block || tag_block_valid(block, blocklen) != 1) {
+        /* The single grammar owner wants a NUL-terminated block; this one is
+         * terminated by a separator (or the line end) instead. `buf` is our
+         * own copy, so borrow one byte: NUL-terminate, validate, restore.
+         * Nothing after `p` is read by the grammar, and the byte is put back
+         * before any field is copied out. */
+        if (p == block) {
             msg_buf_free(out, buf);
             return -1;
+        }
+        {
+            char *const bend = block + blocklen; /* == p, kept mutable */
+            const char save = *bend;
+            int valid;
+
+            *bend = '\0';
+            valid = tag_block_valid(block);
+            *bend = save;
+            if (valid != 1) {
+                msg_buf_free(out, buf);
+                return -1;
+            }
         }
         tags = field_put(&f, block, blocklen);
         if (p < end) {

@@ -333,6 +333,66 @@ int main(void)
     }
     message_free(&m);
 
+    /* --- the single tag grammar (#183): edges pinned at the message level --- */
+    /* Duplicate keys keep the FIRST: a block cannot rewrite a tag another
+     * node set (irc-serve-origin is the tag that rule protects). */
+    assert(message_parse("@a=first;a=second PING", &m) == 0);
+    {
+        char value[64];
+        assert(message_tag_get(&m, "a", value, sizeof value) == 0);
+        assert(strcmp(value, "first") == 0);
+    }
+    message_free(&m);
+
+    /* `\:` is a semicolon; `\;` is an invalid escape, and a raw ';' always
+     * separates pairs -- so `\;` ends the pair instead of smuggling a
+     * separator inside the value. The retired core grammar read `\;` as an
+     * escaped ';' and disagreed with ircv3_tags.c here; the single grammar
+     * splits, and the dangling backslash decodes to nothing. */
+    assert(message_parse("@v=a\\:b PING", &m) == 0);
+    {
+        char value[64];
+        assert(message_tag_get(&m, "v", value, sizeof value) == 0);
+        assert(strcmp(value, "a;b") == 0);
+    }
+    message_free(&m);
+    assert(message_parse("@v=a\\;b PING", &m) == 0);
+    {
+        char value[64];
+        assert(message_tag_get(&m, "v", value, sizeof value) == 0);
+        assert(strcmp(value, "a") == 0);
+        assert(message_tag_get(&m, "b", value, sizeof value) == 0);
+        assert(strcmp(value, "") == 0);
+    }
+    message_free(&m);
+
+    /* A lone trailing backslash in a value decodes to nothing. */
+    assert(message_parse("@v=ab\\ PING", &m) == 0);
+    {
+        char value[64];
+        assert(message_tag_get(&m, "v", value, sizeof value) == 0);
+        assert(strcmp(value, "ab") == 0);
+    }
+    message_free(&m);
+
+    /* parse -> serialize is byte-for-byte, duplicates and escapes included:
+     * the stored block is the wire bytes, so a relay re-emits them. */
+    {
+        static const char *const lines[] = {
+            "@note=a\\sb\\:c:d\\\\e;flag;other=v PING x",
+            "@a=first;a=second PING",
+            "@k=\\\\ PING",
+        };
+        char line[256];
+        for (size_t i = 0; i < sizeof lines / sizeof lines[0]; i++) {
+            assert(message_parse(lines[i], &m) == 0);
+            assert(message_format(&m, line, sizeof line) ==
+                   strlen(lines[i]));
+            assert(strcmp(line, lines[i]) == 0);
+            message_free(&m);
+        }
+    }
+
     /* A value containing '=' is not truncated at the first '='. */
     assert(message_parse("@k=a=b=c PING", &m) == 0);
     {
