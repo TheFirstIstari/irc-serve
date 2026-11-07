@@ -296,29 +296,27 @@
  * thing, so it applies none of it. */
 #define IRC_BURST_MAX_CHANS ((size_t)1024u)
 
-/* The shipped bound for THIS PROCESS, and a per-process override of it. 0 keeps
- * the built-in. Call it before the burst runs; the value is read on every
- * comparison, so calling it later is legal but would apply mid-flight.
+/* The shipped bound for THIS NODE, and a per-node override of it. 0 keeps the
+ * current value, which server_init() seeded with the built-in. Call it before
+ * the burst runs; the value is read on every comparison, so calling it later
+ * is legal but would apply mid-flight.
  *
  * WHY THERE IS A KNOB AT ALL, stated rather than smuggled: IRC_BURST_MAX_BYTES
  * is the SHIPPED bound and a deployment is what it says. Proving the refusal
  * path without a knob needs a fixture that actually exceeds half a link's
  * queue, and at the worst-case line sizes above that is roughly 170 records --
  * so a few hundred client connections and channels, on every run, forever, to
- * exercise one branch. This is the same per-process override the four link
+ * exercise one branch. This is the same per-node override the four link
  * timers have and for the same reason (see the #ifndef block at the top of
- * federation/link.h): a build default serves a deployment and a per-process
+ * federation/link.h): a build default serves a deployment and a per-node
  * override serves a case whose slowness must not become the next case's
  * slowness.
  *
  * IT IS NOT A TEST HOOK, and the difference is the same one
  * federation/link.h draws between fed_set_timeouts() and a test-only symbol: it
- * is a per-process CONFIGURATION value with the same one-node-per-process
- * property the secret and the timers have, not a door into the implementation.
- * fed_open() is what makes that property safe, and nothing here is reachable
- * before it. The cost of the knob is that a second node in one process would
- * not see it -- which fed_open() already refuses to happen. */
-void fed_burst_set_max_bytes(size_t max_bytes);
+ * is a per-node CONFIGURATION value for this node's staging bound, not a door
+ * into the implementation. */
+void fed_burst_set_max_bytes(server_t *s, size_t max_bytes);
 
 /* Is `verb` one of the five burst words? The guard chain asks this before its
  * own verb table, because a burst is a TRANSACTION and its five shapes have
@@ -391,17 +389,18 @@ int fed_burst_apply(server_t *s, server_link_t *link, const message_t *m);
  * that catches every case is better than five call sites that each catch one,
  * and a caller that reached for this on a mid-burst drop would be adding a
  * second mechanism to a problem that has one. */
-void fed_burst_abandon(server_link_t *link);
+void fed_burst_abandon(server_t *s, server_link_t *link);
 
 /* Release any open shadow, as a node teardown rather than as a protocol event.
  *
- * THE CALLER IS server_shutdown(), and this arm exists because the shadow is a
- * MODULE GLOBAL rather than a field on server_t, so every other allocation this
- * node makes has an owner that can be reached from the shutdown and this one
- * did not. Without it, a process that stops mid-transaction -- a SIGTERM while a
- * peer is bursting -- leaves the shadow's records behind for the kernel to
- * reclaim, bounded by IRC_BURST_MAX_BYTES but still the only leak-shaped thing
- * in this file.
+ * THE CALLER IS server_shutdown(), and this arm releases the shadow the node
+ * holds on server_t (issue #173): every other allocation this node makes has
+ * an owner reachable from the shutdown, and this one is no exception. Without
+ * it, a process that stops mid-transaction -- a SIGTERM while a peer is
+ * bursting -- leaves the shadow's records behind for the kernel to reclaim,
+ * bounded by IRC_BURST_MAX_BYTES but still the only leak-shaped thing in this
+ * file. The shadow struct itself is freed and the field cleared, so a second
+ * close is a NONE rather than a double free.
  *
  * IT IS EXPORTED AND HAS A PROTOTYPE rather than being static, and the reason is
  * the one server.h gives for the dedup table being freed from a place that does
@@ -422,10 +421,8 @@ void fed_burst_abandon(server_link_t *link);
  * `fed_burst_close: shadow=OPEN` is checking that the arm RAN rather than that
  * it freed anything.
  *
- * `s` is unused today and is taken anyway: the shadow is a module global, but a
- * teardown that may one day need to touch the node should not have its signature
- * changed, and every other teardown in this tree has the same shape. Safe on a
- * node that never called fed_open(). */
+ * `s` is the node whose shadow is released: the layout is this file's and the
+ * pointer is the node's. Safe on a node that never called fed_open(). */
 void fed_burst_close(server_t *s);
 
 /* The resync, as a PRODUCT of the node rather than as a step in establishing

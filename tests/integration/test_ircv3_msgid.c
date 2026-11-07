@@ -676,7 +676,7 @@ static void child_setup(server_t *s)
      * which completes in two ticks on an idle box misses its budget, and the
      * failure then reads as "federation is broken" rather than "the fixture was
      * too impatient". These bound the FAILURE case only. */
-    fed_set_timeouts(5000, 5000, 30000, 90000);
+    fed_set_timeouts(s, 5000, 5000, 30000, 90000);
 
     if (g_peer_port <= 0) {
         return;

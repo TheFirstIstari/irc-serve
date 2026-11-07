@@ -149,6 +149,11 @@ struct fed_advert;
  * could not have. */
 struct fed_rnick;
 
+/* 4.3's inbound resync shadow: one transaction's staged records. Defined in
+ * federation/burst.c and held as an opaque pointer on server_t (see the
+ * field), so this header names it and nothing more. */
+struct burst_shadow;
+
 /* The version string this build reports in 002, 004 and PONG.
  *
  * It lives here, and not in the node's own banner, so that there is exactly
@@ -158,6 +163,23 @@ struct fed_rnick;
  * system -- Phase 6 owns that, and it will want a real version/identity
  * surface -- it is the single constant the Phase 3 numerics need. */
 #define IRC_SERVE_VERSION "irc-serve-0.1.0"
+
+/* Issue #173: the federation secret bound. The DOCUMENTED bound lives in
+ * federation/link.h (why 128, why refused-not-truncated); this is the same
+ * number, guarded, so server_t can carry the secret itself. link.h's #ifndef
+ * keeps the same value, so the two cannot disagree: whichever header is seen
+ * first wins and both spell the same bound. */
+#ifndef IRC_FED_MAX_SECRET
+#define IRC_FED_MAX_SECRET 128
+#endif
+
+/* Issue #173: the width of server_t::fed_rejected. It is indexed by
+ * federation/link.h's fed_federate_result_t, whose members are link.c's
+ * FED_RESULT_COUNT (11: FED_OK plus ten rejections). The enum cannot be seen
+ * from here -- link.h includes this file, so including it back would be a
+ * cycle -- so the width is a literal with a preprocessor #error tie at the
+ * definition (link.c) rather than a second spelling nobody checks. */
+#define IRC_FED_REJECT_REASONS 11
 
 /* The node-wide channel cap (issue #169): the most chan_t objects one node
  * will hold at once. The per-connection cap (CONN_MAX_CHANNELS, 128) bounds
@@ -1160,6 +1182,55 @@ struct server {
      * number for it would be one more place for the two to disagree. */
     struct account_store *account_store;
     uint64_t  n_account_refused;
+
+    /* ------------------------------------------------------------------------
+     * Issue #173: per-node federation and resume configuration and state.
+     * ------------------------------------------------------------------------
+     *
+     * Everything here used to be a file-static global in federation/link.c
+     * (the secret, the wrapped dispatch, the four link timers, the three
+     * reconnect intervals and the per-reason rejection breakdown),
+     * federation/burst.c (the inbound resync shadow and its byte budget) and
+     * core/resume.c (the session window length). One node per process made
+     * that invisible; two server_t in one process made it wrong -- the second
+     * fed_open() was refused outright and every timer override hit every node
+     * at once. The node is what this struct is, so the node's secret, its
+     * timers and its transaction state live on it, seeded to the shipped
+     * defaults by server_init() and stored by fed_open().
+     *
+     * core/poll_loop.c's g_stop is deliberately NOT here: it is written from
+     * a signal handler, and signals are delivered to the PROCESS rather than
+     * to a node, so no server_t can own it. See that file. */
+    server_dispatch_fn fed_inner;  /* dispatch fed_open() wrapped; NULL until open */
+    int      fed_opened;           /* fed_open() ran on this node */
+    char     fed_secret[IRC_FED_MAX_SECRET];
+    size_t   fed_secret_len;
+    uint64_t fed_dial_ms;          /* DIAL_CONNECTING deadline (link.h default) */
+    uint64_t fed_hs_ms;            /* HANDSHAKE_SENT deadline (link.h default) */
+    uint64_t fed_advertise_ms;     /* ADVERTISE period, 0 disables (link.h default) */
+    uint64_t fed_keepalive_ms;     /* ESTABLISHED probe period (link.h default) */
+    uint64_t fed_dead_ms;          /* ESTABLISHED silence limit (link.h default) */
+    uint64_t fed_retry_base_ms;    /* reconnect ladder base (link.h default) */
+    uint64_t fed_retry_max_ms;     /* reconnect ladder ceiling (link.h default) */
+    unsigned fed_retry_budget;     /* consecutive failures before giving up */
+    /* The per-reason rejection breakdown, indexed by fed_federate_result_t
+     * (link.h). FED_OK's slot is never written: an accepted claim is not a
+     * rejection. Width is IRC_FED_REJECT_REASONS, asserted against link.c's
+     * FED_RESULT_COUNT at the definition. */
+    uint64_t fed_rejected[IRC_FED_REJECT_REASONS];
+    /* 4.3's staging bound for THIS node (burst.h default): a burst that does
+     * not fit is refused in full rather than truncated. */
+    size_t   burst_max_bytes;
+    /* 4.3's inbound resync shadow. Opaque here for the same reason the dedup
+     * table is: burst.c owns the record layout and this struct holds only the
+     * pointer. Allocated by burst.c on the first SBURST BEGIN, released by
+     * fed_burst_close() from server_shutdown(); NULL means no transaction has
+     * ever been staged on this node. */
+    struct burst_shadow *burst;
+    /* The session window length for THIS node (resume.h default), in
+     * milliseconds. resume_set_window() writes it; the sweep, the hold and
+     * the grace derive from it. */
+    uint64_t resume_window_ms;
 
     int       trace;             /* emit [observable] per-line output */
 };

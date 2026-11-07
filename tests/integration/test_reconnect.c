@@ -105,7 +105,7 @@
  * IRC_RESUME_WINDOW_MS = 120000, so waiting out a real expiry would be a
  * two-minute test on a good runner and a five-minute one on a loaded CI box.
  *
- * The child calls resume_set_window(400) and the expiry case waits for the
+ * The child calls resume_set_window(s, RESUME_WINDOW_MS) on its node and the expiry case waits for the
  * node's own `session_resume_miss: ... reason=EXPIRED` line. Every other number
  * in this file is the shipped one, and -- this is the part that matters -- the
  * thing being tested is not the LENGTH. It is:
@@ -200,9 +200,9 @@ static void child_setup(server_t *s)
     /* The window, shortened. Set before anything can drop a client, which is
      * before any socket is accepted, so there is no window in which a client
      * could be recorded against the shipped length. */
-    resume_set_window(RESUME_WINDOW_MS);
+    resume_set_window(s, RESUME_WINDOW_MS);
     printf("[fixture] resume_window_ms=%llu\n",
-           (unsigned long long)resume_window_ms());
+           (unsigned long long)resume_window_ms(s));
 }
 
 /* Register a client and drain with a UNIQUE token, so that every later wait on
@@ -975,7 +975,7 @@ static void case_a_dropped_client_gets_its_channels_back(void)
 
     /* AND THE HOLD ON THE CHANNELS WAS RELEASED BEFORE THE WINDOW WAS RETIRED,
      * which is the ordering that keeps 2.2's disposal rule true. The hold is
-     * resume_hold_ms() -- window/2 clamped into [1000ms, 5000ms], so 1000 ms here
+     * resume_hold_ms(s) -- window/2 clamped into [1000ms, 5000ms], so 1000 ms here
      * -- and it is well inside the 1500 ms window, so the node's own two lines
      * are in this order and the assertion is about the order rather than about
      * either line existing. A hold as long as the window would delay a channel's

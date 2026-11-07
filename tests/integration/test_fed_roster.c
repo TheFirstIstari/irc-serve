@@ -156,7 +156,7 @@ static void child_setup(server_t *s)
      * 5000 is 100 poll ticks of POLL_TICK_MS, which is the shipped handshake
      * default. The happy path still completes in two ticks, so nothing waits
      * longer -- these budgets only bound the failure case. */
-    fed_set_timeouts(5000, 5000, 30000, 90000);
+    fed_set_timeouts(s, 5000, 5000, 30000, 90000);
 
     if (g_peer_port <= 0) {
         /* The accepting side. No peer is configured, and that IS the

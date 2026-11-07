@@ -288,7 +288,7 @@
  * BUILD-time default and it is not how a test uses it -- every case in
  * tests/integration/test_fed_handshake.c lives in ONE executable, so a
  * compile-time value would make a 5-second wait a property of the binary
- * rather than of the case. fed_set_timeouts() below is the per-process
+ * rather than of the case. fed_set_timeouts() below is the per-node
  * override those cases use, and they call it in the CHILD, after fork, which
  * is why "in the child's own process" is a real statement and not a
  * description.
@@ -387,7 +387,7 @@
  *
  * The #ifndef is for the reason the four timers above have it, and the two
  * mechanisms must not be confused: a BUILD-time default serves a deployment,
- * and a per-process override serves a test whose case must not make the next
+ * and a per-node override serves a test whose case must not make the next
  * case wait out real backoff. fed_set_retry() below is the override, and a
  * compile-time value would make a schedule a property of the binary -- every
  * case in one test executable sharing it -- which is the difference between a
@@ -604,8 +604,8 @@ fed_federate_result_t fed_check_federate(const server_t *s,
  * peers are unauthenticated; it is a node that federates with nobody. The
  * operator-facing text is in node_main.c's --help and on its startup line, and
  * both say the same thing. Returns 0 on success, -1 on a NULL node, a secret
- * longer than IRC_FED_MAX_SECRET - 1, or a second call for a DIFFERENT node in
- * the same process (see the module-state note below).
+ * longer than IRC_FED_MAX_SECRET - 1, or a second call for the SAME node
+ * (which would wrap the wrapper and recurse).
  *
  * IT DOES NOT INSTALL THE TICK. srv.on_tick = fed_tick is a separate, visible
  * assignment in node_main.c, so that a reader of the node can see the loop's
@@ -613,35 +613,41 @@ fed_federate_result_t fed_check_federate(const server_t *s,
  * opens the module and does not install the tick can accept a peer and can
  * never notice one going away; that is a real hazard and it is visible.
  *
- * MODULE STATE, AND WHY IT IS SAFE HERE: the saved inner dispatch and the
- * secret are file-static, so this module is ONE NODE PER PROCESS. That is true
- * of the shipped binary and of every fixture in the test harness, and the
- * refusal above makes it a diagnosed condition rather than a silent one -- a
- * second node in the same process would otherwise chain a second wrapper round
- * the first. A second call for the SAME node is also refused, because it would
- * wrap the wrapper and recurse.
+ * PER-NODE STATE (issue #173): the secret and the saved inner dispatch are
+ * fields on server_t, seeded by server_init(), so a second node in the same
+ * process is an ordinary second caller rather than a refusal. A second call
+ * for the SAME node is still refused, because it would wrap the wrapper and
+ * recurse.
  */
 int fed_open(server_t *s, const char *secret);
 
-/* Override the three link timers for THIS PROCESS. A 0 argument keeps the
- * built-in. Call it before the loop is armed; the values are read on every
- * comparison, so calling it later is legal but would apply mid-flight.
+/* Unwrap the dispatch fed_open() installed and forget this node's secret, so
+ * a server_t that is shut down can be re-opened and no credential outlives
+ * the node. Safe on a node that never called fed_open(), and on NULL. Called
+ * from server_shutdown(), after the fed_send_shutdown() goodbye. */
+void fed_close(server_t *s);
+
+/* Override the three link timers for THIS NODE. A 0 argument keeps the
+ * current value, which server_init() seeded with the built-in. Call it before
+ * the loop is armed; the values are read on every comparison, so calling it
+ * later is legal but would apply mid-flight.
  *
- * This is the per-process half of the #ifndef guards above, and the reason
+ * This is the per-node half of the #ifndef guards above, and the reason
  * both exist is in the header: a build default serves a deployment, and a
- * per-process override serves a test whose case must not make the next case
+ * per-node override serves a test whose case must not make the next case
  * wait. `dead_ms` is passed separately rather than derived from
  * `keepalive_ms` so that a case can declare a liveness threshold on its own
  * terms -- and a caller that wants the shipped relationship should pass
  * 3 * keepalive_ms, which is what IRC_FED_DEAD_MS already is. */
-void fed_set_timeouts(uint64_t dial_ms, uint64_t hs_ms, uint64_t keepalive_ms,
-                      uint64_t dead_ms);
+void fed_set_timeouts(server_t *s, uint64_t dial_ms, uint64_t hs_ms,
+                       uint64_t keepalive_ms, uint64_t dead_ms);
 
 /* ---------------------------------------------------------------------------
  * fed_hs_due: T2's DEADLINE, as a predicate, and why it is not inline
  * ---------------------------------------------------------------------------
- * Returns non-zero when a handshake stamped `created_ms` has had the handshake
- * timeout (fed_set_timeouts()'s `hs_ms`, or IRC_FED_HS_TIMEOUT_MS) by `now_ms`.
+ * Returns non-zero when a handshake stamped `created_ms` has had this node's
+ * handshake timeout (fed_set_timeouts()'s `hs_ms`, or IRC_FED_HS_TIMEOUT_MS)
+ * by `now_ms`.
  * `created_ms == 0` means no attempt is stamped, so nothing is due; that is the
  * reset case link.c's fed_link_reset() creates and T2's own `!= 0u` guard used
  * to spell out.
@@ -678,9 +684,9 @@ void fed_set_timeouts(uint64_t dial_ms, uint64_t hs_ms, uint64_t keepalive_ms,
  * intermittently, and a defect that can only be observed by winning a race
  * cannot be regression-tested at all.
  */
-int fed_hs_due(uint64_t created_ms, uint64_t now_ms);
+int fed_hs_due(const server_t *s, uint64_t created_ms, uint64_t now_ms);
 
-/* Override the three RECONNECT intervals for THIS PROCESS. A 0 argument keeps
+/* Override the three RECONNECT intervals for THIS NODE. A 0 argument keeps
  * the built-in, on the same terms as fed_set_timeouts() above.
  *
  * IT EXISTS BECAUSE A BACKOFF TEST THAT CANNOT SHORTEN ITS OWN LADDER IS A
@@ -700,7 +706,7 @@ int fed_hs_due(uint64_t created_ms, uint64_t now_ms);
  * retry" cannot say so here -- that is deliberate, because a policy with a
  * disable switch is a policy whose default is the thing under test. A test that
  * wants the old no-redial behaviour asserts on the budget being SPENT. */
-void fed_set_retry(uint64_t base_ms, uint64_t max_ms, unsigned budget);
+void fed_set_retry(server_t *s, uint64_t base_ms, uint64_t max_ms, unsigned budget);
 
 /* Configure a peer: a name, and its PRE-RESOLVED address.
  *
@@ -997,7 +1003,7 @@ int fed_send_squit_named(server_t *s, const char *server, const server_link_t *d
  * own deadline, and the shipped value is chosen for a mesh where a stale load
  * figure is not worth a line. The ADVERTISE is ALSO sent once on establishment,
  * which is the half that matters for a peer that has just arrived. */
-void fed_set_advertise_interval(uint64_t ms);
+void fed_set_advertise_interval(server_t *s, uint64_t ms);
 
 void fed_link_reset(server_t *s, server_link_t *link);
 

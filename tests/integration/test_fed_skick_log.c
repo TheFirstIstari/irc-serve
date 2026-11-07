@@ -130,7 +130,7 @@ static void child_setup(server_t *s)
      * breaks is noticed rather than being carried into the next probe -- and this
      * test's three probes are milliseconds apart, so a tighter value would only
      * make the module's own traffic land between them. */
-    fed_set_timeouts(5000, 5000, 30000, 90000);
+    fed_set_timeouts(s, 5000, 5000, 30000, 90000);
 
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;

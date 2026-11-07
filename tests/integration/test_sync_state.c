@@ -163,8 +163,8 @@ static void child_setup(server_t *s)
                  "fed_open() failed in the child; a node with an unopenable "
                  "federation module cannot reach any assertion in this test");
     s->on_tick = fed_tick;
-    fed_set_timeouts(2000, 2000, KEEPALIVE_MS, DEAD_MS);
-    fed_set_retry(RETRY_BASE_MS, RETRY_MAX_MS, RETRY_BUDGET);
+    fed_set_timeouts(s, 2000, 2000, KEEPALIVE_MS, DEAD_MS);
+    fed_set_retry(s, RETRY_BASE_MS, RETRY_MAX_MS, RETRY_BUDGET);
 
     if (g_cfg.peer_name != NULL && g_cfg.peer_port > 0) {
         memset(&addr, 0, sizeof addr);
