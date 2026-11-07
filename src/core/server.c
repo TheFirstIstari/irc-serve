@@ -902,6 +902,14 @@ void server_shutdown(server_t *s)
     free(s->by_fd);
     s->by_fd = NULL;
     s->nconns = 0;
+    /* The enumeration goes with the index it enumerates. Every conn above was
+     * closed through server_close_conn(), so this is normally already empty;
+     * freed unconditionally because a node that never held a connection holds
+     * NULL here either way. */
+    free(s->active_fds);
+    s->active_fds = NULL;
+    s->nactive = 0;
+    s->active_cap = 0;
 }
 
 int server_listen(server_t *s, int port)
@@ -1240,6 +1248,19 @@ int server_add_conn(server_t *s, conn_t *c)
     if (s->by_fd[c->fd] != NULL) {
         return -1;
     }
+    /* The active list grows BEFORE anything is registered, so a failed
+     * realloc leaves the node exactly as it was: by_fd untouched, nconns
+     * untouched. Growth is geometric, like dials. */
+    if (s->nactive == s->active_cap) {
+        size_t want = (s->active_cap == 0) ? 16u : s->active_cap * 2u;
+        int *grown = (int *)realloc(s->active_fds, want * sizeof *grown);
+
+        if (grown == NULL) {
+            return -1;
+        }
+        s->active_fds = grown;
+        s->active_cap = want;
+    }
     /* Phase 12: the conn acquires its NODE here, which is the only writer. The TLS
      * backend needs the node's SSL_CTX and the call site that starts a handshake
      * -- conn_pump(), from inside the connection layer -- has no server_t. See
@@ -1247,6 +1268,7 @@ int server_add_conn(server_t *s, conn_t *c)
      * and the backend treats that as "not configured" rather than dereferencing. */
     c->owner = s;
     s->by_fd[c->fd] = c;
+    s->active_fds[s->nactive++] = c->fd;
     s->nconns++;
     s->n_accepted++;
     return 0;
@@ -1364,6 +1386,7 @@ int server_accept_one(server_t *s)
 void server_close_conn(server_t *s, int fd)
 {
     conn_t *c = server_conn(s, fd);
+    size_t i;
 
     if (c == NULL) {
         return; /* unregistered: a second close is a no-op, not a double close */
@@ -1402,9 +1425,17 @@ void server_close_conn(server_t *s, int fd)
 
     /* Detach from the registry BEFORE closing, so a descriptor the OS reuses
      * between the close() and the next poll iteration cannot resolve to this
-     * conn. */
+     * conn. The active list loses the fd in the same breath, by swap-remove:
+     * order is insignificant, so the last entry fills the hole in O(1) with
+     * no shift and no compaction pass. */
     s->by_fd[fd] = NULL;
     s->nconns--;
+    for (i = 0; i < s->nactive; i++) {
+        if (s->active_fds[i] == fd) {
+            s->active_fds[i] = s->active_fds[--s->nactive];
+            break;
+        }
+    }
 
     /* Retire the connection from the nick index, and through the ONE function
      * that does it. This is the whole of issue #102: the close used to remove
@@ -1484,16 +1515,25 @@ int server_queue(server_t *s, conn_t *c, const char *data, size_t len)
 
 int server_reap(server_t *s)
 {
-    size_t i;
+    size_t i = 0;
     int closed = 0;
 
     if (s == NULL || s->by_fd == NULL) {
         return 0;
     }
-    for (i = 0; i < SERVER_FD_TABLE; i++) {
-        if (s->by_fd[i] != NULL && s->by_fd[i]->state == CONN_CLOSING) {
-            server_close_conn(s, (int)i);
+    /* The reaper walks the active list, not the flat table: O(nconns) per
+     * tick. server_close_conn() swap-removes, so after a close the index is
+     * re-examined rather than advanced -- the entry now sitting there has not
+     * been looked at yet. */
+    while (i < s->nactive) {
+        int fd = s->active_fds[i];
+        conn_t *c = server_conn(s, fd);
+
+        if (c != NULL && c->state == CONN_CLOSING) {
+            server_close_conn(s, fd);
             closed++;
+        } else {
+            i++;
         }
     }
     return closed;
