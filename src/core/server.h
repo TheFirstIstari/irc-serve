@@ -747,13 +747,20 @@ struct server {
     uint64_t  n_fed_malformed;     /* arity or field validation refused it    */
     /* The drop the guard chain took at the dedup guard, and the store's own
      * count of the same event. They are incremented together at G7 and are
-     * equal on any node this build produces; they are two names for one fact
-     * on purpose, because they are read at two different levels -- a loop test
-     * asserts on the guard's drop, and a dedup test asserts on the store's --
-     * and a difference between them would be a real bug in the chain rather
-     * than a number nobody looked at. */
+     * equal on any node whose n_fed_dedup_error is 0; they are two names for
+     * one fact on purpose, because they are read at two different levels --
+     * a loop test asserts on the guard's drop, and a dedup test asserts on
+     * the store's -- and a difference between them is either a store error
+     * (counted below) or a real bug in the chain rather than a number nobody
+     * looked at. */
     uint64_t  n_fed_dup_drop;
     uint64_t  n_fed_dedup_dup;
+    /* The G7 drop that was NOT a duplicate: fed_dedup_seen() answered -1, so
+     * the store could not record (allocation failure, or full past eviction).
+     * It is not counted in n_fed_dedup_dup -- a climbing dup counter under
+     * memory pressure is what #174 removes -- but it is still a guard drop, so
+     * n_fed_dup_drop counts it. Logged as fed_dedup_error, not fed_duplicate. */
+    uint64_t  n_fed_dedup_error;
 
     /* ------------------------------------------------------------------------
      * Phase 6 C5: a peer that says THIS NODE is gone. federation/verbs.c's

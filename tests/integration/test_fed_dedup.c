@@ -8,7 +8,8 @@
  * one sentence: a node must not handle the same (origin, epoch, id) twice, and
  * it must not forward a message that would come back.
  *
- *   A. THE STORE. fed_dedup_seen()'s 1/0 contract, the LRU's TTL, the sweep
+ *   A. THE STORE. fed_dedup_seen()'s tri-state contract (0 new, 1 duplicate,
+ *      -1 store error; the error arm is test_dedup_error.c's), the LRU's TTL,
  *      throttle, the capacity eviction, and the case-fold on the key. Asserted
  *      on RETURN VALUES, which is what 7/Contributing calls observable
  *      behaviour, so nothing here reads a struct field to decide whether the
