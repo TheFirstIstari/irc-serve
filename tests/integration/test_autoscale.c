@@ -404,9 +404,9 @@ static void child_setup(server_t *s)
     s->on_tick = fed_tick;
 
     /* A 0 argument keeps the built-in, so this is safe to call unconditionally. */
-    fed_set_timeouts(g_cfg.dial_ms, g_cfg.hs_ms, g_cfg.keepalive_ms, g_cfg.dead_ms);
+    fed_set_timeouts(s, g_cfg.dial_ms, g_cfg.hs_ms, g_cfg.keepalive_ms, g_cfg.dead_ms);
     if (g_cfg.retry_base_ms != 0u) {
-        fed_set_retry(g_cfg.retry_base_ms, g_cfg.retry_max_ms, g_cfg.retry_budget);
+        fed_set_retry(s, g_cfg.retry_base_ms, g_cfg.retry_max_ms, g_cfg.retry_budget);
     }
     /* THIS NODE'S OWN LOAD FIGURE, and it is a KNOB rather than a measurement --
      * see fed_set_load()'s comment, which is the reason this whole feature cannot
@@ -424,7 +424,7 @@ static void child_setup(server_t *s)
     /* Set in EVERY child, not just the publishing one, so the second advertisement
      * (the one that CHANGES the figure and exercises the edge latch) is inside this
      * test's deadline. See the file header's "what is shortened". */
-    fed_set_advertise_interval(ADVERTISE_MS);
+    fed_set_advertise_interval(s, ADVERTISE_MS);
     for (size_t i = 0; i < sizeof g_cfg.peers / sizeof g_cfg.peers[0]; i++) {
         struct sockaddr_in sa;
 

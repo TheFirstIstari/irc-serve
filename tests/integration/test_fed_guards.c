@@ -161,7 +161,7 @@ static void child_setup(server_t *s)
      * handful of lines over a few seconds, and shortening the keepalive would
      * put PINGs on the peer link that the test's own sends would have to be
      * distinguished from. */
-    fed_set_timeouts(1000, 5000, 30000, 90000);
+    fed_set_timeouts(s, 1000, 5000, 30000, 90000);
 
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;

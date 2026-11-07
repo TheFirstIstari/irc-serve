@@ -294,13 +294,13 @@ static void child_setup(server_t *s)
 
     /* A 0 argument keeps the built-in, so this is safe to call unconditionally
      * and a node that wants the shipped values says nothing. */
-    fed_set_timeouts(g_cfg.dial_ms, g_cfg.hs_ms, g_cfg.keepalive_ms, g_cfg.dead_ms);
+    fed_set_timeouts(s, g_cfg.dial_ms, g_cfg.hs_ms, g_cfg.keepalive_ms, g_cfg.dead_ms);
     /* NO fed_set_load() CALL, and the omission is deliberate: the function is
      * declared and never defined, so a call here would not link. The consequence
      * for this file is that the figure this node publishes is the zero
      * server_init() left behind -- see LOAD_OUT_TEXT. */
     if (g_cfg.retry_base_ms != 0u) {
-        fed_set_retry(g_cfg.retry_base_ms, g_cfg.retry_max_ms, g_cfg.retry_budget);
+        fed_set_retry(s, g_cfg.retry_base_ms, g_cfg.retry_max_ms, g_cfg.retry_budget);
     }
     for (size_t i = 0; i < sizeof g_cfg.peers / sizeof g_cfg.peers[0]; i++) {
         struct sockaddr_in sa;
