@@ -190,6 +190,8 @@ irc_add_integration_test(test_readiness_intent test_readiness_intent.c)
 # 3.4: bounded write queues; a saturated link is dropped and nobody else is.
 irc_add_integration_test(test_writeq_overflow test_writeq_overflow.c)
 
+# MT 2.1 (#240): --writers N flag and the server_set_writer_threads() seam.
+irc_add_integration_test(test_writers_flag test_writers_flag.c)
 # 3.4: explicit fd >= FD_SETSIZE rejection at the accept site.
 irc_add_integration_test(test_fdsize_reject test_fdsize_reject.c)
 

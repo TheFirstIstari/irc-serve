@@ -240,7 +240,7 @@ static void usage(FILE *out, const char *argv0)
     fprintf(out, "            [--tls-cert PATH --tls-key PATH] [--tls-ca PATH]\n");
     fprintf(out, "            [--tls-port PORT] [--tls-require] [--tls-insecure]\n");
     fprintf(out, "            [--tls-ocsp-staple PATH] [--tls-staple-permissive]\n");
-    fprintf(out, "            [--tls-sts-duration SECONDS]\n");
+    fprintf(out, "            [--tls-sts-duration SECONDS] [--writers N]\n");
     fprintf(out, "\n");
     fprintf(out, "  port   TCP port to listen on, 0-%d; 0 asks the kernel for\n"
                  "         an ephemeral port and reports which one it chose\n",
@@ -453,6 +453,10 @@ static void usage(FILE *out, const char *argv0)
                  "         administrator DELIBERATELY chooses an expiry rather than\n"
                  "         inheriting one. 0 advertises no persistence policy; it\n"
                  "         does not disable TLS or STARTTLS.\n");
+    fprintf(out, "\n");
+    fprintf(out, "  --writers N\n"
+                 "         writer threads for the write drain (MT 2.1). Default 0,\n"
+                 "         the single-threaded drain; the only mode so far.\n");
     fprintf(out, "\n");
     fprintf(out, "  --help  print this text and exit\n");
     fprintf(out, "\n");
@@ -716,6 +720,8 @@ typedef struct {
      * ERROR rather than a setting that quietly does nothing -- see main(). */
     char        tls_peers[NODE_MAX_PEERS][IRC_MAX_SERVER_NAME + 1];
     int         ntls_peers;
+    /* MT 2.1 (#240): writer thread count; 0 = single-threaded (only mode yet). */
+    int         writers;
 } node_opts_t;
 
 static void opts_defaults(node_opts_t *o)
@@ -814,7 +820,7 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
             strcmp(arg, "--secret-file") == 0 ||
             strcmp(arg, "--peer") == 0 || strcmp(arg, "--sasl-store") == 0 ||
             strcmp(arg, "--account-store") == 0 ||
-            strcmp(arg, "--user") == 0 ||
+            strcmp(arg, "--user") == 0 || strcmp(arg, "--writers") == 0 ||
             strcmp(arg, "--peer-tls") == 0 || strcmp(arg, "--tls-cert") == 0 ||
             strcmp(arg, "--tls-key") == 0 || strcmp(arg, "--tls-ca") == 0 ||
             strcmp(arg, "--tls-ocsp-staple") == 0 ||
@@ -923,6 +929,18 @@ static int parse_args(int argc, char **argv, node_opts_t *o)
                 return -1;
             }
             o->tls_sts_duration = (uint32_t)seconds;
+        } else if (strcmp(arg, "--writers") == 0) {
+            char *end = NULL;
+            long n;
+
+            errno = 0;
+            n = strtol(value, &end, 10);
+            if (errno != 0 || end == value || *end != '\0' || n < 0) {
+                fprintf(stderr, "irc-serve: bad --writers: %s\n", value);
+                fprintf(stderr, "  expected a whole number, 0 or more\n");
+                return -1;
+            }
+            o->writers = (int)n;
         } else if (strcmp(arg, "--peer-tls") == 0) {
             /* The name is validated here with the SAME predicate the --peer name
              * goes through, so a --peer-tls naming something that could never be a
@@ -1136,7 +1154,8 @@ int main(int argc, char **argv)
      * lines are the contract described at the top of this file, so the trace
      * flag is on for the shipped binary. */
     srv.trace = 1;
-
+    /* MT 2.1 (#240): only 0 exists yet; nonzero runs single-threaded for now. */
+    server_set_writer_threads(&srv, opts.writers);
     /* The command surface. Phase 2 installed nothing here, which was the
      * honest state of a node with no vocabulary: the loop accepted, framed and
      * parsed and then said nothing at all. This is the assignment rather than a

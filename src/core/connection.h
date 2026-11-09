@@ -96,6 +96,7 @@
 #ifndef IRC_CORE_CONNECTION_H
 #define IRC_CORE_CONNECTION_H
 
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -1162,6 +1163,9 @@ typedef struct conn {
     char       *rbuf;              /* read buffer */
     size_t      rlen;
     size_t      rcap;
+    /* MT 2.1 (#240): guards wbuf/wlen/woff/wcap + want_write ONLY. Single-threaded
+     * loop calls conn_queue()/conn_pump() exactly as before, so no behavior change. */
+    pthread_mutex_t wq_lock;
     char       *wbuf;              /* write queue; wbuf[woff..wlen) is unsent */
     size_t      woff;
     size_t      wlen;
