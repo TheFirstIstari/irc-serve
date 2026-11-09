@@ -1,14 +1,23 @@
 /* Observable lock-free contract.
- * Design decision: concurrent-safe state transition observed via volatile
+ * Design decision: concurrent-safe state transition observed via _Atomic
  * shared state (no plumbing assertions — no internal lock variables, no
  * thread-ID plumbing). Consumer asserts only observable before/after state.
+ * _Atomic (not volatile): volatile is not synchronization, and the
+ * writer/reader pair is a C11 data race (UB) that TSan correctly reports.
  * Compiles with -Wall -Wextra -Werror -Wpedantic -std=c11.
  */
 #include <assert.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
-/* Observable shared state: minimal atomic-style observable behavior. */
-static volatile int lf_observable_state = 0;
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wpre-c11-compat"
+#pragma clang diagnostic ignored "-Watomic-implicit-seq-cst"
+#endif
+
+/* Observable shared state: atomic transition, observed atomically. */
+static _Atomic int lf_observable_state = 0;
 
 /* Concurrent writer: performs observable transition without plumbing locks. */
 static void *concurrent_writer(void *arg) {
@@ -45,3 +54,6 @@ int main(void) {
     assert(lf_observable_state == 42);
     return 0;
 }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif

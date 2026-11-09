@@ -78,15 +78,15 @@
  * IRC_DEDUP_TABLE_BYTES (~416 KiB), which is the point. */
 #define OOM_HEADROOM ((unsigned long long)(64u * 1024u))
 
-#if defined(__SANITIZE_ADDRESS__)
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
 #define DEDUP_ERR_NO_OOM 1
 #elif defined(__has_feature)
-#if __has_feature(address_sanitizer)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
 #define DEDUP_ERR_NO_OOM 1
 #endif
 #endif
 
-/* The ceiling probe runs only where it can work: Linux, without ASan. */
+/* The ceiling probe runs only where it can work: Linux, without ASan/TSan. */
 #if defined(__linux__) && !defined(DEDUP_ERR_NO_OOM)
 #define DEDUP_ERR_CEILING 1
 #endif
