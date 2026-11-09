@@ -74,6 +74,7 @@
  */
 #include "core/fanout.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -1086,7 +1087,7 @@ static int queue_prebuilt(server_t *s, conn_t *m, const char *line, size_t len)
     if (m->kind == CONN_SERVER) {
         return -1;
     }
-    if (m->state == CONN_CLOSING) {
+    if (atomic_load_explicit(&m->state, memory_order_acquire) == CONN_CLOSING) {
         return -1;
     }
     if (server_queue(s, m, line, len) != 0) {

@@ -266,7 +266,7 @@ int main(void)
     {
         message_t m;
 
-        peer->state = CONN_REG_PASS;
+        atomic_store_explicit(&peer->state, CONN_REG_PASS, memory_order_release);
         peer->nick[0] = '\0';
         TF_CHECK_MSG(message_parse("NICK intruder", &m) == 0, "parse failed");
         commands_dispatch(&s, peer, &m);
@@ -275,9 +275,9 @@ int main(void)
                      "a CONN_SERVER conn REGISTERED a nickname (\"%s\"): 2.3 "
                      "exempts a peer link from the client state machine "
                      "entirely", peer->nick);
-        TF_CHECK_MSG(peer->state == CONN_REG_PASS,
+        TF_CHECK_MSG(atomic_load_explicit(&peer->state, memory_order_acquire) == CONN_REG_PASS,
                      "a CONN_SERVER conn advanced its registration state to %d",
-                     peer->state);
+                     atomic_load_explicit(&peer->state, memory_order_acquire));
         TF_CHECK_MSG(server_nick_lookup(&s, "intruder") == NULL,
                      "a peer conn put a nickname into the user registry");
         TF_CHECK_MSG(!has_bytes(sv[1], T_ABSENT_MS), "a peer conn was answered");

@@ -96,6 +96,7 @@
 #ifndef IRC_CORE_CONNECTION_H
 #define IRC_CORE_CONNECTION_H
 
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <time.h>
@@ -916,7 +917,7 @@ typedef struct conn {
     char        user[64];
     char        host[128];
     char        realname[256];
-    int         state;             /* CONN_REG_* | CONN_CLOSING */
+    atomic_int  state;             /* CONN_REG_* | CONN_CLOSING; release/acquire */
     /* THE "A USER ARRIVED" FLAG, AND WHY IT EXISTS NOW WHEN IT DID NOT BEFORE.
      * `have_user()` used to be `c->user[0] != '\0'`, and that was sound for as
      * long as an empty ident was the ONLY way `c->user` could be empty: a
@@ -1091,8 +1092,8 @@ typedef struct conn {
      * entry whose mask is zero, so including it would only spend a slot. It is
      * reachable only for a transport that has said it wants nothing, and the
      * plaintext transport never says it (want_read is always 1). */
-    int         want_read;         /* poll() must include POLLIN */
-    int         want_write;        /* poll() must include POLLOUT */
+    atomic_int  want_read;         /* poll() must include POLLIN; release/acquire */
+    atomic_int  want_write;        /* poll() must include POLLOUT; release/acquire */
     /* PHASE 12: THE TRANSPORT this connection's bytes go through. `t_ops` is
      * NULL until conn_new() installs the plaintext ops, and `t_ctx` is the
      * transport's own state -- NULL for plaintext, the SSL* for TLS. The ops

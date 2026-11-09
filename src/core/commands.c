@@ -6,6 +6,7 @@
 #include "core/batch.h"
 #include "core/label.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -73,7 +74,7 @@ static int have_nick(const conn_t *c)
 
 int commands_registered(const conn_t *c)
 {
-    return c != NULL && c->state == CONN_REG_READY;
+    return c != NULL && atomic_load_explicit(&c->state, memory_order_acquire) == CONN_REG_READY;
 }
 
 /* ---------------------------------------------------------------------------
@@ -374,7 +375,7 @@ void commands_state_update(server_t *s, conn_t *c)
     } else {
         state = CONN_REG_PASS;
     }
-    if (state == c->state) {
+    if (state == atomic_load_explicit(&c->state, memory_order_acquire)) {
         return;
     }
     /* ------------------------------------------------------------------------
@@ -415,7 +416,7 @@ void commands_state_update(server_t *s, conn_t *c)
         printf("[observable] reg_held: fd=%d reason=SASL_FAILED\n", c->fd);
         return;
     }
-    c->state = state;
+    atomic_store_explicit(&c->state, state, memory_order_release);
     if (state == CONN_REG_READY) {
         send_welcome(s, c);
         /* THE SESSION WINDOW IS APPLIED HERE AND NOWHERE ELSE, and the position
@@ -1987,11 +1988,12 @@ static void handle_starttls(server_t *s, conn_t *c, const message_t *m)
                "reason=AFTER_CREDENTIAL\n", c->fd);
         return;
     }
-    if (c->state != CONN_REG_PASS) {
+    if (atomic_load_explicit(&c->state, memory_order_acquire) != CONN_REG_PASS) {
+        int st = atomic_load_explicit(&c->state, memory_order_acquire);
         (void)reply(s, c, "691", NULL, 0,
                     "STARTTLS failed: it is only available before registration");
         printf("[observable] starttls_refused: fd=%d reason=AFTER_REGISTRATION "
-               "state=%d\n", c->fd, c->state);
+               "state=%d\n", c->fd, st);
         return;
     }
     /* THE DISCARD, before the confirmation and not after it: a line that arrived
@@ -2772,7 +2774,7 @@ void commands_dispatch(server_t *s, conn_t *c, const message_t *m)
      * has already dropped from its poll set. Reachable: one TCP segment
      * carrying "QUIT :bye" and "PING :are you there" hands this function a
      * second line after the first has already marked the conn CLOSING. */
-    if (c->state == CONN_CLOSING) {
+    if (atomic_load_explicit(&c->state, memory_order_acquire) == CONN_CLOSING) {
         /* Measured, like poll_loop.c's `line:` and for the same reason: this is a
          * verb off a socket and a verb is an identifier, so the value is kept when
          * it is printable and withheld when it is not. */
