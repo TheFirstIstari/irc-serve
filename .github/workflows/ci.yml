@@ -292,6 +292,7 @@ jobs:
             build_type: Release
           - name: ci_macos (Debug)
             build_type: Debug
+    name: ${{ matrix.name }}
     permissions:
       contents: read
     steps:
