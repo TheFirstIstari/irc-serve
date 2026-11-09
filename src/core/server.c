@@ -713,6 +713,14 @@ int server_init(server_t *s, const char *name)
     s->writers = NULL;
     s->wq_stop = 0;
     s->writers_started = 0;
+    /* MT 2.2: reg_mu guards the registry against writer scans. Initialized
+     * here (not in writers_start) so the loop's add/close paths can take it
+     * unconditionally, even at N == 0 where it is uncontended. */
+    if (pthread_mutex_init(&s->reg_mu, NULL) != 0) {
+        server_shutdown(s);
+        return -1;
+    }
+    s->reg_started = 1;
     /* The resync shadow itself is NOT allocated here: burst.c allocates it on
      * the first SBURST BEGIN and fed_burst_close() releases it, so a node
      * with no peers pays nothing for a second node in the process not
@@ -745,6 +753,14 @@ static void writer_drain_one(server_t *s)
 {
     size_t i;
 
+    /* MT 2.2: the whole scan holds reg_mu, so the loop's add/detach cannot
+     * move active_fds/by_fd under us (TSan) and a resolved conn cannot be
+     * detached/freed mid-pump. Lock order reg_mu -> wq_lock is fixed: the
+     * pump takes wq_lock inside, never the reverse. The loop never blocks on
+     * reg_mu while holding wq_lock (fill/queue take wq_lock alone). */
+    if (s->reg_started) {
+        pthread_mutex_lock(&s->reg_mu);
+    }
     for (i = 0; i < s->nactive; i++) {
         int fd;
         conn_t *c;
@@ -755,10 +771,10 @@ static void writer_drain_one(server_t *s)
             break;
         }
         fd = s->active_fds[i];
-        c = server_conn(s, fd);
+        c = (s->by_fd != NULL && fd >= 0 && fd < SERVER_FD_TABLE) ? s->by_fd[fd] : NULL;
         /* No CLOSING skip: writers drain CLOSING conns with queued bytes too
          * (the 417-flush path leaves them for us). Only the reaper closes; a
-         * failed pump still only marks. A freed conn is gone from by_fd. */
+         * failed pump still only marks. */
         if (c == NULL) {
             continue;
         }
@@ -766,6 +782,9 @@ static void writer_drain_one(server_t *s)
             !atomic_load_explicit(&c->want_write, memory_order_acquire)) {
             continue;
         }
+        /* wlen/woff are wq_lock-guarded (loop's conn_queue vs our pump);
+         * reg_mu covers structure only, so these stay locked reads. Order
+         * reg_mu -> wq_lock holds: nothing takes them in reverse. */
         before = conn_write_pending_locked(c);
         rc = conn_pump(c);
         if (rc < 0) {
@@ -777,6 +796,9 @@ static void writer_drain_one(server_t *s)
         if (before > 0 && conn_write_pending_locked(c) > 0) {
             atomic_fetch_add_explicit(&s->n_partial_writes, 1u, memory_order_relaxed);
         }
+    }
+    if (s->reg_started) {
+        pthread_mutex_unlock(&s->reg_mu);
     }
 }
 
@@ -1155,6 +1177,13 @@ void server_shutdown(server_t *s)
     s->active_fds = NULL;
     s->nactive = 0;
     s->active_cap = 0;
+    /* MT 2.2: destroy reg_mu last among the registry arms -- every add/detach
+     * above is done, and writers were joined before the by_fd walk. Guarded:
+     * a half-built node from a failed init may never have started it. */
+    if (s->reg_started) {
+        pthread_mutex_destroy(&s->reg_mu);
+        s->reg_started = 0;
+    }
 }
 
 int server_listen(server_t *s, int port)
@@ -1484,14 +1513,21 @@ conn_t *server_conn(server_t *s, int fd)
 
 int server_add_conn(server_t *s, conn_t *c)
 {
+    int rc = -1;
+
     if (s == NULL || s->by_fd == NULL || c == NULL) {
         return -1;
     }
     if (c->fd < 0 || c->fd >= SERVER_FD_TABLE) {
         return -1; /* see SERVER_FD_TABLE: a descriptor poll() cannot name */
     }
+    /* MT 2.2: serialize against writer scans (reg_mu -> wq_lock order; the
+     * add path takes no wq_lock). */
+    if (s->reg_started) {
+        pthread_mutex_lock(&s->reg_mu);
+    }
     if (s->by_fd[c->fd] != NULL) {
-        return -1;
+        goto out;
     }
     /* The active list grows BEFORE anything is registered, so a failed
      * realloc leaves the node exactly as it was: by_fd untouched, nconns
@@ -1501,7 +1537,7 @@ int server_add_conn(server_t *s, conn_t *c)
         int *grown = (int *)realloc(s->active_fds, want * sizeof *grown);
 
         if (grown == NULL) {
-            return -1;
+            goto out;
         }
         s->active_fds = grown;
         s->active_cap = want;
@@ -1516,7 +1552,12 @@ int server_add_conn(server_t *s, conn_t *c)
     s->active_fds[s->nactive++] = c->fd;
     s->nconns++;
     s->n_accepted++;
-    return 0;
+    rc = 0;
+out:
+    if (s->reg_started) {
+        pthread_mutex_unlock(&s->reg_mu);
+    }
+    return rc;
 }
 
 int server_accept_one(server_t *s)
@@ -1672,7 +1713,15 @@ void server_close_conn(server_t *s, int fd)
      * between the close() and the next poll iteration cannot resolve to this
      * conn. The active list loses the fd in the same breath, by swap-remove:
      * order is insignificant, so the last entry fills the hole in O(1) with
-     * no shift and no compaction pass. */
+     * no shift and no compaction pass.
+     *
+     * MT 2.2: under reg_mu -- the detach (by_fd NULL + swap-remove + nconns)
+     * is the mutation writer scans race. Everything after the detach only
+     * touches this conn's own teardown (nicks/channels already handled above
+     * on the loop thread) and needs no registry lock. */
+    if (s->reg_started) {
+        pthread_mutex_lock(&s->reg_mu);
+    }
     s->by_fd[fd] = NULL;
     s->nconns--;
     for (i = 0; i < s->nactive; i++) {
@@ -1680,6 +1729,9 @@ void server_close_conn(server_t *s, int fd)
             s->active_fds[i] = s->active_fds[--s->nactive];
             break;
         }
+    }
+    if (s->reg_started) {
+        pthread_mutex_unlock(&s->reg_mu);
     }
 
     /* Retire the connection from the nick index, and through the ONE function

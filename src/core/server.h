@@ -1283,6 +1283,17 @@ struct server {
     pthread_cond_t wq_avail;      /* work may be available */
     int       wq_stop;            /* 1: writers exit after draining what they hold */
     int       writers_started;    /* 1: wq_mu/wq_avail/writers are live */
+    /* MT 2.2 (#241): registry mutex. The loop thread is the only mutator
+     * (server_add_conn / the detach half of server_close_conn), but writers
+     * resolve conns through the same by_fd/active structures -- without this
+     * the writer scan races the loop's accept/reap (TSan). Lock order is
+     * reg_mu -> wq_lock: a holder of wq_lock never takes reg_mu. The loop's
+     * own (same-thread) resolutions need no lock; only cross-thread
+     * resolve/pump paths take it. Writers hold it across resolve+pump, so a
+     * conn cannot be detached/freed mid-pump (the close handoff in #242 will
+     * replace this coarse hold with a per-conn scheme). */
+    pthread_mutex_t reg_mu;
+    int       reg_started;        /* 1: reg_mu is live */
     /* MT 2.2: reap-deferral deadline per fd (monotonic ms, 0 = none). At N > 0
      * a CLOSING conn with unsent bytes stays registered while writers drain
      * it -- but only until this deadline, so a peer that never reads cannot
