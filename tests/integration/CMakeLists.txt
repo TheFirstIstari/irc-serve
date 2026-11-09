@@ -205,6 +205,9 @@ irc_add_integration_test(test_eintr test_eintr.c)
 # gets one 417 and a close, an honest client is unaffected.
 irc_add_integration_test(test_flood_rate test_flood_rate.c)
 
+# MT 2.3 (#242): the reaper never closes a conn under a writer's wq_lock.
+irc_add_integration_test(test_close_handoff test_close_handoff.c)
+
 # 3.4: the reaper is the only close site, and a closed slot leaves nothing
 # behind. The structural half is the test below.
 irc_add_integration_test(test_reaper_close test_reaper_close.c)
