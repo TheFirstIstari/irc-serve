@@ -806,6 +806,48 @@ jobs:
           # reason it has to be spelled here rather than discovered.
           bash scripts/gate-linux-cell.sh --report-render <build/asan-coverage.log
 
+  # --- ThreadSanitizer cell (MT wave 1, #237) ---------------------------------
+  # TSan only: mutually exclusive with the ASan+UBSan build above (the CMake
+  # option refuses both at once). Linux-only -- TSan needs pthreads and a
+  # supported toolchain, and the hosted runner has both.
+  #
+  # The --writers 4 half of this cell's name lands with #240: the binary
+  # rejects unknown flags today, so the cell runs the suite under TSAN_OPTIONS
+  # (halt_on_error=1, so a race fails the run instead of printing past it).
+  ci_tsan:
+    name: ci_tsan (ThreadSanitizer)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          echo "  host   : $(uname -srm)"
+          echo "  gcc    : $(gcc --version | head -1)"
+      - name: Configure
+        run: |
+          set -euo pipefail
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=ON \
+            -DBUILD_BENCHMARK=OFF \
+            -DWITH_TLS=OFF \
+            -DIRC_TSAN=ON \
+            -DIRC_SANITIZE=OFF
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+      - name: Unit Tests
+        working-directory: build
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        shell: bash
+        run: ctest --output-on-failure --timeout 120 -j 2 | tee ctest.log
+      - name: Skip gate (ratchet)
+        run: ./scripts/check-skips.sh -b build build/ctest.log
+
   # --- The opt-in probes get COMPILED in CI, and that is the whole job -------
   # WHY THIS JOB EXISTS. `-DIRC_LSAN_PROBE=ON` builds two executables that no
   # default configuration builds: tests/integration/lsan_probe.c and
