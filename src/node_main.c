@@ -1597,7 +1597,7 @@ int main(int argc, char **argv)
            (unsigned long long)srv.n_dial_connected,
            (unsigned long long)srv.n_dial_failed,
            (unsigned long long)srv.n_pass_seen,
-           (unsigned long long)srv.n_reply_refused,
+           (unsigned long long)atomic_load_explicit(&srv.n_reply_refused, memory_order_relaxed),
            (unsigned long long)srv.n_msg_stripped,
            (unsigned long long)srv.n_link_rejected,
            (unsigned long long)srv.n_link_duplicate,

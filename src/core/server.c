@@ -769,6 +769,7 @@ static void writer_drain_one(server_t *s)
         before = conn_write_pending_locked(c);
         rc = conn_pump(c);
         if (rc < 0) {
+            atomic_fetch_add_explicit(&s->n_write_error, 1u, memory_order_relaxed);
             printf("[observable] conn_close: fd=%d reason=write_error\n", c->fd);
             conn_mark_closing(c);
             continue;
@@ -789,7 +790,14 @@ static void *writer_main(void *arg)
             pthread_mutex_unlock(&s->wq_mu);
             writer_drain_one(s);
             pthread_mutex_lock(&s->wq_mu);
-            pthread_cond_wait(&s->wq_avail, &s->wq_mu);
+            /* Re-check under the mutex: the stop broadcast between our
+             * unlock and this lock hits no waiter (we were draining), so
+             * an unconditional wait here would sleep past shutdown and
+             * hang the join. The check-then-wait is atomic under wq_mu,
+             * which the stopper also holds while setting wq_stop. */
+            if (!s->wq_stop) {
+                pthread_cond_wait(&s->wq_avail, &s->wq_mu);
+            }
         }
         pthread_mutex_unlock(&s->wq_mu);
         return NULL;
@@ -1779,7 +1787,7 @@ int server_reap(server_t *s)
             if (s->writer_threads > 0 && conn_write_pending_locked(c) > 0) {
                 uint64_t now = server_now_ms();
 
-                if (fd >= 0 && fd < 1024) {
+                if (fd >= 0 && fd < SERVER_FD_TABLE) {
                     if (s->wq_close_at[fd] == 0) {
                         s->wq_close_at[fd] = now + 2000u;
                     }
@@ -1790,7 +1798,7 @@ int server_reap(server_t *s)
                     }
                 }
             }
-            if (fd >= 0 && fd < 1024) {
+            if (fd >= 0 && fd < SERVER_FD_TABLE) {
                 s->wq_close_at[fd] = 0;
             }
             server_close_conn(s, fd);

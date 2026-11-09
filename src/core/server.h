@@ -663,8 +663,12 @@ struct server {
      * CONN_SERVER conn, to nothing, or to a connection already on its way out.
      * This one should be zero forever on a single node, so a non-zero value is
      * a bug report rather than a metric -- which is why reply() prints it
-     * whether or not tracing is on. */
-    uint64_t  n_reply_refused;
+     * whether or not tracing is on.
+     *
+     * MT 2.2 (#241): _Atomic: at N > 0 a writer can mark the target CLOSING
+     * between two lines of one loop-composed burst, so a refusal can race
+     * the composer. Same rule as the other writer-touched counters. */
+    atomic_ullong n_reply_refused;
 
     /* Relayed PRIVMSG/NOTICE texts from which a terminal-controlling byte was
      * removed: ESC, BEL, DEL, or the encoded C1 pair. msg_verbs.c's send_message()
@@ -1282,9 +1286,8 @@ struct server {
     /* MT 2.2: reap-deferral deadline per fd (monotonic ms, 0 = none). At N > 0
      * a CLOSING conn with unsent bytes stays registered while writers drain
      * it -- but only until this deadline, so a peer that never reads cannot
-     * pin a conn forever (test_reaper_close). Cleared on close/add.
-     * Indexed by fd (SERVER_FD_TABLE == FD_SETSIZE == 1024 here). */
-    uint64_t  wq_close_at[1024];
+     * pin the conn forever (test_reaper_close). Cleared on close/add. */
+    uint64_t  wq_close_at[SERVER_FD_TABLE];
 
     int       trace;             /* emit [observable] per-line output */
 };
