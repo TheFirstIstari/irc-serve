@@ -1,0 +1,44 @@
+schema: spec-driven
+
+# Project context (optional)
+# Add only constraints that should guide OpenSpec artifacts and workflows.
+# Include constraints an agent cannot infer by reading the code.
+# Keep general project documentation and discoverable codebase facts out.
+# Example:
+#   context: |
+#     Designs and tasks must cover Windows, macOS, and Linux
+#     Write all artifacts in Spanish
+context: |
+  Federated IRC server in strict C11 (src/), single-threaded poll() loop, no
+  required third-party dependencies (TLS via -DWITH_TLS=ON adds OpenSSL).
+  Multi-node from day one: nicks scoped per server (nick@server), channels
+  origin-owned, one shared client/peer dispatch path. Refusing beats queueing:
+  a node never applies channel state it cannot route to the channel's origin.
+  Quality gates: tests green, 0 warnings on gcc-16/upstream-Clang/Apple-clang
+  (-Weverything, Release+Debug), ASan+UBSan clean, CodeQL 0 open alerts.
+  Proposals MUST keep: single-threaded event loop (no threads), no new required
+  dependencies, per-connection and node-wide caps on every growth path,
+  fail-closed auth/TLS (never log-and-continue on revoked/failed auth),
+  refuse-rather-than-truncate on client-visible fields.
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always state what is out of scope
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing
