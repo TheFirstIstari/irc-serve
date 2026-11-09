@@ -32,6 +32,10 @@ with no obvious cause. That happened here in September 2026 for three weeks.
 Not required, but please read the result: `ci_macos`, `build_arch` (gcc and
 clang, Release and Debug), and `build_cachyos` (self-hosted, push to main only).
 
+Landing several PRs at once: `./scripts/merge-train.sh 12 13 14` brings each
+branch up to date and merges each as its checks go green. Never bypass
+protection to do this faster.
+
 ## Before you open a PR
 
 ```sh
