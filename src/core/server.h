@@ -1219,7 +1219,9 @@ struct server {
      *
      * core/poll_loop.c's g_stop is deliberately NOT here: it is written from
      * a signal handler, and signals are delivered to the PROCESS rather than
-     * to a node, so no server_t can own it. See that file. */
+     * to a node, so no server_t can own it. The per-node half (MT 1.5, issue
+     * #239) IS here as ::stop, for callers that can name their node. See
+     * poll_loop.c. */
     server_dispatch_fn fed_inner;  /* dispatch fed_open() wrapped; NULL until open */
     int      fed_opened;           /* fed_open() ran on this node */
     char     fed_secret[IRC_FED_MAX_SECRET];
@@ -1246,6 +1248,11 @@ struct server {
      * fed_burst_close() from server_shutdown(); NULL means no transaction has
      * ever been staged on this node. */
     struct burst_shadow *burst;
+    /* MT 1.5 (issue #239): per-node stop flag, checked alongside the
+     * process-wide g_stop in core/poll_loop.c. Plain int: the loop is still
+     * single-threaded (3.4), so no atomics yet. server_init() clears it. */
+    int       stop;
+
     /* The session window length for THIS node (resume.h default), in
      * milliseconds. resume_set_window() writes it; the sweep, the hold and
      * the grace derive from it. */

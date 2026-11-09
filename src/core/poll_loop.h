@@ -18,7 +18,8 @@
 
 /* Request a clean stop. Async-signal-safe and callable from a signal handler,
  * which is how node_main wires SIGTERM and SIGINT to it. Latched, so a signal
- * that arrives while poll() is blocked is not lost. */
+ * that arrives while poll() is blocked is not lost. Process-wide: signal
+ * handlers name no node. */
 void poll_loop_request_stop(void);
 
 /* Has a stop been requested? */
@@ -28,6 +29,16 @@ int poll_loop_stopped(void);
  * stops a loop and then starts one again -- a test process that runs a node more
  * than once, or a future embedder. poll_loop_run() never needs it. */
 void poll_loop_clear_stop(void);
+
+/* MT 1.5 (issue #239): per-node stop. request sets s->stop only (the process
+ * latch is untouched, so a sibling node in the same process keeps running);
+ * stopped is true when EITHER the process latch or this node's flag is set.
+ * poll_loop_run() loops on the per-node form. Plain int, still single-threaded. */
+void poll_loop_request_stop_for(server_t *s);
+int poll_loop_stopped_for(const server_t *s);
+
+/* Clear a node's stop flag, the per-node half of poll_loop_clear_stop(). */
+void poll_loop_clear_stop_for(server_t *s);
 
 /* Run one iteration: build the poll sets, wait up to `timeout_ms`, then do the
  * accept, read, write, dial-progress and reap work for that iteration, and

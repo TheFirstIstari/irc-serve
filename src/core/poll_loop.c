@@ -46,16 +46,18 @@
 #define RATE_BURST 256.0
 #define RATE_REFILL_PER_SEC 50.0
 
-/* The stop latch. sig_atomic_t because it is written from a signal handler
- * while the loop reads it; volatile so the read is not cached across poll().
+/* The PROCESS stop latch. sig_atomic_t because it is written from a signal
+ * handler while the loop reads it; volatile so the read is not cached across
+ * poll().
  *
  * Issue #173 deliberately leaves this global while every other module global
  * moved onto server_t: a signal handler receives only a signal number, so it
  * cannot name which node should stop, and signals are delivered to the PROCESS
- * rather than to a node in it. A per-server flag here would be a flag no
- * handler could set -- the one writer this variable has is the thing that
- * cannot take a server_t. The loop polls it and stops whichever node it is
- * driving, which is the correct scope for "the process was asked to exit". */
+ * rather than to a node in it. MT 1.5 (issue #239) adds the per-node half --
+ * server_t::stop, set via poll_loop_request_stop_for() -- for a caller that
+ * CAN name its node. poll_loop_run() loops on poll_loop_stopped_for(), which
+ * is true when EITHER is set, so a process signal still stops whichever node
+ * the loop is driving. */
 static volatile sig_atomic_t g_stop = 0;
 
 void poll_loop_request_stop(void)
@@ -71,6 +73,29 @@ int poll_loop_stopped(void)
 void poll_loop_clear_stop(void)
 {
     g_stop = 0;
+}
+
+void poll_loop_request_stop_for(server_t *s)
+{
+    if (s != NULL) {
+        /* Plain store, still single-threaded; signal handlers never touch it. */
+        s->stop = 1;
+    }
+}
+
+int poll_loop_stopped_for(const server_t *s)
+{
+    if (s != NULL && s->stop) {
+        return 1;
+    }
+    return (int)g_stop;
+}
+
+void poll_loop_clear_stop_for(server_t *s)
+{
+    if (s != NULL) {
+        s->stop = 0;
+    }
 }
 
 /* #168: refill one connection's bucket toward the burst. A stamp of 0 means
@@ -580,7 +605,7 @@ int poll_loop_run(server_t *s)
     if (s == NULL) {
         return -1;
     }
-    while (!poll_loop_stopped()) {
+    while (!poll_loop_stopped_for(s)) {
         if (poll_loop_step(s, POLL_TICK_MS) < 0) {
             return -1;
         }
