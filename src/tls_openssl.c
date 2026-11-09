@@ -67,6 +67,7 @@
  * And it is safe on a node that never configured TLS, which is every node in this
  * build by default -- s->tls is NULL until tls_backend_node_init() succeeds.
  */
+#include <assert.h>
 #include "tls_backend.h"
 
 #include <arpa/inet.h>
@@ -108,6 +109,10 @@ typedef struct tls_node {
     SSL_CTX *cli;   /* dialling role: peer links. See "THE CONTEXTS" above. */
     int      insecure; /* --tls-insecure: do NOT fail an unverifiable peer */
     int      have_ca;  /* a --tls-ca was loaded into cli */
+    /* MT 3.1 (#244): THE FREEZE. Set to 1 once init's last SSL_CTX_* call has
+     * run, never cleared. SSL_new sites assert it, so a future post-init
+     * SSL_CTX_* mutator trips a debug build instead of racing the writers. */
+    int      frozen;
     /* --tls-ocsp-staple: the DER bytes of an OCSP response for this node's own
      * certificate, read ONCE here and stapled on every server-role handshake.
      *
@@ -265,7 +270,14 @@ static ssize_t tls_fail(conn_t *c, SSL *ssl, int ret, const char *what)
  * read of OpenSSL's internal buffer with no syscall, so the extra iteration costs
  * a function call rather than a round trip to the kernel. On a plaintext
  * connection none of this exists, which is the other half of why the default
- * build is the one with no dependency in it. */
+ * build is the one with no dependency in it.
+ *
+ * MT 3.1 (#244): SERIALIZATION. Each SSL* is driven under its conn's wq_lock,
+ * which the CALLER holds -- conn_pump() across transport_send(), conn_fill()
+ * across transport_recv() (recv-side lock lands with #241). These ops take NO
+ * lock themselves: wq_lock is non-recursive, so locking here would deadlock
+ * on the only paths that reach it. The one-SSL-one-thread invariant is a
+ * caller contract, verified by ci_tsan at --writers 4. */
 static ssize_t tls_recv(conn_t *c, void *buf, size_t len)
 {
     SSL *ssl = (SSL *)c->t_ctx;
@@ -276,11 +288,34 @@ static ssize_t tls_recv(conn_t *c, void *buf, size_t len)
     if (len > (size_t)INT_MAX) {
         return TRANSPORT_FATAL;
     }
-    /* No pending loop here: conn_fill() already calls this again right
-     * away after n > 0, and want_read=1 keeps the next poll step reading.
-     * Looping with a second SSL_read() into the same buf overwrote the
-     * first record. */
+    /* MT 3.1 drain for #230: one record can decrypt to more than one read
+     * consumes, and EAGAIN with bytes still inside OpenSSL stalls (no POLLIN
+     * will re-fire). So a successful read is followed by pending reads ADVANCING
+     * the buffer -- not overwriting it -- while room remains. The first loop
+     * below replaces the old single-shot read; the old comment's warning (a
+     * second read into the SAME buf) is exactly what the advancing offset
+     * avoids. Caller holds wq_lock throughout, so the drain is atomic with
+     * the record that revealed it. */
     int n = SSL_read(ssl, buf, (int)len);
+    if (n > 0 && (size_t)n < len) {
+        /* shortcut: only loop while OpenSSL says bytes remain; one extra call
+         * per record, no syscall when empty. */
+        while (SSL_pending(ssl) > 0) {
+            int m;
+            size_t room = len - (size_t)n;
+            if (room == 0u || room > (size_t)INT_MAX) {
+                break;
+            }
+            m = SSL_read(ssl, (char *)buf + n, (int)room);
+            if (m <= 0) {
+                break; /* WANT_READ or error: report what we have; next call resumes */
+            }
+            n += m;
+            if ((size_t)n >= len) {
+                break;
+            }
+        }
+    }
 
     if (n > 0) {
         /* Publish intent BEFORE returning, as the interface requires. */
@@ -313,7 +348,8 @@ static ssize_t tls_send(conn_t *c, const void *buf, size_t len)
     if (ssl == NULL) {
         return TRANSPORT_FATAL;
     }
-    /* THE HANDSHAKE PASS. connection.c calls this once with an empty queue after
+    /* MT 3.1 (#244): caller holds wq_lock (conn_pump); takes none here.
+     * THE HANDSHAKE PASS. connection.c calls this once with an empty queue after
      * the queue has drained, and for TLS that call is the ONLY thing that can
      * start or continue a handshake: a server flight has to go out before there
      * is any application data, and there is no application data on a connection
@@ -377,7 +413,8 @@ static void tls_close(conn_t *c)
      * reliable effect is on OpenSSL's own state, and the descriptor close stays
      * where 3.4 put it: in the reaper.
      *
-     * IT DOES NOT CLOSE THE DESCRIPTOR. That is not an omission; it is the rule. */
+     * MT 3.1 (#244): single-threaded teardown -- conn_free runs on the reaper,
+     * never concurrently with a pump, so no lock is taken here. */
     (void)SSL_shutdown(ssl);
     SSL_free(ssl);
     c->t_ctx = NULL;
@@ -1574,6 +1611,9 @@ int tls_backend_node_init(tls_node_t **out, const char *cert, const char *key,
      * split that still stands in 3.x and 4.x. */
     (void)SSL_CTX_set_tlsext_status_cb(node->srv, tls_status_cb);
     (void)SSL_CTX_set_tlsext_status_arg(node->srv, node);
+    /* MT 3.1 (#244): freeze. No SSL_CTX_* mutator may run past this point; the
+     * SSL_new site asserts it in debug builds. */
+    node->frozen = 1;
 
     *out = node;
     /* ONE LINE, THE WHOLE POLICY. `verify=` is the peer-certificate policy this
@@ -1645,6 +1685,7 @@ int tls_backend_starttls_peer(conn_t *c, int as_server, const char *peer_host)
      * cast is here to prevent, since the handshake mutates the context's
      * per-connection state. */
     ctx = as_server ? node->srv : node->cli;
+    assert(node->frozen != 0); /* MT 3.1 (#244): CTX immutable post-init */
     if (ctx == NULL) {
         return -1;
     }

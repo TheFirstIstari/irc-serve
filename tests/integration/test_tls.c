@@ -1013,6 +1013,74 @@ static int has_federate(const char *buf, size_t n)
     }
     return 0;
 }
+static void case_tls_multi_record_burst(const char *cert, const char *key);
+
+/* MT 3.1 (#244, #230): a multi-record burst over one TLS connection must not
+ * stall. One TLS record can decrypt to more bytes than one SSL_read() consumes;
+ * before the pending-drain the remainder sat inside OpenSSL with no POLLIN to
+ * re-fire it, and the client stalled until it sent more. Pipelining four PINGs
+ * makes one record carry several framed lines, so all four PONGs must arrive
+ * with no further write from the client. */
+static void case_tls_multi_record_burst(const char *cert, const char *key)
+{
+    nf_node_t n;
+    char a0[] = "irc-serve";
+    char a1[] = "0";
+    char a2[] = "--name";
+    char a3[] = "irc.tls";
+    char a4[] = "--tls-port";
+    char a5[] = "0";
+    char *argv[11];
+    int tls_port = -1;
+
+    argv[0] = a0; argv[1] = a1; argv[2] = a2; argv[3] = a3;
+    argv[4] = "--tls-cert"; argv[5] = (char *)(uintptr_t)(const void *)cert;
+    argv[6] = "--tls-key"; argv[7] = (char *)(uintptr_t)(const void *)key;
+    argv[8] = a4; argv[9] = a5; argv[10] = NULL;
+    if (spawn_argv(&n, argv) != 0) {
+        check(0, "spawn a node for the multi-record burst", NULL);
+        return;
+    }
+    {
+        const char *p = strstr(n.out, "tls_port=");
+
+        tls_port = (p != NULL) ? atoi(p + 9) : -1;
+    }
+    check(tls_port > 0, "the burst node bound its own implicit-TLS port", n.out);
+    if (tls_port > 0) {
+        tf_tls_t t;
+        const char *why = NULL;
+
+        if (tf_tls_connect(&t, tls_port, cert, "irc.tls", &why) != 0) {
+            check(0, "the burst handshake succeeds",
+                  (why != NULL) ? why : "handshake failed");
+        } else {
+            int i;
+
+            check(tf_tls_send(&t, "NICK burst") == 0, "send NICK", NULL);
+            check(tf_tls_send(&t, "USER burst 0 * :Burst") == 0, "send USER", NULL);
+            check(tf_tls_expect(&t, " 001 ", 10000) == 0,
+                  "registration completes before the burst", tf_tls_buffer(&t));
+            for (i = 1; i <= 4; i++) {
+                char line[64];
+
+                (void)snprintf(line, sizeof line, "PING :burst%d", i);
+                check(tf_tls_send(&t, line) == 0, "send a pipelined PING", NULL);
+            }
+            for (i = 1; i <= 4; i++) {
+                char want[64];
+
+                (void)snprintf(want, sizeof want, "burst%d", i);
+                check(tf_tls_expect(&t, want, 10000) == 0,
+                      "every PONG in the burst arrives with no further write",
+                      tf_tls_buffer(&t));
+            }
+            tf_tls_close(&t);
+        }
+    }
+    (void)nf_stop(&n);
+    nf_free(&n);
+}
 
 static void case_peer_tls_sends_no_federate_in_clear(const char *cert,
                                                      const char *key)
@@ -1397,6 +1465,7 @@ int main(void)
              * `sts` disappear, and it is a separate spawn because the flag is read
              * once at startup. */
             case_caps_vary_by_connection(g_cert, g_key, "15552000", 15552000ul);
+            case_tls_multi_record_burst(g_cert, g_key);
             case_caps_vary_by_connection(g_cert, g_key, NULL, 0ul);
             /* The counters are published at SHUTDOWN, not per tick, so the check
              * has to come after nf_stop() rather than before it. Asking for a
