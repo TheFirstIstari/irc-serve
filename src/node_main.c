@@ -1359,7 +1359,7 @@ int main(int argc, char **argv)
      * file is a blocking call. fed_open() copies it, so the file's buffer is
      * wiped the moment the copy exists. */
     {
-        static char file_secret[IRC_FED_MAX_SECRET];
+        char file_secret[IRC_FED_MAX_SECRET];
         volatile char *wipe;
         size_t k;
 
