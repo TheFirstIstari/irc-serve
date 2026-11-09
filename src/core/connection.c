@@ -60,6 +60,7 @@ conn_t *conn_new(int fd, int kind)
     }
     c->fd = fd;
     c->kind = kind;
+    pthread_mutex_init(&c->wq_lock, NULL); /* MT 2.1: only the write queue */
     atomic_store_explicit(&c->state, CONN_REG_PASS, memory_order_release);
     /* Phase 12: the READINESS INTENT a plaintext connection starts with, and
      * the value that makes the loop's poll set for this connection byte-for-byte
@@ -120,6 +121,8 @@ void conn_free(conn_t *c)
      * OpenSSL is told about the teardown with SSL_shutdown() and then dropped;
      * the socket is closed by close() a line later in server_close_conn(). */
     transport_close(c);
+    /* MT 2.1: connections are reaped single-threaded; no lock held at free. */
+    pthread_mutex_destroy(&c->wq_lock);
     free(c->rbuf);
     free(c->wbuf);
     free(c->peer_name);
@@ -223,15 +226,20 @@ int conn_next_line(conn_t *c, char *dst, size_t dstcap, size_t *len)
 
 int conn_queue(conn_t *c, const char *data, size_t len)
 {
-    size_t pending = c->wlen - c->woff;
+    size_t pending;
+    int rc = 0;
+
+    pthread_mutex_lock(&c->wq_lock);
+    pending = c->wlen - c->woff;
 
     if (len == 0) {
-        return 0;
+        goto out;
     }
     /* The cap is on the unsent tail, and it is checked BEFORE the buffer is
      * grown, so an over-cap append is refused without allocating anything. */
     if (len > CONN_WQ_MAX - pending) {
-        return -1;
+        rc = -1;
+        goto out;
     }
 
     /* Reclaim the already-sent head before growing, so a connection that has
@@ -261,7 +269,8 @@ int conn_queue(conn_t *c, const char *data, size_t len)
 
     if (c->wlen + len > c->wcap) {
         if (buf_grow(&c->wbuf, &c->wcap, c->wlen + len, CONN_WQ_MAX) != 0) {
-            return -1;
+            rc = -1;
+            goto out;
         }
     }
     memcpy(c->wbuf + c->wlen, data, len);
@@ -271,7 +280,9 @@ int conn_queue(conn_t *c, const char *data, size_t len)
      * in connection.h: a transport's last publish predates these bytes, so it
      * cannot know they exist. See conn_queue()'s comment. */
     atomic_store_explicit(&c->want_write, 1, memory_order_release);
-    return 0;
+out:
+    pthread_mutex_unlock(&c->wq_lock);
+    return rc;
 }
 
 void conn_want(conn_t *c, int read, int write)
@@ -285,6 +296,10 @@ void conn_want(conn_t *c, int read, int write)
 
 int conn_pump(conn_t *c)
 {
+    int rc = 0;
+
+    pthread_mutex_lock(&c->wq_lock);
+    /* MT 2.1: loop still calls queue/pump single-threaded; lock changes nothing. */
     for (;;) {
         size_t pending = c->wlen - c->woff;
 
@@ -312,7 +327,8 @@ int conn_pump(conn_t *c)
             if (n == TRANSPORT_RETRY) {
                 break; /* partial write: the rest is drained on a later tick */
             }
-            return -1;
+            rc = -1;
+            goto out;
         }
     }
 
@@ -332,10 +348,13 @@ int conn_pump(conn_t *c)
         if (transport_starttls(c, 1) != 0) {
             printf("[observable] starttls_failed: fd=%d reason=HANDSHAKE_START\n",
                    c->fd);
-            return -1;
+            rc = -1;
+            goto out;
         }
     }
-    return 0;
+out:
+    pthread_mutex_unlock(&c->wq_lock);
+    return rc;
 }
 
 size_t conn_write_pending(const conn_t *c)

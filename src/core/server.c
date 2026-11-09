@@ -707,11 +707,21 @@ int server_init(server_t *s, const char *name)
     s->fed_retry_budget = (unsigned)IRC_FED_RETRY_BUDGET;
     s->burst_max_bytes = (size_t)IRC_BURST_MAX_BYTES;
     s->resume_window_ms = (uint64_t)IRC_RESUME_WINDOW_MS;
+    /* MT 2.1 (#240): single-threaded drain; no writer threads until 2b. */
+    s->writer_threads = 0;
     /* The resync shadow itself is NOT allocated here: burst.c allocates it on
      * the first SBURST BEGIN and fed_burst_close() releases it, so a node
      * with no peers pays nothing for a second node in the process not
      * sharing its transactions. */
     return 0;
+}
+
+void server_set_writer_threads(server_t *s, int n)
+{
+    if (s == NULL) {
+        return;
+    }
+    s->writer_threads = (n < 0) ? 0 : n;
 }
 
 void server_shutdown(server_t *s)

@@ -1258,6 +1258,10 @@ struct server {
      * the grace derive from it. */
     uint64_t resume_window_ms;
 
+    /* MT 2.1 (#240): writer thread count; 0 = single-threaded drain (default).
+     * Stored by server_set_writer_threads(); no threads exist yet (2b). */
+    int       writer_threads;
+
     int       trace;             /* emit [observable] per-line output */
 };
 
@@ -1645,8 +1649,11 @@ int server_dial_progress(server_t *s, const struct pollfd *pfds, size_t nfds);
 /* Number of dials currently in the table, in any state. Zero until Phase 6. */
 size_t server_dial_count(const server_t *s);
 
+/* MT 2.1 (#240): test seam for the writer pool (2b). Stores `n` (clamped to
+ * >= 0); no threads start. NULL server is a no-op. */
+void server_set_writer_threads(server_t *s, int n);
+
 /* The tick hook and the clock, called by the loop. server_tick() stamps the
  * clock, counts the invocation and forwards to s->on_tick when set. */
 void server_tick(server_t *s, uint64_t now_ms);
-
 #endif /* IRC_CORE_SERVER_H */
