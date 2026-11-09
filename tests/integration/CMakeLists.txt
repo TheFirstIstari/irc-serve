@@ -195,6 +195,9 @@ irc_add_integration_test(test_writers_flag test_writers_flag.c)
 # MT 2.2 (#241): writers own conn_pump at N > 0; reaper defers CLOSING close
 # until drained.
 irc_add_integration_test(test_writer_drain test_writer_drain.c)
+# MT 2.4 (#243): writer wakeup latency -- queued burst on an idle conn must
+# drain within one tick at N > 0, or the kick -> wakeup path lost a kick.
+irc_add_integration_test(test_writer_wakeup test_writer_wakeup.c)
 # 3.4: explicit fd >= FD_SETSIZE rejection at the accept site.
 irc_add_integration_test(test_fdsize_reject test_fdsize_reject.c)
 

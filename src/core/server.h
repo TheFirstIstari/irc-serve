@@ -1277,10 +1277,16 @@ struct server {
     int       writer_threads;
     /* Pool state; NULL/idle when writer_threads == 0. wq_avail is signalled
      * whenever a conn's want_write rises (server_queue) or the pool starts;
-     * wq_stop ends the wait so join can proceed at shutdown. */
+     * wq_stop ends the wait so join can proceed at shutdown. wq_gen is the
+     * wakeup generation, bumped under wq_mu by every kick: writers wait on
+     * the (stop, gen-changed) predicate, so a kick landing while a writer
+     * is mid-drain (not yet waiting) is still observed -- a blind wait would
+     * sleep past it and stall an idle conn's queued bytes with no further
+     * kick coming and no POLLOUT-driven pump at N > 0. */
     pthread_t *writers;          /* N thread handles, or NULL */
-    pthread_mutex_t wq_mu;        /* guards wq_avail/wq_stop below */
+    pthread_mutex_t wq_mu;        /* guards wq_avail/wq_stop/wq_gen below */
     pthread_cond_t wq_avail;      /* work may be available */
+    unsigned long wq_gen;         /* kick generation; wait predicate */
     int       wq_stop;            /* 1: writers exit after draining what they hold */
     int       writers_started;    /* 1: wq_mu/wq_avail/writers are live */
     /* MT 2.2 (#241): registry mutex. The loop thread is the only mutator
