@@ -192,6 +192,9 @@ irc_add_integration_test(test_writeq_overflow test_writeq_overflow.c)
 
 # MT 2.1 (#240): --writers N flag and the server_set_writer_threads() seam.
 irc_add_integration_test(test_writers_flag test_writers_flag.c)
+# MT 2.2 (#241): writers own conn_pump at N > 0; reaper defers CLOSING close
+# until drained.
+irc_add_integration_test(test_writer_drain test_writer_drain.c)
 # 3.4: explicit fd >= FD_SETSIZE rejection at the accept site.
 irc_add_integration_test(test_fdsize_reject test_fdsize_reject.c)
 

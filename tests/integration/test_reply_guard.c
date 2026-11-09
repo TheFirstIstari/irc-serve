@@ -49,8 +49,8 @@
  * writing to a socket itself. Every runtime invariant above would still hold
  * with such a handler in place -- it would just be wrong.
  */
+#include <stdatomic.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -139,11 +139,11 @@ int main(void)
                  "reply() queued %zu bytes for a peer conn: the refusal must "
                  "happen BEFORE anything is buffered, not after",
                  conn_write_pending(peer));
-    TF_CHECK_MSG(s.n_reply_refused == 1,
+    TF_CHECK_MSG(atomic_load_explicit(&s.n_reply_refused, memory_order_relaxed) == 1,
                  "n_reply_refused is %llu, expected 1: the refusal must be "
                  "counted, or a node that refused a peer numeric for a week "
                  "would look identical to one that never had the chance",
-                 (unsigned long long)s.n_reply_refused);
+                 (unsigned long long)atomic_load_explicit(&s.n_reply_refused, memory_order_relaxed));
     TF_CHECK_MSG(!has_bytes(sv[1], T_ABSENT_MS),
                  "bytes arrived at the far end of the socket behind a "
                  "CONN_SERVER conn. The refusal is supposed to mean no byte is "
@@ -157,9 +157,9 @@ int main(void)
                  "through a different function");
     TF_CHECK_MSG(!has_bytes(sv[1], T_ABSENT_MS),
                  "send_pong() wrote to a peer socket");
-    TF_CHECK_MSG(s.n_reply_refused == 2,
+    TF_CHECK_MSG(atomic_load_explicit(&s.n_reply_refused, memory_order_relaxed) == 2,
                  "n_reply_refused is %llu, expected 2 after the PONG",
-                 (unsigned long long)s.n_reply_refused);
+                 (unsigned long long)atomic_load_explicit(&s.n_reply_refused, memory_order_relaxed));
 
     /* ------------------------------------------------------------------------
      * The POSITIVE CONTROL, and it is the load-bearing half of this file.
@@ -210,10 +210,10 @@ int main(void)
      * whose prefix were wrong would still satisfy every other check here. */
     TF_CHECK_MSG(strstr(got, ":irc.test 433 ") == got,
                  "the numeric does not begin with the node's own name");
-    TF_CHECK_MSG(s.n_reply_refused == 2,
+    TF_CHECK_MSG(atomic_load_explicit(&s.n_reply_refused, memory_order_relaxed) == 2,
                  "n_reply_refused moved to %llu: a message that WAS sent was "
                  "counted as a refusal, or a refusal was not counted",
-                 (unsigned long long)s.n_reply_refused);
+                 (unsigned long long)atomic_load_explicit(&s.n_reply_refused, memory_order_relaxed));
 
     /* ------------------------------------------------------------------------
      * A NULL src: no client to answer, so nothing is emitted -- and that is a
@@ -367,12 +367,12 @@ int main(void)
     }
 
     /* The refusals above all happened; the positive control did not. */
-    TF_CHECK_MSG(s.n_reply_refused == 4,
+    TF_CHECK_MSG(atomic_load_explicit(&s.n_reply_refused, memory_order_relaxed) == 4,
                  "n_reply_refused is %llu, expected 4: two peer numerics, one "
                  "peer PONG, one NULL src and one CLOSING target. A different "
                  "number means a refusal path stopped refusing, or a message "
                  "that should have been sent was dropped.",
-                 (unsigned long long)s.n_reply_refused);
+                 (unsigned long long)atomic_load_explicit(&s.n_reply_refused, memory_order_relaxed));
     TF_CHECK_MSG(conn_write_pending(peer) == 0, "the peer conn has queued bytes");
 
     conn_free(peer);

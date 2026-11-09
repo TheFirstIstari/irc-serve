@@ -148,16 +148,16 @@ int conn_fill(conn_t *c)
         }
 
         room = c->rcap - c->rlen;
-        /* Phase 12: the read goes through the transport, which is where the
-         * recv() and the errno policy moved to. What is left here is the part
-         * that is about the CONNECTION rather than about the bytes: appending,
-         * the idle stamp, and the three outcomes the loop's EOF and error arms
-         * already distinguish. The buffer is never full at this point -- the
-         * block above guarantees room -- which matters for TLS: a transport with
-         * decrypted bytes already buffered returns them without touching the
-         * descriptor, and it may only do that because the caller always has
-         * somewhere to put them. */
+        /* MT 2.2 (#241, from MT31SSL's deadlock question): transport_recv()
+         * (notably TLS's SSL_read) runs under wq_lock here, matching
+         * conn_pump()'s hold around transport_send. Once writers exist the
+         * loop's SSL_read would otherwise race writers' SSL_write on the same
+         * SSL* with no serialization; OpenSSL needs external locking per
+         * SSL*. tls_send/tls_recv take no lock themselves (caller-holds
+         * precondition); this hold plus the pump's is the whole invariant. */
+        pthread_mutex_lock(&c->wq_lock);
         n = transport_recv(c, c->rbuf + c->rlen, room);
+        pthread_mutex_unlock(&c->wq_lock);
         if (n > 0) {
             c->rlen += (size_t)n;
             /* Bytes arrived, so the connection is not idle. This is the only
@@ -360,6 +360,23 @@ out:
 size_t conn_write_pending(const conn_t *c)
 {
     return c->wlen - c->woff;
+}
+
+/* MT 2.2 (#241): locked read of the pending tail, for threads that already
+ * hold no lock but need a race-free byte count (writers' before/after,
+ * reaper deferral). Takes and releases wq_lock; NOT for use inside a
+ * conn_pump critical section. */
+size_t conn_write_pending_locked(conn_t *c)
+{
+    size_t n;
+
+    if (c == NULL) {
+        return 0;
+    }
+    pthread_mutex_lock(&c->wq_lock);
+    n = c->wlen - c->woff;
+    pthread_mutex_unlock(&c->wq_lock);
+    return n;
 }
 
 void conn_mark_closing(conn_t *c)

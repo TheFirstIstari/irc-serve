@@ -1286,6 +1286,11 @@ void conn_want(conn_t *c, int read, int write);
 /* Bytes still unsent: wlen - woff. */
 size_t conn_write_pending(const conn_t *c);
 
+/* MT 2.2 (#241): locked pending read; takes wq_lock. For cross-thread
+ * checks (writer accounting, reaper deferral). NOT connection.h externals
+ * churn: one accessor, same units. */
+size_t conn_write_pending_locked(conn_t *c);
+
 /* Mark the connection CLOSING. Idempotent, and deliberately the only state
  * transition a send or read path is allowed to make. */
 void conn_mark_closing(conn_t *c);

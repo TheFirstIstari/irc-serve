@@ -59,7 +59,10 @@ static int refuse(server_t *s, const conn_t *c, const char *code,
                   const char *reason)
 {
     if (s != NULL) {
-        s->n_reply_refused++;
+        /* MT 2.2 (#241): writers mark CLOSING on send failure while the loop
+         * composes later lines of the same burst; the counter still records
+         * every refusal. */
+        atomic_fetch_add_explicit(&s->n_reply_refused, 1u, memory_order_relaxed);
     }
     printf("[observable] reply_refused: fd=%d code=%s reason=%s\n",
            (c != NULL) ? c->fd : -1, (code != NULL) ? code : "?", reason);

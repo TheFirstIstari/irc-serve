@@ -79,10 +79,22 @@ int main(void)
         server_set_writer_threads(&s, 4);
         TF_CHECK_MSG(s.writer_threads == 4, "seam did not store 4: %d",
                      s.writer_threads);
+        /* MT 2.2 (#241): start/stop lifecycle on a live pool; noop kick/stop
+         * at 0. A start failure would leave writer_threads nonzero with no
+         * drain, so the seam test asserts the round trip works. */
+        TF_CHECK_MSG(server_writers_start(&s) == 0, "pool did not start");
+        server_writers_kick(&s);
+        server_writers_kick(NULL);
+        TF_CHECK_MSG(s.writers_started == 1, "pool did not mark started");
+        server_writers_stop(&s);
+        TF_CHECK_MSG(s.writers_started == 0, "pool did not mark stopped");
+        server_writers_stop(&s); /* second stop is a no-op, must not crash */
+        server_writers_stop(NULL); /* NULL is a no-op, must not crash */
         server_set_writer_threads(&s, -1);
         TF_CHECK_MSG(s.writer_threads == 0, "seam did not clamp -1: %d",
                      s.writer_threads);
         server_set_writer_threads(NULL, 4); /* no-op, must not crash */
+        TF_CHECK_MSG(server_writers_start(NULL) == 0, "NULL start must be 0");
         server_shutdown(&s);
     }
 
