@@ -182,6 +182,11 @@
  * the other. */
 #define NODE_MAX_PEERS IRC_FED_MAX_PEERS
 
+/* MT 1.5 (issue #239): the node the loop is driving, so the stop handler can
+ * set its per-node flag alongside the process latch. Set once server_init()
+ * succeeds; signal handlers never touch it before then. */
+static server_t *g_srv_for_stop = NULL;
+
 /* SIGTERM and SIGINT stop the loop; SIGUSR1 exists so the EINTR path is
  * reachable from outside. Neither sets SA_RESTART: the handlers must interrupt
  * poll() rather than have it silently restarted, because an EINTR that the
@@ -190,6 +195,8 @@ static void on_stop_signal(int sig)
 {
     (void)sig;
     poll_loop_request_stop();
+    /* The per-node half: this process runs one node, so the signal names it. */
+    poll_loop_request_stop_for(g_srv_for_stop);
 }
 
 static void on_usr1_signal(int sig)
@@ -1124,6 +1131,7 @@ int main(int argc, char **argv)
                opts.name);
         return 1;
     }
+    g_srv_for_stop = &srv;
     /* Observable per-line framing/parse output. The node's own [observable]
      * lines are the contract described at the top of this file, so the trace
      * flag is on for the shipped binary. */
