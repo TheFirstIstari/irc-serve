@@ -64,9 +64,9 @@ static void overflow_dispatch(server_t *s, conn_t *c, const message_t *m)
         TF_CHECK_MSG(server_queue(s, c, chunk, CHUNK_BYTES) != 0,
                      "the second %u byte append should exceed the 256 KB cap",
                      CHUNK_BYTES);
-        TF_CHECK_MSG(c->state == CONN_CLOSING,
+        TF_CHECK_MSG(atomic_load_explicit(&c->state, memory_order_acquire) == CONN_CLOSING,
                      "an over-cap append must mark the connection CLOSING, "
-                     "not close it: state=%d", c->state);
+                     "not close it: state=%d", atomic_load_explicit(&c->state, memory_order_acquire));
         TF_CHECK_MSG(c->fd >= 0,
                      "the send path must not have closed the descriptor");
         free(chunk);

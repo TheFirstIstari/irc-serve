@@ -144,15 +144,15 @@ static void case_plaintext_invariant(void)
         return;
     }
 
-    check(c->want_read == 1,
+    check(atomic_load_explicit(&c->want_read, memory_order_acquire) == 1,
           "a new plaintext connection wants to be read",
           "conn_new() must publish want_read = 1");
-    check(c->want_write == 0,
+    check(atomic_load_explicit(&c->want_write, memory_order_acquire) == 0,
           "a new plaintext connection wants no writability",
           "conn_new() must publish want_write = 0 with an empty queue");
 
     check(conn_queue(c, "PING :x\r\n", 9) == 0, "queue a line", "append failed");
-    check(c->want_write == 1,
+    check(atomic_load_explicit(&c->want_write, memory_order_acquire) == 1,
           "queueing a reply raises want_write",
           "conn_queue() must raise the intent, or the reply waits for the peer "
           "to speak first");
@@ -191,7 +191,7 @@ static void case_plaintext_invariant(void)
         close(sv[1]);
         return;
     }
-    check(c->want_write == 1,
+    check(atomic_load_explicit(&c->want_write, memory_order_acquire) == 1,
           "a short write leaves want_write raised",
           "conn_pump() must not clear the intent while bytes remain: the loop "
           "would stop asking for POLLOUT and the queue would never finish "
@@ -208,11 +208,11 @@ static void case_plaintext_invariant(void)
           "a zero pending count means the earlier check passed vacuously");
     check(conn_write_pending(c) == 0u, "the queue drains once the peer reads",
           "conn_pump() stopped making progress");
-    check(c->want_write == 0,
+    check(atomic_load_explicit(&c->want_write, memory_order_acquire) == 0,
           "an empty queue lowers want_write",
           "conn_pump() must lower the intent, or the loop polls POLLOUT on a "
           "connection with nothing to send and spins");
-    check(c->want_read == 1,
+    check(atomic_load_explicit(&c->want_read, memory_order_acquire) == 1,
           "the plaintext read intent is never lowered",
           "something cleared want_read on a plaintext connection");
 
@@ -374,7 +374,7 @@ static ssize_t stalled_recv(conn_t *c, void *buf, size_t len)
     /* Publish what a parked transport publishes: no readability. want_write is
      * passed through unchanged because it is still this connection's write
      * queue's business and not the double's. */
-    conn_want(c, 0, c->want_write);
+    conn_want(c, 0, atomic_load_explicit(&c->want_write, memory_order_acquire));
     if (g_double_served != 0 || len < n) {
         return TRANSPORT_RETRY;
     }
@@ -466,7 +466,7 @@ static void stop_reading_tick(server_t *s, uint64_t now_ms)
             continue;
         }
         /* REGISTERED: NICK and USER are in. */
-        if (c->state != CONN_REG_READY) {
+        if (atomic_load_explicit(&c->state, memory_order_acquire) != CONN_REG_READY) {
             continue;
         }
         /* AND ITS WRITE QUEUE IS EMPTY, so the registration burst has actually
@@ -475,12 +475,16 @@ static void stop_reading_tick(server_t *s, uint64_t now_ms)
         if (conn_write_pending(c) > 0u) {
             continue;
         }
-        c->t_ops = &k_stalled_ops;
-        c->t_ctx = NULL;
-        conn_want(c, 0, c->want_write);
-        printf("[observable] readiness_intent_parked: fd=%d want_read=%d "
-               "want_write=%d transport=PARKED\n", fd, c->want_read,
-               c->want_write);
+        {
+            int parked_write = atomic_load_explicit(&c->want_write, memory_order_acquire);
+            c->t_ops = &k_stalled_ops;
+            c->t_ctx = NULL;
+            conn_want(c, 0, parked_write);
+            printf("[observable] readiness_intent_parked: fd=%d want_read=%d "
+                   "want_write=%d transport=PARKED\n", fd,
+                   atomic_load_explicit(&c->want_read, memory_order_acquire),
+                   atomic_load_explicit(&c->want_write, memory_order_acquire));
+        }
         g_stalled_done = 1;
         return;
     }

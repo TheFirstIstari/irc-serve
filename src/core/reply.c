@@ -17,6 +17,7 @@
  */
 #include "core/reply.h"
 
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -81,7 +82,7 @@ static int emit_to_client(server_t *s, conn_t *c, const char *code,
     }
     /* The loop has already dropped a CLOSING conn from the poll set, so
      * queued bytes would never be pumped; the reaper closes the fd instead. */
-    if (c->state == CONN_CLOSING) {
+    if (atomic_load_explicit(&c->state, memory_order_acquire) == CONN_CLOSING) {
         return refuse(s, c, code, "closing");
     }
     if (server_queue(s, c, line, len) != 0) {

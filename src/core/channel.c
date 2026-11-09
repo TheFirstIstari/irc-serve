@@ -203,7 +203,7 @@ int chan_member_is(const struct member *m, unsigned flag)
 
 int chan_member_live(const struct member *m)
 {
-    return (m != NULL && m->c != NULL && m->c->state != CONN_CLOSING) ? 1 : 0;
+    return (m != NULL && m->c != NULL && atomic_load_explicit(&m->c->state, memory_order_acquire) != CONN_CLOSING) ? 1 : 0;
 }
 
 int chan_add_member(chan_t *ch, conn_t *c, unsigned flags)

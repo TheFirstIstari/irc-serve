@@ -1597,7 +1597,7 @@ int server_reap(server_t *s)
         int fd = s->active_fds[i];
         conn_t *c = server_conn(s, fd);
 
-        if (c != NULL && c->state == CONN_CLOSING) {
+        if (c != NULL && atomic_load_explicit(&c->state, memory_order_acquire) == CONN_CLOSING) {
             server_close_conn(s, fd);
             closed++;
         } else {

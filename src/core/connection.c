@@ -60,7 +60,7 @@ conn_t *conn_new(int fd, int kind)
     }
     c->fd = fd;
     c->kind = kind;
-    c->state = CONN_REG_PASS;
+    atomic_store_explicit(&c->state, CONN_REG_PASS, memory_order_release);
     /* Phase 12: the READINESS INTENT a plaintext connection starts with, and
      * the value that makes the loop's poll set for this connection byte-for-byte
      * what it was before the intent existed. See the block in connection.h.
@@ -71,8 +71,8 @@ conn_t *conn_new(int fd, int kind)
      * being true. Nothing here talks to a transport: conn_new() installs the
      * plaintext ops below and a TLS connection's own ops publish their intent
      * the moment they exist. */
-    c->want_read = 1;
-    c->want_write = 0;
+    atomic_store_explicit(&c->want_read, 1, memory_order_release);
+    atomic_store_explicit(&c->want_write, 0, memory_order_release);
     /* ...and the transport, which is the plaintext one because a brand-new
      * conn_t has no TLS on it and the only two ways to get any are
      * transport_starttls() (a STARTTLS, or an implicit-TLS listener's accept)
@@ -270,7 +270,7 @@ int conn_queue(conn_t *c, const char *data, size_t len)
      * ONE place outside a transport that may set the intent, and the reason is
      * in connection.h: a transport's last publish predates these bytes, so it
      * cannot know they exist. See conn_queue()'s comment. */
-    c->want_write = 1;
+    atomic_store_explicit(&c->want_write, 1, memory_order_release);
     return 0;
 }
 
@@ -279,8 +279,8 @@ void conn_want(conn_t *c, int read, int write)
     if (c == NULL) {
         return;
     }
-    c->want_read = read ? 1 : 0;
-    c->want_write = write ? 1 : 0;
+    atomic_store_explicit(&c->want_read, read ? 1 : 0, memory_order_release);
+    atomic_store_explicit(&c->want_write, write ? 1 : 0, memory_order_release);
 }
 
 int conn_pump(conn_t *c)
@@ -345,7 +345,7 @@ size_t conn_write_pending(const conn_t *c)
 
 void conn_mark_closing(conn_t *c)
 {
-    c->state = CONN_CLOSING;
+    atomic_store_explicit(&c->state, CONN_CLOSING, memory_order_release);
 }
 
 size_t conn_hostmask(const conn_t *c, char *out, size_t cap)

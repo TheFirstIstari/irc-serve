@@ -654,7 +654,7 @@ void handle_who(server_t *s, conn_t *c, const message_t *m)
     for (size_t i = 0; i < server_nick_count(s); i++) {
         conn_t *who = server_nick_at(s, i);
 
-        if (who == NULL || who->nick[0] == '\0' || who->state == CONN_CLOSING) {
+        if (who == NULL || who->nick[0] == '\0' || atomic_load_explicit(&who->state, memory_order_acquire) == CONN_CLOSING) {
             continue;
         }
         if (fanout_mask_match(mask, who->nick) == 0) {

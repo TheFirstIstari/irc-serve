@@ -88,7 +88,7 @@ static void bug_report(const char *what, const conn_t *c)
 {
     printf("[fixture] BUG %s fd=%d state=%d woff=%zu wlen=%zu rlen=%zu "
            "kind=%d nick=%s\n",
-           what, c->fd, c->state, c->woff, c->wlen, c->rlen, c->kind, c->nick);
+           what, c->fd, atomic_load_explicit(&c->state, memory_order_acquire), c->woff, c->wlen, c->rlen, c->kind, c->nick);
     fflush(stdout);
 }
 
@@ -115,7 +115,7 @@ static void audit_tick(server_t *s, uint64_t now_ms)
             continue;
         }
         live++;
-        if (c->state == CONN_CLOSING) {
+        if (atomic_load_explicit(&c->state, memory_order_acquire) == CONN_CLOSING) {
             BUG("closing_survived_reap", c);
         }
         if (c->fd != i) {
@@ -131,16 +131,16 @@ static void audit_tick(server_t *s, uint64_t now_ms)
                 g_reported[c->fd] |= 2u;
                 printf("[fixture] reuse fd=%d rstate=%d roff=%zu rlen=%zu "
                        "rkind=%d rnick=%s\n",
-                       c->fd, c->state, c->woff, c->rlen, c->kind, c->nick);
+                       c->fd, atomic_load_explicit(&c->state, memory_order_acquire), c->woff, c->rlen, c->kind, c->nick);
                 fflush(stdout);
             }
-            if (c->state != CONN_REG_PASS || c->woff != 0u || c->wlen != 0u ||
+            if (atomic_load_explicit(&c->state, memory_order_acquire) != CONN_REG_PASS || c->woff != 0u || c->wlen != 0u ||
                 c->rlen != 0u || c->kind != CONN_CLIENT || c->nick[0] != '\0') {
                 BUG("reuse_dirty", c);
             }
         } else if ((g_reported[c->fd] & 1u) == 0u) {
             g_reported[c->fd] |= 1u;
-            printf("[fixture] first_conn fd=%d state=%d\n", c->fd, c->state);
+            printf("[fixture] first_conn fd=%d state=%d\n", c->fd, atomic_load_explicit(&c->state, memory_order_acquire));
             fflush(stdout);
         }
     }
@@ -179,7 +179,7 @@ static void dirty_and_drop(server_t *s, conn_t *c, const message_t *m)
                  "could not queue the dirty payload");
     conn_mark_closing(c);
     printf("[fixture] mark_closing fd=%d wlen=%zu state=%d\n", c->fd,
-           conn_write_pending(c), c->state);
+           conn_write_pending(c), atomic_load_explicit(&c->state, memory_order_acquire));
     fflush(stdout);
 }
 

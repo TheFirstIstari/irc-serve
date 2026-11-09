@@ -209,7 +209,7 @@ static void conn_on_readable(server_t *s, int fd)
     conn_t *c = server_conn(s, fd);
     int rc;
 
-    if (c == NULL || c->state == CONN_CLOSING) {
+    if (c == NULL || atomic_load_explicit(&c->state, memory_order_acquire) == CONN_CLOSING) {
         return;
     }
     rc = conn_fill(c);
@@ -338,7 +338,7 @@ static void conn_on_writable(server_t *s, int fd)
     conn_t *c = server_conn(s, fd);
     size_t before;
 
-    if (c == NULL || c->state == CONN_CLOSING) {
+    if (c == NULL || atomic_load_explicit(&c->state, memory_order_acquire) == CONN_CLOSING) {
         return;
     }
     before = conn_write_pending(c);
@@ -404,7 +404,7 @@ int poll_loop_step(server_t *s, int timeout_ms)
         conn_t *c = s->by_fd[s->active_fds[i]];
         short events = 0;
 
-        if (c == NULL || c->state == CONN_CLOSING) {
+        if (c == NULL || atomic_load_explicit(&c->state, memory_order_acquire) == CONN_CLOSING) {
             continue; /* a CLOSING conn is already out of the set */
         }
         /* PHASE 12: THE POLL SET IS NOW THE CONNECTION'S OWN INTENT, and this is
@@ -433,10 +433,10 @@ int poll_loop_step(server_t *s, int timeout_ms)
          * it would only spend a slot in POLL_MAX_FDS and make the cost of a node
          * with many parked TLS handshakes proportional to a number it does not
          * need to be. */
-        if (c->want_read) {
+        if (atomic_load_explicit(&c->want_read, memory_order_acquire)) {
             events |= POLLIN;
         }
-        if (c->want_write) {
+        if (atomic_load_explicit(&c->want_write, memory_order_acquire)) {
             events |= POLLOUT;
         }
         if (events == 0) {
@@ -460,7 +460,7 @@ int poll_loop_step(server_t *s, int timeout_ms)
         for (i = 0; i < s->nactive; i++) {
             conn_t *c = s->by_fd[s->active_fds[i]];
 
-            if (c != NULL && c->state != CONN_CLOSING && conn_has_line(c)) {
+            if (c != NULL && atomic_load_explicit(&c->state, memory_order_acquire) != CONN_CLOSING && conn_has_line(c)) {
                 timeout_ms = 0;
                 break;
             }
@@ -541,7 +541,7 @@ int poll_loop_step(server_t *s, int timeout_ms)
             if ((re & POLLIN) != 0 || conn_has_line(server_conn(s, fd))) {
                 conn_t *c = server_conn(s, fd);
 
-                if (c != NULL && c->state != CONN_CLOSING) {
+                if (c != NULL && atomic_load_explicit(&c->state, memory_order_acquire) != CONN_CLOSING) {
                     conn_on_readable(s, fd);
                 }
             }
@@ -566,7 +566,7 @@ int poll_loop_step(server_t *s, int timeout_ms)
         for (i = 0; i < s->nactive; i++) {
             conn_t *c = s->by_fd[s->active_fds[i]];
 
-            if (c != NULL && c->state != CONN_CLOSING) {
+            if (c != NULL && atomic_load_explicit(&c->state, memory_order_acquire) != CONN_CLOSING) {
                 rate_refill(c, now_ms);
             }
         }
