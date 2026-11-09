@@ -805,24 +805,30 @@ static void writer_drain_one(server_t *s)
 static void *writer_main(void *arg)
 {
     server_t *s = (server_t *)arg;
+    /* MT 2.4 (#243): wakeup-generation predicate. Each writer remembers the
+     * last generation it consumed; a kick between drain-finish and the lock
+     * bumps wq_gen, so the waiter below sees gen != seen and drains instead
+     * of sleeping past it (idle conn, no POLLOUT-driven pump at N > 0).
+     * wq_stop is part of the same predicate, so the shutdown broadcast is
+     * never mistaken for a spurious wakeup. */
+    unsigned long seen = 0ul;
 
     for (;;) {
+        /* Drain first: queued work is handled without waiting for a wakeup. */
+        writer_drain_one(s);
         pthread_mutex_lock(&s->wq_mu);
-        while (!s->wq_stop) {
-            pthread_mutex_unlock(&s->wq_mu);
-            writer_drain_one(s);
-            pthread_mutex_lock(&s->wq_mu);
-            /* Re-check under the mutex: the stop broadcast between our
-             * unlock and this lock hits no waiter (we were draining), so
-             * an unconditional wait here would sleep past shutdown and
-             * hang the join. The check-then-wait is atomic under wq_mu,
-             * which the stopper also holds while setting wq_stop. */
-            if (!s->wq_stop) {
-                pthread_cond_wait(&s->wq_avail, &s->wq_mu);
+        for (;;) {
+            if (s->wq_stop) {
+                pthread_mutex_unlock(&s->wq_mu);
+                return NULL;
             }
+            if (s->wq_gen != seen) {
+                seen = s->wq_gen;
+                break;
+            }
+            pthread_cond_wait(&s->wq_avail, &s->wq_mu);
         }
         pthread_mutex_unlock(&s->wq_mu);
-        return NULL;
     }
 }
 
@@ -849,6 +855,8 @@ int server_writers_start(server_t *s)
         return -1;
     }
     s->wq_stop = 0;
+    s->wq_gen = 1ul; /* nonzero: writers start with seen = 0, so the first
+                      * predicate check drains rather than sleeps. */
     s->writers_started = 1;
     for (i = 0; i < s->writer_threads; i++) {
         if (pthread_create(&s->writers[i], NULL, writer_main, s) != 0) {
@@ -870,7 +878,11 @@ int server_writers_start(server_t *s)
             return -1;
         }
     }
+    /* MT 2.4 (#243): bumping wq_gen turns the broadcast into a countable
+     * event; a writer that finished draining just before takes this lock,
+     * sees gen != seen, and drains again instead of losing the wakeup. */
     pthread_mutex_lock(&s->wq_mu);
+    s->wq_gen++;
     pthread_cond_broadcast(&s->wq_avail);
     pthread_mutex_unlock(&s->wq_mu);
     return 0;
@@ -882,6 +894,7 @@ void server_writers_kick(server_t *s)
         return;
     }
     pthread_mutex_lock(&s->wq_mu);
+    s->wq_gen++;
     pthread_cond_broadcast(&s->wq_avail);
     pthread_mutex_unlock(&s->wq_mu);
 }
