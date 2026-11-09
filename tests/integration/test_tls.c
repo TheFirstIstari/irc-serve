@@ -1013,30 +1013,49 @@ static int has_federate(const char *buf, size_t n)
     }
     return 0;
 }
-static void case_tls_multi_record_burst(const char *cert, const char *key);
+static void case_tls_multi_record_burst_writers(const char *cert, const char *key,
+                                               int writers);
 
-/* MT 3.1 (#244, #230): a multi-record burst over one TLS connection must not
- * stall. One TLS record can decrypt to more bytes than one SSL_read() consumes;
- * before the pending-drain the remainder sat inside OpenSSL with no POLLIN to
- * re-fire it, and the client stalled until it sent more. Pipelining four PINGs
- * makes one record carry several framed lines, so all four PONGs must arrive
- * with no further write from the client. */
+ /* MT 3.1 (#244, #230): a multi-record burst over one TLS connection must not
+  * stall. One TLS record can decrypt to more bytes than one SSL_read() consumes;
+  * before the pending-drain the remainder sat inside OpenSSL with no POLLIN to
+  * re-fire it, and the client stalled until it sent more. Pipelining four PINGs
+  * makes one record carry several framed lines, so all four PONGs must arrive
+  * with no further write from the client. */
+/* MT 3.2 (#245): the same burst at --writers 4, where the owning writer thread
+ * must drain SSL_pending() under the conn lock while the read buffer has room
+ * (the #230 stall with writers: pending bytes never re-arm POLLIN, so waiting
+ * for readiness instead of draining stalls the burst). */
 static void case_tls_multi_record_burst(const char *cert, const char *key)
 {
-    nf_node_t n;
-    char a0[] = "irc-serve";
-    char a1[] = "0";
-    char a2[] = "--name";
-    char a3[] = "irc.tls";
-    char a4[] = "--tls-port";
-    char a5[] = "0";
-    char *argv[11];
-    int tls_port = -1;
+    case_tls_multi_record_burst_writers(cert, key, 0);
+    case_tls_multi_record_burst_writers(cert, key, 4);
+}
 
-    argv[0] = a0; argv[1] = a1; argv[2] = a2; argv[3] = a3;
-    argv[4] = "--tls-cert"; argv[5] = (char *)(uintptr_t)(const void *)cert;
-    argv[6] = "--tls-key"; argv[7] = (char *)(uintptr_t)(const void *)key;
-    argv[8] = a4; argv[9] = a5; argv[10] = NULL;
+static void case_tls_multi_record_burst_writers(const char *cert,
+                                               const char *key, int writers)
+ {
+     nf_node_t n;
+     char a0[] = "irc-serve";
+     char a1[] = "0";
+     char a2[] = "--name";
+     char a3[] = "irc.tls";
+     char a4[] = "--tls-port";
+     char a5[] = "0";
+    char a6[] = "--writers";
+    char a7[] = "4";
+    char *argv[13];
+     int tls_port = -1;
+ 
+     argv[0] = a0; argv[1] = a1; argv[2] = a2; argv[3] = a3;
+     argv[4] = "--tls-cert"; argv[5] = (char *)(uintptr_t)(const void *)cert;
+     argv[6] = "--tls-key"; argv[7] = (char *)(uintptr_t)(const void *)key;
+    argv[8] = a4; argv[9] = a5;
+    if (writers > 0) {
+        argv[10] = a6; argv[11] = a7; argv[12] = NULL;
+    } else {
+        argv[10] = NULL;
+    }
     if (spawn_argv(&n, argv) != 0) {
         check(0, "spawn a node for the multi-record burst", NULL);
         return;
@@ -1046,7 +1065,14 @@ static void case_tls_multi_record_burst(const char *cert, const char *key)
 
         tls_port = (p != NULL) ? atoi(p + 9) : -1;
     }
-    check(tls_port > 0, "the burst node bound its own implicit-TLS port", n.out);
+    {
+        char what[96];
+
+        (void)snprintf(what, sizeof what,
+                       "the burst node bound its own implicit-TLS port (writers=%d)",
+                       writers);
+        check(tls_port > 0, what, n.out);
+    }
     if (tls_port > 0) {
         tf_tls_t t;
         const char *why = NULL;
