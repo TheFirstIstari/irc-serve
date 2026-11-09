@@ -193,7 +193,12 @@ add_library(irc_core STATIC
   federation/nickreg.c
 )
 
-target_link_libraries(irc_core PRIVATE pthread)
+# Portable threads linkage: find_package(Threads) resolves to -pthread on
+# glibc and to nothing extra on macOS, where pthread is in libSystem. A bare
+# `pthread` library name is not portable (it is a linker search, not a target),
+# and C11 threads.h stays unused -- the codebase calls pthread_* directly.
+find_package(Threads REQUIRED)
+target_link_libraries(irc_core PRIVATE Threads::Threads)
 
 if(WITH_TLS)
   # PUBLIC, because a test that drives a real handshake links OpenSSL headers of
