@@ -707,8 +707,12 @@ int server_init(server_t *s, const char *name)
     s->fed_retry_budget = (unsigned)IRC_FED_RETRY_BUDGET;
     s->burst_max_bytes = (size_t)IRC_BURST_MAX_BYTES;
     s->resume_window_ms = (uint64_t)IRC_RESUME_WINDOW_MS;
-    /* MT 2.1 (#240): single-threaded drain; no writer threads until 2b. */
+    /* MT 2.2 (#241): the seam default; the pool starts in server_writers_start()
+     * once the count is set (node_main / tests call the seam before serving). */
     s->writer_threads = 0;
+    s->writers = NULL;
+    s->wq_stop = 0;
+    s->writers_started = 0;
     /* The resync shadow itself is NOT allocated here: burst.c allocates it on
      * the first SBURST BEGIN and fed_burst_close() releases it, so a node
      * with no peers pays nothing for a second node in the process not
@@ -722,6 +726,155 @@ void server_set_writer_threads(server_t *s, int n)
         return;
     }
     s->writer_threads = (n < 0) ? 0 : n;
+}
+/* MT 2.2 (#241): the writer pool. One place, next to the seam: spawn, stop,
+ * and the worker live here so server.c owns the whole lifecycle.
+ *
+ * Each writer loops: wait for work, then scan the active list for a live conn
+ * with want_write set, and conn_pump() it under that conn's wq_lock. The loop
+ * thread never pumps when N > 0 (see poll_loop.c), so every send on a conn
+ * happens under exactly one holder of wq_lock at a time -- and conn_pump()
+ * itself takes that lock, so two writers can never drain the same FIFO
+ * concurrently. Order follows: bytes leave in queue order per conn.
+ *
+ * Counters: writers bump n_write_error / n_partial_writes with fetch_add;
+ * everyone else reads them with atomic loads. */
+static void *writer_main(void *arg);
+
+static void writer_drain_one(server_t *s)
+{
+    size_t i;
+
+    for (i = 0; i < s->nactive; i++) {
+        int fd;
+        conn_t *c;
+        size_t before;
+        int rc;
+
+        if (i >= s->nactive) {
+            break;
+        }
+        fd = s->active_fds[i];
+        c = server_conn(s, fd);
+        /* No CLOSING skip: writers drain CLOSING conns with queued bytes too
+         * (the 417-flush path leaves them for us). Only the reaper closes; a
+         * failed pump still only marks. A freed conn is gone from by_fd. */
+        if (c == NULL) {
+            continue;
+        }
+        if (atomic_load_explicit(&c->state, memory_order_acquire) != CONN_CLOSING &&
+            !atomic_load_explicit(&c->want_write, memory_order_acquire)) {
+            continue;
+        }
+        before = conn_write_pending_locked(c);
+        rc = conn_pump(c);
+        if (rc < 0) {
+            printf("[observable] conn_close: fd=%d reason=write_error\n", c->fd);
+            conn_mark_closing(c);
+            continue;
+        }
+        if (before > 0 && conn_write_pending_locked(c) > 0) {
+            atomic_fetch_add_explicit(&s->n_partial_writes, 1u, memory_order_relaxed);
+        }
+    }
+}
+
+static void *writer_main(void *arg)
+{
+    server_t *s = (server_t *)arg;
+
+    for (;;) {
+        pthread_mutex_lock(&s->wq_mu);
+        while (!s->wq_stop) {
+            pthread_mutex_unlock(&s->wq_mu);
+            writer_drain_one(s);
+            pthread_mutex_lock(&s->wq_mu);
+            pthread_cond_wait(&s->wq_avail, &s->wq_mu);
+        }
+        pthread_mutex_unlock(&s->wq_mu);
+        return NULL;
+    }
+}
+
+int server_writers_start(server_t *s)
+{
+    int i;
+
+    if (s == NULL || s->writer_threads <= 0 || s->writers_started) {
+        return 0;
+    }
+    s->writers = (pthread_t *)calloc((size_t)s->writer_threads, sizeof *s->writers);
+    if (s->writers == NULL) {
+        return -1;
+    }
+    if (pthread_mutex_init(&s->wq_mu, NULL) != 0) {
+        free(s->writers);
+        s->writers = NULL;
+        return -1;
+    }
+    if (pthread_cond_init(&s->wq_avail, NULL) != 0) {
+        pthread_mutex_destroy(&s->wq_mu);
+        free(s->writers);
+        s->writers = NULL;
+        return -1;
+    }
+    s->wq_stop = 0;
+    s->writers_started = 1;
+    for (i = 0; i < s->writer_threads; i++) {
+        if (pthread_create(&s->writers[i], NULL, writer_main, s) != 0) {
+            int j;
+
+            pthread_mutex_lock(&s->wq_mu);
+            s->wq_stop = 1;
+            pthread_cond_broadcast(&s->wq_avail);
+            pthread_mutex_unlock(&s->wq_mu);
+            for (j = 0; j < i; j++) {
+                (void)pthread_join(s->writers[j], NULL);
+            }
+            pthread_cond_destroy(&s->wq_avail);
+            pthread_mutex_destroy(&s->wq_mu);
+            free(s->writers);
+            s->writers = NULL;
+            s->writers_started = 0;
+            s->writer_threads = 0;
+            return -1;
+        }
+    }
+    pthread_mutex_lock(&s->wq_mu);
+    pthread_cond_broadcast(&s->wq_avail);
+    pthread_mutex_unlock(&s->wq_mu);
+    return 0;
+}
+
+void server_writers_kick(server_t *s)
+{
+    if (s == NULL || !s->writers_started) {
+        return;
+    }
+    pthread_mutex_lock(&s->wq_mu);
+    pthread_cond_broadcast(&s->wq_avail);
+    pthread_mutex_unlock(&s->wq_mu);
+}
+
+void server_writers_stop(server_t *s)
+{
+    int i;
+
+    if (s == NULL || !s->writers_started) {
+        return;
+    }
+    pthread_mutex_lock(&s->wq_mu);
+    s->wq_stop = 1;
+    pthread_cond_broadcast(&s->wq_avail);
+    pthread_mutex_unlock(&s->wq_mu);
+    for (i = 0; i < s->writer_threads; i++) {
+        (void)pthread_join(s->writers[i], NULL);
+    }
+    pthread_cond_destroy(&s->wq_avail);
+    pthread_mutex_destroy(&s->wq_mu);
+    free(s->writers);
+    s->writers = NULL;
+    s->writers_started = 0;
 }
 
 void server_shutdown(server_t *s)
@@ -744,6 +897,12 @@ void server_shutdown(server_t *s)
      * implementation would have to guess at is a compatibility break bought for
      * nothing, and the receiver's log already names who left. */
     (void)fed_send_shutdown(s, NULL);
+    /* MT 2.2 (#241): stop writers BEFORE the goodbye is drained below AND the
+     * by_fd walk frees conns. Writers pump under wq_lock and may mark CLOSING,
+     * but only the reaper closes; joining first means no writer can touch a
+     * conn mid-teardown or race the single-threaded drain. Safe on a
+     * never-started node (no-op). */
+    server_writers_stop(s);
     /* Issue #173: unwrap the federation dispatch and forget the secret, so a
      * server_t that is shut down can be re-opened and no credential outlives
      * the node. Safe on a node that never called fed_open(). After the
@@ -1579,6 +1738,8 @@ void server_close_conn(server_t *s, int fd)
 int server_queue(server_t *s, conn_t *c, const char *data, size_t len)
 {
     if (c == NULL || conn_queue(c, data, len) == 0) {
+        /* MT 2.2 (#241): wake writers on growth; no-op when N == 0. */
+        server_writers_kick(s);
         return 0;
     }
     /* 3.4: bounded write queues, and a saturated link is DROPPED, not
@@ -1608,6 +1769,30 @@ int server_reap(server_t *s)
         conn_t *c = server_conn(s, fd);
 
         if (c != NULL && atomic_load_explicit(&c->state, memory_order_acquire) == CONN_CLOSING) {
+            /* MT 2.2 (#241): at N > 0 a CLOSING conn with unsent bytes stays
+             * registered while writers drain it -- closing now would RST the
+             * 417 (or any queued reply) the loop deliberately left for them.
+             * Bounded by wq_close_at[fd] (2 s from first sight): a peer that
+             * never reads cannot pin the conn forever, and the common case
+             * (drain in ms) is unaffected. N == 0 is unchanged: the loop
+             * already flushed synchronously. */
+            if (s->writer_threads > 0 && conn_write_pending_locked(c) > 0) {
+                uint64_t now = server_now_ms();
+
+                if (fd >= 0 && fd < 1024) {
+                    if (s->wq_close_at[fd] == 0) {
+                        s->wq_close_at[fd] = now + 2000u;
+                    }
+                    if (now < s->wq_close_at[fd]) {
+                        server_writers_kick(s);
+                        i++;
+                        continue;
+                    }
+                }
+            }
+            if (fd >= 0 && fd < 1024) {
+                s->wq_close_at[fd] = 0;
+            }
             server_close_conn(s, fd);
             closed++;
         } else {

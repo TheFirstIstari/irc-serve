@@ -74,8 +74,8 @@
  * the drain never finish. Those are the two things this test exists for.
  */
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -274,13 +274,14 @@ static void flood_tick(server_t *s, uint64_t now_ms)
 
     (void)now_ms;
 
-    if (g_flood_fd < 0 || s == NULL || s->n_partial_writes == g_last_pw) {
+    if (g_flood_fd < 0 || s == NULL ||
+        atomic_load_explicit(&s->n_partial_writes, memory_order_relaxed) == g_last_pw) {
         return;
     }
-    g_last_pw = s->n_partial_writes;
+    g_last_pw = atomic_load_explicit(&s->n_partial_writes, memory_order_relaxed);
     c = server_conn(s, g_flood_fd);
     printf("[fixture] pump partial_writes=%llu pending=%zu\n",
-           (unsigned long long)s->n_partial_writes,
+           (unsigned long long)atomic_load_explicit(&s->n_partial_writes, memory_order_relaxed),
            (c != NULL) ? conn_write_pending(c) : (size_t)0);
     fflush(stdout);
 }

@@ -71,6 +71,8 @@
 #define IRC_CORE_SERVER_H
 
 #include <poll.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -627,7 +629,11 @@ struct server {
 
     /* Observable counters. Every one of these is a claim the loop makes about
      * itself, and each is a real rejection or event rather than a derived
-     * guess, so a test can assert on them. */
+     * guess, so a test can assert on them.
+     *
+     * MT 2.2 (#241): n_write_error and n_partial_writes are _Atomic because
+     * writers increment them while the loop and the tick read them. The rest
+     * stay plain: only the loop thread touches them under the wave-2 rules. */
     uint64_t  n_accepted;        /* conns registered */
     uint64_t  n_rejected_fd;     /* accepted fds >= FD_SETSIZE, closed unrejected */
     uint64_t  n_closed;          /* conns the reaper closed */
@@ -635,8 +641,8 @@ struct server {
     uint64_t  n_parse_reject;    /* message_parse_n() rejections */
     uint64_t  n_frame_error;     /* unterminated over-long lines */
     uint64_t  n_writeq_overflow; /* appends refused over CONN_WQ_MAX */
-    uint64_t  n_write_error;     /* fatal send() on a conn */
-    uint64_t  n_partial_writes;  /* pumps that left bytes queued */
+    atomic_ullong n_write_error;     /* fatal send() on a conn (loop or writers) */
+    atomic_ullong n_partial_writes;  /* pumps that left bytes queued (loop or writers) */
     uint64_t  n_eintr;           /* poll() calls interrupted by a signal */
     uint64_t  n_ticks;           /* tick hook invocations */
     uint64_t  n_dial_connected;
@@ -1258,9 +1264,27 @@ struct server {
      * the grace derive from it. */
     uint64_t resume_window_ms;
 
-    /* MT 2.1 (#240): writer thread count; 0 = single-threaded drain (default).
-     * Stored by server_set_writer_threads(); no threads exist yet (2b). */
+    /* MT 2.2 (#241): writer pool. Threads spawn in server_init() when
+     * writer_threads > 0 and join before server_shutdown() frees conns.
+     * Loop thread never calls conn_pump() when N > 0; writers own it.
+     * Ordered delivery holds because one writer drains one conn's FIFO at a
+     * time under that conn's wq_lock -- bytes enter and leave in queue order,
+     * and the lock makes concurrent drains of the same conn impossible. */
     int       writer_threads;
+    /* Pool state; NULL/idle when writer_threads == 0. wq_avail is signalled
+     * whenever a conn's want_write rises (server_queue) or the pool starts;
+     * wq_stop ends the wait so join can proceed at shutdown. */
+    pthread_t *writers;          /* N thread handles, or NULL */
+    pthread_mutex_t wq_mu;        /* guards wq_avail/wq_stop below */
+    pthread_cond_t wq_avail;      /* work may be available */
+    int       wq_stop;            /* 1: writers exit after draining what they hold */
+    int       writers_started;    /* 1: wq_mu/wq_avail/writers are live */
+    /* MT 2.2: reap-deferral deadline per fd (monotonic ms, 0 = none). At N > 0
+     * a CLOSING conn with unsent bytes stays registered while writers drain
+     * it -- but only until this deadline, so a peer that never reads cannot
+     * pin a conn forever (test_reaper_close). Cleared on close/add.
+     * Indexed by fd (SERVER_FD_TABLE == FD_SETSIZE == 1024 here). */
+    uint64_t  wq_close_at[1024];
 
     int       trace;             /* emit [observable] per-line output */
 };
@@ -1649,9 +1673,18 @@ int server_dial_progress(server_t *s, const struct pollfd *pfds, size_t nfds);
 /* Number of dials currently in the table, in any state. Zero until Phase 6. */
 size_t server_dial_count(const server_t *s);
 
-/* MT 2.1 (#240): test seam for the writer pool (2b). Stores `n` (clamped to
+/* MT 2.2 (#241): test seam for the writer pool (2b). Stores `n` (clamped to
  * >= 0); no threads start. NULL server is a no-op. */
 void server_set_writer_threads(server_t *s, int n);
+
+/* MT 2.2 (#241): writer pool lifecycle, one place (server.c). Start spawns
+ * s->writer_threads threads after the seam set a nonzero count; idempotent
+ * and a no-op at 0. Kick wakes writers after queue growth. Stop flags exit
+ * and joins; safe on a never-started node. Shutdown calls stop before the
+ * by_fd walk, so no writer touches a conn the reaper freed. */
+int server_writers_start(server_t *s);
+void server_writers_kick(server_t *s);
+void server_writers_stop(server_t *s);
 
 /* The tick hook and the clock, called by the loop. server_tick() stamps the
  * clock, counts the invocation and forwards to s->on_tick when set. */

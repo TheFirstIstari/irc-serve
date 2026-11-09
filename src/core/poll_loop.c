@@ -172,15 +172,24 @@ static void conn_readable(server_t *s, conn_t *c)
          * conn is never read again. */
         if (c->kind != CONN_SERVER) {
             if (c->rate_tokens < 1.0) {
+                int need_flush;
                 printf("[observable] rate_limited: fd=%d\n", c->fd);
                 (void)reply_refused(s, c, m.command, NULL, "417", NULL, 0,
                                     "Input rate limit exceeded");
                 message_free(&m);
-                /* Flush NOW: the loop's write step runs before its read step
-                 * per iteration, and a CLOSING conn leaves the poll set, so a
-                 * 417 left queued would die in the reaper's close() unsent.
-                 * conn_pump() never closes; the mark below still does. */
-                (void)conn_pump(c);
+                /* Flush NOW at N == 0: the loop's write step runs before its
+                 * read step per iteration, and a CLOSING conn leaves the poll
+                 * set, so a 417 left queued would die in the reaper's close()
+                 * unsent. conn_pump() never closes; the mark below still does.
+                 * At N > 0 the loop must NOT pump (writers own it); instead the
+                 * 417 stays queued, the conn is marked CLOSING, and the reaper
+                 * defers close until writers drain it (see server_reap). */
+                need_flush = (s->writer_threads <= 0);
+                if (need_flush) {
+                    (void)conn_pump(c);
+                } else {
+                    server_writers_kick(s);
+                }
                 conn_mark_closing(c);
                 return;
             }
@@ -357,7 +366,12 @@ static void conn_on_readable(server_t *s, int fd)
  * Phase 12 the loop only asked for POLLOUT when there were bytes to write, so
  * there was no such thing as "reachable with an empty queue" and no need for
  * conn_pump() to do anything about it. The partial-write counter below is
- * guarded by `before > 0` and so cannot be moved by that pass. */
+ * guarded by `before > 0` and so cannot be moved by that pass.
+ *
+ * MT 2.2 (#241): when s->writer_threads > 0 the loop NEVER pumps -- writers
+ * own conn_pump()/transport_send. The loop still marks and queues (readable,
+ * 417-flush, reap); the poll set still advertises want_write so POLLOUT keeps
+ * arriving, and this handler is the one place that steps aside for N > 0. */
 static void conn_on_writable(server_t *s, int fd)
 {
     conn_t *c = server_conn(s, fd);
@@ -366,15 +380,24 @@ static void conn_on_writable(server_t *s, int fd)
     if (c == NULL || atomic_load_explicit(&c->state, memory_order_acquire) == CONN_CLOSING) {
         return;
     }
-    before = conn_write_pending(c);
+    if (s->writer_threads > 0) {
+        /* Writers drain; the poll set still tracks the intent. Kick here --
+         * not only in server_queue() -- because dispatches queue via
+         * conn_queue() directly, and POLLOUT arriving IS the demand signal
+         * the loop would otherwise serve. Without this a queued conn whose
+         * producers bypass server_queue() sleeps while writers wait. */
+        server_writers_kick(s);
+        return;
+    }
+    before = conn_write_pending_locked(c);
     if (conn_pump(c) < 0) {
-        s->n_write_error++;
+        atomic_fetch_add_explicit(&s->n_write_error, 1u, memory_order_relaxed);
         printf("[observable] conn_close: fd=%d reason=write_error\n", c->fd);
         conn_mark_closing(c);
         return;
     }
-    if (before > 0 && conn_write_pending(c) > 0) {
-        s->n_partial_writes++;
+    if (before > 0 && conn_write_pending_locked(c) > 0) {
+        atomic_fetch_add_explicit(&s->n_partial_writes, 1u, memory_order_relaxed);
     }
 }
 
