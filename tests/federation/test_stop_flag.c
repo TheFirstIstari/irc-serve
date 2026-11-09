@@ -40,8 +40,9 @@ int main(void)
     poll_loop_clear_stop_for(&a);
     assert(poll_loop_stopped_for(&a) == 0);
 
-    /* server_init() clears a set flag. */
+    /* server_init() clears a set flag (shutdown first: re-init leaks). */
     poll_loop_request_stop_for(&a);
+    server_shutdown(&a);
     assert(server_init(&a, "irc.a") == 0);
     assert(poll_loop_stopped_for(&a) == 0);
 
