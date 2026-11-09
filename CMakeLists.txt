@@ -231,6 +231,24 @@ if(IRC_SANITIZE)
   add_link_options(-fsanitize=address,undefined)
 endif()
 
+# ---------------------------------------------------------------------------
+# IRC_TSAN: the opt-in ThreadSanitizer build (MT wave 1, #237)
+# ---------------------------------------------------------------------------
+# OFF by default, same argument as IRC_SANITIZE above: a sanitizer run is a
+# different build, not a stricter one. Mutually exclusive with IRC_SANITIZE --
+# AddressSanitizer and ThreadSanitizer cannot instrument the same binary, and a
+# build that asked for both would otherwise silently pick one. Wave 2 runs the
+# suite under this build with --writers 4; until #240 lands the flag, the CI
+# cell runs the suite with TSAN_OPTIONS instead.
+option(IRC_TSAN "Build with -fsanitize=thread (mutually exclusive with IRC_SANITIZE)" OFF)
+if(IRC_TSAN AND IRC_SANITIZE)
+  message(FATAL_ERROR "irc-serve: IRC_TSAN and IRC_SANITIZE are mutually exclusive -- thread and address sanitizers cannot instrument the same binary.")
+endif()
+if(IRC_TSAN)
+  add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=thread)
+endif()
+
 # Compiler warnings (performance + correctness)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   add_compile_options(-Wall -Wextra -Werror -Wpedantic -O2)
