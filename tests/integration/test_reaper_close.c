@@ -106,8 +106,6 @@ static void audit_tick(server_t *s, uint64_t now_ms)
     uint64_t live = 0;
     int i;
 
-    (void)now_ms;
-
     for (i = 0; i < FD_SETSIZE; i++) {
         const conn_t *c = s->by_fd[i];
 
@@ -115,8 +113,23 @@ static void audit_tick(server_t *s, uint64_t now_ms)
             continue;
         }
         live++;
+        /* MT 2.2 (#241): at N > 0 the reaper deliberately defers a CLOSING
+         * conn with unsent bytes until writers drain it (bounded by the
+         * wq_close_at[fd] deadline in server_reap). BUGging on any survival
+         * would exit(3) the child on tick ~2 -- racing the intentional async
+         * drain, which is exactly the failure this audit used to report.
+         * Mirror the reaper's own rule: tolerate survival with a non-empty
+         * queue inside the deadline; BUG only past it (real leak) or with an
+         * empty queue (writer failed to drain). */
         if (atomic_load_explicit(&c->state, memory_order_acquire) == CONN_CLOSING) {
-            BUG("closing_survived_reap", c);
+            uint64_t dl = (c->fd >= 0 && c->fd < FD_SETSIZE) ? s->wq_close_at[c->fd] : 0;
+            int pending = (c->wlen > c->woff) ? 1 : 0;
+
+            if (s->writer_threads <= 0 || !pending) {
+                BUG("closing_survived_reap", c);
+            } else if (dl != 0 && now_ms >= dl) {
+                BUG("closing_survived_deadline", c);
+            }
         }
         if (c->fd != i) {
             /* The table is indexed BY descriptor; a mismatch means a lookup
@@ -124,19 +137,35 @@ static void audit_tick(server_t *s, uint64_t now_ms)
             BUG("fd_index_mismatch", c);
         }
         if (seen_before(c->fd)) {
-            /* (3) A reissued descriptor must come back pristine. The report
-             * carries every field a stale struct would corrupt, so the test can
-             * assert the values rather than take "it looked fine" on trust. */
-            if ((g_reported[c->fd] & 2u) == 0u) {
-                g_reported[c->fd] |= 2u;
-                printf("[fixture] reuse fd=%d rstate=%d roff=%zu rlen=%zu "
-                       "rkind=%d rnick=%s\n",
-                       c->fd, atomic_load_explicit(&c->state, memory_order_acquire), c->woff, c->rlen, c->kind, c->nick);
-                fflush(stdout);
-            }
-            if (atomic_load_explicit(&c->state, memory_order_acquire) != CONN_REG_PASS || c->woff != 0u || c->wlen != 0u ||
-                c->rlen != 0u || c->kind != CONN_CLIENT || c->nick[0] != '\0') {
-                BUG("reuse_dirty", c);
+            /* MT 2.2 (#241): at N > 0 the fd may still hold the DEFERRED
+             * conn1 (CLOSING, draining), not a reissued conn2. A CLOSING
+             * conn gets the deadline rule, not the pristine rule -- and no
+             * reuse report, so conn2's later pristine report is the one the
+             * parent's rstate=0 needle matches. */
+            if (atomic_load_explicit(&c->state, memory_order_acquire) == CONN_CLOSING) {
+                uint64_t ddl = (c->fd >= 0 && c->fd < FD_SETSIZE) ? s->wq_close_at[c->fd] : 0;
+                int dpending = (c->wlen > c->woff) ? 1 : 0;
+
+                if (s->writer_threads <= 0 || !dpending) {
+                    BUG("reuse_dirty", c);
+                } else if (ddl != 0 && now_ms >= ddl) {
+                    BUG("closing_survived_deadline", c);
+                }
+            } else {
+                /* (3) A reissued descriptor must come back pristine. The report
+                 * carries every field a stale struct would corrupt, so the test can
+                 * assert the values rather than take "it looked fine" on trust. */
+                if ((g_reported[c->fd] & 2u) == 0u) {
+                    g_reported[c->fd] |= 2u;
+                    printf("[fixture] reuse fd=%d rstate=%d roff=%zu rlen=%zu "
+                           "rkind=%d rnick=%s\n",
+                           c->fd, atomic_load_explicit(&c->state, memory_order_acquire), c->woff, c->rlen, c->kind, c->nick);
+                    fflush(stdout);
+                }
+                if (atomic_load_explicit(&c->state, memory_order_acquire) != CONN_REG_PASS || c->woff != 0u || c->wlen != 0u ||
+                    c->rlen != 0u || c->kind != CONN_CLIENT || c->nick[0] != '\0') {
+                    BUG("reuse_dirty", c);
+                }
             }
         } else if ((g_reported[c->fd] & 1u) == 0u) {
             g_reported[c->fd] |= 1u;

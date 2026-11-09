@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -683,8 +684,8 @@ static void nf_child_print_stats(const server_t *s)
            (unsigned long long)s->n_parse_reject,
            (unsigned long long)s->n_frame_error,
            (unsigned long long)s->n_writeq_overflow,
-           (unsigned long long)s->n_write_error,
-           (unsigned long long)s->n_partial_writes,
+           (unsigned long long)atomic_load_explicit(&s->n_write_error, memory_order_relaxed),
+           (unsigned long long)atomic_load_explicit(&s->n_partial_writes, memory_order_relaxed),
            (unsigned long long)s->n_eintr,
            (unsigned long long)s->n_rejected_fd,
            (unsigned long long)s->nconns,
@@ -766,9 +767,36 @@ static int nf_child_run(nf_setup_fn setup)
 
     /* The test's hook runs here: after the listener exists (so it owns a small
      * descriptor) and before anything may connect (so the node is in its final
-     * shape when the parent is told it is ready). */
+     * shape when the parent is told it is ready).
+     *
+     * MT 2.2 (#241): N>0 verification runs without editing every test. If
+     * IRC_WRITERS names a positive count, it overrides writer_threads AFTER
+     * the setup hook (which owns the seam otherwise). Production code is
+     * untouched: this is test-only plumbing for the N=4 suite pass. */
     if (setup != NULL) {
         setup(s);
+    }
+    {
+        const char *env = getenv("IRC_WRITERS");
+
+        if (env != NULL && env[0] != '\0') {
+            char *end = NULL;
+            long n = strtol(env, &end, 10);
+
+            if (end != env && *end == '\0' && n > 0 && n <= 64) {
+                server_set_writer_threads(s, (int)n);
+            }
+        }
+    }
+    /* MT 2.2 (#241): start the writer pool AFTER the setup hook (which owns
+     * writer_threads in N>0 tests) and before serving. server_shutdown()
+     * joins, so a start failure here fails the child rather than serving
+     * without a drain. */
+    if (server_writers_start(s) != 0) {
+        fprintf(stderr, "fixture: server_writers_start failed\n");
+        server_shutdown(s);
+        free(s);
+        return 1;
     }
     /* The test's tick hook is chained, not replaced: the fixture's own check
      * for parent death has to run whether or not the test wanted a tick. */
@@ -1004,6 +1032,27 @@ static int nf_spawn_common(nf_node_t *n, nf_mode_t mode, nf_setup_fn setup,
 
 int nf_spawn_binary(nf_node_t *n)
 {
+    /* MT 2.2 (#241): N>0 verification for binary-spawned tests. Same
+     * IRC_WRITERS override as the inline path, appended to the default argv
+     * (explicit-argv callers pass their own flags). */
+    const char *env = getenv("IRC_WRITERS");
+
+    if (env != NULL && env[0] != '\0') {
+        char *end = NULL;
+        long wn = strtol(env, &end, 10);
+
+        if (end != env && *end == '\0' && wn > 0 && wn <= 64) {
+            static char a0[] = "irc-serve";
+            static char a1[] = "0";
+            static char a2[] = "--writers";
+            static char wbuf[16];
+            char *w[5];
+
+            snprintf(wbuf, sizeof wbuf, "%ld", wn);
+            w[0] = a0; w[1] = a1; w[2] = a2; w[3] = wbuf; w[4] = NULL;
+            return nf_spawn_common(n, NF_BINARY, NULL, NULL, w);
+        }
+    }
     return nf_spawn_common(n, NF_BINARY, NULL, NULL, NULL);
 }
 

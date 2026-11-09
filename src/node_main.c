@@ -91,6 +91,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1154,8 +1155,15 @@ int main(int argc, char **argv)
      * lines are the contract described at the top of this file, so the trace
      * flag is on for the shipped binary. */
     srv.trace = 1;
-    /* MT 2.1 (#240): only 0 exists yet; nonzero runs single-threaded for now. */
+    /* MT 2.2 (#241): store the count, then start the pool. A start failure
+     * refuses startup rather than degrading silently: writers owned the drain
+     * from this point on, so a half-started pool is a node that cannot send. */
     server_set_writer_threads(&srv, opts.writers);
+    if (server_writers_start(&srv) != 0) {
+        fprintf(stderr, "irc-serve: writer pool failed to start\n");
+        server_shutdown(&srv);
+        return 1;
+    }
     /* The command surface. Phase 2 installed nothing here, which was the
      * honest state of a node with no vocabulary: the loop accepted, framed and
      * parsed and then said nothing at all. This is the assignment rather than a
@@ -1583,13 +1591,13 @@ int main(int argc, char **argv)
            (unsigned long long)srv.n_parse_reject,
            (unsigned long long)srv.n_frame_error,
            (unsigned long long)srv.n_writeq_overflow,
-           (unsigned long long)srv.n_write_error,
-           (unsigned long long)srv.n_partial_writes,
+           (unsigned long long)atomic_load_explicit(&srv.n_write_error, memory_order_relaxed),
+           (unsigned long long)atomic_load_explicit(&srv.n_partial_writes, memory_order_relaxed),
            (unsigned long long)srv.n_rejected_fd,
            (unsigned long long)srv.n_dial_connected,
            (unsigned long long)srv.n_dial_failed,
            (unsigned long long)srv.n_pass_seen,
-           (unsigned long long)srv.n_reply_refused,
+           (unsigned long long)atomic_load_explicit(&srv.n_reply_refused, memory_order_relaxed),
            (unsigned long long)srv.n_msg_stripped,
            (unsigned long long)srv.n_link_rejected,
            (unsigned long long)srv.n_link_duplicate,

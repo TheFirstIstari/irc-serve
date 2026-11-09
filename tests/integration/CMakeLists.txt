@@ -192,6 +192,9 @@ irc_add_integration_test(test_writeq_overflow test_writeq_overflow.c)
 
 # MT 2.1 (#240): --writers N flag and the server_set_writer_threads() seam.
 irc_add_integration_test(test_writers_flag test_writers_flag.c)
+# MT 2.2 (#241): writers own conn_pump at N > 0; reaper defers CLOSING close
+# until drained.
+irc_add_integration_test(test_writer_drain test_writer_drain.c)
 # 3.4: explicit fd >= FD_SETSIZE rejection at the accept site.
 irc_add_integration_test(test_fdsize_reject test_fdsize_reject.c)
 
@@ -201,6 +204,9 @@ irc_add_integration_test(test_eintr test_eintr.c)
 # #168: per-connection flood rate limit (burst 256, 50 lines/sec); a flooder
 # gets one 417 and a close, an honest client is unaffected.
 irc_add_integration_test(test_flood_rate test_flood_rate.c)
+
+# MT 2.3 (#242): the reaper never closes a conn under a writer's wq_lock.
+irc_add_integration_test(test_close_handoff test_close_handoff.c)
 
 # 3.4: the reaper is the only close site, and a closed slot leaves nothing
 # behind. The structural half is the test below.
