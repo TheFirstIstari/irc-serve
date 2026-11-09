@@ -1842,24 +1842,37 @@ int server_reap(server_t *s)
         conn_t *c = server_conn(s, fd);
 
         if (c != NULL && atomic_load_explicit(&c->state, memory_order_acquire) == CONN_CLOSING) {
-            /* MT 2.2 (#241): at N > 0 a CLOSING conn with unsent bytes stays
-             * registered while writers drain it -- closing now would RST the
-             * 417 (or any queued reply) the loop deliberately left for them.
-             * Bounded by wq_close_at[fd] (2 s from first sight): a peer that
-             * never reads cannot pin the conn forever, and the common case
-             * (drain in ms) is unaffected. N == 0 is unchanged: the loop
-             * already flushed synchronously. */
-            if (s->writer_threads > 0 && conn_write_pending_locked(c) > 0) {
-                uint64_t now = server_now_ms();
+            /* MT 2.3 (#242): structural close handoff. The reaper must never
+             * close()+free() a conn while a writer holds its wq_lock mid-drain
+             * (conn_pump). The 2 s wq_close_at deadline below still bounds the
+             * deferral, but the guarantee is not timing-only: a non-blocking
+             * trylock proves no writer is inside the pump right now, and a held
+             * lock skips this tick WITHOUT touching the deadline (a draining
+             * writer is progress, not stalling). Pending is read under that
+             * same hold, so check and decision cannot race the queue. The
+             * trylock never blocks, so reg_mu -> wq_lock order cannot invert. */
+            if (s->writer_threads > 0) {
+                size_t pending = 0;
 
-                if (fd >= 0 && fd < SERVER_FD_TABLE) {
-                    if (s->wq_close_at[fd] == 0) {
-                        s->wq_close_at[fd] = now + 2000u;
-                    }
-                    if (now < s->wq_close_at[fd]) {
-                        server_writers_kick(s);
-                        i++;
-                        continue;
+                if (pthread_mutex_trylock(&c->wq_lock) != 0) {
+                    server_writers_kick(s);
+                    i++;
+                    continue;
+                }
+                pending = c->wlen - c->woff;
+                pthread_mutex_unlock(&c->wq_lock);
+                if (pending > 0) {
+                    uint64_t now = server_now_ms();
+
+                    if (fd >= 0 && fd < SERVER_FD_TABLE) {
+                        if (s->wq_close_at[fd] == 0) {
+                            s->wq_close_at[fd] = now + 2000u;
+                        }
+                        if (now < s->wq_close_at[fd]) {
+                            server_writers_kick(s);
+                            i++;
+                            continue;
+                        }
                     }
                 }
             }
