@@ -9,14 +9,16 @@ schema: spec-driven
 #     Designs and tasks must cover Windows, macOS, and Linux
 #     Write all artifacts in Spanish
 context: |
-  Federated IRC server in strict C11 (src/), single-threaded poll() loop, no
+  Federated IRC server in strict C11 (src/), poll() loop with writers-only
+  threads (--writers; loop is the single writer when disabled), no
   required third-party dependencies (TLS via -DWITH_TLS=ON adds OpenSSL).
   Multi-node from day one: nicks scoped per server (nick@server), channels
   origin-owned, one shared client/peer dispatch path. Refusing beats queueing:
   a node never applies channel state it cannot route to the channel's origin.
   Quality gates: tests green, 0 warnings on gcc-16/upstream-Clang/Apple-clang
   (-Weverything, Release+Debug), ASan+UBSan clean, CodeQL 0 open alerts.
-  Proposals MUST keep: single-threaded event loop (no threads), no new required
+  Proposals MUST keep: loop-is-single-writer threading (writers-only threads via
+  --writers, loop never sends when writers own the pump), no new required
   dependencies, per-connection and node-wide caps on every growth path,
   fail-closed auth/TLS (never log-and-continue on revoked/failed auth),
   refuse-rather-than-truncate on client-visible fields.
