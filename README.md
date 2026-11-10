@@ -386,6 +386,24 @@ Two things to know:
 Addresses are resolved once at startup, never inside the event loop. Joining the
 same channel from a client on each node puts both nicks in both rosters.
 
+### Writer threads (`--writers`)
+
+`./build/src/irc-serve 6667 --writers N` moves the write drain off the event
+loop onto N writer threads (full text in `irc-serve --help`). **Default `0`**:
+the loop drains inline, byte-identical to the single-threaded build. With N > 0
+the loop never sends — writers own `conn_pump`/`transport_send` — and a close
+handoff keeps the reaper from freeing a buffer a writer still holds.
+
+Tuning: `tests/benchmark/bench_writer_drain.c` drains 32 conns × 64 KiB at
+N=0/2/4 and fails on a stall; N=2 and N=4 both drain fully. The inline N=0 path
+is fastest on an unloaded node — thread handoff costs more than it saves there —
+so stay on the default until a loaded node spends its tick budget on sends, then
+try 2 and measure before 4. `--writers 0` is the rollback. The suite passes at
+N=0 and at N=4 (`IRC_WRITERS=4`, a test-harness override in
+`tests/harness/node_fixture.c`). Design:
+`openspec/changes/add-multithreading/specs/threading/spec.md`.
+
+
 ## Layout
 
 ```
