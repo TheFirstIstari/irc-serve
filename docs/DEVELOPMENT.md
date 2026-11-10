@@ -283,6 +283,29 @@ lifting it is a deliberate, visible act. This is a feature — the normal way ba
 is `revert`, and rewriting `main` should never be something a tired person does
 at 2am.
 
+## Writer threads (`--writers`)
+
+`irc-serve --writers N` moves the write drain off the event loop onto N writer
+threads. **Default `0`**: the loop drains inline, byte-identical to the
+single-threaded build. With N > 0 the loop never calls `send()` on a connection
+a writer owns, and a close handoff keeps the reaper from freeing a buffer a
+writer still holds. `--writers 0` is the rollback; no restart dance, just the
+flag. Spec: `openspec/changes/add-multithreading/specs/threading/spec.md`.
+
+```sh
+./build/src/irc-serve 6667 --writers 2   # offload the drain
+IRC_WRITERS=4 ctest --test-dir build     # run the suite under 4 writers
+```
+
+`IRC_WRITERS` is test-only plumbing in `tests/harness/node_fixture.c`: it
+overrides the writer count after each test's setup hook, so the N=4 suite pass
+needs no per-test edits.
+
+Tuning comes from `tests/benchmark/bench_writer_drain` (32 conns × 64 KiB,
+drained at N=0/2/4, nonzero exit on a stall, advisory-only in CI). The inline
+path wins unloaded, so stay on the default until the tick budget says otherwise,
+then try N=2 and measure again before N=4.
+
 ## Local verification
 
 ```sh
