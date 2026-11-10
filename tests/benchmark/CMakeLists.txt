@@ -1,9 +1,11 @@
 add_executable(bench_mem footprint.c)
 add_executable(bench_throughput throughput.c)
 add_executable(bench_fanout bench_fanout.c)
+add_executable(bench_writer_drain bench_writer_drain.c)
 
 # Benchmarks exercise real parser code from irc_core.
 target_link_libraries(bench_throughput PRIVATE irc_core)
+target_link_libraries(bench_writer_drain PRIVATE irc_core)
 
 # Ensure assert() checks are not compiled out in Release builds used by CI.
 target_compile_options(bench_mem PRIVATE $<$<CONFIG:Release>:-UNDEBUG>)
@@ -21,3 +23,6 @@ set_tests_properties(BenchmarkThroughput PROPERTIES LABELS Benchmark)
 
 add_test(NAME BenchmarkFanout COMMAND bench_fanout)
 set_tests_properties(BenchmarkFanout PROPERTIES LABELS Benchmark)
+
+add_test(NAME BenchmarkWriterDrain COMMAND bench_writer_drain)
+set_tests_properties(BenchmarkWriterDrain PROPERTIES LABELS Benchmark)
